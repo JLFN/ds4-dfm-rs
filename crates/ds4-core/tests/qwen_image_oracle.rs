@@ -11,11 +11,21 @@
 //!
 //!     DS4_QWEN_IMAGE_ORACLE=<prefix> cargo test -p ds4-core --test qwen_image_oracle
 //!
-//! With the variable unset every test returns early, so the suite stays
+//! Stage 2 (the DiT forward) additionally needs the artifact, and supports two
+//! diagnostics: `DS4_QWEN_IMAGE_DIT_OUT=<prefix>` writes the per-pass velocities
+//! in the reference's dump format, and `DS4_QWEN_IMAGE_EXPORT=<tensor>` with
+//! `DS4_QWEN_IMAGE_EXPORT_OUT=<file>` writes one dequantized tensor so an
+//! independent dequantizer can be diffed against it.
+//!
+//!     DS4_QWEN_IMAGE_ORACLE=<prefix> DS4_QWEN_IMAGE_DIT=<gguf> \
+//!         cargo test -p ds4-core --release --test qwen_image_oracle
+//!
+//! With the variables unset every test returns early, so the suite stays
 //! model-free by default, in the style the other families use.
 
 use std::path::PathBuf;
 
+use ds4_core::qwen_image::dit::{cfg_combine, forward, parity, DitPass, DitWeights};
 use ds4_core::qwen_image::oracle::{
     apply_rope, build_layout, euler_step, flux_sigmas, flow_timestep, initial_noise,
     noise_scaling, rope_table, text_mask, Philox, RopePairing,
@@ -262,4 +272,164 @@ fn philox_is_seed_and_call_position_dependent() {
     assert_ne!(a, b);
     assert_eq!(a, first);
     assert_ne!(first, second);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: the DiT forward
+// ---------------------------------------------------------------------------
+
+/// The artifact the stage-2 gate evaluates, from `DS4_QWEN_IMAGE_DIT`.
+fn dit_weights() -> Option<DitWeights> {
+    let path = std::env::var("DS4_QWEN_IMAGE_DIT").ok()?;
+    Some(DitWeights::open(&PathBuf::from(path)).expect("open the DiT artifact"))
+}
+
+/// Writes one tensor in the reference dump's own format, so a scratch check can
+/// diff it without this crate knowing how to read the format back.
+fn write_dump(path: &str, dims: &[u64], values: &[f32]) {
+    let header: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    let mut bytes = format!("dims {} {}\n", dims.len(), header.join(" ")).into_bytes();
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, bytes).expect("write dump");
+}
+
+/// One CFG-combined velocity for a pairing: both guidance passes, then the
+/// reference's own combination (`guidance.cpp:171`, `--cfg-scale 6.0`).
+fn cfg_velocity(
+    weights: &DitWeights,
+    cond: &Dump,
+    uncond: &Dump,
+    latent: &Dump,
+    timestep: f32,
+    pairing: RopePairing,
+) -> Vec<f32> {
+    let (height, width) = (latent.dims[1] as usize, latent.dims[0] as usize);
+    let evaluate = |context: &Dump| {
+        forward(
+            weights,
+            &DitPass {
+                latent: &latent.data,
+                height,
+                width,
+                context: &context.data,
+                text_length: context.dims[1] as usize,
+                timestep,
+                pairing,
+            },
+        )
+        .expect("the DiT forward")
+    };
+
+    let cond_pred = evaluate(cond);
+    let uncond_pred = evaluate(uncond);
+    assert_eq!(cond_pred.len(), latent.data.len());
+
+    let combined = cfg_combine(&cond_pred, &uncond_pred, 6.0);
+
+    if let Ok(prefix) = std::env::var("DS4_QWEN_IMAGE_DIT_OUT") {
+        let name = match pairing {
+            RopePairing::Interleaved => "interleaved",
+            RopePairing::HalfSplit => "halfsplit",
+        };
+        for (part, values) in
+            [("cond", &cond_pred), ("uncond", &uncond_pred), ("cfg", &combined)]
+        {
+            write_dump(&format!("{prefix}.{name}.{part}.bin"), &latent.dims, values);
+        }
+    }
+    combined
+}
+
+/// Stage 2's gate: the reference's own step-1 velocity, and the probe that
+/// settles the RoPE pairing by measurement rather than by reading
+/// (`rope_interleaved` defaults to true but these weights were trained
+/// elsewhere).
+///
+/// `pred` is the model output itself: `DiscreteFlowDenoiser` has `c_skip = 1`
+/// and `c_out = -sigma`, so `denoised = x - sigma*model_out` and the Euler
+/// velocity `d = (x - denoised)/sigma` is `model_out` — which is why the CFG
+/// combination of the two passes is what the dump holds.
+#[test]
+fn dit_forward_reproduces_the_reference_step_velocity() {
+    if std::env::var("DS4_QWEN_IMAGE_ORACLE").is_err() {
+        return;
+    }
+    let Some(weights) = dit_weights() else {
+        return;
+    };
+
+    let (_, cond) = fixture("", ".cond.0.bin").expect("cond dump");
+    let (_, uncond) = fixture("", ".cond.1.bin").expect("uncond dump");
+    let (_, latent) = fixture("", ".step1.in.bin").expect("latent dump");
+    let (path, reference) = fixture("", ".step1.pred.bin").expect("pred dump");
+
+    let image_tokens = (latent.dims[0] * latent.dims[1]) as i64;
+    let sigmas = flux_sigmas(image_tokens, 2);
+    let timestep = flow_timestep(sigmas[0]);
+    assert_eq!(timestep, 1000.0, "the first sigma is 1, so the DiT sees 1000");
+
+    let mut measured = Vec::new();
+    for pairing in [RopePairing::Interleaved, RopePairing::HalfSplit] {
+        let start = std::time::Instant::now();
+        let velocity = cfg_velocity(&weights, &cond, &uncond, &latent, timestep, pairing);
+        let elapsed = start.elapsed().as_secs_f32();
+        let result = parity(&velocity, &reference.data);
+
+        println!(
+            "{}: correlation {:.6}, relative RMS {:.4e}, max |diff| {:.4e}, {:.1}s",
+            match pairing {
+                RopePairing::Interleaved => "interleaved",
+                RopePairing::HalfSplit => "half-split",
+            },
+            result.correlation,
+            result.relative_rms,
+            result.max_abs,
+            elapsed
+        );
+        measured.push((pairing, result));
+    }
+
+    let (winner, best) =
+        measured.iter().copied().max_by(|a, b| a.1.correlation.total_cmp(&b.1.correlation)).expect("two pairings");
+    let (loser, worst) = measured.iter().copied().find(|(p, _)| *p != winner).expect("the other pairing");
+
+    assert_eq!(winner, RopePairing::Interleaved, "the pairing this port applies");
+    assert!(
+        best.correlation > 0.999,
+        "{}: correlation {:.6} against {}",
+        path.display(),
+        best.correlation,
+        best.relative_rms
+    );
+    assert!(best.relative_rms < 0.02, "{}: relative RMS {:.4e}", path.display(), best.relative_rms);
+    assert!(
+        best.correlation - worst.correlation > 0.05,
+        "the pairings are not distinguishable: {winner:?} {:.6} vs {loser:?} {:.6}",
+        best.correlation,
+        worst.correlation
+    );
+}
+
+/// Scratch: writes one tensor's dequantized F32 for the independent
+/// cross-check against the `gguf` Python dequantizer. Gated, like the rest.
+#[test]
+fn export_tensor_for_crosscheck() {
+    let (Ok(path), Ok(name), Ok(out)) = (
+        std::env::var("DS4_QWEN_IMAGE_DIT"),
+        std::env::var("DS4_QWEN_IMAGE_EXPORT"),
+        std::env::var("DS4_QWEN_IMAGE_EXPORT_OUT"),
+    ) else {
+        return;
+    };
+
+    let weights = DitWeights::open(&PathBuf::from(path)).expect("open");
+    let values = weights.dequantize_f32(&name).expect("dequantize");
+
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in &values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(out, bytes).expect("write");
 }

@@ -1,15 +1,16 @@
-# Qwen-Image-2.1 port — phase P1, the CPU oracle (stage 1: exact numerics)
+# Qwen-Image-2.1 port — phase P1, the CPU oracle (stages 1 and 2)
 
 [Documentation index](README.md) | [Repository README](../README.md) |
 [Plan](qwen-image-2.1-plan.md) | [Recipe](qwen-image-2.1-recipe.md) |
 [Roadmap](qwen-image-2.1-roadmap.md) | [Phase S](qwen-image-2.1-phase-s.md) |
 [P0](qwen-image-2.1-decision.md) | [P1 recipe](qwen-image-2.1-recipe.md)
 
-Status: in progress, stage 1 of 3 done. Stage 1 is the part of P1 the plan calls
-exact by construction — the initial noise, the positions, the RoPE table inputs,
-the segment masks and the flow schedule — plus the harness that makes every later
-stage comparable. The DiT evaluation, the VAE decode and the image are stage 2
-and 3 and are not in this document.
+Status: in progress, stages 1 and 2 of 3 done. Stage 1 is the part of P1 the plan
+calls exact by construction — the initial noise, the positions, the RoPE table
+inputs, the segment masks and the flow schedule. Stage 2 is the DiT evaluation
+itself, driven by the reference's own conditioning and gated on the reference's
+own dumped velocity. The VAE decode and the image are stage 3 and are not in this
+document.
 
 Date: 2026-10-01. Host: RTX 4070 SUPER (sm_89, 12282 MiB nominal), driver
 610.43.03. Reference: `/data/imagegen/bin/sd-cli`, version
@@ -92,8 +93,81 @@ Read out of the run log and the dumps, in the reference's own words:
 
 The RoPE table's pairing convention (`rope_interleaved`) is the one item the
 recipe lists as unsettleable by reading. Both pairings are implemented behind
-`RopePairing`; the DiT evaluation in stage 2 is the probe that selects one, so
-this document does not claim a convention yet.
+`RopePairing`; section 4 settles it by measurement.
+
+## 4. Stage 2: the DiT forward
+
+One complete F32 DiT evaluation, driven by the reference's own conditioning dumps
+and compared with the reference's own velocity. The gate is the dumped
+`step1.pred.bin` from a `--cfg-scale 6.0` run, which is
+`uncond + 6*(cond - uncond)` over the two guidance passes: `DiscreteFlowDenoiser`
+has `c_skip = 1` and `c_out = -sigma`, so the Euler velocity the sampler applies
+is the model output itself (`denoised = x - sigma*model_out`,
+`d = (x - denoised)/sigma`).
+
+Measured on this host (release build, 271 joint tokens, 15 + 256, both passes
+and the combination; the wall time is one run on this host and moves with load):
+
+| pairing | correlation | relative RMS | max abs | wall time |
+| --- | --- | --- | --- | --- |
+| `RopePairing::Interleaved` | **0.999973** | **7.56e-3** | 1.37 | 106 s |
+| `RopePairing::HalfSplit` | 0.742873 | 6.69e-1 | 30.2 | 108 s |
+
+The pairing is therefore settled by measurement and not by reading: the port
+applies the interleaved pairing, the reference's own default, and the other
+pairing is 0.257 away in correlation. The gate asserts the winner's identity,
+its correlation and relative RMS, and a clear separation from the loser.
+
+### Why the residual is a tolerance and not a bug
+
+Two independent F32 implementations of this forward — this port and a from-source
+numpy port (`misc/scratch/p1/dit_numpy.py`, gitignored) — agree with each other
+to **1.2e-6 relative RMS** on the conditioned pass and 4.1e-7 on the
+unconditioned one (correlation 1.0000000, max |diff| 2.4e-5, both measured
+through the fixture test's `DS4_QWEN_IMAGE_DIT_OUT` dumps). On the same run both
+sit 5.2e-3 relative RMS from the reference's conditioned pass and 7.6e-3 from
+its CFG combination. F32 summation-order noise is three orders of magnitude
+below the residual, so the difference is not how the sums are ordered: it is the
+reference's own arithmetic. The reference evaluated this fixture on CUDA
+(`diffusion=cuda0`) with Q6_K weights through its quantized matmul, and the
+manual attention path it selected (`flash_attn: false` in the run log — the F16
+casts of k and v live in `build_kqv`, which only runs under flash or sage
+attention) still leaves the rest of the graph on kernels this port does not
+model. Which kernel or numeric type accounts for the residual is not isolated
+here, and not claimed.
+
+### The comparison harness
+
+`misc/scratch/p1/dit_numpy.py` is a second, independent implementation of the
+same forward, written in numpy from the pinned source rather than ported from
+this one; it is scratch and gitignored, not a shipped artifact. Comparing the
+two stage by stage during development is what exposed three layout errors in
+this port — the matmul's output order, patchify's channel order and the
+unpatchify order — each of which left the magnitudes correct and the content
+scrambled. The reproducible part of that comparison is section 4's pass-level
+agreement, through the fixture test's own dumps.
+
+### The dequantizers are checked against a third implementation
+
+The two weight layouts the forward needs are Q6_K (`ql[128] | qh[64] |
+scales[16] i8 | d f16`, 210 bytes per 256 values) and BF16. Both were compared
+against the `gguf` Python package's dequantizer, whose Q6_K comes from llama.cpp
+rather than from this port: `img_in.weight` (BF16), `attn.to_q.weight` (Q6_K),
+`timestep_embedder.linear_2.weight` and `modulation.1.weight` all match with a
+maximum difference of zero. The comparison is `DS4_QWEN_IMAGE_EXPORT=<tensor>` on
+the fixture test, which writes one dequantized tensor for an external check.
+
+### What stage 2 does not establish
+
+1. Only step 1 of the fixture, at the fixture's 16x16 latent grid. Step 2 is a
+   second evaluation of the same function at a different sigma and is not run.
+2. Text-to-image only: a joint sequence with reference latents is refused by name
+   (`DitError::Unsupported`), which is the img2img path and belongs with its own
+   gate.
+3. No VAE, no latent statistics, no PNG — stage 3.
+4. No kernel, no GPU path, no timing worth quoting: the forward is a reference
+   implementation, and its 106 s for two passes is the CPU's, not a serving
+   number.
 
 ### The operation order of a step is measurable
 
@@ -133,23 +207,34 @@ oracle exists to prevent: the all-F32 version is wrong in 5142 of 16384 samples
 (4774 by one ulp, 360 by two, 8 by three), a difference no downstream tolerance
 would ever have flagged.
 
-## 4. Code and tests
+## 5. Code and tests
 
 - `crates/ds4-core/src/qwen_image/oracle.rs`: `Philox`, `initial_noise`,
   `Layout`/`Segment`/`build_layout`/`LayoutError`, `rope_table`, `apply_rope` +
   `RopePairing`, `text_mask`, `flux_time_shift`/`flux_mu`/`flux_sigmas`/
   `flow_timestep`/`noise_scaling`/`euler_step`. 12 unit tests, model-free.
-- `crates/ds4-core/tests/qwen_image_oracle.rs`: 7 fixtures tests, gated on
-  `DS4_QWEN_IMAGE_ORACLE=<prefix>`; with the variable unset they return early, so
-  the suite stays model-free by default.
+- `crates/ds4-core/src/qwen_image/dit.rs`: `DitWeights` (`open`, `linear`,
+  `dequantize_f32`), `DitPass`, `DitError`, `forward`, `cfg_combine`, `Parity` /
+  `parity`, with the Q6_K and BF16 dequantizers, the F32 matmul and the
+  elementwise kernels the forward needs. 9 unit tests, model-free.
+- `crates/ds4-core/tests/qwen_image_oracle.rs`: 9 tests. Six evaluate the
+  reference's dumps and return early unless `DS4_QWEN_IMAGE_ORACLE=<prefix>` is
+  set (the DiT gate also needs `DS4_QWEN_IMAGE_DIT=<gguf>`), one is the dequant
+  cross-check hook gated on `DS4_QWEN_IMAGE_EXPORT=<tensor>`, and two are
+  model-free and always run. Cargo runs the test binary from the package
+  directory, so the fixture prefix must be an absolute path.
 
 ```
 cargo test -p ds4-core --lib qwen_image::oracle                          # 12 passed
-DS4_QWEN_IMAGE_ORACLE=misc/scratch/p1/refdump/run1 \
-  cargo test -p ds4-core --test qwen_image_oracle                        # 7 passed
+cargo test -p ds4-core --lib qwen_image::dit                             # 9 passed
+D=/data/ds4-dfm-rs/misc/scratch/p1/refdump/run1
+DS4_QWEN_IMAGE_ORACLE=$D cargo test -p ds4-core --test qwen_image_oracle # 9 passed
+DS4_QWEN_IMAGE_ORACLE=$D \
+DS4_QWEN_IMAGE_DIT=/data/imagegen/models/diffusion_models/qwen-image-2.1-Q6_K.gguf \
+  cargo test -p ds4-core --release --test qwen_image_oracle dit_forward_reproduces
 ```
 
-## 5. Artifacts
+## 6. Artifacts
 
 Re-verified this session (`misc/scratch/p1/p1-artifact-hashes.txt`):
 
@@ -159,13 +244,12 @@ Re-verified this session (`misc/scratch/p1/p1-artifact-hashes.txt`):
 | `qwen_image_2.1_vae_bf16.safetensors` | `bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9` |
 | `misc/scratch/p0/vae-decode-bf16.gguf` | `d3feefed174e69d51f380c71bb500ab92033d85fc83f5d87c9811a8775725372` |
 
-## 6. What this does not establish
+## 7. What this does not establish
 
-1. Nothing about the DiT: `img_in`, the text projection, the modulation, the 32
-   blocks, `norm_out`/`proj_out` and the unpatchify are stage 2.
-2. Nothing about the VAE decode, the latent statistics, the conversions or the
+1. Nothing about the VAE decode, the latent statistics, the conversions or the
    PNG, which are stage 3.
-3. No kernel, no GPU path and no timing. P1 is a reference, not a measurement.
-4. The RoPE pairing is implemented both ways and unresolved until stage 2.
-5. The conditioning intake consumes dumps; the text encoder that produces them
+2. No kernel, no GPU path and no serving timing. P1 is a reference, not a
+   measurement.
+3. The conditioning intake consumes dumps; the text encoder that produces them
    is P7's and is not exercised here.
+4. Stage 2's limits are listed in section 4.
