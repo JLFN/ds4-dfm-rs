@@ -2,7 +2,7 @@
 
 [Documentation index](README.md) | [Repository README](../README.md) |
 [Plan](qwen-image-2.1-plan.md) | [Recipe](qwen-image-2.1-recipe.md) |
-[Roadmap](qwen-image-2.1-roadmap.md)
+[Roadmap](qwen-image-2.1-roadmap.md) | [Decision](qwen-image-2.1-decision.md)
 
 Status: complete. Three measurements, each against the reference's own kernels on
 the same hardware. Verdict: **none of the three shows a gain the port can
@@ -274,6 +274,11 @@ grounds. If the port is wanted for ownership, the first thing to scope is a
 fusion pass over the elementwise glue, because that is the only measured
 unclaimed headroom left; and the roadmap's M1/M2 items should be marked as
 settled rather than open.
+
+Resolved 2026-10-01: the [decision](qwen-image-2.1-decision.md) scoped that
+fusion pass at 250-450 ms/step and closed the port, because it is below what the
+free `--diffusion-fa` flag already returns. M1/M2 are recorded as settled in the
+roadmap's tracker.
 
 ## 8. What this does not prove
 
