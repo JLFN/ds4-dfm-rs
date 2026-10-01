@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ds4_server::image_cli::{check_image, parse_placement};
+use ds4_server::image_cli::{check_image, parse_max_vram_gib, parse_placement};
 
 fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("ds4-qwen-image-tests");
@@ -68,7 +68,7 @@ fn every_ar_control_is_refused_by_name() {
     let dit = tmp("not-a-dit.gguf");
     write_tiny_gguf(&dit, "img_in.weight", &[64, 4096]);
     let argv: Vec<String> = AR_ARGV.iter().map(|s| s.to_string()).collect();
-    let out = check_image(Some(dit.to_str().unwrap()), None, false, &[], true, &argv);
+    let out = check_image(Some(dit.to_str().unwrap()), None, false, &[], None, true, &argv);
     assert_eq!(out.exit_code, 2, "a run carrying AR controls must not pass");
     for flag in [
         "--ctx",
@@ -91,7 +91,7 @@ fn every_ar_control_is_refused_by_name() {
 
 #[test]
 fn a_check_without_artifacts_refuses_the_run() {
-    let out = check_image(Some("absent.gguf"), None, false, &[], true, &[]);
+    let out = check_image(Some("absent.gguf"), None, false, &[], None, true, &[]);
     assert_eq!(out.exit_code, 2);
     assert!(out.stderr.iter().any(|l| l.contains("absent.gguf")));
 }
@@ -101,8 +101,36 @@ fn placement_refusals_come_from_the_measured_rules() {
     let dit = tmp("not-a-dit.gguf");
     write_tiny_gguf(&dit, "img_in.weight", &[64, 4096]);
     let placement = parse_placement("vae=cuda0:vram").unwrap();
-    let out = check_image(Some(dit.to_str().unwrap()), None, false, &placement, true, &[]);
+    let out = check_image(Some(dit.to_str().unwrap()), None, false, &placement, None, true, &[]);
     assert!(out.report.contains("image_double_pin_unsupported"), "{}", out.report);
+}
+
+/// The same pin that is refused above resolves once the device's budget is
+/// declared large enough: the rule is the budget's, not the engine's.
+#[test]
+fn a_large_declared_budget_admits_the_measured_pin() {
+    let dit = tmp("not-a-dit.gguf");
+    write_tiny_gguf(&dit, "img_in.weight", &[64, 4096]);
+    let placement = parse_placement("te=cuda0:vram,diffusion=cuda0:vram,vae=cuda0:vram").unwrap();
+
+    let refused = check_image(Some(dit.to_str().unwrap()), None, false, &placement, None, true, &[]);
+    assert!(refused.report.contains("image_te_vram_unsupported"), "{}", refused.report);
+    assert!(refused.report.contains("image_double_pin_unsupported"), "{}", refused.report);
+
+    // The one-tensor stand-in still fails artifact identification, so the
+    // assertion is on the placement codes, not on the exit code.
+    let admitted = check_image(
+        Some(dit.to_str().unwrap()),
+        None,
+        false,
+        &placement,
+        parse_max_vram_gib("140").ok(),
+        true,
+        &[],
+    );
+    assert!(!admitted.report.contains("image_te_vram_unsupported"), "{}", admitted.report);
+    assert!(!admitted.report.contains("image_double_pin_unsupported"), "{}", admitted.report);
+    assert!(!admitted.report.contains("image_vram_budget_exceeded"), "{}", admitted.report);
 }
 
 #[test]
@@ -113,7 +141,7 @@ fn image_artifacts_when_configured() {
     ) else {
         return;
     };
-    let out = check_image(Some(&dit), Some(&vae), false, &[], true, &["--check-config".into()]);
+    let out = check_image(Some(&dit), Some(&vae), false, &[], None, true, &["--check-config".into()]);
     assert_eq!(out.exit_code, 0, "clean check failed:\n{}\n{}", out.report, out.stderr.join("\n"));
     assert!(out.report.contains("dit_tensors=297"), "{}", out.report);
     assert!(out.report.contains("dit_q6_k=229"), "{}", out.report);
@@ -126,6 +154,7 @@ fn image_artifacts_when_configured() {
         Some(&vae),
         false,
         &[],
+        None,
         true,
         &["--check-config".into(), "--ctx".into(), "8192".into()],
     );

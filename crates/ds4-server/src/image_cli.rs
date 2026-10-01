@@ -43,6 +43,18 @@ pub fn parse_tier(name: &str) -> Option<ParamTier> {
     }
 }
 
+/// `--max-vram <GiB>`: the per-device budget for managed weights and runner
+/// buffers, in the reference's own unit, returned in MiB.
+pub fn parse_max_vram_gib(value: &str) -> Result<u64, String> {
+    let gib: u64 = value
+        .parse()
+        .map_err(|_| format!("--max-vram {value}: expected a whole number of GiB"))?;
+    if gib == 0 {
+        return Err("--max-vram 0: a zero budget pins nothing".into());
+    }
+    Ok(gib * 1024)
+}
+
 /// `--image-placement te=cpu:host,diffusion=cuda0:vram,vae=cpu:host`
 pub fn parse_placement(spec: &str) -> Result<Vec<ModulePlacement>, String> {
     let mut out = Vec::new();
@@ -81,6 +93,7 @@ pub fn check_image(
     vae: Option<&str>,
     offload: bool,
     placement: &[ModulePlacement],
+    vram_budget_mib: Option<u64>,
     check_config: bool,
     argv: &[String],
 ) -> ImageCheck {
@@ -120,6 +133,7 @@ pub fn check_image(
         ar_controls: controls,
         placement: placement.to_vec(),
         offload,
+        vram_budget_mib,
     };
     let mut plan = resolve_image_plan(&req, &ids);
     if let Some(message) = artifact_error {
@@ -163,8 +177,19 @@ mod tests {
 
     #[test]
     fn image_flags_require_check_config() {
-        let out = check_image(Some("x.gguf"), None, false, &[], false, &[]);
+        let out = check_image(Some("x.gguf"), None, false, &[], None, false, &[]);
         assert_eq!(out.exit_code, 2);
         assert!(out.stderr[0].contains("--check-config"));
+    }
+
+    /// The budget arrives in GiB on the command line, as the reference's own
+    /// flag does, and is carried in MiB.
+    #[test]
+    fn max_vram_parses_gib_and_refuses_zero_or_junk() {
+        assert_eq!(parse_max_vram_gib("140").unwrap(), 140 * 1024);
+        assert_eq!(parse_max_vram_gib("12").unwrap(), 12288);
+        assert!(parse_max_vram_gib("0").is_err());
+        assert!(parse_max_vram_gib("12.5").is_err());
+        assert!(parse_max_vram_gib("twelve").is_err());
     }
 }

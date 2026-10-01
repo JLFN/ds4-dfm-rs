@@ -62,6 +62,7 @@ fn main() {
     let mut image_vae: Option<String> = None;
     let mut image_offload = false;
     let mut image_placement: Vec<ModulePlacement> = Vec::new();
+    let mut image_max_vram: Option<u64> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if dist
@@ -97,6 +98,13 @@ fn main() {
             "--image-dit" => image_dit = Some(args.next().unwrap_or_else(|| usage())),
             "--image-vae" => image_vae = Some(args.next().unwrap_or_else(|| usage())),
             "--image-offload" => image_offload = true,
+            "--max-vram" => {
+                let spec = args.next().unwrap_or_else(|| usage());
+                image_max_vram = Some(
+                    ds4_server::image_cli::parse_max_vram_gib(&spec)
+                        .unwrap_or_else(|e| cli_error(&e)),
+                );
+            }
             "--image-placement" => {
                 let spec = args.next().unwrap_or_else(|| usage());
                 image_placement = ds4_server::image_cli::parse_placement(&spec)
@@ -225,6 +233,7 @@ fn main() {
             image_vae.as_deref(),
             image_offload,
             &image_placement,
+            image_max_vram,
             serve_req.check_config,
         );
     }
@@ -770,10 +779,19 @@ fn run_image_check(
     vae: Option<&str>,
     offload: bool,
     placement: &[ModulePlacement],
+    max_vram_mib: Option<u64>,
     check_config: bool,
 ) -> ! {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let out = ds4_server::image_cli::check_image(dit, vae, offload, placement, check_config, &argv);
+    let out = ds4_server::image_cli::check_image(
+        dit,
+        vae,
+        offload,
+        placement,
+        max_vram_mib,
+        check_config,
+        &argv,
+    );
     for line in &out.stderr {
         eprintln!("ds4-server-rs: {line}");
     }
@@ -797,7 +815,7 @@ Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-disk-space 32G] [--kv-
          [--kv-cache-reject-different-quant]\n\
          Distributed: [--role coordinator|worker] [--layers A:B] [--listen HOST PORT] [--coordinator HOST PORT]\n\
          [--dist-prefill-chunk N] [--dist-prefill-window N] [--dist-activation-bits N] [--dist-replay-check] [--debug]\n\
-Image engine (P0, check-config only): [--image-dit GGUF] [--image-vae GGUF] [--image-placement te=cpu:host,diffusion=cuda0:vram,vae=cpu:host] [--image-offload]"
+Image engine (P0, check-config only): [--image-dit GGUF] [--image-vae GGUF] [--image-placement te=cpu:host,diffusion=cuda0:vram,vae=cpu:host] [--image-offload] [--max-vram GiB]"
     );
     std::process::exit(2);
 }

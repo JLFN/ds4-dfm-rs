@@ -717,6 +717,55 @@ pub struct ImageRequest {
     pub placement: Vec<ModulePlacement>,
     /// The offload mode: weights in host RAM streamed into a fixed VRAM arena.
     pub offload: bool,
+    /// The per-device VRAM budget in MiB (`--max-vram`), which is what the
+    /// placement rules resolve against. `None` means the deployed card's own
+    /// budget, so an existing invocation keeps the behaviour it had.
+    pub vram_budget_mib: Option<u64>,
+}
+
+impl ImageRequest {
+    /// The budget the placement resolves against: what the caller declared, else
+    /// the deployed card's usable VRAM.
+    fn budget_mib(&self) -> u64 {
+        self.vram_budget_mib.unwrap_or(FOOTPRINT_DEFAULT_BUDGET_MIB)
+    }
+}
+
+/// Device footprints in MiB, the unit the reference's own log prints as "MB"
+/// (5876556448 bytes prints as 5604.32). Each one is a measured figure ROUNDED
+/// UP, so a sum is an upper bound and a budget is never over-counted, and each
+/// names the artifact or log line it came from.
+///
+/// The resolution matters and is not incidental: the DiT's compute buffer is
+/// 34.66 MiB for a 256-square generation and 2317.45 MiB for the 1024-square one
+/// whose figures are used here, because the rules these footprints drive were
+/// measured at 1024 square ("cannot complete a 1024-square generation on a 12 GB
+/// card"). A different qualified resolution needs its own buffer figure.
+///
+/// They are the budget's inputs, not engine invariants: a module's footprint is
+/// the same everywhere, and what decides is the device's declared budget.
+const FOOTPRINT_TEXT_ENCODER_MIB: u64 = 4303;
+const FOOTPRINT_DIT_WEIGHTS_MIB: u64 = 5605;
+const FOOTPRINT_DIT_COMPUTE_MIB: u64 = 2318;
+/// The decode-only GGUF this engine loads, not the reference's safetensors: the
+/// converted artifact holds 518096424 bytes of BF16 tensor data (494.10 MiB),
+/// while the reference's own 128-tensor VAE reports 482.81 MiB.
+const FOOTPRINT_VAE_WEIGHTS_MIB: u64 = 495;
+/// What an untiled VAE decode needs BEYOND its own parameters. A measured
+/// FLOOR, not a measurement of the decode: with the DiT pinned the measured
+/// 7921 MiB of the card's 11894 leave 3973 MiB and the decode does not fit, so
+/// it needs more than that (plan A.1).
+const FOOTPRINT_VAE_DECODE_FLOOR_MIB: u64 = 3973;
+/// The deployed card's usable VRAM, and therefore the default budget.
+const FOOTPRINT_DEFAULT_BUDGET_MIB: u64 = 11894;
+
+/// What one module's parameters and its runner buffer cost on a device.
+fn module_footprint_mib(module: ImageModule) -> u64 {
+    match module {
+        ImageModule::TextEncoder => FOOTPRINT_TEXT_ENCODER_MIB,
+        ImageModule::Diffusion => FOOTPRINT_DIT_WEIGHTS_MIB + FOOTPRINT_DIT_COMPUTE_MIB,
+        ImageModule::Vae => FOOTPRINT_VAE_WEIGHTS_MIB + FOOTPRINT_VAE_DECODE_FLOOR_MIB,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -900,28 +949,72 @@ fn resolve_modules(req: &ImageRequest) -> Vec<ModulePlacement> {
     out
 }
 
-/// Placement rules that are measured, not assumed (plan A.1).
+/// Placement rules that follow from the device budget, not from the engine
+/// (plan A.1).
+///
+/// The two configurations below were measured to fail on a 12 GB card, and they
+/// still fail there because the footprint and the default budget are that card's
+/// measurements. What they are not is an engine invariant: a device whose budget
+/// is large enough may pin the text encoder, or the DiT and the VAE together,
+/// which is how the whole stack becomes resident in VRAM on a DGX Spark.
 fn check_placement(req: &ImageRequest, eff: &[ModulePlacement], issues: &mut Vec<ImageIssue>) {
-    let te = eff.iter().find(|p| p.module == ImageModule::TextEncoder);
-    if let Some(p) = te {
-        if p.tier == ParamTier::Vram {
+    let mut devices: Vec<u32> = eff
+        .iter()
+        .filter(|p| p.tier == ParamTier::Vram)
+        .filter_map(|p| match p.device {
+            ImageDevice::Cuda(index) => Some(index),
+            // A VRAM tier on a CPU graph is not a device pin; there is nothing
+            // to budget.
+            ImageDevice::Cpu => None,
+        })
+        .collect();
+    devices.sort_unstable();
+    devices.dedup();
+
+    for device in devices {
+        let here: Vec<&ModulePlacement> = eff
+            .iter()
+            .filter(|p| p.tier == ParamTier::Vram && p.device == ImageDevice::Cuda(device))
+            .collect();
+        let pinned_mib: u64 = here.iter().map(|p| module_footprint_mib(p.module)).sum();
+        let budget_mib = req.budget_mib();
+        if pinned_mib <= budget_mib {
+            continue;
+        }
+
+        let pinned = |module: ImageModule| here.iter().any(|p| p.module == module);
+        let over = format!(
+            "pinning {} on cuda{device} needs about {pinned_mib} MiB and the budget is {budget_mib} MiB",
+            modules_str(&here.iter().map(|p| **p).collect::<Vec<_>>())
+        );
+        let mut named = false;
+        if pinned(ImageModule::TextEncoder) {
             issues.push(error(
                 "image_te_vram_unsupported",
-                "pinning the text encoder's parameters cannot complete a 1024-square generation \
-                 on a 12 GB card (measured, plan A.1); keep te on host or disk"
-                    .into(),
+                format!(
+                    "{over}: the text encoder's parameters leave too little room for a 1024-square \
+                     generation (measured on the deployed 12 GB card, plan A.1). Raise --max-vram on \
+                     a device with more memory, or keep te on host or disk"
+                ),
             ));
+            named = true;
         }
-    }
-    let diff = eff.iter().find(|p| p.module == ImageModule::Diffusion);
-    let vae = eff.iter().find(|p| p.module == ImageModule::Vae);
-    if let (Some(d), Some(v)) = (diff, vae) {
-        if d.tier == ParamTier::Vram && v.tier == ParamTier::Vram {
+        if pinned(ImageModule::Diffusion) && pinned(ImageModule::Vae) {
             issues.push(error(
                 "image_double_pin_unsupported",
-                "pinning both the DiT and the VAE parameters starves the untiled VAE decode \
-                 (measured, plan A.1); move the VAE to host, disk, or the offload mode"
-                    .into(),
+                format!(
+                    "{over}: the untiled VAE decode is left less than the {floor} MiB it needs beyond \
+                     its own parameters (measured, plan A.1). Move the VAE to host, disk or the \
+                     offload mode, or raise --max-vram on a device with more memory",
+                    floor = FOOTPRINT_VAE_DECODE_FLOOR_MIB
+                ),
+            ));
+            named = true;
+        }
+        if !named {
+            issues.push(error(
+                "image_vram_budget_exceeded",
+                format!("{over}: lower the pins, or raise --max-vram on a device with more memory"),
             ));
         }
     }
@@ -1026,6 +1119,7 @@ mod tests {
             ar_controls: AR_CONTROLS.iter().map(|c| c.flag.to_string()).collect(),
             placement: Vec::new(),
             offload: false,
+            vram_budget_mib: None,
         };
         let plan = resolve_image_plan(&req, &[]);
         assert!(!plan.may_load());
@@ -1072,6 +1166,78 @@ mod tests {
         };
         let plan = resolve_image_plan(&req, &[]);
         assert!(plan.issues.iter().any(|i| i.code == "image_te_vram_unsupported"));
+    }
+
+    fn pinned(module: ImageModule) -> ModulePlacement {
+        ModulePlacement { module, device: ImageDevice::Cuda(0), tier: ParamTier::Vram }
+    }
+
+    /// With no budget declared the deployed card's own is used, so both measured
+    /// refusals stand exactly as they did before the budget existed.
+    #[test]
+    fn the_deployed_budget_still_refuses_both_measured_pins() {
+        let te = resolve_image_plan(&ImageRequest { placement: vec![pinned(ImageModule::TextEncoder)], ..Default::default() }, &[]);
+        assert!(te.issues.iter().any(|i| i.code == "image_te_vram_unsupported"), "{}", te.report());
+
+        let vae = resolve_image_plan(&ImageRequest { placement: vec![pinned(ImageModule::Vae)], ..Default::default() }, &[]);
+        assert!(vae.issues.iter().any(|i| i.code == "image_double_pin_unsupported"), "{}", vae.report());
+    }
+
+    /// A DGX-class budget makes the whole stack resident in VRAM. Nothing about
+    /// the configuration changed, only the device's budget: that is what it means
+    /// for the rule to be budget-derived rather than an engine invariant.
+    #[test]
+    fn a_large_budget_admits_the_whole_stack_pinned() {
+        let req = ImageRequest {
+            placement: vec![
+                pinned(ImageModule::TextEncoder),
+                pinned(ImageModule::Diffusion),
+                pinned(ImageModule::Vae),
+            ],
+            vram_budget_mib: Some(140 * 1024),
+            ..Default::default()
+        };
+        let plan = resolve_image_plan(&req, &[]);
+        assert!(plan.may_load(), "{}", plan.report());
+        assert_eq!(plan.effective.modules.len(), 3);
+        assert_eq!(plan.effective.modules[0].tier, ParamTier::Vram);
+    }
+
+    /// The rule is arithmetic on the declared budget, so a mid budget refuses
+    /// only what overflows it: here the DiT and the VAE together, not the VAE
+    /// with the DiT moved off the device.
+    #[test]
+    fn a_mid_budget_refuses_only_what_overflows_it() {
+        let on_host = ModulePlacement {
+            module: ImageModule::Diffusion,
+            device: ImageDevice::Cuda(0),
+            tier: ParamTier::HostRam,
+        };
+
+        let double = ImageRequest {
+            placement: vec![pinned(ImageModule::Diffusion), pinned(ImageModule::Vae)],
+            vram_budget_mib: Some(9000),
+            ..Default::default()
+        };
+        let plan = resolve_image_plan(&double, &[]);
+        assert!(plan.issues.iter().any(|i| i.code == "image_double_pin_unsupported"), "{}", plan.report());
+
+        let vae_only = ImageRequest {
+            placement: vec![on_host, pinned(ImageModule::Vae)],
+            vram_budget_mib: Some(9000),
+            ..Default::default()
+        };
+        let plan = resolve_image_plan(&vae_only, &[]);
+        assert!(plan.may_load(), "{}", plan.report());
+
+        // Below the VAE's own footprint the refusal is the generic budget one.
+        let tiny = ImageRequest {
+            placement: vec![on_host, pinned(ImageModule::Vae)],
+            vram_budget_mib: Some(1000),
+            ..Default::default()
+        };
+        let plan = resolve_image_plan(&tiny, &[]);
+        assert!(plan.issues.iter().any(|i| i.code == "image_vram_budget_exceeded"), "{}", plan.report());
     }
 
     #[test]

@@ -429,9 +429,17 @@ values:
 - It holds about 4.4 GiB less host RAM and about 3.4 GiB less of the VRAM peak
   than sd.cpp's `--offload-to-cpu`.
 - Pinning the text encoder's parameters as well cannot complete a 1024-square
-  generation on a 12 GB card.
-- The DiT must not be pinned if an untiled VAE decode is wanted; pinning it
-  starves the decode and forces tiling.
+  generation on a 12 GB card. This and the next bullet are measurements of THAT
+  card, and they are why its usable 11894 MiB is the engine's default budget. The
+  engine does not treat them as invariants: the placement resolves against a
+  per-device budget (`--max-vram <GiB>`), so a device with more memory pins them.
+  The three modules' measured footprints total 16694 MiB (16.3 GiB) at 1024
+  square, the generation these rules were measured on, which a DGX Spark's 128 GB
+  holds resident without offload. The DiT's compute buffer is the resolution-
+  dependent term: 34.66 MiB at 256 square against the 2318 MiB used here, so a
+  budget quoted at another resolution needs that figure requoted.
+- The DiT must not be pinned on a 12 GB card if an untiled VAE decode is wanted;
+  pinning it starves the decode and forces tiling.
 - The VAE's graph device is `cpu` in the standing file, while an earlier
   committed figure paired `vae=cuda0` with `--params-backend vae=cpu`; which one
   the retained images are sensitive to has not been measured.

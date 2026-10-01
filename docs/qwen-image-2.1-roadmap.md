@@ -252,18 +252,22 @@ was written.
 - Tests. `cargo test -p ds4-core --test qwen_image` (8) with
   `DS4_QWEN_IMAGE_DIT`/`DS4_QWEN_IMAGE_VAE` named identifies both real artifacts
   and pins 297/229/68 and 134; 13 module unit tests cover the contract tables, the
-  permute index math, the byte math and the placement rules (the
-  `--lib qwen_image` filter reports 15, two of them batch tests that match the
-  name); `cargo test -p ds4-server --test image_cli` (4) drives the refusal set
-  at argv level, and `--lib image_cli` (2) the placement parser.
+  permute index math, the byte math and the budget-driven placement rules (the
+  `--lib qwen_image` filter reports 39, the P1 units having added the oracle's 12
+  and the DiT forward's 9); `cargo test -p ds4-server --test image_cli` (5)
+  drives the refusal set at argv level, and `--lib image_cli` (3) the placement
+  parser and the `--max-vram` value.
 - `--check-config` refusals, by name: `--ctx`, `--max-seqs`, `--prefix-reuse`,
   `--mtp-mode`, `--mtp`, `--mtp-draft`, `--mtp-margin`, `--kv-disk-dir`,
   `--kv-disk-space-mb`, `--kv-cache-min-tokens`, `--cont-width`. A clean check
   exits 0; one carrying any of those exits 2 with the flag named in the message.
 - Placement: `--image-placement te=cpu:host,diffusion=cuda0:vram,vae=cpu:host`,
-  reported per module in requested/effective/qualified. Two measured rules are
-  enforced: text-encoder parameters in VRAM and a DiT+VAE double pin are both
-  refused (plan appendix A.1).
+  reported per module in requested/effective/qualified. The two measured rules -
+  text-encoder parameters in VRAM, and a DiT+VAE double pin - are enforced
+  against the device's budget (`--max-vram <GiB>`, defaulting to the deployed
+  card's 11894 MiB): refused when the pinned footprint does not fit, admitted
+  when it does (plan appendix A.1), which is what makes the whole stack resident
+  on a device with more memory.
 - Not proven: nothing here runs a model. Step time, the resolution ceiling and
   the VRAM peak are still P6's ledger, and the qualified block of the plan says
   so in the report itself.
