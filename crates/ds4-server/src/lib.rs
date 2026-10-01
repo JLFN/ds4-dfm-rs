@@ -11,6 +11,7 @@ pub mod expected_plan;
 pub mod format;
 pub mod generate;
 pub mod http;
+pub mod image_cli;
 pub mod json;
 pub mod kv_cli;
 pub mod metrics;

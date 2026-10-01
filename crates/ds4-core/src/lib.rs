@@ -28,6 +28,10 @@ mod naive;
 mod naive_mtp;
 mod payload;
 mod progress;
+// The image engine keeps its own catalogue beside the text families: it is a
+// sibling engine kind, not a `ModelFamily`, so its layout contract, plan and
+// refusals are not flattened into this crate's AR-shaped surface.
+pub mod qwen_image;
 mod qwen35;
 mod serving;
 mod serving_cuda;

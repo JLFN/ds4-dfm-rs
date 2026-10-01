@@ -9,6 +9,7 @@ use ds4_core::{
     ModelOpenOption, MtpMode, PrefixReuse, ServingCaps, ServingRequest, Support, Vocab,
     WeightSlice,
 };
+use ds4_core::qwen_image::ModulePlacement;
 use ds4_server::cache_identity::CacheIdentity;
 use ds4_server::expected_plan::ExpectedPlan;
 use ds4_server::kv_cli::DiskKvArgs;
@@ -55,6 +56,12 @@ fn main() {
     let mut kv = DiskKvArgs::default();
     let mut expected_plan: Option<ExpectedPlan> = None;
     let mut dist = DistArgs::default();
+    // The image engine's artifacts and placement; any of these selects the
+    // image path instead of the autoregressive one.
+    let mut image_dit: Option<String> = None;
+    let mut image_vae: Option<String> = None;
+    let mut image_offload = false;
+    let mut image_placement: Vec<ModulePlacement> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if dist
@@ -86,6 +93,14 @@ fn main() {
                     }
                 }
                 model_path = Some(path);
+            }
+            "--image-dit" => image_dit = Some(args.next().unwrap_or_else(|| usage())),
+            "--image-vae" => image_vae = Some(args.next().unwrap_or_else(|| usage())),
+            "--image-offload" => image_offload = true,
+            "--image-placement" => {
+                let spec = args.next().unwrap_or_else(|| usage());
+                image_placement = ds4_server::image_cli::parse_placement(&spec)
+                    .unwrap_or_else(|e| cli_error(&e));
             }
             "--vision" => {
                 let path = args.next().unwrap_or_else(|| usage());
@@ -200,6 +215,19 @@ fn main() {
             }
         }
     }
+    // The image engine has no serving surface yet, so naming its artifacts is a
+    // configuration check by construction. It runs before the autoregressive
+    // preconditions that follow: those abort on flags this engine must report
+    // by name instead.
+    if image_dit.is_some() || image_vae.is_some() {
+        run_image_check(
+            image_dit.as_deref(),
+            image_vae.as_deref(),
+            image_offload,
+            &image_placement,
+            serve_req.check_config,
+        );
+    }
     kv.validate().unwrap_or_else(|error| cli_error(&error));
     if mtp_path.is_some() && model_path.is_none() {
         cli_error("--mtp requires --model");
@@ -226,6 +254,7 @@ fn main() {
         serve_req.kv_disk_space_mb = Some(kv.space_mb());
     }
     serve_req.kv_min_tokens = Some(kv.min_tokens());
+
 
     let launch = server_launch(dist.opt.role, model_path.is_some())
         .unwrap_or_else(|error| cli_error(&error));
@@ -734,6 +763,29 @@ fn cli_error(message: &str) -> ! {
     std::process::exit(2);
 }
 
+/// `--check-config` for the image engine. The plan, the refusals and the exit
+/// code come from the library; this only prints and exits.
+fn run_image_check(
+    dit: Option<&str>,
+    vae: Option<&str>,
+    offload: bool,
+    placement: &[ModulePlacement],
+    check_config: bool,
+) -> ! {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let out = ds4_server::image_cli::check_image(dit, vae, offload, placement, check_config, &argv);
+    for line in &out.stderr {
+        eprintln!("ds4-server-rs: {line}");
+    }
+    if out.report.is_empty() {
+        // The reason is already on stderr, prefixed; do not repeat it.
+        std::process::exit(out.exit_code);
+    }
+    eprint!("{}", out.report);
+    println!("{}", out.json);
+    std::process::exit(out.exit_code);
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: ds4-server-rs [--version] [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--vision GGUF] [--mtp GGUF] [--mtp-mode off|auto|on] [--backend cuda|cpu|metal|--cuda] [--tokens N|-n N] [-c N] [--max-seqs N|auto] [--prefix-reuse off|exact|partial|auto] [--prefill-chunk N] [--prefill-chunk-live N] [--native-chunk N] [--print-plan] [--check-config] [-t N] [--mtp-draft N] [--mtp-margin N] [--mem-floor-gb N] [--cors]\n\
@@ -744,7 +796,8 @@ Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-disk-space 32G] [--kv-
          [--kv-cache-boundary-align-tokens N]\n\
          [--kv-cache-reject-different-quant]\n\
          Distributed: [--role coordinator|worker] [--layers A:B] [--listen HOST PORT] [--coordinator HOST PORT]\n\
-         [--dist-prefill-chunk N] [--dist-prefill-window N] [--dist-activation-bits N] [--dist-replay-check] [--debug]"
+         [--dist-prefill-chunk N] [--dist-prefill-window N] [--dist-activation-bits N] [--dist-replay-check] [--debug]\n\
+Image engine (P0, check-config only): [--image-dit GGUF] [--image-vae GGUF] [--image-placement te=cpu:host,diffusion=cuda0:vram,vae=cpu:host] [--image-offload]"
     );
     std::process::exit(2);
 }
