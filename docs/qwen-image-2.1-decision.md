@@ -4,7 +4,16 @@
 [Plan](qwen-image-2.1-plan.md) | [Recipe](qwen-image-2.1-recipe.md) |
 [Roadmap](qwen-image-2.1-roadmap.md) | [Phase S](qwen-image-2.1-phase-s.md)
 
-Status: final. This document answers the question phase S left open, and it
+Status: **superseded 2026-10-01.** The operator reopened the port for ownership
+and P0 was built; the reopen is the one motive this document said it could not
+price away (section 8, trigger 3). Everything below stands as the record of what
+the port does *not* buy — the performance motive is dead by measurement, the
+ownership case is thin, the fusion headroom is below a free reference flag — and
+as the list of triggers that would have justified stopping. The live state is the
+[roadmap](qwen-image-2.1-roadmap.md) tracker.
+
+Original status (2026-10-01): final, closing the port. This document answers the
+question phase S left open, and it
 closes the port. The [spike](qwen-image-2.1-phase-s.md) settled the performance
 motive; this prices the ownership motive, prices the one unclaimed headroom the
 spike measured, and decides the P0 boundary. Verdict: **stop — do not build the

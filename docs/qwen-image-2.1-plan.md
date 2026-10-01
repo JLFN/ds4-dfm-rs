@@ -3,20 +3,20 @@
 [Documentation index](README.md) | [Repository README](../README.md) |
 [Roadmap](qwen-image-2.1-roadmap.md) | [Port recipe](qwen-image-2.1-recipe.md)
 
-Status: superseded — the port is stopped. Nothing in this document is
-implemented and no branch carries code. Every claim is a citation into a checked
-source or is explicitly marked unverified. The [recipe](qwen-image-2.1-recipe.md)
-holds the file-and-line reference index; the [roadmap](qwen-image-2.1-roadmap.md)
-holds the phase detail and the tracker. This document holds the goal, the
-strategy, what the tree lends, the translation map and the risks.
+Status: proposal, being built. P0 (identification, the two artifact contracts,
+the format tool, the plan and the placement model) landed on `feat/image` and its
+gate result is in the [roadmap](qwen-image-2.1-roadmap.md) section 4; P1 onward is
+unimplemented. Every claim is a citation into a checked source or is explicitly
+marked unverified. The [recipe](qwen-image-2.1-recipe.md) holds the file-and-line
+reference index; the [roadmap](qwen-image-2.1-roadmap.md) holds the phase
+detail and the tracker. This document holds the goal, the strategy, what the
+tree lends, the translation map and the risks.
 
 Phase S ran on 2026-10-01 and returned **no capturable gain** on all three
-measurements, so the performance case below is dead. The decision unit then
-priced the ownership case that was left and the one unclaimed headroom the spike
-measured, and **closed the port**: the [decision](qwen-image-2.1-decision.md) is
-the authority, the roadmap's tracker records each phase's closure, and this
-document is retained as the definition of what was not built. The numbers are in
-the [phase-S report](qwen-image-2.1-phase-s.md).
+measurements, so the performance case below is dead and the port proceeds on
+ownership alone. That pricing, and the day the port spent closed before the
+operator reopened it, are recorded in the [decision](qwen-image-2.1-decision.md);
+no phase below may be justified by a speed claim the spike refuted.
 
 
 ## 1. Goal
@@ -80,11 +80,6 @@ which of the tree's optimizations transfer to a diffusion workload, and the
 answer is: fewer than you would expect.
 
 ## 3. What this buys, and what it does not
-
-The list below is the case as proposed. The [decision](qwen-image-2.1-decision.md)
-section 3 restates each item as a loss the deployment suffers today and prices
-it; two of them do not survive, and the rest were judged not to be worth the
-port. The text is kept as proposed so the pricing can be read against it.
 
 Buys:
 
@@ -304,10 +299,8 @@ route applies to `ggml-metal`, to be confirmed at P8.
 ## 11. Build order and gates
 
 Phase S comes first because it is the only thing that settles whether the port
-buys speed; everything after it was to be justified by ownership regardless of
-its result. Ownership did not carry it: S measured no gain and the
-[decision](qwen-image-2.1-decision.md) priced the rest, so **no phase below is
-started**. Details, work items and the per-phase closure are in the
+buys speed; everything after it is justified by ownership regardless of its
+result. Details, work items and the tracker are in the
 [roadmap](qwen-image-2.1-roadmap.md).
 
 | Phase | Work | Gate |
