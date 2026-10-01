@@ -1,151 +1,178 @@
-QA report: feat/image — phase-S spike for the Qwen-Image-2.1 port (docs unit)
+QA report: feat/image — the Qwen-Image-2.1 stop decision (docs unit), pass 3
 
-Third QA pass (refresh). The five pass-2 residual nits are fixed; the commit was
-then amended once more during this pass (82cea30 -> 4f549bf), a change I also
-verified.
+Third pass, on the second amendment. This pass verifies the two post-pass-2
+corrections, confirms nothing else moved, and re-runs the gate. The substantive
+checks from passes 1 and 2 are retained below and still stand. Independent
+falsification pass, rule 19. The deployment at /data/imagegen was read read-only
+(nothing written, nothing started or stopped there).
 
 Unit identification
 
 Repository /data/ds4-dfm-rs, branch feat/image.
-HEAD at verification time: 4f549bf06e9f6c7f358eb93540165f1e2dda42df
-  ("docs(image): record the phase-S spike results"), working tree clean.
-The task named HEAD 82cea30; that commit was amended to 4f549bf mid-pass. The
-82cea30 -> 4f549bf diff touches only docs/qwen-image-2.1-phase-s.md and adds:
-  - the steady-state bullet now cites an independent re-run ("4.75-4.78 s and
-    2.81-2.82 s") alongside the recorded "4.84-4.87 s" / "2.93-2.96 s", and says
-    the ratio rather than the absolute seconds is the reproducible quantity;
-  - the evidence-index cross-reference "section 8" is corrected to "section 9"
-    (the evidence index is section 9; 8 is "what this does not prove");
-  - a new evidence-index row for qa-evidence/qa-report.md;
-  - section 5 "rest" 173 -> 173.2 (2992.5 - 2819.2 = 173.3; with the 2992.4 ms
-    kernel total I measured, 173.2).
-All four are accurate. The re-run pair quoted is exactly my pass-1 result
-(4.75-4.78 / 2.81-2.82); the "1.65x" is the recorded-run ratio (4.855/2.945 =
-1.649), while the re-run ratio is 1.693x, i.e. the ratio moved 2.7% against
-4.4% for the FA absolute - so "the ratio is the more reproducible quantity" is
-defensible, with the parenthetical naming the recorded value.
+HEAD 082335fdbbe6a1d98c01c691e98d56f5abce2998 ("docs(image): close the port
+after pricing its motives"). Amendment history: 78fab2b (pass 1) -> d35aeff
+(pass 2) -> 082335f (this pass). The diff d35aeff..082335f is
+docs/qwen-image-2.1-decision.md only, 2 insertions / 2 deletions; the other four
+documents and docs/README.md are unchanged across both amendments. The worktree
+matches HEAD for docs/ (git diff HEAD -- docs/ is empty); the only modified file
+is this report.
+Base ref fork/feat/image = d92e5614544ddd77efb74a4619580aa9ffa41c88 (== d92e561).
+merge-base with origin/main = 7b6448b9985ae81f9089ea68c19f3a936e44fdf7.
+git diff --name-only d92e561..HEAD: docs/README.md,
+docs/qwen-image-2.1-decision.md, docs/qwen-image-2.1-phase-s.md,
+docs/qwen-image-2.1-plan.md, docs/qwen-image-2.1-roadmap.md.
+No remote-writing git command was run; origin stays read-only.
 
-Correction history on this unit:
-  44d669d  original phase-S docs commit
-  7f87762  amended during pass 1 (M1 headroom arithmetic, M2 peak sentence)
-  c4a5903  pass-2 correction round (M1 attention total, MMQ split, kernel
-           counts, capture range, footprint attribution)
-  82cea30  five pass-2 nits (scale_f32 geometry, 1.66x->1.65x, tracker cell,
-           appendix A.1 rewrite, ceiling 2.9-3.1)
-  4f549bf  amended during this pass (re-run citation, section 9 fix, QA-report
-           evidence row, rest 173.2)
-Base ref fork/feat/image = 1b15ba24db4596c15a422000a4e5b7c030c08c89 (unpushed).
-merge-base with origin/main = 7b6448b9985ae81f9089ea68c19f3a936e44fdf7. Remotes
-unchanged (origin read-only). No remote-writing git command was run.
+Handoff record: the trailer "Unit: 1 complete" IS present on d92e561
+(git log -1 --format=%B d92e561 ends with it), so the handoff's claim that the
+unit marker is missing is stale. This has been true in every pass.
 
-The four gate surfaces, sha256 at the current working tree (= HEAD 4f549bf):
-FILE docs/qwen-image-2.1-phase-s.md
-  sha256 ed0a8bd252710b4b5d3d8822dd2b78da2a3f583b1008cb11a05fee7ba14df86c
-  (this is the 4f549bf content; the earlier 82cea30 content was
-   564e9a67d2313d6df0b2a1da8e439ea67ea63b6d8aa6ba150db30913ee7671c3)
-FILE docs/qwen-image-2.1-plan.md
-  sha256 067c0f318aadc054eb505824db572fc2cff181cfbcf5ee1dc9a52c4bf86fe5a9
-FILE docs/qwen-image-2.1-roadmap.md
-  sha256 210bde171c9af7f27b8a2480bb0e0553de5f19e931e6294fe530b194afd32acd
-FILE docs/README.md
-  sha256 940ccfd03f13e99a039ee88b938e492c6576acec625b160ba7d4688b2b41571e
+The two changes under test (d35aeff -> 082335f)
 
-What this pass fixed (the five pass-2 nits)
+1. Section 7 item 3 grammar: the sentence now reads "The deployment's own record
+   has 1152 square exceeding the 240 s read timeout at 40 steps
+   (architecture.md:148-152); whether the flag moves that tier inside the timeout
+   is a deployment measurement this unit did not make." The pass-2 bald phrasing
+   ("has 1152 square do not fit") is gone.
+2. Comparison table, last row: the unreachable-pool step time is now 1.910 s
+   (was 1.912 s). The 53.5 s and -82.4 s cells are unchanged.
 
-1. scale_f32 geometry in phase-s section 2 now reads "gridX 2101760 / 2104832,
-   gridY=gridZ=1, block (256,1,1)"; the prose names the four grid shapes that
-   disappear (gridX 11, 29, 2101760, 2104832, 32 launches each) and gives
-   341.1 + 340.1 = 681.2 ms.
-2. phase-s section 6 "1.66x" -> "1.65x", matching section 2.
-3. roadmap tracker gate-result cell "M3 1.8-5.5%" -> "M3 <=5.5%".
-4. plan appendix A.1 rewritten so the correct statement leads and the retracted
-   "about 11 GB" is quoted inside the audit note rather than asserted.
-5. launch-overhead ceiling "2.9-3.0" -> "2.9-3.1 ms/step (0.1%)".
+Check A — the two fixes are present and correct
 
-New-value check (the only new arithmetic this round)
+git diff d35aeff 082335f shows exactly two changed lines, nothing else.
 
-From the section-2 table: scale_f32 681.2 ms (128 launches, 5.322 ms/launch) +
-soft_max_f32 706.3 + cutlass 256x64 520.6 + cutlass 64x64 483.6.
-  341.1 + 340.1 = 681.2                       exact
-  681.2 + 706.3 + 520.6 + 483.6 = 2391.7     exact
-  681.2 / 128 = 5.3219 ms = 5.322            exact
-  2391.7 / 4697.7 = 50.912% = 50.9%           holds
-  2391.7 / 544.4 = 4.393x = 4.39x             holds
-Against my own trace numbers (ref-nsys.sqlite steady step 2): scale_f32
-grid(2101760,1,1) 341.1 ms / 32 launches and grid(2104832,1,1) 340.1 ms /
-32 launches - the source of both addends, exact; soft_max_f32 706.2 (the doc's
-706.3 is the trace average); cutlass 520.6 and 483.6 exact; my step-2 sum is
-2391.6, i.e. 50.91%. The prose is also right that the default step runs 520
-scale_f32 launches in eight distinct grid shapes (1, 11, 16, 29, 65680, 65776,
-2101760, 2104832), that 392 remain under flash attention in four of them
-(1, 16, 65680, 65776), and that exactly 32 launches each of gridX 11, 29,
-2101760 and 2104832 (128 total) disappear.
+- Grammar: the new sentence is grammatical and states the true fact. It is
+  consistent with the source it cites: /data/imagegen/docs/architecture.md
+  lines 148-152 say "Requests at 1152 square do not fit open-grok's 240 s read
+  timeout at 40 steps (275.88 s here)". 275.88 s exceeds 240 s, so "exceeding"
+  is correct. The old string "do not fit" no longer appears in the decision;
+  "exceeding the 240 s" appears once.
+- Step time: 2.945 s (the --diffusion-fa step) minus the 1034.7 ms glue pool =
+  1.9103 s -> 1.910 s. The new value is exactly consistent with the amended
+  pool. 1.910 x 28 = 53.49 -> 53.5 s (unchanged) and 135.9 - 53.5 = 82.4 s
+  (unchanged), so the row is now internally consistent. The old "1.912 s" no
+  longer appears.
 
-No residual inconsistency: a sweep of the four documents finds no surviving
-1.66x, ~3800, "1.8-5.5%", 2389.7 or 679.2; the 2.9-3.1 ceiling is consistent
-with 0.650 us x 4544/4736 = 2.95/3.08 ms; and the "about 11 GB" / "11.5 GB"
-strings appear only inside the correction notes that retract them, never as
-assertions. The one rounding difference is the roadmap gate result's "2390
-ms/step", a three-significant-figure round of 2391.7 (the same cell says 50.9%
-and 1.65x, both consistent).
+Check B — no other number moved
 
-Claim-by-claim against the corrected documents
+git diff d35aeff 082335f is the two lines above and nothing more; only
+docs/qwen-image-2.1-decision.md changed between the two commits. In the amended
+decision the pass-2 figures are all still present and unchanged: 34.6% (4x),
+1034.7 (3x), 2992.5 (2x), 955.1, 993.6, 408.1, 133.7 (2x), 175.8, 112.7 (2x),
+1.85x; and the stale pass-1 figures remain absent: 2977.7, 1033.5, 848.2, 407.0,
+176.8, 1.9x, 1.912 s all count zero. The other four documents are byte-identical
+to the versions pass 2 checked, so their cross-references (roadmap 34.7% /
+1910 ms, phase-s 2992.5 / 133.7 / 112.7, README index lines 49-53) are unchanged
+and still agree.
 
-C1 footprint 5604.32 MB weights / 297 tensors + 2317.45 MB compute, not ~11 GB:
-   REPRODUCED (pass 1; unchanged).
-C2 steady step 4.855 s -> 2.945 s, 1.65x (recorded), on a 4697.7 -> 2992.5 ms
-   kernel budget; re-run 4.765 -> 2.815 s: REPRODUCED (my pass-1 pair is now the
-   one the doc cites; my ratio 1.69x vs the doc's 1.65x, noted).
-C3 unfused attention 2391.7 ms / 50.9% (incl. 681.2 ms of 128 attention-path
-   scale_f32 launches): REPRODUCED, arithmetic exact against my step-2 trace.
-C4 flash attention 544.4 ms / 64 launches, 18.2%; 4.39x: REPRODUCED (unchanged).
-C5 Q6_K MMQ 1309.8 ms default / 1410.9 ms FA, 448 launches both, 47.1% of the FA
-   step, ~8% run/clock spread: REPRODUCED from both traces.
-C6 Q6_K 72.0-80.8 TFLOP/s vs cuBLAS 70.4-77.3 (report 71.3-79.1 vs 69.5-74.0):
-   REPRODUCED.
-C7 4544 / 4736 kernels per step; launch ceiling 2.9-3.1 ms/step (0.1%):
-   REPRODUCED (13632/3 and 14208/3; 0.650 us x counts = 2.95/3.08 ms).
-C8 capture block-pass an unstable 3-55 ms/step bounded by the 172.7 ms (5.5%)
-   host bubble: REPRODUCED (my runs 3-47 ms/step; bubble exact).
-C9 footprint attributions to plan appendix A.1 and section 14; roadmap
-   attribution retracted; A.1 now leads with the measured statement:
-   REPRODUCED.
-C10 whole-run totals 120.92 / 103.62 s marked not comparable (cold 13.13 s vs
-   warm 1.46 s encoder): REPRODUCED / ADDRESSED.
+Re-confirmed by re-derivation (pass 2, unchanged this pass)
 
-Correction history retained from earlier passes
+Command: python3 + sqlite3 over misc/scratch/phase-s/ref-fa-nsys.sqlite and
+ref-nsys.sqlite (CUPTI_ACTIVITY_KIND_KERNEL joined to StringIds; end-start),
+segmented at the six timestep_embedding_f32 launches.
 
-Pass 1 found six load-bearing claims reproduced and five defects: M1's unfused
-attention under-count (the 128 scale_f32 launches), the "703.7 + 606.1 = 1410.9"
-mixing two runs, "~3800 kernels/step", the un-pinned 55 ms/step capture figure,
-and the false roadmap footprint attribution. Pass 2 verified all five addressed
-and recorded five residual nits. This pass verifies the nits fixed, plus the
-mid-pass amend above. The phase-S decision (no performance gain capturable by
-the port; ownership-only) has never been in question in any pass.
+- Steady-state step (the second of three): 2992.5 ms of kernel time.
+- Per-class, matching the amended table exactly: op_mul 178.3, cpy_scalar 139.4,
+  op_add 136.8, quantize 133.7, concat 112.7, SiLU 101.3, repeat 62.0, norms
+  93.0, scale_f32 41.0, f16 copies 36.4; total 1034.7; 1034.7 / 2992.5 = 34.6%.
+- Like-for-like: unfused 955.1 ms of 4697.7 ms against fused 993.6 ms (the
+  unrounded sum is 993.7) = 3.88%, within 4%; extra unfused cpy_scalar 184.6 vs
+  139.4 and scale_f32 720.2 confirmed.
+- Fusion pools: 408.1 / 133.7 / 175.8 / 112.7 all re-derive.
 
-Accepted risks / what this does not establish
+Check 2 — the free-flag comparison (unchanged)
 
-- The docs commit was amended repeatedly during the QA passes (44d669d ->
-  7f87762 -> c4a5903 -> 82cea30 -> 4f549bf). HEAD and the hashes above are the
-   working-tree state at verification; a further amend would invalidate them.
-   I confirmed 4f549bf stable for 20 s before this report.
-- Clocks were not locked (no passwordless sudo); all numbers are same-session at
-  an observed 2565-2805 MHz band. The 8% MMQ spread between the two traces and
-  the absolute step times are not clock-locked; the report says so.
-- No reference or harness was re-run this pass; the new arithmetic is an exact
-  re-aggregation of the pass-1 trace numbers I measured (341.1, 340.1, 706.2,
-  520.6, 483.6 ms).
-- Harnesses are scratch and link prebuilt cuda/mmq/*.o older than the sources;
-  the intervening commit adds PQ2_0 code only, so the measured Q6_K dense path
-  is unchanged.
-- Attention TFLOP/s remains derived arithmetic, not a counter reading.
+ref-run.log "2/3 - 4.87s/it | 3/3 - 4.84s/it", vae decode 76.93 s;
+ref-fa.log "2/3 - 2.96s/it | 3/3 - 2.93s/it", vae decode 77.67 s; both
+image_seq_len=4096; 4.855 / 2.945 = 1.65x. run-ref.sh and run-ref-fa.sh differ
+only by --diffusion-fa, on the deployed placement. Unchanged by the amendment.
+Verdict: holds.
+
+Check 3 — the live re-run (pass-1 result stands)
+
+GPU-free live re-run in pass 1: deployed flags 4.69/4.69 s, --diffusion-fa
+2.90/2.92 s, ratio 1.61, CPU VAE decode 77.95/79.79 s, image_seq_len=4096 —
+within a few percent of the recorded values. Outputs under
+misc/scratch/phase-s/qa/. Not repeated this pass: the amendment is docs-only and
+changes no measured figure. Verdict: holds (pass-1 live evidence).
+
+Check 4 — ownership pricing (unchanged)
+
+Pass 1 verified each item live against /data/imagegen; the amendment did not
+touch section 3 or the deployment. Still holding: crates/bridge/src/main.rs is
+1641 lines and is_alive() is try_wait-only (line 640); the alive-but-unresponsive
+limitation is commented at 1421-1423; supervise_backend (679) reaps and respawns
+with backoff; imagegen.toml backend_args is the two placement flags with no
+--diffusion-fa, steps=28, no adapter configured, plain Q6_K; patches 0001/0002
+are int8-convrot-only and the encoder file is deleted; docs/host-memory-guard.md
+shows the guard is a job launcher so the hook-launched image stack is outside
+it; nothing resident, ports 8787/8788/8899 closed, systemctl unit not-found.
+Verdict: holds.
+
+Check 5 — internal consistency of the five documents
+
+Commands: python3 link resolver over the five files; grep -n for the shared
+numbers and status lines; git diff d35aeff 082335f.
+
+- Scope: only docs/qwen-image-2.1-decision.md changed in this amendment. All
+  relative links in the five files resolve; docs/README.md lines 49-53 still
+  match the status lines; no phase is presented as startable; the plan is still
+  marked superseded; docs/qwen-image-2.1-roadmap.md line 132 (34.7% spike
+  figure) and line 134 (1910 ms free-flag return) still agree with the decision,
+  which reconciles the spike's 34.7% against its 34.6%.
+- Numbers shared across documents (2992.5, 133.7, 112.7, 4.855/2.945/1.65,
+  250-450 ms) agree.
+- Both pass-2 residuals in this area are now fixed: the grammar slip (residual
+  1) and the 1.912 s step time (residual 2).
+
+Residual defects still open (none material):
+
+1. Concat launches: the decision (section 4) says 324, phase-s section 5 says
+   322, for the same class on the same step. The trace has 322
+   concat_cont<...,(int)1> plus 2 concat_cont<...,(int)0>, so 324 is correct for
+   "concat_cont" and phase-s undercounts by 2. Pre-existing phase-s text; the
+   decision is right.
+2. cpy_scalar is 139.4 in the decision and 139.5 in phase-s (unrounded 139.45) —
+   half-rounding.
+
+Verdict for check 5: holds, with the two non-material residuals above.
+
+Gate
+
+Command: bash tests/qa-gate.sh (base resolves to fork/feat/image = d92e561).
+Output: all eight checks PASS, "QA GATE: overall PASS". Exit code 0.
+
+Claims I could not verify, and whether the gap is acceptable
+
+Gap table (claim / why unverified / acceptable)
+
+  1. F1-F4 fusion savings, 250-450 ms/step (8-15%)
+     why: no fused graph exists in this tree; the decision labels it an
+     estimate and does not rest the verdict on it.  acceptable: yes.
+  2. 28-step sampling-phase totals (135.9 / 82.5 / 70-76 / 53.5 s)
+     why: extrapolations; only 3-step spikes were run.  acceptable: yes.
+  3. An end-to-end 28-step 1024-square request
+     why: not run; decision section 9 admits this.  acceptable: yes.
+  4. concat_cont launches 324 (decision) against 322 (phase-s)
+     why: the trace has 324; phase-s undercounts by 2.  acceptable: yes.
+  5. Clock-locked re-run of any number
+     why: no passwordless sudo on this host (nvidia-smi -lgc unavailable); the
+     decision section 9 now states the clocks were unlocked.  acceptable: yes.
+  6. The live re-run (check 3) was not repeated in passes 2 or 3
+     why: the amendments are docs-only and change no measured figure; the
+     pass-1 run against the same reference and artifacts stands.
+     acceptable: yes.
 
 Verdict
 
-The third pass is a clean refresh. The five pass-2 nits are fixed, the new
-attention total (681.2 + 706.3 + 520.6 + 483.6 = 2391.7 ms, 50.9%, 4.39x)
-matches the section-2 table and my own trace numbers exactly, no figure in the
-four documents is left inconsistent with it, and the late amend (re-run
-citation, section 9 fix, evidence row, rest 173.2) is accurate.
+Both post-pass-2 corrections are present and correct: the section 7 item 3
+sentence is now grammatical and matches its source, and the comparison table's
+last-row step time (1.910 s) is now consistent with the 1034.7 ms pool it
+subtracts. The diff d35aeff..082335f is exactly those two lines, so no other
+figure moved; every pass-2 number is intact, the stale ones remain absent, and
+the other four documents are unchanged. The gate passes with exit code 0. The
+only residual defects are the two pre-existing phase-s text nits (concat
+launches 322 vs 324; cpy_scalar 139.5 vs 139.4), neither of which affects the
+STOP verdict or its evidence.
 
 verdict: overall PASS
