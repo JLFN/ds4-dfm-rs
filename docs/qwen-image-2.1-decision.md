@@ -52,6 +52,7 @@ Every claim below traces to one of these, run on 2026-10-01:
 | Glue accounting | re-derived from the phase-S trace, `ref-fa-nsys.sqlite`, segmented at the `timestep_embedding_f32` launches | 1034.7 ms of a 2992.5 ms steady-state step = **34.6%**, reproducing the spike's 34.7% within rounding |
 | The free flag | `ref-fa.log` line 231, `run-ref-fa.sh` | steps 2 and 3 at **2.96 / 2.93 s** against **4.87 / 4.84 s** for the deployed flags; the invocation is the deployed placement plus `--diffusion-fa`, nothing else |
 | The request budget | `ref-run.log`, `ref-fa.log` | CPU VAE decode **76.93 s** / 77.67 s, CPU text encode 13.13 s, `image_seq_len=4096` |
+| The resolution ceiling | `MAX_EDGE` in `/data/imagegen/crates/bridge/src/main.rs`, its README, `git log --full-history -Smax_edge -- imagegen.toml`, and a tally of the bridge's own request log | the live bridge refuses nothing below **1536** on either edge; `max_edge = 1152` was real in the toml at `d5fcfe0` and is gone at HEAD, so the record describes an older revision; the five logged requests are all at 1024 long edge |
 
 The deployment's own documents were read as the record of its design
 (`/data/imagegen/docs/architecture.md`, `imagegen.toml` comments); where a claim
@@ -258,10 +259,21 @@ changes only documents in this tree.
    reverted and deleted; the standing configuration uses the GGUF encoder that
    patch 0001 says it cannot affect. Dropping them is a deployment cleanup with
    no port attached.
-3. **The 1152-square tier and the client timeout** were not re-measured here.
-   The deployment's own record has 1152 square exceeding the 240 s read timeout
-   at 40 steps (`architecture.md:148-152`); whether the flag moves that tier
-   inside the timeout is a deployment measurement this unit did not make.
+3. **Resolution.** The live bridge accepts up to 1536 on either edge
+   (`MAX_EDGE`, `crates/bridge/src/main.rs:973`), so a 1152-square request is
+   servable today. The deployment's record calls that ceiling a configuration
+   value of 1152, which describes an older revision: `imagegen.toml` did carry
+   `max_edge = 1152` at `d5fcfe0`, and at HEAD the key is gone and the compiled
+   1536 governs (documented at `crates/bridge/README.md:41`). Every request the
+   bridge has actually logged is smaller: five of them through 2026-09-29, at
+   768x1024 and 1024x672, 28 steps, base mode, from the aspect ratio the client
+   sends. What was not measured here is the step time above 1024 under the
+   deployed placement, and the record's "1152 square does not fit the 240 s read
+   timeout" is a 40-step figure (`architecture.md:148-152`), not the deployed 28.
+   One consequence is worth the operator's attention: the deployed pinned layout
+   measures a ceiling below the bridge's — 1344 square fails during weight
+   preparation (`architecture.md:126-140`) — so the accepted range extends past
+   the servable one, and sizes between 1152 and 1344 were not measured.
 
 ## 8. Reopen triggers
 

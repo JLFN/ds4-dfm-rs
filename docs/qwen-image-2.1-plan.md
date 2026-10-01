@@ -485,13 +485,25 @@ reported.
 
 ### A.2 The size ceiling is a property of the layout
 
-The bridge advertises a maximum edge (1152 in the deployed configuration) and
-refuses larger requests with a named reason, checked on the final size from both
-request paths, because a size the layout cannot hold fails after roughly 35 s
-with an opaque backend error. Sizes must be divisible by 32, and the
-aspect-ratio plus resolution pair resolves to a concrete width and height.
+The bridge refuses oversized requests with a named reason, checked on the final
+size from both request paths, because a size the layout cannot hold fails after
+roughly 35 s with an opaque backend error. Sizes must be divisible by 32, and
+the aspect-ratio plus resolution pair resolves to a concrete width and height.
+
+The live value is not what the deployment's record says. `architecture.md:233-240`
+describes the ceiling as a configuration value set to the measured pinned-layout
+ceiling of 1152, and that describes an earlier revision rather than the ship: the
+deployed repository did carry `max_edge = 1152` in `imagegen.toml` at `d5fcfe0`
+(2026-09-22 11:29, "bound the bridge"), and at HEAD that key is gone. What
+governs now is `const MAX_EDGE: u32 = 1536` (`crates/bridge/src/main.rs:973`,
+documented at `crates/bridge/README.md:41`), introduced earlier the same day by
+`fb054be`. It is therefore hardcoded *above* what the deployed pinned layout can
+serve: 1344 square fails during weight preparation (`architecture.md:126-140`),
+so the accepted range extends past the servable one — sizes between 1152 and
+1344 were not measured.
+
 Requirement: the same refusal from the same resolved plan, with the ceiling tied
-to the layout rather than hardcoded.
+to the layout rather than hardcoded. The live bridge does the opposite.
 
 ### A.3 Sampling profile
 
