@@ -49,6 +49,7 @@ Other recipes and dated gates retain their hardware and workload limits.
 | [Image generation (plan)](qwen-image-2.1-plan.md) | Proposal: native Qwen-Image-2.1, benefit assessment, phases and gates |
 | [Image generation (recipe)](qwen-image-2.1-recipe.md) | Reference index, model geometry and the ds4 op mapping for the port |
 | [Image generation (roadmap)](qwen-image-2.1-roadmap.md) | Goal, success criteria and the detailed phase guideline |
+| [Image generation (phase S)](qwen-image-2.1-phase-s.md) | The decisive spike: three measured numbers and the no-gain verdict |
 
 ## Development
 

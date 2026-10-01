@@ -10,6 +10,12 @@ reference index; the [roadmap](qwen-image-2.1-roadmap.md) holds the phase
 detail and the tracker. This document holds the goal, the strategy, what the
 tree lends, the translation map and the risks.
 
+Phase S ran on 2026-10-01 and returned **no capturable gain** on all three
+measurements, so the performance case below is dead and the port is justified by
+ownership alone if at all. The numbers and the decision are in the
+[phase-S report](qwen-image-2.1-phase-s.md); the roadmap's tracker records it.
+
+
 ## 1. Goal
 
 **ds4-dfm-rs serves local text-to-image generation on its own engine and host:
@@ -117,7 +123,9 @@ Applies, with the evidence:
   case, cleaner than autoregressive decode. The stale-argument rule still
   applies: the timestep and sigma are that graph's `pos0`.
 - Residency. The CUDA residency plan (`ds4.c:71725`: VMM arena, HBM promote) is
-  this tree's own code, and it is what a 12 GB card holding an 11 GB model needs.
+  this tree's own code, and it is what a 12 GB card holding a resident DiT needs
+  (measured 2026-10-01 at 7921 MiB of 11894 MiB — see the
+  [phase-S report](qwen-image-2.1-phase-s.md) section 4).
 - Placement and the offload mode (appendix A.1): per-module tiers, a device
   budget, a fixed staging arena, segmentation with prefetch.
 - Admission: the host memory guard owns limits, cgroups and pressure handling.
@@ -343,8 +351,11 @@ Decision risks, each evidenced:
   client timeout until P6 measures it.
 - Upstream drift: the port forks from `6dcb5bb` and will not follow the
   reference's later models and fixes.
-- VRAM contention: the image stack peaks around 11.5 GB on the same 12 GB card
-  ds4 benchmarks on.
+- VRAM contention: the three-module stack totals about 11.5 GB, but on the
+  deployed placement only the DiT is on the card. Measured 2026-10-01: the DiT
+  needs 7921 MiB (5604 MB of weights plus a 2317 MB compute buffer) of the
+  11894 MiB the card offers, leaving ~4 GB spare — see the
+  [phase-S report](qwen-image-2.1-phase-s.md) section 4.
 
 Unverified: every effort and timing figure. Nothing has been built or measured;
 the phase table is a sequence, not a schedule.
@@ -422,9 +433,13 @@ The offload mode is required, not optional. `--offload-to-cpu` keeps the weights
 in host RAM and brings them into VRAM when needed. That is a different thing
 from `--params-backend cpu`, which keeps the weights in RAM *and* runs the graph
 on the CPU: the first streams into a device graph, the second never touches the
-device. This plan needs the first, because the DiT at Q6_K is 297 tensors and
-about 11 GB, and any artifact or device combination that does not fit must still
-run. It is a fallback with a measured cost rather than a default: the standing
+device. This plan needs the first, because a Q6_K artifact and any device
+combination that does not fit must still run. (The first draft of this appendix
+said the DiT was "about 11 GB"; measured 2026-10-01 it is 297 tensors, 5604 MB of
+weights plus a 2317 MB compute buffer, and the ~11 GB figure is the whole
+three-module stack. See the [phase-S report](qwen-image-2.1-phase-s.md)
+section 6.)
+It is a fallback with a measured cost rather than a default: the standing
 deployment deliberately moved off it once the per-module assignment fit, and
 that assignment holds less host RAM and a lower VRAM peak.
 

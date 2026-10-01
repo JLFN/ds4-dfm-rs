@@ -123,6 +123,32 @@ dead, the port proceeds only on ownership grounds, and this document says so
 instead of implying otherwise. If one does, P6 inherits it as a starting
 hypothesis rather than an open question.
 
+**Gate result (2026-10-01, [report](qwen-image-2.1-phase-s.md)): no gain, all
+three.** Measured on the reference's own kernels at the real shape (4096 image
+tokens + 128 text, 4224-column GEMMs):
+
+1. Attention: the deployed reference runs it unfused at 2390 ms/step (50.9% of
+   the step — the two matmuls, the masked softmax and its separate score-scaling
+   kernel) and the flag `--diffusion-fa` replaces all of that with one fused
+   kernel at 544 ms/step (18.2%), taking the steady-state step from 4.855 s to
+   2.945 s (1.65x). The port's own P2 route is to vendor that same upstream
+   kernel, so it captures 0; the residual headroom (47% of the dense-FP16 rate)
+   is only reachable by writing a better kernel and is worth at most 9.6% of a
+   step.
+2. Q6_K dense MMQ: the production kernel runs at 71.3-79.1 TFLOP/s against a
+   cuBLAS dense-FP16 GEMM's 69.5-74.0 at the same shapes — at the tensor-core
+   limit, with nothing for a pipelined K loop to close.
+3. Capture, residency and staging: capture is bounded by the measured 5.5%
+   host bubble (the direct GEMM block-pass figure was not stable across
+   repeats, 3-55 ms/step), the offload arena costs 8.0% when the whole DiT is
+   staged per step, and the DiT needs 7921 MiB of 11894 MiB, so residency is not
+   the constraint the plan assumed.
+
+The one unclaimed measured headroom is the 34.7% of the step spent in
+elementwise glue. That is fusion work, which no phase below owns; if the port
+proceeds for ownership reasons, it is the first thing to scope. P0-P6 must not
+be started on a speed motive.
+
 Traps: a short run is not a sustained one, and a micro-benchmark is not the
 whole workload. Report both what was measured and what it does not prove.
 
@@ -394,7 +420,7 @@ Neither is a research problem.
 
 | Phase | Status | Unit / branch | Gate result |
 | --- | --- | --- | --- |
-| S | not started | — | — |
+| S | **done — no gain** | `feat/image`, [phase-S report](qwen-image-2.1-phase-s.md) | three numbers measured; none capturable by the port (M1 0%, M2 0%, M3 <=5.5%) |
 | P0 | not started | — | — |
 | P1 | not started | — | — |
 | P2 | not started | — | — |
