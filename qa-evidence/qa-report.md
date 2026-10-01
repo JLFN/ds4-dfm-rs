@@ -1,140 +1,136 @@
-QA report: feat/image — the P1 oracle's DiT forward (Qwen-Image-2.1, stage 2),
-final re-verification of the amended unit. Independent falsification pass,
-rule 19. Unit: commit bc23830 "feat(image): add the P1 oracle's DiT forward"
-(amended from e7becd8, 84d2d4d, b3b5c79), branch feat/image, one commit ahead of
-fork/feat/image = 6d613d6. Refs inspected: bc23830, e7becd8, 84d2d4d, b3b5c79,
-6d613d6, the pinned reference copies, and upstream leejet/stable-diffusion.cpp at
-6dcb5bb. Nothing was committed or pushed; the only file written is this report.
+QA report: feat/image — the budget-derived placement rules (Qwen-Image-2.1 P0),
+re-verification of the amended unit. Independent falsification pass, rule 19.
+Unit: commit 5a5c339 "feat(image): derive the placement rules from the device
+budget" (amended from c698939, message only), branch feat/image, one commit ahead
+of fork/feat/image = c4c75c7; HEAD b95e6df is the QA evidence commit on top. Tree
+identity checked with git: git rev-parse c698939^{tree} 5a5c339^{tree} both return
+7c271a53567e826227329d9c9dfadd39ac7a30a7 and git diff c698939 5a5c339 is empty,
+so the content is exactly what the previous pass verified. (c698939 and the
+intermediate amend 901c3c0 are still reachable and share that tree.) The only
+change between their messages is the 482 MiB sentence; see the findings below.
+Refs inspected this pass: 5a5c339, c698939, the reflog, both commit messages, and
+the tree diff. Refs inspected in the previous pass and still governing the tree:
+f37e034, c4c75c7, the full diff c4c75c7..c698939, misc/scratch/p1/refdump/run1.log
+(256x256), misc/scratch/phase-s/ref-run.log (1024x1024), the two real artifacts,
+docs/qwen-image-2.1-plan.md and docs/qwen-image-2.1-roadmap.md. Nothing was
+committed or pushed by me; the only file written is this report.
 
-Verdict: PASS. Both remaining findings are fixed and I reproduced them live: all
-four section-5 commands now run verbatim from the repo root with the annotated
-outputs, and the "nothing runs" sentence is gone. Every measured claim in
-docs/qwen-image-2.1-p1.md and in the commit message checks out against my own
-measurement or re-derivation. A short list of minor, non-blocking imprecisions
-is recorded below as findings (an undefined shell variable in the reference-run
-block, and three rounded/representative figures); none changes a result or
-misleads a reader about one, so none is a defect.
+Surfaces covered (each on its own line, exact string from the gate)
 
-Covered surfaces (each on its own line, exact string from the gate)
-
-crates/ds4-core/src/qwen_image/dit.rs
 crates/ds4-core/src/qwen_image.rs
-crates/ds4-core/tests/qwen_image_oracle.rs
-docs/qwen-image-2.1-p1.md
-pub const Q6K_BLOCK_BYTES
-pub const QK_K
-pub enum DitError
-pub fn cfg_combine
-pub fn dequantize_f32
-pub fn forward
-pub fn linear
-pub fn open
-pub fn parity
-pub fn token
-pub struct DitPass
-pub struct DitWeights
-pub struct Parity
+crates/ds4-server/src/bin/ds4-server-rs.rs
+crates/ds4-server/src/image_cli.rs
+crates/ds4-server/tests/image_cli.rs
+docs/qwen-image-2.1-plan.md
+docs/qwen-image-2.1-roadmap.md
 
-All seventeen present (dit.rs lines 37, 39, 275/288, 331, 337, 388, 415, 459,
-710, 840, 846, 856; qwen_image.rs "pub mod dit;"; the test and doc). Amendment
-scope: git diff --stat 84d2d4d bc23830 is "docs/qwen-image-2.1-p1.md | 26 ...,
-1 file changed, 13 insertions(+), 13 deletions(-)" and nothing else; git diff
-84d2d4d bc23830 -- crates/ is empty, so the code and tests are byte-identical to
-the first reviewed tree.
+All six in the unit diff (283 insertions, 33 deletions across exactly those
+files), and all six identical between c698939 and 5a5c339.
 
-Findings D and E re-verified.
+Findings from the previous pass, re-checked
 
-Finding D (doc commands unusable) FIXED. Section 5 now defines
-D=/data/ds4-dfm-rs/misc/scratch/p1/refdump/run1 and passes the absolute path. I
-ran all four documented commands verbatim from the repo root:
-  cargo test -p ds4-core --lib qwen_image::oracle              -> 12 passed  (# 12 passed)
-  cargo test -p ds4-core --lib qwen_image::dit                 ->  9 passed  (# 9 passed)
-  D=/data/ds4-dfm-rs/misc/scratch/p1/refdump/run1;
-  DS4_QWEN_IMAGE_ORACLE=$D cargo test -p ds4-core --test qwen_image_oracle
-                                                               ->  9 passed  (# 9 passed)
-  DS4_QWEN_IMAGE_ORACLE=$D DS4_QWEN_IMAGE_DIT=<gguf> \
-    cargo test -p ds4-core --release --test qwen_image_oracle dit_forward_reproduces
-                                                               ->  1 passed (the DiT gate)
-The gate printed "interleaved: correlation 0.999973, relative RMS 7.5578e-3,
-max |diff| 1.3715e0, 119.3s" and "half-split: 0.742873, 6.6874e-1, 3.0159e1,
-115.6s". The prose now also states correctly that cargo runs the test binary
-from the package directory, which I independently confirmed: with
-DS4_QWEN_IMAGE_ORACLE=../../misc/scratch/p1/refdump/run1 the suite passes 9;
-with the repo-root-relative form it fails.
+D1 (VAE footprint sourced from the wrong artifact) FIXED.
+FOOTPRINT_VAE_WEIGHTS_MIB is 495. The decode-only GGUF this engine loads
+(misc/scratch/p0/vae-decode-bf16.gguf, sha256 d3feefed...5372) holds 518096424
+bytes of BF16 tensor data = 494.095 MiB, so 495 is the round-up. The comment now
+states this explicitly and distinguishes the reference's own 128-tensor VAE
+figure (482.81 MiB, run1.log:244). All four weight/buffer constants are now
+rounded up from their measured sources and each names its source:
+  FOOTPRINT_TEXT_ENCODER_MIB  4303  <- 4302.32 / 4302.33 (run1.log:160, :195)
+  FOOTPRINT_DIT_WEIGHTS_MIB   5605  <- 5876556448 bytes = 5604.32 MiB (artifact)
+  FOOTPRINT_DIT_COMPUTE_MIB   2318  <- 2317.45 (phase-s ref-run.log:228)
+  FOOTPRINT_VAE_WEIGHTS_MIB    495  <- 518096424 bytes = 494.10 MiB (GGUF)
+  FOOTPRINT_VAE_DECODE_FLOOR_MIB 3973 (floor, unchanged)
+  FOOTPRINT_DEFAULT_BUDGET_MIB 11894 (unchanged)
+Every rounded value >= its source. Re-derived sums, all confirmed against the
+string printed live by the rebuilt binary:
+  te + DiT            = 4303 + 5605 + 2318              = 12226 MiB
+  DiT + VAE           = 5605 + 2318 + 495 + 3973         = 12391 MiB
+  all three           = 12226 + 495 + 3973               = 16694 MiB
+16694 MiB = 16.30 GiB, and both 12226 and 12391 exceed the 11894 MiB default,
+so the two refusals still stand at the default.
 
-Finding E ("Nothing runs without the environment") FIXED. Section 5 now says
-"two are model-free and always run". Verified: with no environment variables
-cargo test -p ds4-core --test qwen_image_oracle runs 9 tests, 9 passed, and the
-two model-free tests (noise_scaling_is_identity_at_the_first_sigma,
-philox_is_seed_and_call_position_dependent) execute rather than return early.
+D2 (A.1 mislabelled the measurement resolution) FIXED.
+docs/qwen-image-2.1-plan.md A.1 now reads "The three modules' measured footprints
+total 16694 MiB (16.3 GiB) at 1024 square, the generation these rules were
+measured on ... The DiT's compute buffer is the resolution-dependent term: 34.66
+MiB at 256 square against the 2318 MiB used here, so a budget quoted at another
+resolution needs that figure requoted." This is true: the 2318 MiB compute buffer
+and the 3973 MiB floor come from the 1024-square reference run
+(misc/scratch/phase-s/ref-run.log: width 1024, height 1024, generate_image
+1024x1024, compute buffer 2317.45 MB at line 228), and the 256-square run reports
+34.66 MB (misc/scratch/p1/refdump/run1.log: width 256, height 256, generate_image
+256x256, line 233). 16694/1024 = 16.30, so "16.3 GiB" holds. The stale "at 256
+square" phrase is gone (the only remaining "256 square" is the correct
+resolution-dependent caveat).
 
-Live measurements (release gate; the independent numpy port run on the same
-DS4_QWEN_IMAGE_DIT_OUT dumps)
+Acceptance, live, on the rebuilt binary (from the previous pass; the tree is
+unchanged, so these still hold)
 
-  comparison                              corr        rel RMS      max |diff|
-  rust cond   vs numpy cond               1.0000000   1.1948e-06   2.3961e-05
-  rust uncond vs numpy uncond             1.0000000   4.1175e-07   2.8610e-06
-  rust cond   vs refdump/cfg1 pred        0.9999874   5.1500e-03   2.2745e-01
-  numpy cond  vs refdump/cfg1 pred        0.9999874   5.1504e-03   2.2745e-01
-  rust cfg    vs refdump/run1 pred        0.9999732   7.5578e-03   1.3715e+00
-  numpy cfg   vs refdump/run1 pred        0.9999732   7.5583e-03   1.3715e+00
+  ./ds4-server --check-config --image-dit <dit> --image-vae <vae> \
+      --image-placement te=cuda0:vram,diffusion=cuda0:vram,vae=cuda0:vram
+  EXIT=2, both codes present, each naming the footprint and the budget:
+    error: pinning te=cuda0,vram diffusion=cuda0:vram vae=cuda0:vram on cuda0
+      needs about 16694 MiB and the budget is 11894 MiB: ... (image_te_vram_unsupported)
+    error: ... same 16694/11894 ... (image_double_pin_unsupported)
+  the same request with --max-vram 140
+  EXIT=0, neither code present, artifacts identified (dit_tensors=297 dit_q6_k=229
+  dit_bf16=68 vae_tensors=134, refusals=11). Matches the commit message.
 
-The doc's and the commit's 1.2e-6, 4.1e-7, 1.0000000, 2.4e-5, 5.2e-3 and 7.6e-3
-all reproduce. The argument holds: the residual (5.15e-3) is ~4.3e3 times the
-implementation-to-implementation F32 agreement (1.19e-6).
+Default behaviour unchanged (no --max-vram)
+  - te=cuda0:vram (DiT at the default cuda0:vram): EXIT=2,
+    image_te_vram_unsupported, "needs about 12226 MiB and the budget is 11894".
+  - vae=cuda0:vram (DiT at the default cuda0:vram): EXIT=2,
+    image_double_pin_unsupported, "needs about 12391 MiB and the budget is 11894".
+The old pass set was {no te in VRAM} AND {not both DiT and VAE in VRAM}; every
+such configuration pins 0, 4468 or 7923 MiB per device at the default budget,
+all <= 11894, so no configuration that used to pass now fails. No regression.
 
-Stage-1 numbers re-derived this pass (code unchanged): least squares
-sum((x1-x0)*p0)/sum(p0^2) = -0.377540647882 (doc -0.377540648); the reference's
-Euler chain rebuilds step2.in.bin with 0 of 16384 differing while the
-one-expression form differs in 692; sigma1 = 0.622459352016449; the token ids
-behind the two dumps are 29 and 23 (run1.log:190, :221); the Box-Muller table is
-exact - all-F32 11242 byte-identical with ulp distances {1: 4774, 2: 360, 3: 8}
-(total 5142), double-throughout 12136, and the mixed form the port mirrors
-16384/16384.
+Tests (from the previous pass; tree unchanged)
+  cargo test -p ds4-core --lib qwen_image        -> 39 passed, 0 failed.
+  cargo test -p ds4-server --test image_cli      ->  5 passed, 0 failed.
+  cargo test -p ds4-server --lib image_cli       ->  3 passed, 0 failed.
+  cargo test -p ds4-core --test tokenizer        -> FAILED,
+    tokenizer_families_match_c_oracle (qwen35 specials family=12 vs the C oracle's
+    11, crates/ds4-core/tests/tokenizer.rs:174). Pre-existing and untouched:
+    git diff --name-only c4c75c7 5a5c339 lists no tokenizer path (the only crates
+    file in the diff is crates/ds4-core/src/qwen_image.rs).
+Commit trailer: "Unit: 6 complete" is the last body line of 5a5c339 (verified
+this pass; unchanged by the amend).
+Parsing on the fresh binary: --max-vram twelve / 0 / 12.5 all exit 2; the flag is
+in the usage text ("... [--image-offload] [--max-vram GiB]"); the value reaches
+the placement as MiB (12 GiB = 12288 admits te+DiT at 12226; 11 GiB refuses).
 
-Other claims re-verified
-
-- Artifact hashes (doc section 6): qwen-image-2.1-Q6_K.gguf
-  a3a0d39b...4fb9, qwen_image_2.1_vae_bf16.safetensors bb21f747...6b7c9, and
-  misc/scratch/p0/vae-decode-bf16.gguf d3feefed...5372 all match the doc and
-  misc/scratch/p1/p1-artifact-hashes.txt.
-- Dequantizers: to_q (Q6_K) max|diff| 0.0 against gguf.quants.dequantize; the
-  doc's "maximum difference of zero" holds. Q6_K arithmetic matches ds4.c:4538
-  and the layout ds4.c:1163-1168.
-- Layout conventions and reference semantics are unchanged from the first pass
-  (crates/ byte-identical) and still check out against the pinned sources.
-- The doc's scope claims hold: forward() refuses reference latents with
-  DitError::Unsupported, and stage 3 (VAE/PNG) and any GPU path are excluded.
-- Commit message: the removed "stage by stage / 1e-6 or less at every stage"
-  and F16 claims are absent; the trailer "Unit: 5 complete" is the last
-  non-empty body line.
-- Regression: cargo test -p ds4-core --test tokenizer still fails
-  tokenizer_families_match_c_oracle (qwen35 family 12 vs C oracle 11) at
-  crates/ds4-core/tests/tokenizer.rs:174; the amendment touches no tokenizer
-  file, so it is pre-existing and not this unit's regression.
+No false DGX/resolution claims. A.1 says the two measured rules are "measurements
+of THAT card" (the 12 GB RTX 4070 SUPER) and that a DGX Spark's 128 GB "holds
+resident" the 16.3 GiB stack - a capacity comparison, not a Spark measurement; no
+Spark number exists. The roadmap P0 placement line states no resolution and no
+DGX figure. (plan.md:111-112 is a pre-existing capacity statement, not from this
+unit.)
 
 Minor, non-blocking imprecisions (findings, not defects)
 
-- docs section 1's reference-run code block uses $D (for the dump prefix and the
-  output PNG) without defining it; the intended directory is named in the
-  sentence that follows. The block is illustrative (it also needs the
-  proprietary sd-cli and internal model paths), so it does not block anything.
-- "5.6 GiB" (commit message; dit.rs's module doc says the same): the artifact is
-  5876556448 bytes = 5.47 GiB. A rounding, ~2% high.
-- "dequantizes one Q6_K row at a time into a 16 KiB buffer" (commit message):
-  16 KiB is the 4096-wide row; the 12288-wide img_mlp.out rows are 48 KiB. The
-  bounded-buffer claim holds; the figure is representative.
-- Section 5's "the fixture prefix must be an absolute path": a path relative to
-  the package directory also resolves; absolute is the practical instruction.
+- The commit message previously called the reference's figure "the reference's
+  own 482 MiB safetensors" (the safetensors file is 675509688 bytes = 644.38 MiB;
+  482.81 MiB is the loaded params buffer, run1.log:244). FIXED by this amend:
+  5a5c339 now reads "not the 482 MiB the reference's own 128-tensor scope
+  reports", which is accurate. The message diff c698939..5a5c339 is confined to
+  that sentence.
+- Unchanged from the earlier pass and outside this amend: the new per-device,
+  budget-based logic relaxes three configurations that the old code refused
+  (te=cuda0:vram with the DiT on host; DiT and VAE pinned on different cuda
+  devices; a VRAM tier on the Cpu device, te=cpu:vram / vae=cpu:vram). None is a
+  configuration that used to pass, so none is a regression; recorded for the
+  operator as the intended direction of the change.
 
 Unverified items (findings, not passes)
 
-- The doc's claim that the deployed sd-cli's SD_DUMP_* hooks are absent from
-  upstream at 6dcb5bb: I confirmed the pinned reference copies contain no
-  SD_DUMP string (and existence of the dumps), not the deployed binary itself.
-- The reference-internal line citations (diffusion_engine.cpp:1428,
-  denoiser.hpp:767, sample_euler, guidance.cpp:171) were checked against the run
-  log and the pinned sources for the items this unit uses; the rest of the
-  reference's internals is outside this unit.
+- That the reference's params-buffer figure (482.81 MB) is meant to be
+  byte-comparable to this engine's GGUF; I read both and the artifact sizes but
+  did not reconcile the reference graph's 128 tensors against the converter's
+  134. D1 is resolved either way because the constant now uses this engine's own
+  artifact.
+- I did not re-run the full serialized workspace suite; only the four gates the
+  task names. The amend touched no test and no other crate.
 
 verdict: overall PASS
