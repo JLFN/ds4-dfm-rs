@@ -15,6 +15,7 @@
 //! the VAE config; both files are indexed by `docs/qwen-image-2.1-recipe.md`.
 
 pub mod convert;
+pub mod oracle;
 
 use crate::gguf::{GgufError, GgufFile};
 use crate::tensors::{TensorError, TensorInventory};

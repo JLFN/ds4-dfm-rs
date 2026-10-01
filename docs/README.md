@@ -51,6 +51,7 @@ Other recipes and dated gates retain their hardware and workload limits.
 | [Image generation (roadmap)](qwen-image-2.1-roadmap.md) | Goal, success criteria and the phase guideline; P0 built |
 | [Image generation (phase S)](qwen-image-2.1-phase-s.md) | The decisive spike: three measured numbers and the no-gain verdict |
 | [Image generation (decision)](qwen-image-2.1-decision.md) | Superseded: the ownership and fusion pricing, kept as the record |
+| [Image generation (P1 oracle)](qwen-image-2.1-p1.md) | The CPU reference: the dump harness, the exact-numerics stage and its measurements |
 
 ## Development
 
