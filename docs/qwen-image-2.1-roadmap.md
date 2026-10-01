@@ -174,12 +174,14 @@ Work items:
    contract does not apply.
 2. Format decision for the VAE. The diffusion model ships as GGUF
    (`leejet/Qwen-Image-2.1-GGUF`), but the VAE ships as
-   `qwen_image_2.1_vae_bf16.safetensors` and this tree reads GGUF only
-   (`crates/ds4-core/src/gguf.rs` is the only loader; grep finds no
-   safetensors reader). Choose one: a small Rust converter producing a GGUF with
+   `qwen_image_2.1_vae_bf16.safetensors` and this tree read GGUF only
+   (`crates/ds4-core/src/gguf.rs` was the only loader; there was no safetensors
+   reader). Choose one: a small Rust converter producing a GGUF with
    a pinned tensor layout, or a safetensors reader. Recommended: the converter,
    run once, with its output checksummed and the tool committed, because it keeps
-   the runtime on one format.
+   the runtime on one format. Done: the converter and the `qwen-image-vae-gguf`
+   tool exist, the runtime still has exactly one loader, and the decode-only
+   output is 134 tensors with its sha256 recorded (see the gate result below).
 3. DiT identification. Architecture key, tensor-name table, and the dims from
    the [recipe](qwen-image-2.1-recipe.md) section 3.1 (32 layers, hidden 4096,
    head 128, 32 heads, context 4096, in/out 64, axes 16/56/56).
@@ -456,8 +458,8 @@ made on the P6 numbers.
 
 ## 6. Size
 
-Estimates by content, not measurements — nothing has been built. They are
-judgements about volume of code and evidence, not schedules.
+Estimates by content, not measurements — nothing beyond P0 has been built. They
+are judgements about volume of code and evidence, not schedules.
 
 The strategy is porting, not inventing, and that is what sets the size. Every
 piece of model code is a 1:1 translation of a working reference file, and every

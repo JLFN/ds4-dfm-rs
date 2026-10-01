@@ -248,11 +248,15 @@ Native ops that exist and are candidates. Line numbers are in `ds4_gpu.h`.
 ## 9. Gap inventory
 
 One gap is not a kernel. The diffusion model ships as GGUF, but the VAE ships as
-`qwen_image_2.1_vae_bf16.safetensors`, and this tree reads GGUF only — grep finds
-no safetensors reader and `crates/ds4-core/src/gguf.rs` is the sole loader.
-Either a one-time converter writes the VAE into a GGUF with a pinned layout, or
-a reader is added. The converter is recommended: one format at runtime, and the
-same tool can normalize the DiT's missing metadata (appendix B.7). P0 owns it.
+`qwen_image_2.1_vae_bf16.safetensors`, and before P0 this tree read GGUF only:
+there was no safetensors reader and `crates/ds4-core/src/gguf.rs` was the sole
+loader. Either a one-time converter writes the VAE into a GGUF with a pinned
+layout, or a reader is added. The converter is recommended: one format at
+runtime, and the same tool can normalize the DiT's missing metadata
+(appendix B.7). P0 owned it and built it: `crates/ds4-core/src/qwen_image/
+convert.rs` plus the `qwen-image-vae-gguf` tool read the safetensors header
+table to write the pinned GGUF, so the runtime keeps its single loader
+(`crates/ds4-core/src/gguf.rs`).
 
 The rest are ops this tree does not have today. Verified by grep: `conv2d`,
 `conv3d`, `upsample`, `groupnorm` and `pixel_shuffle` appear nowhere in `ds4.c`,
