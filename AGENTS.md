@@ -255,3 +255,32 @@ Rule 7: Use the body to explain what and why vs. how. Assume the code explains t
         the message must explain the context and reasoning.
 
 - If the prompt indicates that a bug is being fixed, don't write the fix right away. First write the test. Observe it failing. Then write the fix. And observe the test passing.
+
+## Upstream is read-only — never push and never open a PR there
+
+`origin` is `https://github.com/Baekpica/ds4-dfm-rs` and is READ-ONLY. Our
+account holds pull rights only. Never run any of these against it:
+
+```
+git push origin <anything>        git push --all | --mirror | --tags origin
+git push -u origin <branch>       gh pr create --repo Baekpica/ds4-dfm-rs
+gh pr comment | review | merge    gh release create, gh api writes
+```
+
+Every push goes to the fork, remote `fork` =
+`https://github.com/JLFN/ds4-dfm-rs`, and nowhere else. Before any push:
+
+```
+git remote -v                                    # confirm the URL you write to
+git rev-parse --abbrev-ref <branch>@{upstream}   # must be fork/<branch>
+```
+
+Never set `origin` as a branch upstream. Never create, comment on, review,
+merge or close a pull request in Baekpica/ds4-dfm-rs, and never force-push a
+branch that is a PR head there. If a change is meant for upstream, ask the
+operator: opening that PR is their decision, not the agent's.
+
+Why this is a hard rule: on 2026-09-30 a docs commit pushed to a fork branch
+that was the head of an upstream PR appeared in that PR immediately, and had
+to be hard-reset and force-pushed out of the fork. Branch `feat/image` on the
+fork is not a PR head and must stay that way.
