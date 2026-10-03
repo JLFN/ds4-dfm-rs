@@ -1,136 +1,192 @@
-QA report: feat/image — the budget-derived placement rules (Qwen-Image-2.1 P0),
-re-verification of the amended unit. Independent falsification pass, rule 19.
-Unit: commit 5a5c339 "feat(image): derive the placement rules from the device
-budget" (amended from c698939, message only), branch feat/image, one commit ahead
-of fork/feat/image = c4c75c7; HEAD b95e6df is the QA evidence commit on top. Tree
-identity checked with git: git rev-parse c698939^{tree} 5a5c339^{tree} both return
-7c271a53567e826227329d9c9dfadd39ac7a30a7 and git diff c698939 5a5c339 is empty,
-so the content is exactly what the previous pass verified. (c698939 and the
-intermediate amend 901c3c0 are still reachable and share that tree.) The only
-change between their messages is the 482 MiB sentence; see the findings below.
-Refs inspected this pass: 5a5c339, c698939, the reflog, both commit messages, and
-the tree diff. Refs inspected in the previous pass and still governing the tree:
-f37e034, c4c75c7, the full diff c4c75c7..c698939, misc/scratch/p1/refdump/run1.log
-(256x256), misc/scratch/phase-s/ref-run.log (1024x1024), the two real artifacts,
-docs/qwen-image-2.1-plan.md and docs/qwen-image-2.1-roadmap.md. Nothing was
-committed or pushed by me; the only file written is this report.
+QA report: feat/image — the P1 oracle's VAE decode (Qwen-Image-2.1 P1 stage 3).
+Independent falsification pass, rule 19. This report was refreshed after the unit
+was amended in place; it describes commit 7e5a145. Nothing was committed or
+pushed by me; the only repo file written is this report.
+
+Unit: commit 7e5a14517641b55131a21b16c6f635aba71af802 "feat(image): add the P1
+oracle's VAE decode" (amended from e195e4d, which remains reachable), branch
+feat/image, one commit ahead of the QA base fork/feat/image = 1396ce1 (verified:
+git rev-parse fork/feat/image = 1396ce17cc30504e6ffd3f156ea5b27e46457627; git log
+1396ce1..HEAD lists only 7e5a145). Diff stat 1396ce1..HEAD: +1503/-21 across
+exactly the same five files. Amendment delta e195e4d..HEAD: vae.rs +14/-2 (the
+f16_round subnormal path now rounds the magnitude at vae.rs:412, with a comment
+at :406-411 and six new sign assertions in f16_round_follows_binary16,
+vae.rs:1248-1253), docs/qwen-image-2.1-p1.md and docs/qwen-image-2.1-roadmap.md
+rewritten with the corrected numbers. The oracle test file and the qwen_image.rs
+module line are byte-identical between the two commits (git diff e195e4d..HEAD
+for them is empty), so the earlier live falsification of the gate carries over.
+Amended vae.rs sha256
+bea404b09a78c4c5f77e1f1663966558b6f309e148af210564e647f4bf36d08a. Commit message
+now records 9.2 s, PSNR 70.2 dB, relative RMS 3.2568e-4, 1312 differing bytes and
+the subnormal correction.
+
+Refs and files inspected: 7e5a145 (full message), e195e4d, 1396ce1, git diff
+1396ce1..HEAD and e195e4d..HEAD for crates/ds4-core/src/qwen_image.rs,
+crates/ds4-core/src/qwen_image/vae.rs (whole 1278-line file), both docs,
+crates/ds4-core/tests/qwen_image_oracle.rs, crates/ds4-core/tests/qwen_image.rs,
+tests/qa-gate.sh, the previous qa-evidence/qa-report.md.
+Artifacts: misc/scratch/p0/vae-decode-bf16.gguf (sha256 d3feefed...5372),
+/data/imagegen/models/diffusion_models/qwen-image-2.1-Q6_K.gguf,
+/data/imagegen/models/vae/qwen_image_2.1_vae_bf16.safetensors (bb21f747...).
+Fixtures: misc/scratch/p1/refdump/run1.{png,log,step1.in.bin,step1.pred.bin,step2.in.bin,step2.pred.bin}.
+Reference harness: /tmp/sdref-build (git 74988b2; vae_harness.cpp, vae_stages.cpp,
+src/model/vae/wan_vae.hpp, src/core/tensor_ggml.hpp, src/runtime/preprocessing.hpp,
+src/model/vae/vae.hpp, ggml/src/ggml-impl.h, build/CMakeCache.txt GGML_F16C=OFF,
+sdref-build.log) and its outputs /tmp/{ref_out_a..f.f32, ref_vae_out.f32,
+z_a_mulstd_plusmean.bin, z_ref.bin, refstage_run1_11.f32, refstage_run2_11.f32,
+ref_harness.png}; /tmp/vaedec.py. My probes: /tmp/qa_f16_probe.rs (the amended
+and the e195e4d f16_round side by side), /tmp/qa_f16.rs (e195e4d only),
+/tmp/qa_refconv.c (linked against the harness build's libggml-base.a).
 
 Surfaces covered (each on its own line, exact string from the gate)
 
 crates/ds4-core/src/qwen_image.rs
-crates/ds4-server/src/bin/ds4-server-rs.rs
-crates/ds4-server/src/image_cli.rs
-crates/ds4-server/tests/image_cli.rs
-docs/qwen-image-2.1-plan.md
+crates/ds4-core/src/qwen_image/vae.rs
+crates/ds4-core/tests/qwen_image_oracle.rs
+docs/qwen-image-2.1-p1.md
 docs/qwen-image-2.1-roadmap.md
+pub enum VaeError
+pub fn channels
+pub fn decode
+pub fn diffusion_to_vae
+pub fn height
+pub fn new
+pub fn open
+pub fn token
+pub fn to_rgba8
+pub fn vae_to_diffusion
+pub fn values
+pub fn width
+pub fn write_png
+pub fn zeros
+pub struct Plane
+pub struct VaeWeights
 
-All six in the unit diff (283 insertions, 33 deletions across exactly those
-files), and all six identical between c698939 and 5a5c339.
+Findings
 
-Findings from the previous pass, re-checked
+1. Re-verified on the amended tree (7e5a145), all live:
+- cargo test -p ds4-core --lib qwen_image::vae -> 15 passed, 0 failed.
+- cargo test -p ds4-core --lib qwen_image -> 54 passed, 0 failed.
+- cargo test -p ds4-server --test image_cli -> 5 passed, 0 failed.
+- DS4_QWEN_IMAGE_ORACLE=/data/ds4-dfm-rs/misc/scratch/p1/refdump/run1
+  DS4_QWEN_IMAGE_VAE=/data/ds4-dfm-rs/misc/scratch/p0/vae-decode-bf16.gguf
+  cargo test -p ds4-core --release --test qwen_image_oracle
+  vae_decode_reproduces_the_reference_image -- --nocapture -> ok:
+  "vae decode: 256x256x4 in 9.4s"; "decode vs reference: max |diff| r 0.00392
+  g 0.00784 b 0.00784 a 0.01961, PSNR 70.2 dB, relative RMS 3.2568e-4, differing
+  bytes r 324 g 364 b 410 a 214 of 65536". Sum 1312, exactly the number the
+  amended docs and the commit message record, and the per-channel maxima are
+  r 1/255, g 2/255, b 2/255, a 5/255. The recorded 9.2 s is one run of a band I
+  observe at 9.2-9.5 s on this host (9.4 s this pass, 9.4-9.5 s in the previous
+  pass); no number contradicts.
+- These amended numbers are exactly what my pre-amendment temporary abs() probe
+  measured (PSNR 70.2, 1312 bytes, b max 2/255), which is the direct evidence
+  that the committed fix is the change that was probed.
 
-D1 (VAE footprint sourced from the wrong artifact) FIXED.
-FOOTPRINT_VAE_WEIGHTS_MIB is 495. The decode-only GGUF this engine loads
-(misc/scratch/p0/vae-decode-bf16.gguf, sha256 d3feefed...5372) holds 518096424
-bytes of BF16 tensor data = 494.095 MiB, so 495 is the round-up. The comment now
-states this explicitly and distinguishes the reference's own 128-tensor VAE
-figure (482.81 MiB, run1.log:244). All four weight/buffer constants are now
-rounded up from their measured sources and each names its source:
-  FOOTPRINT_TEXT_ENCODER_MIB  4303  <- 4302.32 / 4302.33 (run1.log:160, :195)
-  FOOTPRINT_DIT_WEIGHTS_MIB   5605  <- 5876556448 bytes = 5604.32 MiB (artifact)
-  FOOTPRINT_DIT_COMPUTE_MIB   2318  <- 2317.45 (phase-s ref-run.log:228)
-  FOOTPRINT_VAE_WEIGHTS_MIB    495  <- 518096424 bytes = 494.10 MiB (GGUF)
-  FOOTPRINT_VAE_DECODE_FLOOR_MIB 3973 (floor, unchanged)
-  FOOTPRINT_DEFAULT_BUDGET_MIB 11894 (unchanged)
-Every rounded value >= its source. Re-derived sums, all confirmed against the
-string printed live by the rebuilt binary:
-  te + DiT            = 4303 + 5605 + 2318              = 12226 MiB
-  DiT + VAE           = 5605 + 2318 + 495 + 3973         = 12391 MiB
-  all three           = 12226 + 495 + 3973               = 16694 MiB
-16694 MiB = 16.30 GiB, and both 12226 and 12391 exceed the 11894 MiB default,
-so the two refusals still stand at the default.
+2. Falsification evidence, and its carry-over to the amendment:
+- The gate was falsified live on the pre-amendment tree: dropping f16_round at
+  both conv call sites FAILED at PSNR 16.1 dB and 254/255; flipping the range map
+  at to_rgba8 FAILED at 130/255; both reverted byte-exactly and the pass
+  restored. The amended tree changes neither the test file nor the two tolerance
+  asserts or their lines (grep: worst <= 6.0/255 at test:550, psnr >= 55.0 at
+  test:555, unchanged), so the gate's non-vacuity carries unchanged.
+- New check specific to the amendment: the new negative-subnormal assertions were
+  executed against the e195e4d function body in a standalone probe. The amended
+  function returns the correctly rounded values on all four cases; the e195e4d
+  function returns -0.0 on all four (MISMATCH on every case). So the new test
+  would have failed on the old code; it is a real gate on the fix.
 
-D2 (A.1 mislabelled the measurement resolution) FIXED.
-docs/qwen-image-2.1-plan.md A.1 now reads "The three modules' measured footprints
-total 16694 MiB (16.3 GiB) at 1024 square, the generation these rules were
-measured on ... The DiT's compute buffer is the resolution-dependent term: 34.66
-MiB at 256 square against the 2318 MiB used here, so a budget quoted at another
-resolution needs that figure requoted." This is true: the 2318 MiB compute buffer
-and the 3973 MiB floor come from the 1024-square reference run
-(misc/scratch/phase-s/ref-run.log: width 1024, height 1024, generate_image
-1024x1024, compute buffer 2317.45 MB at line 228), and the 256-square run reports
-34.66 MB (misc/scratch/p1/refdump/run1.log: width 256, height 256, generate_image
-256x256, line 233). 16694/1024 = 16.30, so "16.3 GiB" holds. The stale "at 256
-square" phrase is gone (the only remaining "256 square" is the correct
-resolution-dependent caveat).
+3. Cheat audit of the amended diff: no hardcoded output, no dead path, no
+unfireable assert (both tolerance asserts and the new sign assertions are
+demonstrably failable), no reference-file cheat beyond run1.png being the
+reference's own image by design. The new assertions' expected values are the
+reference conversion's own rounded results, independently checked in finding 8.
 
-Acceptance, live, on the rebuilt binary (from the previous pass; the tree is
-unchanged, so these still hold)
+4. The strongest claim (the reference harness reproducing run1.png) was
+re-derived and re-run live in the previous pass on the same fixtures; the
+amendment touches none of it: I rebuilt the harness input byte-identically from
+the dumps (65573 bytes), re-ran /tmp/sdref-build/vae_harness to a byte-identical
+output (sha256 0b8333cd64d8e09e8521ca76b8b322c5cf82866ab6b76ded4f7c9d6d0034b25d),
+and re-derived with the reference's own float_to_u8 semantics (preprocessing.hpp:27-35,
+(x+1)/2 clamp, NaN to 1.0) a pixel-byte-exact match to run1.png, 65536 of 65536
+pixels; the five alternative latent conversions fail at 5.06/10.78/14.08/11.98/
+9.72 dB, inside the claimed 5-14 dB. The amended roadmap's "raw, doubled and
+inverse maps fail at 5-14 dB" is consistent with that. "Byte-exactly" holds at
+the image-data level, not the PNG container (encoder difference); /tmp/ref_harness.png
+is a stale preview of the raw-latent run, not the byte-exact image.
 
-  ./ds4-server --check-config --image-dit <dit> --image-vae <vae> \
-      --image-placement te=cuda0:vram,diffusion=cuda0:vram,vae=cuda0:vram
-  EXIT=2, both codes present, each naming the footprint and the budget:
-    error: pinning te=cuda0,vram diffusion=cuda0:vram vae=cuda0:vram on cuda0
-      needs about 16694 MiB and the budget is 11894 MiB: ... (image_te_vram_unsupported)
-    error: ... same 16694/11894 ... (image_double_pin_unsupported)
-  the same request with --max-vram 140
-  EXIT=0, neither code present, artifacts identified (dit_tensors=297 dit_q6_k=229
-  dit_bf16=68 vae_tensors=134, refusals=11). Matches the commit message.
+5. The 6% saturation claim is unchanged and holds: the pre-scale head output
+(/tmp/refstage_run1_11.f32, verified to reproduce ref_out_a exactly through the
+map) carries 15488 NaN values = 5.91% of 262144, i.e. 3872 of 65536 pixels
+(5.91%) with all four channels NaN, 0 inf at that stage. The amended roadmap's
+reworded range "about [-0.99, +2.77] with ~6% NaN" matches my measurement of the
+finite range [-0.9928, +2.7696] and that 5.91%.
 
-Default behaviour unchanged (no --max-vram)
-  - te=cuda0:vram (DiT at the default cuda0:vram): EXIT=2,
-    image_te_vram_unsupported, "needs about 12226 MiB and the budget is 11894".
-  - vae=cuda0:vram (DiT at the default cuda0:vram): EXIT=2,
-    image_double_pin_unsupported, "needs about 12391 MiB and the budget is 11894".
-The old pass set was {no te in VRAM} AND {not both DiT and VAE in VRAM}; every
-such configuration pins 0, 4468 or 7923 MiB per device at the default budget,
-all <= 11894, so no configuration that used to pass now fails. No regression.
+6. Artifact and contract use, re-checked live on the amended tree: the GGUF
+sha256 matches the doc (d3feefed...5372); identify_vae with DS4_QWEN_IMAGE_VAE
+set yields 134 tensors, all BF16 (tests/qwen_image.rs:166-175), and the contract
+pins every conv at kT=1 (qwen_image.rs:347-440), so "every Conv3d weight has
+ne[2]==1" is established by the exact-dims match; the wrong artifact is rejected,
+not mis-loaded (identify_vae(DiT) fails with a contract problem list, and the
+oracle loader fails with Contract { tensor: "conv2.weight", why: "missing from
+the artifact" }). The 64-channel statistics constants (qwen_image.rs:89-108) are
+element-identical to the reference's VERSION_QWEN_IMAGE_2_1 tables
+(wan_vae.hpp:1373-1390).
 
-Tests (from the previous pass; tree unchanged)
-  cargo test -p ds4-core --lib qwen_image        -> 39 passed, 0 failed.
-  cargo test -p ds4-server --test image_cli      ->  5 passed, 0 failed.
-  cargo test -p ds4-server --lib image_cli       ->  3 passed, 0 failed.
-  cargo test -p ds4-core --test tokenizer        -> FAILED,
-    tokenizer_families_match_c_oracle (qwen35 specials family=12 vs the C oracle's
-    11, crates/ds4-core/tests/tokenizer.rs:174). Pre-existing and untouched:
-    git diff --name-only c4c75c7 5a5c339 lists no tokenizer path (the only crates
-    file in the diff is crates/ds4-core/src/qwen_image.rs).
-Commit trailer: "Unit: 6 complete" is the last body line of 5a5c339 (verified
-this pass; unchanged by the amend).
-Parsing on the fresh binary: --max-vram twelve / 0 / 12.5 all exit 2; the flag is
-in the usage text ("... [--image-offload] [--max-vram GiB]"); the value reaches
-the placement as MiB (12 GiB = 12288 admits te+DiT at 12226; 11 GiB refuses).
+7. The three doc imprecisions recorded by the previous pass are FIXED, and each
+corrected number matches my measurement:
+- p1.md:223 now reads "max abs diff r 0.00392 g 0.00784 b 0.00784 a 0.01961;
+  PSNR 70.2 dB; relative RMS 3.26e-4; 1312 of 262144 channel bytes differ" -
+  measured 3.2568e-4 and 1312, identical.
+- roadmap:315 now reads "max 5/255, on the alpha channel; 1-2/255 on RGB" -
+  measured r 1/255, g 2/255, b 2/255, a 5/255; both clauses true.
+- roadmap:320 now reads "about [-0.99, +2.77] with ~6% NaN (not a clean [-1,1])" -
+  measured finite range [-0.9928, +2.7696] and 5.91% NaN; accurate.
+- p1.md:246-248's new sentence about the negative-subnormal correction matches
+  finding 8. The tracker line (roadmap:513) and the commit message carry 70.2 dB,
+  consistent with the table. No remaining unreproduced number in the amended docs.
 
-No false DGX/resolution claims. A.1 says the two measured rules are "measurements
-of THAT card" (the 12 GB RTX 4070 SUPER) and that a DGX Spark's 128 GB "holds
-resident" the 16.3 GiB stack - a capacity comparison, not a Spark measurement; no
-Spark number exists. The roadmap P0 placement line states no resolution and no
-DGX figure. (plan.md:111-112 is a pre-existing capacity statement, not from this
-unit.)
+8. The previous pass's defect is FIXED. Evidence:
+- Code: vae.rs:412 is now (value.abs() * 16_777_216.0).round_ties_even(), with a
+  comment at :406-411 naming the signed-cast saturation it avoids; the new
+  assertions at :1248-1253 cover -2^-24, -0.75*2^-24, -1e-5 (= -168*2^-24),
+  -6e-5 (= -1007*2^-24) and the sign.
+- Standalone probe of the amended function against the e195e4d body, using the
+  new test's own expressions: amended returns -5.96046448e-8 for -2^-24 and
+  -0.75*2^-24 (both round to -1 ulp of the grid, correctly), -1.00135803e-5 for
+  -1e-5, -6.00218773e-5 for -6e-5, and the sign is negative; the e195e4d body
+  returns -0.0 for all four.
+- Reference check: the reference's own conversion (probe linked against the
+  harness build's libggml-base.a, F16C off) returns -1.00135803e-05 for -1e-5
+  (bits 0x80a8), -6.00218773e-05 for -6e-5, and -5.96046448e-08 for
+  -4.47034836e-8; numpy float16 agrees. The amended function matches the
+  reference on all four cases; the e195e4d function did not.
+- Gate effect, measured: the amended tree reads PSNR 70.2 dB with 1312 differing
+  bytes against the pre-amendment 70.3 dB / 1246; both are far inside the adopted
+  6/255 and 55 dB bound, and the amended docs record the amended numbers.
+This finding is closed as FIXED.
 
-Minor, non-blocking imprecisions (findings, not defects)
+9. No other defect found. Checked and clean: no hardcoded outputs, no tolerance
+inflation, no dead code path in the decode chain, no unfireable assert, no
+reference-file cheat, no scope creep (the unit touches exactly the five files
+above; qwen_image.rs adds the one module line).
 
-- The commit message previously called the reference's figure "the reference's
-  own 482 MiB safetensors" (the safetensors file is 675509688 bytes = 644.38 MiB;
-  482.81 MiB is the loaded params buffer, run1.log:244). FIXED by this amend:
-  5a5c339 now reads "not the 482 MiB the reference's own 128-tensor scope
-  reports", which is accurate. The message diff c698939..5a5c339 is confined to
-  that sentence.
-- Unchanged from the earlier pass and outside this amend: the new per-device,
-  budget-based logic relaxes three configurations that the old code refused
-  (te=cuda0:vram with the DiT on host; DiT and VAE pinned on different cuda
-  devices; a VRAM tier on the Cpu device, te=cpu:vram / vae=cpu:vram). None is a
-  configuration that used to pass, so none is a regression; recorded for the
-  operator as the intended direction of the change.
+Unverified items
 
-Unverified items (findings, not passes)
-
-- That the reference's params-buffer figure (482.81 MB) is meant to be
-  byte-comparable to this engine's GGUF; I read both and the artifact sizes but
-  did not reconcile the reference graph's 128 tensors against the converter's
-  134. D1 is resolved either way because the constant now uses this engine's own
-  artifact.
-- I did not re-run the full serialized workspace suite; only the four gates the
-  task names. The amend touched no test and no other crate.
+- The stage-2 DiT numbers quoted in the roadmap's P1 gate result (correlation
+  0.999973, relative RMS 7.6e-3) were not re-measured here; they belong to the
+  previous unit. Its tests pass in this tree, but I did not re-run the DiT
+  fixture gate against the DiT artifact.
+- The original run1 generation (the reference pipeline that produced run1.png and
+  the dumps) was not re-run; I verified only the decode stage and the harness
+  from those fixtures.
+- I did not count how many conv operands actually land in the negative-subnormal
+  range during the decode; the reach is bounded (6.1e-5 per operand) but not
+  enumerated. This no longer affects correctness, since the rounding now matches
+  the reference for that class.
+- The "overflow to infinity" half of the saturation claim is measured at the
+  final head stage as NaN only; inf was not counted at intermediate levels.
+- Decode wall time is a band (9.2-9.5 s observed across runs on this host); the
+  docs' single 9.2 s figure is one sample of it, not a contradiction.
 
 verdict: overall PASS
