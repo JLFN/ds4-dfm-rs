@@ -30,6 +30,7 @@ use ds4_core::qwen_image::oracle::{
     apply_rope, build_layout, euler_step, flux_sigmas, flow_timestep, initial_noise,
     noise_scaling, rope_table, text_mask, Philox, RopePairing,
 };
+use ds4_core::qwen_image::vae::{decode, diffusion_to_vae, to_rgba8, Plane, VaeWeights};
 use ds4_core::qwen_image::DIT_AXES_DIM;
 
 /// A dumped tensor: its dims on the GGML axes (ne0 first) and its data.
@@ -432,4 +433,124 @@ fn export_tensor_for_crosscheck() {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     std::fs::write(out, bytes).expect("write");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: the VAE decode
+// ---------------------------------------------------------------------------
+
+/// The stage-3 gate: the reference's own PNG, rebuilt from its dumps.
+///
+/// The chain is the reference's: the second Euler step lands on the final latent
+/// (its next sigma is the terminal zero, so the step is the denoised
+/// prediction), the 64-channel statistics move it into the VAE's own space
+/// (`diffusion_to_vae_latents`, `wan_vae.hpp:1393-1396`), the decoder runs, and
+/// the result is scaled to [0,1] and quantized the way `VAE::decode` and
+/// `tensor_to_sd_image` do it.
+///
+/// Fidelity class: stated tolerance. The reference ran its VAE on the CPU
+/// (`vae=cpu`, `run1.log:62`) with F16 parameters and F16 conv operands summed
+/// in ggml's own order, so this decode lands close, not byte-exact. The adopted
+/// bound is a 6/255 per-channel maximum with PSNR above 55 dB, one final
+/// quantization step plus the F32 accumulation-order slack that this decoder's
+/// own unstable cascade amplifies: the latent drives the reference past F16's
+/// range, so ~6% of its pixels overflow to infinity and NaN (both
+/// implementations write those white) and the rest agree to a byte or two.
+#[test]
+fn vae_decode_reproduces_the_reference_image() {
+    if std::env::var("DS4_QWEN_IMAGE_ORACLE").is_err() {
+        return;
+    }
+    let Some(vae_path) = std::env::var("DS4_QWEN_IMAGE_VAE").ok() else {
+        return;
+    };
+
+    let (_, step1_in) = fixture("", ".step1.in.bin").expect("step1 input dump");
+    let (_, step1_pred) = fixture("", ".step1.pred.bin").expect("step1 velocity dump");
+    let (_, step2_in) = fixture("", ".step2.in.bin").expect("step2 input dump");
+    let (_, step2_pred) = fixture("", ".step2.pred.bin").expect("step2 velocity dump");
+
+    let image_tokens = (step2_in.dims[0] * step2_in.dims[1]) as i64;
+    let sigmas = flux_sigmas(image_tokens, 2);
+
+    // The stage-1 parity, restated because everything downstream stands on the
+    // latent it produces.
+    let rebuilt = euler_step(&step1_in.data, &step1_pred.data, sigmas[0], sigmas[1]);
+    assert_eq!(rebuilt, step2_in.data, "the first Euler step");
+
+    let final_latent = euler_step(&step2_in.data, &step2_pred.data, sigmas[1], sigmas[2]);
+    let latent = Plane::new(
+        step2_in.dims[0] as usize,
+        step2_in.dims[1] as usize,
+        step2_in.dims[2] as usize,
+        final_latent,
+    );
+
+    let weights = VaeWeights::open(&PathBuf::from(vae_path)).expect("open the VAE artifact");
+    let vae_latent = diffusion_to_vae(&latent).expect("latent statistics");
+
+    let start = std::time::Instant::now();
+    let decoded = decode(&weights, &vae_latent, 1).expect("the VAE decode");
+    println!(
+        "vae decode: {}x{}x{} in {:.1}s",
+        decoded.width(),
+        decoded.height(),
+        decoded.channels(),
+        start.elapsed().as_secs_f32()
+    );
+
+    let ours = to_rgba8(&decoded);
+    let reference_path = PathBuf::from(format!(
+        "{}.png",
+        std::env::var("DS4_QWEN_IMAGE_ORACLE").unwrap()
+    ));
+    let reference = image::ImageReader::open(&reference_path)
+        .expect("open the reference PNG")
+        .decode()
+        .expect("decode the reference PNG")
+        .to_rgba8();
+
+    assert_eq!(
+        (reference.width(), reference.height()),
+        (decoded.width() as u32, decoded.height() as u32),
+        "the reference PNG's geometry"
+    );
+    let reference = reference.into_raw();
+    assert_eq!(ours.len(), reference.len());
+
+    // Per-channel maxima and a whole-image PSNR, all on the [0,1] scale the
+    // reference's own u8 conversion uses.
+    let mut max_diff = [0f32; 4];
+    let mut above_one = [0usize; 4];
+    let mut diff_sq = 0f64;
+    let mut ref_sq = 0f64;
+    for (index, (a, b)) in ours.iter().zip(&reference).enumerate() {
+        let channel = index % 4;
+        let diff = (*a as f32 - *b as f32).abs() / 255.0;
+        max_diff[channel] = max_diff[channel].max(diff);
+        if *a != *b {
+            above_one[channel] += 1;
+        }
+        diff_sq += (diff as f64) * (diff as f64);
+        ref_sq += (*b as f64 / 255.0) * (*b as f64 / 255.0);
+    }
+    let mse = diff_sq / ours.len() as f64;
+    let psnr = 10.0 * (1.0 / mse).log10();
+    let relative_rms = (diff_sq / ref_sq).sqrt();
+
+    println!(
+        "decode vs reference: max |diff| r {:.5} g {:.5} b {:.5} a {:.5}, PSNR {:.1} dB, relative RMS {:.4e}, \
+         differing bytes r {} g {} b {} a {} of {}",
+        max_diff[0], max_diff[1], max_diff[2], max_diff[3], psnr, relative_rms,
+        above_one[0], above_one[1], above_one[2], above_one[3], ours.len() / 4
+    );
+
+    let worst = max_diff.iter().copied().fold(0f32, f32::max);
+    assert!(
+        worst <= 6.0 / 255.0,
+        "{}: worst channel deviation {worst:.5} ({:.2} of 255)",
+        reference_path.display(),
+        worst * 255.0
+    );
+    assert!(psnr >= 55.0, "{}: PSNR {psnr:.1} dB", reference_path.display());
 }

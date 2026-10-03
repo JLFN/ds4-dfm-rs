@@ -1,18 +1,19 @@
-# Qwen-Image-2.1 port — phase P1, the CPU oracle (stages 1 and 2)
+# Qwen-Image-2.1 port — phase P1, the CPU oracle (stages 1, 2 and 3)
 
 [Documentation index](README.md) | [Repository README](../README.md) |
 [Plan](qwen-image-2.1-plan.md) | [Recipe](qwen-image-2.1-recipe.md) |
 [Roadmap](qwen-image-2.1-roadmap.md) | [Phase S](qwen-image-2.1-phase-s.md) |
 [P0](qwen-image-2.1-decision.md) | [P1 recipe](qwen-image-2.1-recipe.md)
 
-Status: in progress, stages 1 and 2 of 3 done. Stage 1 is the part of P1 the plan
-calls exact by construction — the initial noise, the positions, the RoPE table
-inputs, the segment masks and the flow schedule. Stage 2 is the DiT evaluation
-itself, driven by the reference's own conditioning and gated on the reference's
-own dumped velocity. The VAE decode and the image are stage 3 and are not in this
-document.
+Status: complete, stages 1, 2 and 3 done. Stage 1 is the part of P1 the plan calls
+exact by construction — the initial noise, the positions, the RoPE table inputs,
+the segment masks and the flow schedule. Stage 2 is the DiT evaluation itself,
+driven by the reference's own conditioning and gated on the reference's own
+dumped velocity. Stage 3 is the VAE decode, the latent-statistics conversions and
+the PNG, gated on the reference's own image (section 5).
 
-Date: 2026-10-01. Host: RTX 4070 SUPER (sm_89, 12282 MiB nominal), driver
+Date: 2026-10-01 for stages 1 and 2, 2026-10-03 for stage 3. Host: RTX 4070
+SUPER (sm_89, 12282 MiB nominal), driver
 610.43.03. Reference: `/data/imagegen/bin/sd-cli`, version
 `master-890-74988b2-4-g6dcb5bb`, commit `6dcb5bb` (the [recipe](qwen-image-2.1-recipe.md)
 section 1 pin).
@@ -207,7 +208,62 @@ oracle exists to prevent: the all-F32 version is wrong in 5142 of 16384 samples
 (4774 by one ulp, 360 by two, 8 by three), a difference no downstream tolerance
 would ever have flagged.
 
-## 5. Code and tests
+## 5. Stage 3: the VAE decode and the image
+
+The decode-only VAE (134 BF16 tensors, sha256 `d3feefed…25372`) is now ported to
+F32 in `crates/ds4-core/src/qwen_image/vae.rs`, driven by the final DiT latent and
+compared with the reference's own PNG. The chain is the reference's: the second
+Euler step lands on the final latent, `diffusion_to_vae_latents`
+(`wan_vae.hpp:1393-1396`) applies `latents * std / scale_factor + mean` with the
+64-channel tables, the decoder runs, and the result is scaled and quantized to
+RGBA8.
+
+| stage | quantity | tolerance | measured |
+| --- | --- | --- | --- |
+| decode | 256x256x4 image vs `run1.png` | 6/255 per channel, PSNR > 55 dB | max abs diff r 0.00392 g 0.00784 b 0.00784 a 0.01961; **PSNR 70.2 dB**; relative RMS 3.26e-4; 1312 of 262144 channel bytes differ |
+
+The decode is 9.2 s for 256x256 on this host (single frame, F32, the reference's
+own operand contract).
+
+### What stage 3 settled, by measurement and not by reading
+
+- The RGB channel map and the output range map. The head emits **4** channels,
+  not 3; channel `c` becomes PNG byte `c` (R, G, B, A) after the reference's own
+  map, `(x+1)*0.5` clamped by `std::max(0, std::min(1, v))` — whose comparison
+  order sends NaN to 1.0 (white). Evidence: a CPU build of the reference's own
+  decoder, taken from the pinned upstream source, reproduces `run1.png`
+  **byte-exactly** with exactly this mapping; the inverse conversion, the raw
+  latent, `x*std` alone, `x+mean` alone and the pre-final-step latent all fail
+  (PSNR 5-14 dB). That single check settles the mapping, the conversion direction
+  and the Euler chain together.
+- The reference's convolutions round their operands to **F16**.
+  `ggml_conv_2d`/`ggml_conv_3d` write the im2col patches in the weight's type,
+  and this artifact's conv weights load as F16. It is load-bearing here: the
+  latent drives the last two up levels past F16's 65504, so about 6% of the
+  reference's pixels overflow to infinity and NaN, and its `std::min`-based clamp
+  turns exactly those white. The port mirrors both the F16 rounding and the
+  NaN-to-1.0 clamp; without them the image matched at only 16 dB, with the
+  saturated regions grey instead of white. The rounding also covers negative
+  subnormals by magnitude, matching the reference's conversion; an earlier
+  signed-zero flush there was caught by the unit's QA pass and corrected.
+- The reference's upsample3d temporal branch is a **no-op for `chunk_idx == 0`**
+  (`wan_vae.hpp:203-206`), and every Conv3d weight in this export has a singleton
+  temporal kernel (`kT = 1`, collapsed at `:30-34`). So a single-frame decode is
+  a plain spatial pipeline and the streaming `feat_cache` path does not
+  participate; the port refuses any temporal length other than one by name.
+
+### What stage 3 does not establish
+
+1. Byte identity. The residual 1-5 LSB deviation is F32 accumulation order
+   (ggml's `vec_dot` layout versus the port's taps-outer, channels-inner loops),
+   amplified by this decoder's own unstable cascade; ~6% of pixels sit in a
+   region the reference itself saturates. Matching byte-for-byte would mean
+   reproducing ggml's exact dot-product order, which the port does not do.
+2. Temporal lengths other than one, which are refused by name rather than
+   supported.
+3. No kernel and no GPU path: stage 3 is an oracle; P2 and P4 own CUDA.
+
+## 6. Code and tests
 
 - `crates/ds4-core/src/qwen_image/oracle.rs`: `Philox`, `initial_noise`,
   `Layout`/`Segment`/`build_layout`/`LayoutError`, `rope_table`, `apply_rope` +
@@ -217,24 +273,34 @@ would ever have flagged.
   `dequantize_f32`), `DitPass`, `DitError`, `forward`, `cfg_combine`, `Parity` /
   `parity`, with the Q6_K and BF16 dequantizers, the F32 matmul and the
   elementwise kernels the forward needs. 9 unit tests, model-free.
-- `crates/ds4-core/tests/qwen_image_oracle.rs`: 9 tests. Six evaluate the
+- `crates/ds4-core/src/qwen_image/vae.rs`: `Plane`, `VaeWeights`, `VaeError`,
+  `diffusion_to_vae` / `vae_to_diffusion`, `decode`, `to_rgba8`, `write_png`,
+  and the block kernels (`conv3x3`, `conv1x1`, `rms_norm`, `nearest_up2`,
+  `dup_up3d`, `resample_up2`, `attention`, `residual`, `up_block`) with the F16
+  operand rounding and the NaN-to-1.0 clamp. 15 unit tests, model-free.
+- `crates/ds4-core/tests/qwen_image_oracle.rs`: 10 tests. Seven evaluate the
   reference's dumps and return early unless `DS4_QWEN_IMAGE_ORACLE=<prefix>` is
-  set (the DiT gate also needs `DS4_QWEN_IMAGE_DIT=<gguf>`), one is the dequant
-  cross-check hook gated on `DS4_QWEN_IMAGE_EXPORT=<tensor>`, and two are
-  model-free and always run. Cargo runs the test binary from the package
-  directory, so the fixture prefix must be an absolute path.
+  set (the DiT gate also needs `DS4_QWEN_IMAGE_DIT=<gguf>`, the stage-3 gate
+  `DS4_QWEN_IMAGE_VAE=<gguf>`), one is the dequant cross-check hook gated on
+  `DS4_QWEN_IMAGE_EXPORT=<tensor>`, and two are model-free and always run. Cargo
+  runs the test binary from the package directory, so the fixture prefix must be
+  an absolute path.
 
 ```
 cargo test -p ds4-core --lib qwen_image::oracle                          # 12 passed
 cargo test -p ds4-core --lib qwen_image::dit                             # 9 passed
+cargo test -p ds4-core --lib qwen_image::vae                             # 15 passed
 D=/data/ds4-dfm-rs/misc/scratch/p1/refdump/run1
 DS4_QWEN_IMAGE_ORACLE=$D cargo test -p ds4-core --test qwen_image_oracle # 9 passed
 DS4_QWEN_IMAGE_ORACLE=$D \
 DS4_QWEN_IMAGE_DIT=/data/imagegen/models/diffusion_models/qwen-image-2.1-Q6_K.gguf \
   cargo test -p ds4-core --release --test qwen_image_oracle dit_forward_reproduces
+DS4_QWEN_IMAGE_ORACLE=$D \
+DS4_QWEN_IMAGE_VAE=/data/ds4-dfm-rs/misc/scratch/p0/vae-decode-bf16.gguf \
+  cargo test -p ds4-core --release --test qwen_image_oracle vae_decode_reproduces
 ```
 
-## 6. Artifacts
+## 7. Artifacts
 
 Re-verified this session (`misc/scratch/p1/p1-artifact-hashes.txt`):
 
@@ -244,10 +310,10 @@ Re-verified this session (`misc/scratch/p1/p1-artifact-hashes.txt`):
 | `qwen_image_2.1_vae_bf16.safetensors` | `bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9` |
 | `misc/scratch/p0/vae-decode-bf16.gguf` | `d3feefed174e69d51f380c71bb500ab92033d85fc83f5d87c9811a8775725372` |
 
-## 7. What this does not establish
+## 8. What this does not establish
 
-1. Nothing about the VAE decode, the latent statistics, the conversions or the
-   PNG, which are stage 3.
+1. The VAE decode is an F32 oracle with a stated tolerance, not byte-exact
+   (section 5); stage 3's own limits are listed there.
 2. No kernel, no GPU path and no serving timing. P1 is a reference, not a
    measurement.
 3. The conditioning intake consumes dumps; the text encoder that produces them

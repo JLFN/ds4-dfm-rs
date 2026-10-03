@@ -17,6 +17,7 @@
 pub mod convert;
 pub mod dit;
 pub mod oracle;
+pub mod vae;
 
 use crate::gguf::{GgufError, GgufFile};
 use crate::tensors::{TensorError, TensorInventory};

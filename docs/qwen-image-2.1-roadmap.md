@@ -10,7 +10,7 @@ translation map and the decision; the [recipe](qwen-image-2.1-recipe.md) holds
 the reference index, the model geometry and the op mapping. This document holds
 the order of work.
 
-Nothing here is implemented except P0. Every phase below is a proposal; the
+Nothing here is implemented except P0 and P1. Every phase below is a proposal; the
 status column in section 7 is the live tracker.
 
 Reopened 2026-10-01: the port was closed for a day on the
@@ -308,6 +308,22 @@ temporal padding rule; and the output range map — the decoder already maps to
 previous port of this same model to another runtime, so they are known to be
 real rather than hypothetical.
 
+**Gate result (2026-10-03, [report](qwen-image-2.1-p1.md)): passed.** All three
+stages. The initial noise and the Euler step are byte-identical; the DiT velocity
+matches the reference's own dump at correlation 0.999973 (relative RMS 7.6e-3,
+the residual being the reference's own CUDA/Q6_K arithmetic, not a bug); the VAE
+decode reproduces the reference's own `run1.png` at PSNR 70.2 dB (max 5/255, on
+the alpha channel; 1-2/255 on RGB; tolerance 6/255 and PSNR > 55 dB). P1 is a
+slow F32 oracle: no kernel, no GPU path, no serving timing. One correction to the
+trap above: the decoder's four output channels need the `(x+1)/2` map exactly
+once — the "decoder already maps to `[0,1]`" note did not hold for this artifact.
+The pre-scale head output is about `[-0.99, +2.77]` with ~6% NaN (not a clean
+`[-1,1]`), and a CPU build of the reference's own decoder reproduces `run1.png`
+byte-exactly only with the map, while the raw, doubled and inverse maps fail at
+5-14 dB PSNR. The streaming
+temporal path is deliberately not built: the single-frame decode refuses any
+other temporal length by name.
+
 ### P2 — CUDA primitives
 
 Objective: every kernel the engine needs, each proven against the oracle in
@@ -462,7 +478,7 @@ made on the P6 numbers.
 
 ## 6. Size
 
-Estimates by content, not measurements — nothing beyond P0 has been built. They
+Estimates by content, not measurements — nothing beyond P1 has been built. They
 are judgements about volume of code and evidence, not schedules.
 
 The strategy is porting, not inventing, and that is what sets the size. Every
@@ -494,7 +510,7 @@ Neither is a research problem.
 | --- | --- | --- | --- |
 | S | **done — no gain** | `feat/image`, [phase-S report](qwen-image-2.1-phase-s.md) | three numbers measured; none capturable by the port (M1 0%, M2 0%, M3 <=5.5%) |
 | P0 | **done** | `feat/image`, this document section 4 | layout contract over both artifacts (297/229/68, 134), `--check-config` refuses all 11 AR controls by name |
-| P1 | not started | — | — |
+| P1 | **done** | `feat/image`, [P1 report](qwen-image-2.1-p1.md) | three stages: byte-identical noise and Euler step, DiT velocity correlation 0.999973, VAE image PSNR 70.2 dB vs `run1.png` |
 | P2 | not started | — | — |
 | P3 | not started | — | — |
 | P4 | not started | — | — |
