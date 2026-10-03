@@ -349,6 +349,22 @@ absolute difference and relative RMS.
 Traps: the conv3d weight layout is `[kW, kH, kT, IC*OC]` in F16 with F32
 accumulation; the temporal pad is left-only; single group only.
 
+**Gate result (2026-10-03, first slice): the three new kernels pass.**
+`cuda/qwen_image_primitives.cuh` adds `qwen_image_layernorm`,
+`qwen_image_modulate` and `qwen_image_mlp_gated` (unfused and fused), exposed
+through `ds4_qwen_image_gpu.cuh` and four `ds4_gpu_qwen_image_*` entry points.
+`make test-qwen-image-primitives` compares each against a double host mirror of
+the oracle's own math at the real shapes (hidden 4096, intermediate 12288, 1 and
+4224 joint tokens): max absolute difference <= 7.6e-6 and relative RMS <= 6.0e-8
+against a stated bound of 1e-4 and 1e-5; the plain `modulate` cases are bit-exact.
+The 4224-row residual is the norm's F32 tree reduction against the oracle's double
+accumulation, plus the fused MLP's `expf` tails (7.6e-6, still about 13x inside
+the absolute bound). `make ds4-server CUDA_ARCH=sm_89` still links. The
+fused MLP's chunk order (gate = chunk 0) was confirmed against the reference
+source (`qwen_image_2_1.hpp:229-240`), not only the recipe; the shipped fused
+artifact path is still not exercised by the CPU oracle. The vendored
+convolution, upscale and attention kernels remain for later slices.
+
 ### P3 — DiT on CUDA: residency, graph, capture
 
 Objective: the 32-block DiT runs on the device, captured, and reproduces the
@@ -511,7 +527,7 @@ Neither is a research problem.
 | S | **done — no gain** | `feat/image`, [phase-S report](qwen-image-2.1-phase-s.md) | three numbers measured; none capturable by the port (M1 0%, M2 0%, M3 <=5.5%) |
 | P0 | **done** | `feat/image`, this document section 4 | layout contract over both artifacts (297/229/68, 134), `--check-config` refuses all 11 AR controls by name |
 | P1 | **done** | `feat/image`, [P1 report](qwen-image-2.1-p1.md) | three stages: byte-identical noise and Euler step, DiT velocity correlation 0.999973, VAE image PSNR 70.2 dB vs `run1.png` |
-| P2 | not started | — | — |
+| P2 | **in progress** | `feat/image`, first slice in this document | `make test-qwen-image-primitives` passes (rel RMS <= 6.0e-8, max abs <= 7.6e-6); layernorm, modulate, mlp_gated added |
 | P3 | not started | — | — |
 | P4 | not started | — | — |
 | P5 | not started | — | — |

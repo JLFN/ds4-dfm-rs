@@ -5135,6 +5135,44 @@ int ds4_gpu_step37_qk(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_step37_gate(ds4_gpu_tensor *values, const ds4_gpu_tensor *gate,
         uint32_t heads, uint32_t rows);
 
+/* Qwen-Image-2.1 DiT primitives (recipe section 7).  Every activation is
+ * feature-fastest: element (feature i, token t) of a [n, rows] tensor sits at
+ * i + t*n; one token row is n consecutive floats. */
+
+/* Affine-free LayerNorm over the feature axis, eps 1e-6, in place. */
+int ds4_gpu_qwen_image_layernorm_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        dim,
+        uint32_t        rows);
+
+/* out = residual + x * (gated ? tanh(p) : p + 1), param [hidden, 2] with row
+ * 0 on the image tokens (token >= prefix) and row 1 on the text prefix.
+ * residual may be NULL; the result overwrites x. */
+int ds4_gpu_qwen_image_modulate_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *param,
+        ds4_gpu_tensor       *residual,
+        uint32_t              hidden,
+        uint32_t              tokens,
+        uint32_t              prefix,
+        uint32_t              gated);
+
+/* out = up * silu(gate) for separate [n, rows] gate/up projections. */
+int ds4_gpu_qwen_image_mlp_gated_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t              n,
+        uint32_t              rows);
+
+/* The same from one fused [2n, rows] projection: gate in feature chunk 0, up
+ * in chunk 1 (img_mlp.gate_up.weight). */
+int ds4_gpu_qwen_image_mlp_gated_fused_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *fused,
+        uint32_t              n,
+        uint32_t              rows);
+
 #ifdef __cplusplus
 }
 #endif

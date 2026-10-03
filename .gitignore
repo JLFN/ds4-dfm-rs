@@ -72,6 +72,7 @@
 /tests/test_solar_fattn
 /tests/test_solar_tokenizer
 /tests/test_solar_session
+/tests/test_qwen_image_primitives
 /ds4flash.gguf
 /TODO.md
 /gguf/
