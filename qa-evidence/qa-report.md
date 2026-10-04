@@ -1,197 +1,229 @@
-QA report: feat/image — the P2 DiT primitive kernels (Qwen-Image-2.1, first P2 slice).
-Independent falsification pass, rule 19. Nothing was committed or pushed; the only
-repo file written is this report. Every probe edit was made in the working tree,
-the gate was observed failing, and the header was then restored byte-exactly
-(git checkout; sha256 re-verified = 3cb3ec3eb9d23f9a019a03eedc46d6b9d7f83efb963524a84466f6cb4152f3ba).
-No tracked file is modified by this pass (git status: only the pre-existing
-untracked graphify-rs-out/, run-bonsai-spark.sh, tests/test_qwen35_bonsai_rows).
+QA report: feat/image, unit 9, the DiT rope and segmented attention kernels (Qwen-Image-2.1 P2, second slice).
+Independent falsification pass, rule 19. Falsify, do not approve: every claim below was
+re-run live on this box. Nothing was committed or pushed; the only repo file written by
+this pass is this report. Two probe edits were made in cuda/qwen_image_attn.cuh, each was
+observed to fail the gate, and the file was restored byte-exactly after each (cmp and
+sha256 equal to the git blob, see finding 3). No tracked file is modified at the end
+(git status: only the pre-existing untracked graphify-rs-out/, run-bonsai-spark.sh,
+tests/test_qwen35_bonsai_rows; git diff empty).
 
-Unit: commit e6099f631355379be0f94c6e9d01567181fe5fb3 "feat(image): add the P2 DiT
-primitive kernels", branch feat/image, one commit ahead of the QA base
-fork/feat/image = f074269ec1e75a884f264ca7fa55a53ca25a251f (verified: git rev-parse
-fork/feat/image; git log --oneline f074269..HEAD lists only e6099f6). This report
-was refreshed after the unit was amended in place from 93cfd0c; the amendment
-delta 93cfd0c..e6099f6 touches exactly one file, docs/qwen-image-2.1-roadmap.md
-(+8/-6), verified with git diff --name-only and --numstat. The code, the test, the
-ABI and the Makefile are byte-identical between the two commits
-(cuda/qwen_image_primitives.cuh sha256 3cb3ec3e...152f3ba in both trees; the
-commit message is also byte-identical, diff of git show -s --format=%B is empty),
-so the live gate runs and the four falsification probes below carry over
-unchanged. Diff stat f074269..HEAD: +659/-3 across exactly the eight files below
-(the docs change is the +2 net lines); no crates/ file is touched.
+Unit: commit e6b37ebdc1da32afd097bbe753d4fa7c793904ce "feat(image): add the DiT rope and
+segmented attention kernels", branch feat/image, exactly one commit ahead of the QA base
+fork/feat/image = bda12f6c40d2ff8ab9742e851ef5dfd07ff4d123 (verified: git rev-parse
+fork/feat/image; git log fork/feat/image..HEAD lists only e6b37eb; base is an ancestor).
+Diff stat bda12f6..HEAD: 6 files, +638/-31 (Makefile, cuda/qwen_image_attn.cuh,
+docs/qwen-image-2.1-roadmap.md, ds4_gpu.h, ds4_qwen_image_gpu.cuh,
+tests/test_qwen_image_primitives.c). No crates/ file is touched.
 
-Refs and files inspected: e6099f6 (full message), 93cfd0c (pre-amendment tree),
-f074269; cuda/qwen_image_primitives.cuh
-(whole 155-line file, re-read after every probe), ds4_qwen_image_gpu.cuh (whole
-103-line file), ds4_gpu.h:5138-5173 and :11, ds4_cuda.cu:48454, tests/test_qwen_image_primitives.c
-(whole 327-line file), Makefile:740, :893-901, :103, :1962, tests/qa-gate.sh (whole file),
-.gitignore:75, docs/qwen-image-2.1-roadmap.md:352-366 and :530, docs/qwen-image-2.1-recipe.md:80,
-:187-188, :310-315.
-Oracle: crates/ds4-core/src/qwen_image.rs:39-56 (DIT_NORM_EPS = 1e-6, hidden 4096,
-intermediate 12288), crates/ds4-core/src/qwen_image/dit.rs:197-204 (layer_norm_row), :223-225
-(silu), :488-512 (modulate), :669-704 (block: img_norm1/2, mod[0..3], img_mlp).
-Reference (second oracle, local checkout): /tmp/sdref-build/src/model/diffusion/qwen_image_2_1.hpp:196-197
-(img_norm1/img_norm2 = LayerNorm(hidden, 1e-6f, affine=false)), :208-219 (modulate),
-:229-242 (fused chunk order and silu), :257 (norm_out), and
-/tmp/sdref-build/src/model/common/ggml_block.hpp:739-786 (LayerNorm -> ggml_ext_layer_norm,
-null weight).
-Artifacts: cuda/qwen_image_primitives.cuh sha256 3cb3ec3e...152f3ba; rebuilt live this
-pass: ds4_cuda.o, tests/test_qwen_image_primitives, ds4-server (forced relink).
+Refs and files inspected: e6b37eb (full message and patch), bda12f6; cuda/qwen_image_attn.cuh
+(whole 186-line file, re-read and hashed after every probe), cuda/qwen_image_primitives.cuh
+(whole, for kThreads and block_sum), ds4_qwen_image_gpu.cuh (whole 170-line file),
+ds4_gpu.h:5140-5206, ds4_cuda.cu:48454 (include), Makefile:740,:893-901,:60-62,
+tests/test_qwen_image_primitives.c (whole 643-line file), tests/qa-gate.sh (whole file),
+docs/qwen-image-2.1-roadmap.md:349-375 and :537-540, .ds4-cuda-config.mk
+(CUDA_ARCH=sm_89 persisted). Oracle: crates/ds4-core/src/qwen_image/oracle.rs:183-261
+(build_layout/append_image), :270-284 (linspace/rope_omega), :292-312 (rope_table),
+:322-328 (RopePairing), :332-361 (apply_rope), :370-377 (text_mask);
+crates/ds4-core/src/qwen_image/dit.rs:138-152 (dot8), :212-220 (rms_norm_row), :257-268
+(softmax_row), :523-583 (segment_attention), :591-648 (attention), :740 (rope_table call);
+crates/ds4-core/src/qwen_image.rs:39-54 (DIT_HIDDEN/HEAD_DIM/HEADS/AXES_DIM/ROPE_THETA);
+crates/ds4-core/tests/qwen_image_oracle.rs:355-400 (the fixture-gated pairing measurement).
+Second reference, local checkout /tmp/sdref-build: src/model/diffusion/qwen_image_2_1.hpp:17
+(axes_dim 16/56/56), :340-357 (mask construction), :348 (embed_nd, theta 10000),
+src/model/common/rope.hpp:1110-1151 (apply_rope, interleaved default, pe [L, d_head/2, 2, 2]).
+
+Artifacts: cuda/qwen_image_attn.cuh sha256 1f6d5d5f1c8e6f686dcb4cc114ff7e93606394a97e586e09285262bdc37d521f
+(equals git cat-file -p HEAD:cuda/qwen_image_attn.cuh at the end). tests/test_qwen_image_primitives.c
+sha256 00d084a851ef2a4797c6914af80402a1dce8496b963569d9aa16431f3464b94f. Rebuilt live this
+pass: ds4_cuda.o, tests/test_qwen_image_primitives, ds4-server (forced relink through the
+Rust host). Environment: nvcc 13.3.73, RTX 4070 SUPER sm_89, CUDA_ARCH=sm_89.
 
 Surfaces covered (each on its own line, exact string from the gate)
 
-cuda/qwen_image_primitives.cuh
+cuda/qwen_image_attn.cuh
 docs/qwen-image-2.1-roadmap.md
-ds4_cuda.cu
 ds4_gpu.h
-ds4_gpu_qwen_image_layernorm_tensor
-ds4_gpu_qwen_image_mlp_gated_fused_tensor
-ds4_gpu_qwen_image_mlp_gated_tensor
-ds4_gpu_qwen_image_modulate_tensor
+ds4_gpu_qwen_image_attn_segment_tensor
+ds4_gpu_qwen_image_rope3d_tensor
 ds4_qwen_image_gpu.cuh
-.gitignore
 Makefile
-test-qwen-image-primitives
 tests/test_qwen_image_primitives.c
 
 Findings
 
-1. Re-run on the committed tree, numbers reproduced:
-- make test-qwen-image-primitives CUDA_ARCH=sm_89 -> all 10 cases ok, exit 0.
-  Printed: layernorm rows=1 dim=4096 max_abs 7.451e-09 rel_rms 1.194e-09;
-  rows=4224 max_abs 4.768e-07 rel_rms 5.853e-08; modulate 1/prefix0 plain and
-  4224/prefix128 plain max_abs 0.000e+00 (bit-exact); modulate 129/prefix128 and
-  4224/prefix128 gated+residual max_abs 4.768e-07 rel_rms 5.13-5.14e-08;
-  mlp_gated rows=1 9.537e-07, rows=4224 1.907e-06; mlp_gated_fused rows=1
-  3.815e-06, rows=4224 7.629e-06; rel_rms <= 5.992e-08 everywhere.
-  The commit message's "max abs <= 7.6e-6 and rel RMS <= 6.0e-8" is the rounded
-  reading of the observed maxima 7.629e-06 and 5.990e-08; the printed shape set
-  (hidden 4096, intermediate 12288, 1 and 4224 joint tokens, plus the 129-token
-  prefix-boundary modulate case) matches the message, as do "all cases ok", "the
-  plain modulate cases bit-exact", and the stated bound 1e-4 abs / 1e-5 rel RMS
-  (tests/test_qwen_image_primitives.c:35-36).
-- make ds4-server CUDA_ARCH=sm_89: "up to date", exit 0. To make the link claim
-  non-trivial I forced a real relink (make -W ds4_cuda.o ds4-server CUDA_ARCH=sm_89)
-  -> exit 0, and the resulting binary exports all four symbols (nm: T
-  ds4_gpu_qwen_image_layernorm_tensor at 0x3f27c50, modulate 0x3f27ee0,
-  mlp_gated 0x3f28230, mlp_gated_fused 0x3f28490); ./ds4-server --help exits 0.
-  The Rust host genuinely links the new object content.
-- Test object: recompiled out of tree with the Makefile's exact command
-  (cc -O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 ...) -> exit 0, zero
-  warnings; sha256 c97eb7e5a86b4be31919623cc413e06826d63dbfc159786a60b1454370d8e1ca
-  is byte-identical to the committed tests/test_qwen_image_primitives.o.
+1. Gate re-run on the committed tree, numbers reproduced exactly.
+- make test-qwen-image-primitives CUDA_ARCH=sm_89 -> 14 cases ok, exit 0. Raw lines:
+  layernorm rows=1 max_abs=7.451e-09 rel_rms=1.194e-09; rows=4224 4.768e-07 / 5.853e-08;
+  modulate (4 cases) 0.000e+00/0.000e+00 (plain) and 4.768e-07/5.130e-08,
+  0.000e+00/0.000e+00, 4.768e-07/5.144e-08 (gated+residual);
+  mlp_gated 9.537e-07/5.767e-08 and 1.907e-06/5.992e-08; mlp_gated_fused 3.815e-06/5.921e-08
+  and 7.629e-06/5.990e-08;
+  rope3d q heads=32 tokens=4224 max_abs=0.000e+00 rel_rms=0.000e+00 (bit-exact);
+  rope3d k same 0.000e+00/0.000e+00;
+  attn text prefix (causal) 128 max_abs=1.788e-07 rel_rms=1.253e-07;
+  attn image (unmasked) 4096x4224 max_abs=1.416e-07 rel_rms=1.089e-06.
+  All four claims in the commit message reproduce to the digit (14 ok; rope bit-exact;
+  attention 1.788e-07/1.253e-07 and 1.416e-07/1.089e-06 against 1e-4/1e-5).
+- make ds4-server CUDA_ARCH=sm_89 -> exit 0 (Rust host rebuilt and relinked after the
+  probe restore). nm -C ds4-server shows both symbols T:
+  ds4_gpu_qwen_image_rope3d_tensor and ds4_gpu_qwen_image_attn_segment_tensor.
+- tests/test_qwen_image_primitives and ds4_cuda.o are sm_89 SASS (cuobjdump --list-elf).
 
-2. THE CRITICAL CHECK — the host mirror vs the oracle. I diffed each element the
-  task names; formula-level they agree:
-- modulate row split: dit.rs:507-511 sends tokens prefix..len to row 0 and 0..prefix
-  to row 1; the reference applies rows[0] to the slice from prefix_length and
-  rows[1] to the prefix (qwen_image_2_1.hpp:213-217). Mirror
-  tests/test_qwen_image_primitives.c:143 `row = (t < prefix) ? 1 : 0` and kernel
-  cuda/qwen_image_primitives.cuh:127 `(token < prefix) ? 1u : 0u` agree, and the
-  boundary is right: token == prefix is image-side (dit.rs `for token in prefix..`).
-- gate: dit.rs:495-500 `gate ? v.tanh() : v + 1.0`; reference hpp:210
-  `gate ? ggml_tanh(row) : ggml_scale_bias(row, 1.f, 1.f)` (= row + 1); mirror
-  tests/...c:147 `gated ? tanh(p) : p + 1.0f`; kernel :128 `gated ? tanh_exp(p) : p + 1.0f`.
-- eps: DIT_NORM_EPS = 1e-6 (qwen_image.rs:56) = kLayerNormEps 1e-6f (:51) = mirror
-  1e-6 (tests/...c:129); the reference constructs every DiT norm with 1e-6f and
-  affine=false (qwen_image_2_1.hpp:196-197, :257; ggml_block.hpp:774-786 passes a
-  null weight to ggml_ext_layer_norm).
-- gate/up: unfused oracle gate = img_mlp.gate_layer, up = img_mlp.proj, then
-  up *= silu(gate) (dit.rs:693-697); mirror and kernel do the same. Fused chunk
-  order gate = chunk 0, up = chunk 1 matches the reference
-  qwen_image_2_1.hpp:229-240 (`parts = ggml_ext_chunk(gate_up, 2, 0); gate =
-  parts[0]; h = parts[1]; h = h * silu(gate)`) and the recipe :187-188.
-- silu: dit.rs:223-225 `x / (1 + exp(-x))`; mirror tests/...c:156-158 (double
-  exp); kernel :59-61 (expf).
-Divergences found are precision, not semantics: the mirror accumulates the
-LayerNorm sum/var in double while dit.rs casts the mean to f32 and subtracts in
-f32, and the mirror's tanh/exp are libm double against the kernel's fast-math
-expf (documented in cuda/qwen_image_primitives.cuh:35-40). All are inside the
-1e-4/1e-5 gate and the measured deviations in finding 1. No divergence between
-mirror and oracle in the row split, the gate form, the eps, the chunk order or
-the silu formula.
+2. The critical check: the host mirror is the oracle, element by element. I diffed
+tests/test_qwen_image_primitives.c against oracle.rs/dit.rs and the second reference:
+- axis widths/theta: mirror axes {16,56,56} and theta 10000.0f at
+  tests/test_qwen_image_primitives.c:229-230; oracle DIT_AXES_DIM=[16,56,56] and
+  DIT_ROPE_THETA=10000.0 at crates/ds4-core/src/qwen_image.rs:50,54, consumed by
+  rope_table at dit.rs:740; reference config axes_dim {16,56,56} at
+  /tmp/sdref-build/src/model/diffusion/qwen_image_2_1.hpp:17, theta 10000.f at :348. AGREE.
+- pair-axis concatenation: mirror pair_offset accumulates the three half-widths in axis
+  order (:233-258); oracle rope_table pair_offset = sum of previous halves (:298-299). AGREE.
+- omega ladder: oracle linspace(0, (dim-2)/dim, half) then 1/theta^s (oracle.rs:270-284);
+  mirror end=(dim-2)/dim, step=end/(half-1), omega=1/powf(theta, j*step) (:237-241). For
+  start 0 the two are the same f32 expression (0 + j*step vs j*step). AGREE.
+- pairing: mirror applies (2j, 2j+1) with table [cos,-sin,sin,cos] and cos at +0, sin at +2
+  (:245-255,:271-279); oracle RopePairing::Interleaved (:324,:350-358) and rope_table
+  values (:305-308). The oracle's choice of Interleaved is itself the fixture-measured
+  winner (tests/qwen_image_oracle.rs:375-399), not a stylistic default; the mirror matches
+  that branch. AGREE.
+- mask: mirror masks key > query only when causal, over keys [0,end), (:322-323); kernel
+  passes causal=1 for the text span [0,128) and causal=0 for the image span [128,4224)
+  (:571-582). Oracle text_mask is -inf for k>q (oracle.rs:370-377), applied only when the
+  segment has image_index<0 (dit.rs:639-644); the second reference builds the same
+  [end, end-start] mask with -INFINITY for k>q (qwen_image_2_1.hpp:340-357). AGREE.
+- scale: mirror 1.0f/sqrtf(head_dim) (:316), oracle 1.0f32/(head_dim as f32).sqrt()
+  (dit.rs:536); kernel uses rsqrtf(head_dim) (cuda/qwen_image_attn.cuh:133), a fast-math
+  rounding variant of the same constant (MUFU.RSQ). Same math, kernel rounding inside gate.
+- softmax accumulation: oracle serial max, exp(x-max), sum in key order, divide
+  (dit.rs:257-268); mirror identical (:328-335); kernel does a block-tree max and a
+  block-tree sum over the same key set (cuda/qwen_image_attn.cuh:136-156), masked keys
+  contribute -INFINITY and exp 0. Semantically identical; only the reduction order differs.
+  This is the dominant residual of the two attention cases (1.25e-07 and 1.089e-06 rel
+  RMS), as the header claims.
+- dot8: mirror (:284-297), oracle (dit.rs:138-152) and kernel (cuda/qwen_image_attn.cuh:76-92)
+  have the identical structure: eight accumulators, the same fixed horizontal grouping
+  ((0+1)+(2+3)) + ((4+5)+(6+7)), then the scalar tail.
+- layouts: q/k head-major [head][token][head_dim] (kernel q_row at attn.cuh:135, mirror
+  :319), matching dit.rs's qh/kh reshape (:611-622); v/out feature-fastest with the head
+  offset (mirror v[(key)*hidden+hd+d] / out[query*hidden+hd+d] at :341-352; oracle
+  v[d+head_dim*(head+heads*key)] / row[head*head_dim+d] at dit.rs:568-579; kernel
+  v_head[(key)*hidden+d] / out_head[d] at attn.cuh:163-181). AGREE.
+- positions: mirror text ids 0..127 on all three axes then image temporal=128, spatial
+  h-32, w-32 (:203-223); oracle build_layout/append_image: one position per text token,
+  temporal = running position (128 after the prefix), center = 64 - 64/2 = 32 (oracle.rs:183-261).
+  AGREE.
+- No semantic divergence found in any of the listed elements. The rope bit-exactness is
+  consistent with the kernel SASS (FMUL.FTZ/FFMA.FTZ for the two rotation expressions) and
+  the correspondingly contracted host arithmetic; it is not a coincidence of a shared bug
+  I could find.
 
-3. Falsification — one live edit per kernel, rebuilt at CUDA_ARCH=sm_89, observed
-  failed, restored byte-exactly (sha256 back to 3cb3ec3e...152f3ba):
-- swap the modulate rows (:127) -> all four modulate cases FAIL at max_abs
-  2.702-4.477, rel_rms 0.755-0.927; the other six cases unchanged and ok; make
-  exit 2.
-- kLayerNormEps 1e-3 (:51) -> both layernorm cases FAIL, max_abs 6.523e-04 and
-  7.142e-04, rel_rms 3.72e-04 and 3.75e-04, 6.5-7x past the 1e-4 abs bound; make
-  exit 2.
-- swap the unfused gate/up (:141) -> both mlp_gated cases FAIL at max_abs 7.239
-  and 7.335, rel_rms ~0.79; both fused cases stay ok (separate kernel); make exit 2.
-- swap the fused chunks (:150-153) -> both mlp_gated_fused cases FAIL at max_abs
-  3.554e+01 and 3.581e+01, rel_rms ~0.97; both unfused cases stay ok; make exit 2.
-After each restore the gate passes again with exactly the numbers of finding 1;
-the last restored run is the one recorded there. The gate is non-vacuous for all
-four entry points.
+3. Mask falsification, both directions, independent of the coder's probe.
+- Probe A, no-op causal mask: cuda/qwen_image_attn.cuh:140 changed from
+  "if (causal && key > query) { score = -INFINITY; }" to "if (causal && key > end) ..."
+  (always false, key < end). Rebuilt and ran: attn text prefix (causal) 128
+  max_abs=1.127e+00 rel_rms=8.990e-01 FAIL; attn image unchanged at 1.416e-07/1.089e-06 ok;
+  the other 12 cases untouched; make exit 2 (test exit 1). Matches the commit's 8.99e-1.
+- Probe B, unconditional mask: the same line changed to "if (key > query) ...". Rebuilt and
+  ran: attn text unchanged at 1.788e-07/1.253e-07 ok; attn image max_abs=2.263e-01
+  rel_rms=1.618e+00 FAIL; make exit 2. Matches the commit's 1.62e0.
+- Restore: after each probe the file was copied back from a pre-probe copy and verified with
+  cmp and sha256 = 1f6d5d5f1c8e6f686dcb4cc114ff7e93606394a97e586e09285262bdc37d521f; the
+  final file hash equals git cat-file -p HEAD:cuda/qwen_image_attn.cuh exactly. The final
+  rebuild+run after the restore: all 14 cases ok, exit 0, identical numbers to finding 1.
+  (No git checkout was used; two cp restores only. git status shows no tracked modification.)
 
-4. ABI: a mechanical extraction and comparison of the four declarations in
-  ds4_gpu.h (:5143, :5151, :5161, :5170) against the four extern "C" definitions
-  in ds4_qwen_image_gpu.cuh (:28, :44, :70, :90) reports MATCH on name, return type
-  int, parameter count, order and types for all four. The declarations are inside
-  the header's extern "C" block (ds4_gpu.h:10-11); nvcc enforces the same match
-  because ds4_cuda.cu compiles the definitions after ds4_gpu.h.
+4. The pe-on-host decision: re-measured, the claim holds.
+- Probe /tmp/qa_cosf.cu: 4,194,304 samples over [0, 4224] rad, sm_89, compared against
+  double cos of the same f32 angle. With the tree's flags (--use_fast_math):
+  max_abs=5.527008e-04 at x=4211.344238. Without --use_fast_math: max_abs=8.546459e-08.
+  Host libm cosf in the same sweep: 3.238561e-08. So the device fast-math cosf is indeed
+  ~5.5e-4, five-and-a-half times the 1e-4 absolute gate; the commit number 5.5e-4 is
+  reproduced (5.53e-4), and the error is the fast-math lowering, not angle quantization.
+- The kernel consumes a host-built pe table and computes no trig: rope3d_rows takes the
+  pe pointer as an argument and only loads cos/sin from it (cuda/qwen_image_attn.cuh:99-115);
+  the header contains no sinf/cosf/__sinf/__cosf call (grep, only comments); the SASS of
+  qwen_image_cuda::rope3d_rows contains no MUFU.COS/MUFU.SIN (its only MUFU ops are two
+  MUFU.RCP from the integer-division sequence used for pair indexing); the rotation is
+  FMUL.FTZ/FFMA.FTZ. ds4_qwen_image_gpu.cuh:106-132 just validates and launches with
+  pe->ptr; the test builds the table on the host (tests/test_qwen_image_primitives.c:227-259).
 
-5. Include and build wiring is minimal and correct:
-- ds4_cuda.cu includes ds4_qwen_image_gpu.cuh exactly once (:48454, immediately
-  after ds4_qwen35_gpu.cuh); no other translation unit includes it (repo-wide grep).
-- Makefile:740 lists ds4_qwen_image_gpu.cuh and cuda/qwen_image_primitives.cuh as
-  ds4_cuda.o prerequisites, proven live: the probe header edit triggered the nvcc
-  recompile of ds4_cuda.cu (the ds4_cuda.cu(1258) warning line appears in the
-  probe build output) and ds4_cuda.o's mtime follows the header's.
-- The new test rules mirror the existing per-kernel CUDA tests: tests/...:893-894
-  is the same shape as tests/test_solar_kda.o (Makefile:615-616); the link rule
-  :896-897 uses $(DS4_CUDA_CORE_OBJS) + $(NVCC) like tests/test_solar_kda
-  (Makefile:789-790); the target :900-901 runs the binary as the existing targets
-  do; test-qwen-image-primitives is in the .PHONY list (:103) and in clean (:1962).
-- .gitignore:75 adds /tests/test_qwen_image_primitives; git check-ignore -v
-  tests/test_qwen_image_primitives exits 0 and names .gitignore:75.
+5. ABI: ds4_gpu.h:5176-5204 vs ds4_qwen_image_gpu.cuh:106-170. A mechanical balanced-paren
+parse of both prototypes gives identical parameter lists:
+  rope3d: (ds4_gpu_tensor *x, const ds4_gpu_tensor *pe, uint32_t tokens, uint32_t n_head,
+  uint32_t head_dim), return int, extern "C" on the definition.
+  attn_segment: (ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+  const ds4_gpu_tensor *v, uint32_t tokens, uint32_t n_head, uint32_t head_dim,
+  uint32_t start, uint32_t end, uint32_t causal), return int.
+No name, order, type or return divergence. Both symbols are T in the gate binary and in
+ds4-server. ds4_gpu.h now declares exactly six ds4_gpu_qwen_image_* entry points, matching
+the roadmap's "six" claim.
 
-6. Cheat audit: no hardcoded pass (compare()/g_failures at tests/...c:93-108, shown
-  failable four times); every kernel is launched through its public entry point and
-  read back (device_read after each launch); no skipped or dead case (main at
-  :302-323 runs all 10 unconditionally); no unfireable assert; the tolerances are
-  meaningful — the smallest perturbation probed (eps 1e-6 -> 1e-3) is caught 6-7x
-  beyond the abs bound, and the semantic swaps 4-5 orders beyond; the data are
-  splitmix64 spans (x +/-1.5-2, gate +/-6 so silu crosses both tails, layernorm rows
-  carry per-row offsets), not degenerate. The mirror is independent host code, not
-  a copy of the kernels.
+6. kMaxSegmentKeys = 8192 (cuda/qwen_image_attn.cuh:55). The entry checks
+"if (end > qwen_image_cuda::kMaxSegmentKeys) return 0;" (ds4_qwen_image_gpu.cuh:152),
+before any launch or tensor work. Live probe (/tmp/qa_bound_probe.c, linked against the
+tree's own objects): end=8193, tokens=9000 -> return 0 (refused); end=9000 -> return 0;
+end=8192 exactly -> return 1 (launched). The real 4224-key span is exercised by the gate's
+image case and passes. Shared footprint at the bound is (8192+256)*4 = 33792 bytes, inside
+the 48 KiB default dynamic limit. Note for precision: the refusal is a silent return 0 (no
+stderr line); the "by name" part is the named constant and the early return, not a printed
+message. That is the same failure convention as the other five entries in this header.
 
-7. Docs, on the amended tree (e6099f6): roadmap:352-366's P2 gate result and
-  :530's tracker line match the measurements: "max absolute difference <= 7.6e-6
-  and relative RMS <= 6.0e-8 against a stated bound of 1e-4 and 1e-5" (measured
-  7.629e-06, 5.990e-08), "the plain modulate cases are bit-exact" (measured
-  0.000e+00), "make ds4-server CUDA_ARCH=sm_89 still links" (forced relink,
-  exit 0). The two items my previous pass noted are now closed:
-- Residual attribution: the amended sentence reads "The 4224-row residual is the
-  norm's F32 tree reduction against the oracle's double accumulation, plus the
-  fused MLP's `expf` tails (7.6e-6, still about 13x inside the absolute bound)."
-  That is exactly what I measured: the layernorm 4224-row deviation is 4.768e-07
-  (the kernel's F32 block_sum against the mirror's double accumulation) and the
-  overall maximum 7.629e-06 sits on mlp_gated_fused from the fast-math expf/silu
-  tails; 1e-4 / 7.629e-6 = 13.1, so "about 13x" holds. The old sentence no longer
-  reads as attributing the maximum to the norm; the wording note is FIXED.
-- Fused-order caveat: it now reads "The fused MLP's chunk order (gate = chunk 0)
-  was confirmed against the reference source (`qwen_image_2_1.hpp:229-240`), not
-  only the recipe; the shipped fused artifact path is still not exercised by the
-  CPU oracle", which records exactly the reference confirmation reported in
-  finding 2 (hpp:229-240, `parts = ggml_ext_chunk(gate_up, 2, 0); gate =
-  parts[0]`) and keeps the honest limitation about the shipped artifact.
+7. Cheat audit: no cheat found.
+- Tolerances are meaningful: the falsification probes move the metric from ~1e-6/1e-7 to
+  0.9 and 1.6 rel RMS, and the observed worst case (1.089e-06 rel, 1.416e-07 abs) sits an
+  order inside the stated 1e-5/1e-4. The compare() gate was observed failing (probes A/B).
+- No hardcoded pass, no unreachable assert (the test has no asserts; compare() increments
+  g_failures and the process exits 1 when it fires).
+- No kernel left unlaunched: rope3d is launched twice and attn_segment twice per run, with
+  the return values checked (exit(1) on refusal); the primitive cases launch their entries too.
+- Inputs are not degenerate: splitmix64 uniform q/k/v/norm/param over O(1) ranges; the
+  attention cases run 128 queries x 128 keys (text) and 4096 x 4224 (image), and both mask
+  directions change the output at O(1) scale when broken, so a wrong or absent mask cannot
+  pass. The image case is not uniform and not a single key.
+- The two rope cases share one pe table and one input pattern; that is adequate for the
+  rotation arithmetic, and the attention cases consume the separately verified roped q/k
+  (the isolation is deliberate and stated in the test header).
+
+Observations (not defects, for the next slice):
+- dit.rs reshapes q/k to head-major before norm/rope (dit.rs:611-622); no CUDA counterpart
+  of that transpose exists yet, so the entries require head-major q/k. The next P2 slice
+  must feed head-major from the projections or add the transpose. The commit and roadmap
+  acknowledge the remaining glue.
+- The mirror's table is built with host gcc cosf/sinf; the Rust oracle uses f32::cos/sin.
+  A ~1 ulp table difference is immaterial against 1e-4/1e-5, but the two tables were not
+  numerically diffed (see unverified).
+- The kTextTokens=128 prefix is one fixture shape; the real joint length 4224 matches
+  128 + 64x64 latent tokens.
 
 Unverified items
+- The fixture-gated test that measured Interleaved vs HalfSplit (tests/qwen_image_oracle.rs:355-400)
+  was not run: it needs DS4_QWEN_IMAGE_ORACLE dumps that are not in this tree. The pairing
+  choice is carried by that recorded measurement and by the reference default, not re-measured here.
+- The end-to-end DiT path using these kernels (norm_q/norm_k on the existing weighted-RMS ops,
+  the head-major reshape, timestep/patch glue) is outside this commit and was not exercised.
+- Host libm cosf vs Rust f32::cos/sin equality of the pe table was not numerically diffed.
+- Only sm_89 was tested; no other architecture in this pass.
 
-- The date inside "Gate result (2026-10-03, first slice)" (roadmap:352) was not
-  re-derived; the commit is dated 2026-10-04 01:24 +0200, so a gate run shortly
-  before midnight is plausible, but I have no log of the author's run.
-- The kernels are not yet wired into any DiT graph, so no end-to-end model path
-  exercises them; this slice is the primitive API that the test drives, as the
-  commit states.
-- Production use of the fused [2n, rows] layout is not validated against a shipped
-  fused weight file (there is none in the oracle), matching the commit's caveat.
-- The tanh-vs-MUFU.TANH micro-measurement quoted in the commit message (7.8e-6 vs
-  4.8e-7) was not re-measured; I only re-confirmed the 4.8e-7-scale gated
-  deviation against the mirror.
+Risk analysis
+Decision: accept e6b37eb as PASS for the feat/image QA gate (it may become the next pushed
+state). No push, publish or deploy is done by this pass.
+External risks: none network-facing; the evidence depends on the local CUDA 13.3 toolkit and
+the RTX 4070 SUPER driver/device state (probed: nvcc 13.3.73, sm_89, gate ran green). A
+different arch or a JIT-only build was not tested (unverified).
+Decision risks: the PASS rests on the test's host mirror being the oracle; checked by a
+line-level diff of every element listed in finding 2 (axes, theta, pairing, mask, scale,
+softmax, dot8, layout, positions) plus the second reference source; not checked by an oracle
+dump run (fixtures absent). The mask falsification covers only the mask, not every mirrored
+constant; a constant shared between kernel and mirror in the same wrong way would not be
+caught by this harness (mitigated, not eliminated, by the diff).
+Measurement limits: the cosf sweep is a 4.2M-sample grid over [0,4224]; the observed
+5.527e-4 already exceeds the claimed 5.5e-4, so the claim is safe directionally, but a
+different sample grid could in principle find a slightly larger value.
+Prevention/rollback: this report is written before the gate runs; the unit is a local branch
+commit, so rollback is discarding/rewriting the branch pointer, and the QA gate re-runs from
+a clean tree. Trigger to reopen: any failing gate, any later fixture run that flips the
+pairing, or a mirror-vs-oracle divergence found in the next slice.
+Residual risk: low. The strongest residual is the deferred glue (head-major reshape, norm
+ops) outside this slice's scope.
 
 verdict: overall PASS
