@@ -18,7 +18,7 @@
 #                     (default origin/<current branch>, falling back to
 #                     fork/<current branch>, then origin/main)
 #   QA_MODEL          QA-tester model name, used in messages only; the project's
-#                     recorded choice is deepseek-v4.1-CC-flash
+#                     recorded choice is deepseek-v4-flash-JL1
 #   QA_SURFACE_PATHS  newline list of surface paths (default: below)
 #   QA_SURFACES       newline list of file surfaces (default changed files)
 #   QA_REPORT         path to the report (default qa-evidence/qa-report.md)
@@ -42,7 +42,7 @@ if [[ -z "$BASE" ]]; then
     fi
   done
 fi
-MODEL=${QA_MODEL:-deepseek-v4.1-CC-flash}
+MODEL=${QA_MODEL:-deepseek-v4-flash-JL1}
 REPORT=${QA_REPORT:-qa-evidence/qa-report.md}
 
 # --verify --quiet is required: a plain `git rev-parse <unresolvable-ref>`

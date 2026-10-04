@@ -553,7 +553,7 @@ Neither is a research problem.
 | S | **done — no gain** | `feat/image`, [phase-S report](qwen-image-2.1-phase-s.md) | three numbers measured; none capturable by the port (M1 0%, M2 0%, M3 <=5.5%) |
 | P0 | **done** | `feat/image`, this document section 4 | layout contract over both artifacts (297/229/68, 134), `--check-config` refuses all 11 AR controls by name |
 | P1 | **done** | `feat/image`, [P1 report](qwen-image-2.1-p1.md) | three stages: byte-identical noise and Euler step, DiT velocity correlation 0.999973, VAE image PSNR 70.2 dB vs `run1.png` |
-| P2 | **in progress** | `feat/image`, slices 1-3 in this document | `make test-qwen-image-primitives` passes: layernorm/modulate/mlp_gated (rel RMS <= 6.0e-8), rope3d/attn_segment (rope bit-exact, attention <= 1.1e-6) and the DiT glue (silu/timestep <= 1.6e-7, patch/unpatch exact), each slice falsified |
+| P2 | **in progress** | `feat/image`, slices 1-3 in this document | `make test-qwen-image-primitives` passes: layernorm/modulate/mlp_gated (rel RMS <= 6.0e-8), rope3d/attn_segment (rope bit-exact, attention <= 1.1e-6) and the DiT glue (silu/timestep <= 1.7e-7, patch/unpatch exact), each slice falsified |
 | P3 | not started | — | — |
 | P4 | not started | — | — |
 | P5 | not started | — | — |
