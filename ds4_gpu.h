@@ -5173,6 +5173,34 @@ int ds4_gpu_qwen_image_mlp_gated_fused_tensor(
         uint32_t              n,
         uint32_t              rows);
 
+/* In place 3-axis rope over one [n_head][tokens][head_dim] q or k (head
+ * major, as dit.rs reshapes them), from a prebuilt [tokens, head_dim/2, 2, 2]
+ * table holding [[cos, -sin], [sin, cos]] per adjacent pair
+ * (oracle::rope_table; 3 axes, widths 16/56/56, theta 10000). */
+int ds4_gpu_qwen_image_rope3d_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *pe,
+        uint32_t              tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim);
+
+/* One attention segment, dit.rs::segment_attention: queries [start, end)
+ * attend to keys [0, end); causal != 0 applies the text prefix's causal mask
+ * (key > query is masked), an image segment passes 0 and attends to
+ * everything.  q/k are [n_head][tokens][head_dim], v and out feature-fastest
+ * [hidden, tokens]; head dim 128 and 32 heads at the real DiT shape. */
+int ds4_gpu_qwen_image_attn_segment_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              start,
+        uint32_t              end,
+        uint32_t              causal);
+
 #ifdef __cplusplus
 }
 #endif
