@@ -402,7 +402,8 @@ five DupUp3D shapes bit-exact; rms_norm 3.6e-7 abs; conv3x3/conv1x1 <= 2.9e-4 ab
 and <= 5.6e-6 rel RMS against the F16 section bound (2e-3 / 2e-4, the F16 operand
 contract's accumulation drift, stated in the test); attention 1.8e-7 abs. Nine
 falsifications, each restored byte-exactly (the im2col tap order, eps, the
-upscale parity term, the attention scale, the bias, and both refusal guards).
+nearest_up2 oy halving, the DupUp3D parity term, the attention scale, the bias,
+both refusal guards, and the test's own f16 unpack exponent).
 Open, loud: the P0 VAE artifact stores BF16 (`convert.rs:320`, and the oracle's
 `dequantize_f32` refuses anything else), while the GEMM reads F16 weights from
 the map; the reference casts BF16 -> F16 at load, so P4 must deliver the weights

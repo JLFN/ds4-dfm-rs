@@ -1515,12 +1515,14 @@ static void test_vae_attention_block(uint32_t channels, uint32_t width,
 
     char label[80];
     snprintf(label, sizeof(label), "vae attn block %ux%u ch=%u", width, height, channels);
-    /* The proj GEMM rounds its input (the attention output) to F16.  The
-     * kernel's fast-math expf and its parallel max/denominator differ from the
-     * mirror by ~1e-7, which occasionally crosses an F16 rounding boundary: a
-     * single flipped operand of the 1152-term proj dot moves the result by one
-     * F16 ULP times a weight.  rel_rms stays inside the operand contract; the
-     * max_abs bound carries that F16 boundary effect. */
+    /* The composite's residual is the qkv GEMM's accumulation drift (F16
+     * operands, F32 accumulate in a different order than the double mirror),
+     * amplified through the 1152-wide attention dot and then across F16
+     * boundaries in the proj input: the rule-19 pass isolated it there, with
+     * proj alone on the kernel's attention at 1.2e-4 and the attention stage
+     * at 1.8e-3 once the qkv input carries the drift, while the softmax's
+     * fast-math tail is only ~1.6e-7 at fixed qkv.  The bound carries that
+     * composition drift, not a structural term. */
     compare_tol(label, got, want, plane, 2.0e-4, 2.0e-2);
 
     ds4_gpu_tensor_free(tx);
