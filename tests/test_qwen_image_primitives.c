@@ -871,6 +871,724 @@ static void *test_timestep_path(void) {
     return map;
 }
 
+/* ---------------------------------------------------------------------------
+ * Qwen-Image-2.1 VAE decoder primitives (P2 unit 11), against the P1 oracle
+ * crates/ds4-core/src/qwen_image/vae.rs.
+ *
+ * The convs are compositions: im2col3x3 (or the 1x1 patch permutation) + the
+ * tree's F16 GEMM + the bias add + the inverse permutation.  Their operands are
+ * F16 (the reference F16-casts the conv weights and writes its im2col patches
+ * in the weight's type), so the mirrors round activations with the oracle's own
+ * f16_round and use F16-rounded weights, accumulated in double as the truth.
+ * ------------------------------------------------------------------------- */
+
+/* vae.rs::f16_round: round-to-nearest-even to the binary16 grid, overflow to
+ * infinity, subnormals by magnitude with their sign kept. */
+static float as_float(uint32_t bits) {
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static float vae_f16_round(float value) {
+    const uint32_t SIGN = 0x80000000u, INF_BITS = 0x7f800000u;
+    const uint32_t NAN_BITS = 0x7fc00000u, MANT_BITS = 0x007fffffu;
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = bits & SIGN;
+    const int exponent = (int)((bits >> 23) & 0xffu) - 127;
+    const uint32_t mantissa = bits & MANT_BITS;
+
+    if ((bits & 0x7fffffffu) >= INF_BITS) {
+        return as_float(mantissa == 0 ? (sign | INF_BITS) : (sign | NAN_BITS));
+    }
+    if (exponent > 15) { return as_float(sign | INF_BITS); }
+    if (exponent >= -14) {
+        const uint32_t keep = mantissa >> 13;
+        const uint32_t rest = mantissa & 0x1fffu;
+        uint32_t half = keep;
+        if (rest > 0x1000u || (rest == 0x1000u && (keep & 1u))) { half += 1; }
+        if (half == 0x400u) {
+            if (exponent == 15) { return as_float(sign | INF_BITS); }
+            return as_float(sign | (((uint32_t)(exponent + 128)) << 23));
+        }
+        return as_float(sign | (((uint32_t)(exponent + 127)) << 23) | (half << 13));
+    }
+    if (exponent < -25) { return as_float(sign); }
+    const uint32_t steps = (uint32_t)rint(fabsf(value) * 16777216.0f);
+    if (steps == 0) { return as_float(sign); }
+    uint32_t leading = 31u;
+    while (!(steps & (1u << leading))) { leading--; }
+    const uint32_t biased = leading + 127u - 24u;
+    return as_float(sign | (biased << 23) | ((steps - (1u << leading)) << (23 - leading)));
+}
+
+/* The map stores F16 weights; pack_f16 mirrors CUDA's __float2half (cvt.rn.f16
+ * .f32), which was verified bit-identical to vae_f16_round on the oracle's grid,
+ * subnormal, overflow and tie vectors. */
+static uint16_t pack_f16(float value) {
+    uint32_t x;
+    memcpy(&x, &value, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    uint32_t u = x & 0x7fffffffu;
+    uint32_t result;
+    uint32_t remainder;
+    if (u >= 0x7f800000u) {
+        remainder = 0;
+        result = (u == 0x7f800000u) ? (sign | 0x7c00u) : 0x7fffu;
+    } else if (u > 0x477fefffu) {
+        remainder = 0x80000000u;
+        result = sign | 0x7bffu;
+    } else if (u >= 0x38800000u) {
+        remainder = u << 19;
+        u -= 0x38000000u;
+        result = sign | (u >> 13);
+    } else if (u < 0x33000001u) {
+        remainder = u;
+        result = sign;
+    } else {
+        const uint32_t exponent = u >> 23;
+        const uint32_t shift = 0x7e - exponent;
+        const uint32_t mantissa = (u & 0x7fffffu) | 0x800000u;
+        remainder = mantissa << (32u - shift);
+        result = (sign | (mantissa >> shift)) & 0xffffu;
+    }
+    if (remainder > 0x80000000u || (remainder == 0x80000000u && (result & 1u))) {
+        result++;
+    }
+    return (uint16_t) result;
+}
+
+static float unpack_f16(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t man = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {
+            uint32_t m = man;
+            int e = 0;
+            while (!(m & 0x400u)) { m <<= 1; e++; }
+            bits = sign | ((uint32_t)(113 - e) << 23) | ((m & 0x3ffu) << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7f800000u | (man << 13);
+    } else {
+        bits = sign | ((exp - 15u + 127u) << 23) | (man << 13);
+    }
+    return as_float(bits);
+}
+
+/* ref_layernorm's companion: the same relative-RMS and max-abs report with a
+ * caller-supplied bound (the F16 conv operands ride a wider tolerance than the
+ * DiT's F32 kernels). */
+static void compare_tol(const char *label, const float *got, const float *want,
+                        size_t count, double rel_tol, double abs_tol) {
+    double se = 0.0, sr = 0.0, max_abs = 0.0;
+    for (size_t i = 0; i < count; i++) {
+        const double d = (double) got[i] - (double) want[i];
+        se += d * d;
+        sr += (double) want[i] * (double) want[i];
+        if (fabs(d) > max_abs) { max_abs = fabs(d); }
+    }
+    const double rel_rms = sr > 0.0 ? sqrt(se / sr) : (se > 0.0 ? INFINITY : 0.0);
+    const int ok = rel_rms <= rel_tol && max_abs <= abs_tol;
+    if (!ok) { g_failures++; }
+    printf("%-46s max_abs=%.3e rel_rms=%.3e  %s\n", label, max_abs, rel_rms,
+           ok ? "ok" : "FAIL");
+}
+
+/* The F16 conv gates: two identical F16 operand sets summed in different orders
+ * differ by accumulation drift only, measured well inside these bounds. */
+static const double kF16RelRmsTol = 2.0e-4;
+static const double kF16MaxAbsTol = 2.0e-3;
+
+/* vae.rs::conv3x3 over a channel-slowest plane, F16 operands, double truth.
+ * The operand rounding is hoisted out of the (oc, tap, ic) walk: it depends on
+ * (pixel, ic) only, so rounding once per plane element is the same values at a
+ * fraction of the mirror's cost. */
+static void ref_vae_conv3x3(float *out, const float *x, const uint16_t *w,
+                            const float *bias, uint32_t ci, uint32_t co,
+                            uint32_t width, uint32_t height) {
+    const uint32_t pixels = width * height;
+    float *rounded = host_alloc((size_t) pixels * ci);
+    for (size_t i = 0; i < (size_t) pixels * ci; i++) { rounded[i] = vae_f16_round(x[i]); }
+
+    for (uint32_t oc = 0; oc < co; oc++) {
+        for (uint32_t h = 0; h < height; h++) {
+            for (uint32_t p = 0; p < width; p++) {
+                double acc = 0.0;
+                for (uint32_t tap = 0; tap < 9u; tap++) {
+                    const int ih = (int) h + (int)(tap / 3u) - 1;
+                    const int iw = (int) p + (int)(tap % 3u) - 1;
+                    if (ih < 0 || ih >= (int) height || iw < 0 || iw >= (int) width) { continue; }
+                    for (uint32_t ic = 0; ic < ci; ic++) {
+                        acc += (double) rounded[(uint32_t)(iw + width * ih) + pixels * ic] *
+                               (double) unpack_f16(w[tap + 9u * (ic + ci * oc)]);
+                    }
+                }
+                out[(h * width + p) + pixels * oc] = (float) acc + bias[oc];
+            }
+        }
+    }
+    free(rounded);
+}
+
+/* vae.rs::conv1x1: one unchanged position per pixel, F16 operands. */
+static void ref_vae_conv1x1(float *out, const float *x, const uint16_t *w,
+                            const float *bias, uint32_t ci, uint32_t co,
+                            uint32_t pixels) {
+    float *rounded = host_alloc((size_t) pixels * ci);
+    for (size_t i = 0; i < (size_t) pixels * ci; i++) { rounded[i] = vae_f16_round(x[i]); }
+
+    for (uint32_t oc = 0; oc < co; oc++) {
+        for (uint32_t p = 0; p < pixels; p++) {
+            double acc = 0.0;
+            for (uint32_t ic = 0; ic < ci; ic++) {
+                acc += (double) rounded[p + pixels * ic] *
+                       (double) unpack_f16(w[ic + ci * oc]);
+            }
+            out[p + pixels * oc] = (float) acc + bias[oc];
+        }
+    }
+    free(rounded);
+}
+
+static void ref_vae_im2col3x3(float *dst, const float *src, uint32_t ci,
+                              uint32_t width, uint32_t height) {
+    const uint32_t pixels = width * height;
+    const uint32_t in_dim = 9u * ci;
+    for (uint32_t p = 0; p < pixels; p++) {
+        for (uint32_t j = 0; j < in_dim; j++) {
+            const uint32_t ic = j / 9u, tap = j % 9u;
+            const int ih = (int)(p / width) + (int)(tap / 3u) - 1;
+            const int iw = (int)(p % width) + (int)(tap % 3u) - 1;
+            float value = 0.0f;
+            if (ih >= 0 && ih < (int) height && iw >= 0 && iw < (int) width) {
+                value = src[(uint32_t)(iw + width * ih) + pixels * ic];
+            }
+            dst[j + in_dim * p] = value;
+        }
+    }
+}
+
+/* vae.rs::rms_norm: sum of x^2, scale 1/sqrt(mean + 1e-12), x*scale*gamma. */
+static void ref_vae_rms_norm(float *out, const float *x, const float *gamma,
+                             uint32_t channels, uint32_t pixels) {
+    for (uint32_t p = 0; p < pixels; p++) {
+        double sum = 0.0;
+        for (uint32_t c = 0; c < channels; c++) {
+            const double v = x[p + pixels * c];
+            sum += v * v;
+        }
+        const float mean = (float)(sum / (double) channels);
+        const float scale = 1.0f / sqrtf(mean + 1e-12f);
+        for (uint32_t c = 0; c < channels; c++) {
+            out[p + pixels * c] = x[p + pixels * c] * scale * gamma[c];
+        }
+    }
+}
+
+static void ref_vae_nearest_up2(float *dst, const float *src, uint32_t channels,
+                                uint32_t width, uint32_t height) {
+    const uint32_t out_width = 2u * width, out_pixels = 4u * width * height;
+    for (uint32_t c = 0; c < channels; c++) {
+        for (uint32_t oy = 0; oy < 2u * height; oy++) {
+            for (uint32_t ox = 0; ox < out_width; ox++) {
+                const uint32_t at = (ox / 2u + width * (oy / 2u)) + width * height * c;
+                dst[ox + out_width * oy + out_pixels * c] = src[at];
+            }
+        }
+    }
+}
+
+/* vae.rs::dup_up3d's closed form, which the oracle tests against the literal
+ * ggml concat/reshape/permute chain. */
+static void ref_vae_dup_up3d(float *dst, const float *src, uint32_t cin,
+                             uint32_t cout, uint32_t width, uint32_t height,
+                             uint32_t factor_t) {
+    const uint32_t fs = 2u, factor = fs * fs * factor_t;
+    const uint32_t repeats = cout * factor / cin;
+    const uint32_t out_width = fs * width, out_pixels = fs * fs * width * height;
+    for (uint32_t oc = 0; oc < cout; oc++) {
+        for (uint32_t y = 0; y < fs * height; y++) {
+            for (uint32_t x = 0; x < out_width; x++) {
+                const uint32_t m = fs * fs * (factor_t - 1u + factor_t * oc)
+                                 + fs * (y % fs) + (x % fs);
+                const uint32_t c_in = m / repeats;
+                dst[x + out_width * y + out_pixels * oc] =
+                    src[(x / fs + width * (y / fs)) + width * height * c_in];
+            }
+        }
+    }
+}
+
+/* vae.rs::attention over one head: q/k/v are the channel thirds of the
+ * feature-fastest [3*channels, tokens] fixture; softmax over all tokens.  The
+ * accumulations are F32 in the oracle's own order (one sequential dot per key,
+ * one sequential PV sum per feature), which the kernel mirrors, so the only
+ * residual difference is the block max/denominator reduction order. */
+static void ref_vae_attn(float *out, const float *qkv, uint32_t channels,
+                         uint32_t tokens) {
+    float *scores = host_alloc(tokens);
+    const float scale = 1.0f / sqrtf((float) channels);
+    for (uint32_t qt = 0; qt < tokens; qt++) {
+        const float *q = qkv + (size_t) 3u * channels * qt;
+        for (uint32_t kt = 0; kt < tokens; kt++) {
+            const float *k = qkv + (size_t) 3u * channels * kt + channels;
+            float dot = 0.0f;
+            for (uint32_t f = 0; f < channels; f++) {
+                dot += q[f] * k[f];
+            }
+            scores[kt] = dot * scale;
+        }
+        float max = -INFINITY;
+        for (uint32_t kt = 0; kt < tokens; kt++) { max = fmaxf(max, scores[kt]); }
+        float sum = 0.0f;
+        for (uint32_t kt = 0; kt < tokens; kt++) {
+            scores[kt] = expf(scores[kt] - max);
+            sum += scores[kt];
+        }
+        for (uint32_t kt = 0; kt < tokens; kt++) { scores[kt] /= sum; }
+        for (uint32_t f = 0; f < channels; f++) {
+            float acc = 0.0f;
+            for (uint32_t kt = 0; kt < tokens; kt++) {
+                acc += scores[kt] *
+                       qkv[(size_t)(2u * channels + f) + (size_t) 3u * channels * kt];
+            }
+            out[(size_t) channels * qt + f] = acc;
+        }
+    }
+    free(scores);
+}
+
+/* Packs `w` as F16 into a map at a 16-byte offset; the map's own words are the
+ * mirror's weights, so map and GEMM see exactly the same values. */
+static uint64_t map_put_f16(void *map, uint64_t *cursor, const float *w,
+                            size_t count) {
+    const uint64_t off = (*cursor + 15u) & ~15ull;
+    uint16_t *dst = (uint16_t *)((char *) map + off);
+    for (size_t i = 0; i < count; i++) { dst[i] = pack_f16(w[i]); }
+    *cursor = off + count * 2u;
+    return off;
+}
+
+static void *vae_map_alloc(uint64_t bytes) {
+    void *map = NULL;
+    if (posix_memalign(&map, 4096, bytes)) {
+        fprintf(stderr, "FAIL: VAE weight map allocation\n");
+        exit(1);
+    }
+    memset(map, 0, bytes);
+    return map;
+}
+
+/* One registered map serves every weight-based case: re-registering (and
+ * freeing) a fresh host map per case trips CUDA's host-registration owner, and
+ * the GEMM only ever reads a slice of it. */
+#define VAE_MAP_BYTES (64ull << 20)
+static void *g_vae_map = NULL;
+static const uint64_t g_vae_map_bytes = VAE_MAP_BYTES;
+
+static void vae_map_init(void) {
+    g_vae_map = vae_map_alloc(g_vae_map_bytes);
+    if (!ds4_gpu_set_model_map(g_vae_map, g_vae_map_bytes)) {
+        fprintf(stderr, "FAIL: VAE weight map registration\n");
+        exit(1);
+    }
+}
+
+/* conv3x3 / conv1x1 as the caller composes them: patch permutation, the tree's
+ * F16 GEMM, the per-channel bias add, then the inverse permutation. */
+static void test_vae_conv(uint32_t cin, uint32_t cout, uint32_t width,
+                          uint32_t height, int taps3) {
+    const uint32_t pixels = width * height;
+    if (pixels <= 8u) {
+        fprintf(stderr, "FAIL: conv case below the tree's native F16 token path\n");
+        exit(1);
+    }
+    const uint32_t in_dim = (taps3 ? 9u : 1u) * cin;
+    const size_t weight_count = (size_t) in_dim * cout;
+    const size_t out_count = (size_t) pixels * cout;
+
+    float *x = host_alloc((size_t) pixels * cin);
+    float *w = host_alloc(weight_count);
+    float *bias = host_alloc(cout);
+    float *want = host_alloc(out_count);
+    float *got = host_alloc(out_count);
+    fill_signed(x, (size_t) pixels * cin, 1.0f);
+    fill_signed(w, weight_count, 0.3f);
+    fill_signed(bias, cout, 0.5f);
+
+    uint64_t cursor = 64;
+    const uint64_t woff = map_put_f16(g_vae_map, &cursor, w, weight_count);
+    const uint16_t *w16 = (const uint16_t *)((const char *) g_vae_map + woff);
+
+    if (taps3) {
+        ref_vae_conv3x3(want, x, w16, bias, cin, cout, width, height);
+    } else {
+        ref_vae_conv1x1(want, x, w16, bias, cin, cout, pixels);
+    }
+
+    ds4_gpu_tensor *tx = device_alloc((size_t) pixels * cin);
+    ds4_gpu_tensor *tpatch = device_alloc((size_t) pixels * in_dim);
+    ds4_gpu_tensor *tgemm = device_alloc(out_count);
+    ds4_gpu_tensor *tbias = device_alloc(cout);
+    ds4_gpu_tensor *tout = device_alloc(out_count);
+    device_write(tx, x, (size_t) pixels * cin);
+    device_write(tbias, bias, cout);
+
+    const int patched = taps3
+        ? ds4_gpu_qwen_image_im2col3x3_tensor(tpatch, tx, cin, width, height)
+        : ds4_gpu_qwen_image_patch_1x1_tensor(tpatch, tx, cin, pixels);
+    if (!patched ||
+        !ds4_gpu_matmul_f16_tensor(tgemm, g_vae_map, g_vae_map_bytes, woff,
+                                   in_dim, cout, tpatch, pixels) ||
+        !ds4_gpu_qwen_image_bias_add_tensor(tgemm, tbias, cout, pixels) ||
+        !ds4_gpu_qwen_image_unpatch_crop_tensor(tout, tgemm, cout, pixels)) {
+        fprintf(stderr, "FAIL: VAE conv%s launch refused\n", taps3 ? "3x3" : "1x1");
+        exit(1);
+    }
+    device_read(tout, got, out_count);
+
+    char label[80];
+    snprintf(label, sizeof(label), "vae conv%s %ux%u cin=%u cout=%u",
+             taps3 ? "3x3" : "1x1", width, height, cin, cout);
+    compare_tol(label, got, want, out_count, kF16RelRmsTol, kF16MaxAbsTol);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tpatch);
+    ds4_gpu_tensor_free(tgemm);
+    ds4_gpu_tensor_free(tbias);
+    ds4_gpu_tensor_free(tout);
+    free(x);
+    free(w);
+    free(bias);
+    free(want);
+    free(got);
+}
+
+/* The im2col on its own, so a border-zero error cannot hide behind the GEMM. */
+static void test_vae_im2col(uint32_t ci, uint32_t width, uint32_t height) {
+    const uint32_t pixels = width * height, in_dim = 9u * ci;
+    const size_t count = (size_t) in_dim * pixels;
+    float *x = host_alloc((size_t) pixels * ci);
+    float *want = host_alloc(count);
+    float *got = host_alloc(count);
+    fill_signed(x, (size_t) pixels * ci, 1.0f);
+    ref_vae_im2col3x3(want, x, ci, width, height);
+
+    ds4_gpu_tensor *tx = device_alloc((size_t) pixels * ci);
+    ds4_gpu_tensor *tpatches = device_alloc(count);
+    device_write(tx, x, (size_t) pixels * ci);
+    if (!ds4_gpu_qwen_image_im2col3x3_tensor(tpatches, tx, ci, width, height)) {
+        fprintf(stderr, "FAIL: VAE im2col launch refused\n");
+        exit(1);
+    }
+    device_read(tpatches, got, count);
+
+    char label[80];
+    snprintf(label, sizeof(label), "vae im2col3x3 %ux%u ci=%u", width, height, ci);
+    compare(label, got, want, count);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tpatches);
+    free(x);
+    free(want);
+    free(got);
+}
+
+static void test_vae_rms_norm(uint32_t channels, uint32_t pixels) {
+    const size_t count = (size_t) channels * pixels;
+    float *x = host_alloc(count);
+    float *gamma = host_alloc(channels);
+    float *want = host_alloc(count);
+    float *got = host_alloc(count);
+    fill_signed(x, count, 1.0f);
+    fill_signed(gamma, channels, 1.0f);
+
+    /* Pixel 0 is tiny: its mean square is near eps, so a wrong eps moves its
+     * scale (1e-12 vs 1e-6 changes it by sqrt(2) here).  Pixel 0, channel c is
+     * at index pixels*c in the channel-slowest plane. */
+    for (uint32_t c = 0; c < channels; c++) {
+        x[(size_t) pixels * c] = (c & 1u) ? 1.0e-6f : -1.0e-6f;
+    }
+    ref_vae_rms_norm(want, x, gamma, channels, pixels);
+
+    ds4_gpu_tensor *tx = device_alloc(count);
+    ds4_gpu_tensor *tgamma = device_alloc(channels);
+    device_write(tx, x, count);
+    device_write(tgamma, gamma, channels);
+    if (!ds4_gpu_qwen_image_vae_rms_norm_tensor(tx, tgamma, channels, pixels)) {
+        fprintf(stderr, "FAIL: VAE RMSNorm launch refused\n");
+        exit(1);
+    }
+    device_read(tx, got, count);
+
+    char label[80];
+    snprintf(label, sizeof(label), "vae rms_norm ch=%u pixels=%u", channels, pixels);
+    compare_tol(label, got, want, count, 1.0e-5, 1.0e-4);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgamma);
+    free(x);
+    free(gamma);
+    free(want);
+    free(got);
+}
+
+static void test_vae_nearest_up2(uint32_t channels, uint32_t width,
+                                 uint32_t height) {
+    const size_t count = (size_t) width * height * channels;
+    const size_t out_count = 4u * count;
+    float *x = host_alloc(count);
+    float *want = host_alloc(out_count);
+    float *got = host_alloc(out_count);
+    fill_signed(x, count, 1.0f);
+    ref_vae_nearest_up2(want, x, channels, width, height);
+
+    ds4_gpu_tensor *tx = device_alloc(count);
+    ds4_gpu_tensor *tout = device_alloc(out_count);
+    device_write(tx, x, count);
+    if (!ds4_gpu_qwen_image_nearest_up2_tensor(tout, tx, channels, width, height)) {
+        fprintf(stderr, "FAIL: VAE nearest up2 launch refused\n");
+        exit(1);
+    }
+    device_read(tout, got, out_count);
+
+    char label[80];
+    snprintf(label, sizeof(label), "vae nearest_up2 %ux%u ch=%u", width, height, channels);
+    compare(label, got, want, out_count);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    free(x);
+    free(want);
+    free(got);
+}
+
+static void test_vae_dup_up3d(uint32_t cin, uint32_t cout, uint32_t width,
+                              uint32_t height, uint32_t factor_t) {
+    const size_t count = (size_t) width * height * cin;
+    const size_t out_count = 4u * (size_t) width * height * cout;
+    float *x = host_alloc(count);
+    float *want = host_alloc(out_count);
+    float *got = host_alloc(out_count);
+    fill_signed(x, count, 1.0f);
+    ref_vae_dup_up3d(want, x, cin, cout, width, height, factor_t);
+
+    ds4_gpu_tensor *tx = device_alloc(count);
+    ds4_gpu_tensor *tout = device_alloc(out_count);
+    device_write(tx, x, count);
+    if (!ds4_gpu_qwen_image_dup_up3d_tensor(tout, tx, cin, cout, width, height,
+                                            factor_t)) {
+        fprintf(stderr, "FAIL: VAE DupUp3D launch refused\n");
+        exit(1);
+    }
+    device_read(tout, got, out_count);
+
+    char label[96];
+    snprintf(label, sizeof(label), "vae dup_up3d %ux%u in=%u out=%u ft=%u",
+             width, height, cin, cout, factor_t);
+    compare(label, got, want, out_count);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    free(x);
+    free(want);
+    free(got);
+}
+
+static void test_vae_attn(uint32_t channels, uint32_t tokens) {
+    const size_t count = (size_t) 3u * channels * tokens;
+    float *qkv = host_alloc(count);
+    float *want = host_alloc((size_t) channels * tokens);
+    float *got = host_alloc((size_t) channels * tokens);
+    fill_signed(qkv, count, 1.0f);
+    ref_vae_attn(want, qkv, channels, tokens);
+
+    ds4_gpu_tensor *tqkv = device_alloc(count);
+    ds4_gpu_tensor *tout = device_alloc((size_t) channels * tokens);
+    device_write(tqkv, qkv, count);
+    if (!ds4_gpu_qwen_image_vae_attn_tensor(tout, tqkv, channels, tokens)) {
+        fprintf(stderr, "FAIL: VAE attention launch refused\n");
+        exit(1);
+    }
+    device_read(tout, got, (size_t) channels * tokens);
+
+    char label[80];
+    snprintf(label, sizeof(label), "vae attn ch=%u tokens=%u", channels, tokens);
+    compare_tol(label, got, want, (size_t) channels * tokens, 1.0e-5, 1.0e-4);
+
+    ds4_gpu_tensor_free(tqkv);
+    ds4_gpu_tensor_free(tout);
+    free(qkv);
+    free(want);
+    free(got);
+}
+
+/* The whole AttentionBlock: RMSNorm, to_qkv (1x1), the attention, proj (1x1)
+ * and the residual add, at the decoder's real width.  The last add runs on the
+ * host because the block's own residual is a plain F32 sum. */
+static void test_vae_attention_block(uint32_t channels, uint32_t width,
+                                     uint32_t height) {
+    const uint32_t pixels = width * height;
+    const size_t plane = (size_t) pixels * channels;
+    const size_t qkv_count = 3u * plane;
+
+    float *x = host_alloc(plane);
+    float *gamma = host_alloc(channels);
+    float *wqkv = host_alloc((size_t) channels * 3u * channels);
+    float *bqkv = host_alloc(3u * channels);
+    float *wproj = host_alloc((size_t) channels * channels);
+    float *bproj = host_alloc(channels);
+    float *normed = host_alloc(plane);
+    float *qkv_plane = host_alloc(qkv_count);
+    float *qkv_ff = host_alloc(qkv_count);
+    float *attn_ff = host_alloc(plane);
+    float *attn_plane = host_alloc(plane);
+    float *want = host_alloc(plane);
+    float *got = host_alloc(plane);
+    fill_signed(x, plane, 1.0f);
+    fill_signed(gamma, channels, 1.0f);
+    fill_signed(wqkv, (size_t) channels * 3u * channels, 0.2f);
+    fill_signed(bqkv, 3u * channels, 0.3f);
+    fill_signed(wproj, (size_t) channels * channels, 0.2f);
+    fill_signed(bproj, channels, 0.3f);
+
+    uint64_t cursor = 64;
+    const uint64_t qkv_off = map_put_f16(g_vae_map, &cursor, wqkv, (size_t) channels * 3u * channels);
+    const uint64_t proj_off = map_put_f16(g_vae_map, &cursor, wproj, (size_t) channels * channels);
+    const uint16_t *wqkv16 = (const uint16_t *)((const char *) g_vae_map + qkv_off);
+    const uint16_t *wproj16 = (const uint16_t *)((const char *) g_vae_map + proj_off);
+
+    /* The oracle's own channel order: q, k, v (vae.rs:636-638). */
+    ref_vae_rms_norm(normed, x, gamma, channels, pixels);
+    ref_vae_conv1x1(qkv_plane, normed, wqkv16, bqkv, channels, 3u * channels, pixels);
+    for (uint32_t t = 0; t < pixels; t++) {
+        for (uint32_t f = 0; f < 3u * channels; f++) {
+            qkv_ff[f + (size_t) 3u * channels * t] = qkv_plane[t + (size_t) pixels * f];
+        }
+    }
+    ref_vae_attn(attn_ff, qkv_ff, channels, pixels);
+    for (uint32_t t = 0; t < pixels; t++) {
+        for (uint32_t f = 0; f < channels; f++) {
+            attn_plane[t + (size_t) pixels * f] = attn_ff[f + (size_t) channels * t];
+        }
+    }
+    ref_vae_conv1x1(want, attn_plane, wproj16, bproj, channels, channels, pixels);
+    for (size_t i = 0; i < plane; i++) { want[i] += x[i]; }
+
+    ds4_gpu_tensor *tx = device_alloc(plane);
+    ds4_gpu_tensor *tgamma = device_alloc(channels);
+    ds4_gpu_tensor *tpatch = device_alloc(plane);
+    ds4_gpu_tensor *tqkv = device_alloc(qkv_count);
+    ds4_gpu_tensor *tbqkv = device_alloc(3u * channels);
+    ds4_gpu_tensor *tattn = device_alloc(plane);
+    ds4_gpu_tensor *tproj = device_alloc(plane);
+    ds4_gpu_tensor *tbproj = device_alloc(channels);
+    ds4_gpu_tensor *tout = device_alloc(plane);
+    device_write(tx, x, plane);
+    device_write(tgamma, gamma, channels);
+    device_write(tbqkv, bqkv, 3u * channels);
+    device_write(tbproj, bproj, channels);
+
+    const int launched =
+        ds4_gpu_qwen_image_vae_rms_norm_tensor(tx, tgamma, channels, pixels) &&
+        ds4_gpu_qwen_image_patch_1x1_tensor(tpatch, tx, channels, pixels) &&
+        ds4_gpu_matmul_f16_tensor(tqkv, g_vae_map, g_vae_map_bytes, qkv_off,
+                                  channels, 3u * channels, tpatch, pixels) &&
+        ds4_gpu_qwen_image_bias_add_tensor(tqkv, tbqkv, 3u * channels, pixels) &&
+        ds4_gpu_qwen_image_vae_attn_tensor(tattn, tqkv, channels, pixels) &&
+        ds4_gpu_matmul_f16_tensor(tproj, g_vae_map, g_vae_map_bytes, proj_off,
+                                  channels, channels, tattn, pixels) &&
+        ds4_gpu_qwen_image_bias_add_tensor(tproj, tbproj, channels, pixels) &&
+        ds4_gpu_qwen_image_unpatch_crop_tensor(tout, tproj, channels, pixels);
+    if (!launched) {
+        fprintf(stderr, "FAIL: VAE attention block launch refused\n");
+        exit(1);
+    }
+    device_read(tout, got, plane);
+    for (size_t i = 0; i < plane; i++) { got[i] += x[i]; }
+
+    char label[80];
+    snprintf(label, sizeof(label), "vae attn block %ux%u ch=%u", width, height, channels);
+    /* The proj GEMM rounds its input (the attention output) to F16.  The
+     * kernel's fast-math expf and its parallel max/denominator differ from the
+     * mirror by ~1e-7, which occasionally crosses an F16 rounding boundary: a
+     * single flipped operand of the 1152-term proj dot moves the result by one
+     * F16 ULP times a weight.  rel_rms stays inside the operand contract; the
+     * max_abs bound carries that F16 boundary effect. */
+    compare_tol(label, got, want, plane, 2.0e-4, 2.0e-2);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgamma);
+    ds4_gpu_tensor_free(tpatch);
+    ds4_gpu_tensor_free(tqkv);
+    ds4_gpu_tensor_free(tbqkv);
+    ds4_gpu_tensor_free(tattn);
+    ds4_gpu_tensor_free(tproj);
+    ds4_gpu_tensor_free(tbproj);
+    ds4_gpu_tensor_free(tout);
+    free(x);
+    free(gamma);
+    free(wqkv);
+    free(bqkv);
+    free(wproj);
+    free(bproj);
+    free(normed);
+    free(qkv_plane);
+    free(qkv_ff);
+    free(attn_ff);
+    free(attn_plane);
+    free(want);
+    free(got);
+}
+
+/* The two by-name refusals the entries must make. */
+static void test_vae_refusals(void) {
+    const uint32_t channels = 4, tokens = 9000;
+    /* Sized for 16384 so neither call can be refused by an undersized tensor. */
+    ds4_gpu_tensor *qkv = device_alloc((size_t) 3u * channels * 16384u);
+    ds4_gpu_tensor *out = device_alloc((size_t) channels * 16384u);
+    ds4_gpu_tensor *small = device_alloc(4096);
+    int bad = 0;
+
+    /* DupUp3D asserts cout * factor % cin == 0; 2 * 4 % 3 != 0. */
+    if (ds4_gpu_qwen_image_dup_up3d_tensor(small, small, 3, 2, 2, 2, 1) != 0) { bad++; }
+    /* 9000 is over kMaxAttentionPixels (8192) but inside the 48 KiB shared
+     * limit, so only the named pixel refusal can stop the launch. */
+    if (ds4_gpu_qwen_image_vae_attn_tensor(out, qkv, channels, tokens) != 0) { bad++; }
+    /* 16384 is a 128x128 latent, the first real size over the limit. */
+    if (ds4_gpu_qwen_image_vae_attn_tensor(out, qkv, channels, 16384) != 0) { bad++; }
+    if (bad) { g_failures++; }
+    printf("%-46s %s\n", "vae refusals (DupUp3D ratio, 16384-token attn)",
+           bad ? "FAIL" : "ok");
+    ds4_gpu_tensor_free(qkv);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(small);
+}
+
+/* The map's F16 encoder must round-trip to vae_f16_round; otherwise every
+ * weight-based comparison would be measuring the encoder, not the kernel. */
+static void check_f16_round_trip(void) {
+    const float values[] = {0.0f, 1.0f, -2.0f, 0.5f, 2048.0f, -65504.0f,
+        6.1035156e-5f, 65504.0f, 65520.0f, -70000.0f, 0.1f, 1.0f + 1.0f/2048.0f,
+        1.0f + 3.0f/2048.0f, ldexpf(1.0f, -24), ldexpf(1.0f, -25),
+        0.75f * ldexpf(1.0f, -24), ldexpf(1.0f, -30), -ldexpf(1.0f, -24),
+        -0.75f * ldexpf(1.0f, -24), -1e-5f, -6e-5f};
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+        const float rounded = vae_f16_round(values[i]);
+        const float back = unpack_f16(pack_f16(values[i]));
+        ok = ok && memcmp(&rounded, &back, sizeof(float)) == 0;
+    }
+    if (!ok) { g_failures++; }
+    printf("%-46s %s\n", "vae f16 encoder round-trip", ok ? "ok" : "FAIL");
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         fprintf(stderr, "ds4_gpu_init failed\n");
@@ -901,8 +1619,44 @@ int main(void) {
     test_patch(kChannels, 16384); /* 128x128 latent */
     test_patch(kChannels, 27556); /* 166x166 latent: a partial 32x32 tile */
 
+    printf("== Qwen-Image-2.1 VAE decoder primitives (CUDA vs the oracle's host math) ==\n");
+    vae_map_init();
+    check_f16_round_trip();
+    test_vae_refusals();
+
+    test_vae_im2col(3, 5, 3);        /* every border tap, tiny channel count */
+    test_vae_im2col(kChannels, 16, 16);
+    test_vae_rms_norm(1152, 256);    /* middle width, the P1 16x16 latent grid */
+    test_vae_nearest_up2(1152, 16, 16);
+
+    /* The up ladder's DupUp3D ratios (qwen_image.rs::vae_decoder_dims:
+     * 1152,1152,1152,576,288,144, and VAE_TEMPORAL_UPSAMPLE), plus an
+     * asymmetric ratio the oracle also covers. */
+    test_vae_dup_up3d(1152, 1152, 16, 16, 2);
+    test_vae_dup_up3d(1152, 576, 16, 16, 2);
+    test_vae_dup_up3d(576, 288, 16, 16, 2);
+    test_vae_dup_up3d(288, 144, 16, 16, 1);
+    test_vae_dup_up3d(6, 3, 3, 2, 1);
+
+    /* The convs as caller-side compositions.  conv1 64->1152, the middle
+     * 1152->1152 residuals, a down-ladder 1152->576 and the head's 144->4. */
+    test_vae_conv(64, 1152, 16, 16, 1);
+    test_vae_conv(1152, 1152, 16, 16, 1);
+    test_vae_conv(1152, 576, 16, 16, 1);
+    test_vae_conv(144, 4, 16, 16, 1);
+    test_vae_conv(64, 1152, 5, 3, 1);      /* border padding */
+    test_vae_conv(64, 64, 16, 16, 0);
+    test_vae_conv(1152, 3456, 16, 16, 0);  /* to_qkv */
+    test_vae_conv(1152, 1152, 16, 16, 0);  /* proj */
+    test_vae_conv(1152, 1152, 5, 3, 0);
+
+    test_vae_attn(1152, 256);   /* the middle block's real geometry */
+    test_vae_attn(1152, 1024);  /* the shape the task names */
+    test_vae_attention_block(1152, 16, 16);
+
     ds4_gpu_cleanup();
     free(weights);
+    free(g_vae_map);
     printf("%s\n", g_failures ? "Qwen-Image checks FAILED"
                               : "all Qwen-Image checks passed");
     return g_failures ? 1 : 0;

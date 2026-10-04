@@ -5238,6 +5238,75 @@ int ds4_gpu_qwen_image_unpatch_crop_tensor(
         uint32_t              channels,
         uint32_t              pixels);
 
+/* Qwen-Image-2.1 VAE decoder primitives (recipe section 7; the P1 oracle is
+ * crates/ds4-core/src/qwen_image/vae.rs).  Planes are the reference's own GGML
+ * order [W, H, C, 1]: (pixel p, channel c) sits at p + pixels*c.  The convs are
+ * compositions, not kernels: conv3x3 = im2col3x3 + ds4_gpu_matmul_f16_tensor +
+ * bias_add + patch_1x1/unpatch_crop; conv1x1 = the two patch permutations + the
+ * GEMM + bias_add.  The composition is caller-side because the GEMM owns its own
+ * F16 activation scratch through cuda_tmp_alloc.  The GEMM's __float2half
+ * activation rounding is bit-for-bit the oracle's vae.rs::f16_round. */
+
+/* The 3x3 conv's im2col, stride 1 and zero pad 1: plane [pixels, channels] ->
+ * patches [9*channels, pixels], feature j = tap + 9*ic with tap = kh*3 + kw.
+ * The patches index exactly as the artifact's [kW, kH, kT=1, IC*OC] weight, so
+ * they feed ds4_gpu_matmul_f16_tensor at the weight's map offset unchanged. */
+int ds4_gpu_qwen_image_im2col3x3_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              channels,
+        uint32_t              width,
+        uint32_t              height);
+
+/* Per-output-channel bias add on a feature-fastest [dim, rows] tensor: the
+ * oracle adds the conv bias only after the accumulation. */
+int ds4_gpu_qwen_image_bias_add_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *bias,
+        uint32_t              dim,
+        uint32_t              rows);
+
+/* Channel-wise RMSNorm on a plane, eps 1e-12, per-channel gamma, in place:
+ * mean = sum(x^2)/channels, scale = 1/sqrt(mean + 1e-12), x*scale*gamma. */
+int ds4_gpu_qwen_image_vae_rms_norm_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *gamma,
+        uint32_t              channels,
+        uint32_t              pixels);
+
+/* ggml_upscale(x, 2, NEAREST): plane [W*H, channels] -> [(2W)*(2H), channels],
+ * each pixel a 2x2 block. */
+int ds4_gpu_qwen_image_nearest_up2_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              channels,
+        uint32_t              width,
+        uint32_t              height);
+
+/* DupUp3D at one frame: the closed-form gather the oracle derives from the
+ * reference's concat/reshape/permute chain, a factor_s = 2 nearest upsample
+ * whose channel grouping is set by factor_t.  Refused when
+ * cout * 4 * factor_t % cin != 0, where the reference asserts. */
+int ds4_gpu_qwen_image_dup_up3d_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              cin,
+        uint32_t              cout,
+        uint32_t              width,
+        uint32_t              height,
+        uint32_t              factor_t);
+
+/* One head of the decoder AttentionBlock's attention over all tokens: qkv is
+ * the feature-fastest [3*channels, tokens] to_qkv output (q, k, v in channel
+ * order), out is feature-fastest [channels, tokens], softmax over the whole key
+ * span.  Refused above 8192 tokens (the score vector's shared staging); the
+ * reference's P1 attention is 256 tokens and a 128x128 latent is 16384. */
+int ds4_gpu_qwen_image_vae_attn_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *qkv,
+        uint32_t              channels,
+        uint32_t              tokens);
+
 #ifdef __cplusplus
 }
 #endif

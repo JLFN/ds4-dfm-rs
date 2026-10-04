@@ -1,10 +1,13 @@
-/* Included by the CUDA backend.  Qwen-Image-2.1 DiT entry points: the
- * primitives in cuda/qwen_image_primitives.cuh and the position/attention path
- * in cuda/qwen_image_attn.cuh, validated and launched on the ds4_gpu tensor
+/* Included by the CUDA backend.  Qwen-Image-2.1 entry points: the DiT
+ * primitives in cuda/qwen_image_primitives.cuh, the DiT position/attention path
+ * in cuda/qwen_image_attn.cuh, and the VAE decoder primitives in
+ * cuda/qwen_image_vae.cuh, validated and launched on the ds4_gpu tensor
  * surface.  Together with the host-built sinusoidal timestep table and the
- * tree's existing GEMMs, that is every op the DiT graph of P3 needs. */
+ * tree's existing GEMMs, that is every op the DiT graph of P3 needs; the VAE
+ * graph of P4 composes the decoder primitives with the same GEMMs. */
 
 #include "cuda/qwen_image_attn.cuh"
+#include "cuda/qwen_image_vae.cuh"
 
 namespace qwen_image_gpu {
 
@@ -250,3 +253,161 @@ extern "C" int ds4_gpu_qwen_image_unpatch_crop_tensor(
     qwen_image_gpu::transpose(dst, src, channels, pixels);
     return qwen_image_gpu::launched("Qwen-Image unpatch launch");
 }
+
+/* ---------------------------------------------------------------------------
+ * The VAE decoder primitives (cuda/qwen_image_vae.cuh).  Planes are
+ * channel-slowest [pixels, channels]; the feature-fastest token matrix the
+ * GEMMs consume is built by patch_1x1/unpatch_crop above.
+ * ------------------------------------------------------------------------- */
+
+/* The 3x3 conv's im2col: plane [pixels, IC] -> patches [9*IC, pixels],
+ * feature j = tap + 9*ic, zero padding at the borders.  The result is the
+ * activation for ds4_gpu_matmul_f16_tensor at the weight's own map offset. */
+extern "C" int ds4_gpu_qwen_image_im2col3x3_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              channels,
+        uint32_t              width,
+        uint32_t              height) {
+    if (channels == 0 || width == 0 || height == 0) return 0;
+    const uint64_t pixels = (uint64_t) width * height;
+    if (!qwen_image_gpu::tensor(src, pixels * channels * sizeof(float))) {
+        return 0;
+    }
+    if (pixels > UINT64_MAX / (qwen_image_cuda::kConvTaps * (uint64_t) channels)) {
+        return 0;
+    }
+    const uint64_t patches = qwen_image_cuda::kConvTaps * channels * pixels;
+    if (!qwen_image_gpu::tensor(dst, patches * sizeof(float))) return 0;
+
+    const uint32_t blocks = (uint32_t)((patches + qwen_image_cuda::kThreads - 1u) /
+                                       qwen_image_cuda::kThreads);
+    qwen_image_cuda::im2col3x3_kernel<<<blocks, qwen_image_cuda::kThreads, 0,
+            cuda_decode_stream()>>>((float *) dst->ptr,
+                                    (const float *) src->ptr, channels, width,
+                                    height);
+    return qwen_image_gpu::launched("Qwen-Image VAE im2col launch");
+}
+
+/* Per-output-channel bias add on a feature-fastest [dim, rows] tensor: the
+ * oracle adds the bias only after the conv accumulation (vae.rs:517-520). */
+extern "C" int ds4_gpu_qwen_image_bias_add_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *bias,
+        uint32_t              dim,
+        uint32_t              rows) {
+    if (dim == 0 || rows == 0) return 0;
+    if (!qwen_image_gpu::tensor(out, (uint64_t) dim * rows * sizeof(float))) {
+        return 0;
+    }
+    if (!qwen_image_gpu::tensor(bias, (uint64_t) dim * sizeof(float))) return 0;
+    qwen_image_cuda::bias_add_rows<<<qwen_image_gpu::grid(rows, dim),
+            qwen_image_cuda::kThreads, 0, cuda_decode_stream()>>>(
+            (float *) out->ptr, (const float *) bias->ptr, dim);
+    return qwen_image_gpu::launched("Qwen-Image VAE bias add launch");
+}
+
+/* Channel-wise RMSNorm, eps 1e-12, per-channel gamma, in place on a plane. */
+extern "C" int ds4_gpu_qwen_image_vae_rms_norm_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *gamma,
+        uint32_t              channels,
+        uint32_t              pixels) {
+    if (channels == 0 || pixels == 0) return 0;
+    if (!qwen_image_gpu::tensor(x, (uint64_t) channels * pixels * sizeof(float))) {
+        return 0;
+    }
+    if (!qwen_image_gpu::tensor(gamma, (uint64_t) channels * sizeof(float))) {
+        return 0;
+    }
+    qwen_image_cuda::vae_rms_norm<<<pixels, qwen_image_cuda::kThreads,
+            qwen_image_cuda::kThreads * sizeof(float), cuda_decode_stream()>>>(
+            (float *) x->ptr, (const float *) gamma->ptr, channels, pixels);
+    return qwen_image_gpu::launched("Qwen-Image VAE RMSNorm launch");
+}
+
+/* Nearest 2x spatial upsample of a plane. */
+extern "C" int ds4_gpu_qwen_image_nearest_up2_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              channels,
+        uint32_t              width,
+        uint32_t              height) {
+    if (channels == 0 || width == 0 || height == 0) return 0;
+    const uint64_t pixels = (uint64_t) width * height;
+    if (!qwen_image_gpu::tensor(src, pixels * channels * sizeof(float))) {
+        return 0;
+    }
+    const uint64_t out_pixels = 4u * pixels;
+    if (!qwen_image_gpu::tensor(dst, out_pixels * channels * sizeof(float))) {
+        return 0;
+    }
+    const dim3 grid((uint32_t)((out_pixels + qwen_image_cuda::kThreads - 1u) /
+                               qwen_image_cuda::kThreads),
+                    channels);
+    qwen_image_cuda::nearest_up2_gather<<<grid, qwen_image_cuda::kThreads, 0,
+            cuda_decode_stream()>>>((float *) dst->ptr,
+                                    (const float *) src->ptr, width, height);
+    return qwen_image_gpu::launched("Qwen-Image VAE nearest up2 launch");
+}
+
+/* DupUp3D at one frame: a factor_s = 2 nearest gather whose channel grouping
+ * is set by the temporal factor.  Refused when out*factor % in != 0, where the
+ * reference asserts (wan_vae.hpp:336). */
+extern "C" int ds4_gpu_qwen_image_dup_up3d_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              cin,
+        uint32_t              cout,
+        uint32_t              width,
+        uint32_t              height,
+        uint32_t              factor_t) {
+    if (cin == 0 || cout == 0 || width == 0 || height == 0 || factor_t == 0) {
+        return 0;
+    }
+    const uint64_t factor = (uint64_t) qwen_image_cuda::kUpFactorS *
+                            qwen_image_cuda::kUpFactorS * factor_t;
+    if (((uint64_t) cout * factor) % cin != 0) return 0;
+    const uint32_t repeats = (uint32_t)(((uint64_t) cout * factor) / cin);
+
+    const uint64_t pixels = (uint64_t) width * height;
+    if (!qwen_image_gpu::tensor(src, pixels * cin * sizeof(float))) return 0;
+    const uint64_t out_pixels = 4u * pixels;
+    if (!qwen_image_gpu::tensor(dst, out_pixels * cout * sizeof(float))) {
+        return 0;
+    }
+    const dim3 grid((uint32_t)((out_pixels + qwen_image_cuda::kThreads - 1u) /
+                               qwen_image_cuda::kThreads),
+                    cout);
+    qwen_image_cuda::dup_up3d_gather<<<grid, qwen_image_cuda::kThreads, 0,
+            cuda_decode_stream()>>>((float *) dst->ptr,
+                                    (const float *) src->ptr, width, height,
+                                    factor_t, repeats);
+    return qwen_image_gpu::launched("Qwen-Image VAE DupUp3D launch");
+}
+
+/* One head of the AttentionBlock's attention over all tokens.  qkv is the
+ * feature-fastest [3*channels, tokens] output of the to_qkv conv (q, k, v in
+ * that channel order); out is feature-fastest [channels, tokens].  Refused
+ * above kMaxAttentionPixels (the score vector's shared staging). */
+extern "C" int ds4_gpu_qwen_image_vae_attn_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *qkv,
+        uint32_t              channels,
+        uint32_t              tokens) {
+    if (channels == 0 || tokens == 0) return 0;
+    if (tokens > qwen_image_cuda::kMaxAttentionPixels) return 0;
+    if (!qwen_image_gpu::tensor(qkv, (uint64_t) 3u * channels * tokens * sizeof(float))) {
+        return 0;
+    }
+    if (!qwen_image_gpu::tensor(out, (uint64_t) channels * tokens * sizeof(float))) {
+        return 0;
+    }
+    const uint32_t shared =
+            (tokens + qwen_image_cuda::kThreads) * (uint32_t) sizeof(float);
+    qwen_image_cuda::vae_attn_head<<<tokens, qwen_image_cuda::kThreads, shared,
+            cuda_decode_stream()>>>((float *) out->ptr,
+                                    (const float *) qkv->ptr, channels, tokens);
+    return qwen_image_gpu::launched("Qwen-Image VAE attention launch");
+}
+

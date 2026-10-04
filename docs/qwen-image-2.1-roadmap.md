@@ -349,7 +349,7 @@ absolute difference and relative RMS.
 Traps: the conv3d weight layout is `[kW, kH, kT, IC*OC]` in F16 with F32
 accumulation; the temporal pad is left-only; single group only.
 
-**Gate result (2026-10-03, three slices): the new DiT kernels pass.**
+**Gate result (2026-10-04, four slices): the new DiT and VAE kernels pass.**
 Slice 1: `cuda/qwen_image_primitives.cuh` adds `qwen_image_layernorm`,
 `qwen_image_modulate` and `qwen_image_mlp_gated` (unfused and fused). Slice 2:
 `cuda/qwen_image_attn.cuh` adds `qwen_image_rope3d` and `qwen_image_attn_segment`,
@@ -387,8 +387,29 @@ times the gate. Open: `kMaxSegmentKeys` is 8192 (the 4224-key span fits; a longe
 segment is refused by the entry, so a >8K-token DiT needs the online-softmax
 variant first). The fused MLP's chunk order (gate = chunk 0) was confirmed
 against the reference source (`qwen_image_2_1.hpp:229-240`). The DiT now has
-every primitive P3 needs; the VAE's vendored convolution, upscale, RMSNorm and
-attention kernels are the remaining P2 slice.
+every primitive P3 needs.
+Slice 4 closes the decoder's op set: `cuda/qwen_image_vae.cuh` adds the im2col
+for the 3x3 conv, a per-output-channel bias add, the channel RMSNorm (eps 1e-12),
+the two upscale gathers (nearest 2x and DupUp3D's closed form) and the
+single-head spatial attention, exposed as six more `ds4_gpu_qwen_image_*`
+entries. The convs are compositions, not kernels: conv3x3 = im2col + the tree's
+F16 GEMM + bias, and conv1x1 = the 1x1 patch permutation + the same GEMM + bias,
+which is how the reference's own ggml path does it (im2col written in the
+weight's type, then `mul_mat`) and why no new GEMM was written. The GEMM's
+F32 -> F16 activation conversion was verified bit-for-bit against the oracle's
+`f16_round` over its own vectors. The decoder cases: im2col, nearest_up2 and all
+five DupUp3D shapes bit-exact; rms_norm 3.6e-7 abs; conv3x3/conv1x1 <= 2.9e-4 abs
+and <= 5.6e-6 rel RMS against the F16 section bound (2e-3 / 2e-4, the F16 operand
+contract's accumulation drift, stated in the test); attention 1.8e-7 abs. Nine
+falsifications, each restored byte-exactly (the im2col tap order, eps, the
+upscale parity term, the attention scale, the bias, and both refusal guards).
+Open, loud: the P0 VAE artifact stores BF16 (`convert.rs:320`, and the oracle's
+`dequantize_f32` refuses anything else), while the GEMM reads F16 weights from
+the map; the reference casts BF16 -> F16 at load, so P4 must deliver the weights
+as F16 (a converter variant or a load-time cast) before the decode graph is
+wired. Attention is capped at 8192 tokens by the shared score staging (the
+reference's P1 shape, 256, and 1024 fit; a 128x128 latent, 16384, is refused by
+name).
 
 ### P3 — DiT on CUDA: residency, graph, capture
 
@@ -519,9 +540,9 @@ made on the P6 numbers.
 
 ## 6. Size
 
-Estimates by content, not measurements — P1 is built and P2 is in progress, its
-DiT side complete. They are judgements about volume of code and evidence, not
-schedules.
+Estimates by content, not measurements — P1 is built and P2's kernels are
+complete, its weight delivery carried into P4. They are judgements about volume
+of code and evidence, not schedules.
 
 The strategy is porting, not inventing, and that is what sets the size. Every
 piece of model code is a 1:1 translation of a working reference file, and every
@@ -553,7 +574,7 @@ Neither is a research problem.
 | S | **done — no gain** | `feat/image`, [phase-S report](qwen-image-2.1-phase-s.md) | three numbers measured; none capturable by the port (M1 0%, M2 0%, M3 <=5.5%) |
 | P0 | **done** | `feat/image`, this document section 4 | layout contract over both artifacts (297/229/68, 134), `--check-config` refuses all 11 AR controls by name |
 | P1 | **done** | `feat/image`, [P1 report](qwen-image-2.1-p1.md) | three stages: byte-identical noise and Euler step, DiT velocity correlation 0.999973, VAE image PSNR 70.2 dB vs `run1.png` |
-| P2 | **in progress** | `feat/image`, slices 1-3 in this document | `make test-qwen-image-primitives` passes: layernorm/modulate/mlp_gated (rel RMS <= 6.0e-8), rope3d/attn_segment (rope bit-exact, attention <= 1.1e-6) and the DiT glue (silu/timestep <= 1.7e-7, patch/unpatch exact), each slice falsified |
+| P2 | **done — kernels** | `feat/image`, slices 1-4 in this document | `make test-qwen-image-primitives` passes: the DiT (layernorm/modulate/mlp_gated, rope3d/attn_segment, silu/timestep, patch/unpatch) and the VAE (im2col/conv3x3, conv1x1, rms_norm, both upscales, attention), each slice falsified; the F16 weight delivery is carried into P4 |
 | P3 | not started | — | — |
 | P4 | not started | — | — |
 | P5 | not started | — | — |
