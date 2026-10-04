@@ -10,20 +10,26 @@
  *   4. rope3d: the 3-axis adjacent-pair rope (widths 16/56/56, theta 10000)
  *      applied from a prebuilt [tokens, 64, 2, 2] table;
  *   5. segment attention: queries [start, end) attend to keys [0, end), the
- *      text prefix causal, the image segment unmasked and bidirectional.
+ *      text prefix causal, the image segment unmasked and bidirectional;
+ *   6. the timestep path: the host-built 256-wide sinusoidal table (theta
+ *      10000) through the 256 -> 4096 MLP, whose two silus run on the device;
+ *   7. patch/unpatch at a 1x1 patch: the latent's channel-slowest layout and
+ *      the joint matrix's channel-fastest one, a pure permutation.
  *
  * Each runs at the real DiT geometry (hidden 4096, intermediate 12288, 128
- * text + 4096 image = 4224 joint tokens, 32 heads x head dim 128) and is
- * diffed against a double host mirror of crates/ds4-core/src/qwen_image
- * (dit.rs and oracle.rs).  The kernels accumulate in F32 and the silu/tanh/
- * exp tails ride fast-math, so the gate is relative RMS <= 1e-5 with max abs
- * <= 1e-4 on O(1) data; the observed numbers printed below sit an order of
- * magnitude inside it.
+ * text + 4096 image = 4224 joint tokens, 32 heads x head dim 128, 64 latent
+ * channels) and is diffed against a double host mirror of
+ * crates/ds4-core/src/qwen_image (dit.rs and oracle.rs).  The kernels
+ * accumulate in F32 and the silu/tanh/exp tails ride fast-math, so the gate is
+ * relative RMS <= 1e-5 with max abs <= 1e-4 on O(1) data; the observed numbers
+ * printed below sit an order of magnitude inside it.
  *
  * The attention case is fed the oracle's own normalized and roped q/k, so it
  * isolates the segment kernel; the rope case feeds the normalized q/k and
  * diffs the rotation.  The two compare separately because the text segment's
  * causal mask and the image segment's absence of one are different failures.
+ * The timestep case likewise builds the oracle's own table and diffs the MLP
+ * on the device only, since the table's sin/cos never run there.
  *
  * Build: make test-qwen-image-primitives */
 
@@ -47,6 +53,8 @@ enum {
     kHeadDim = 128,
     kRopePairs = kHeadDim / 2, /* 8 + 28 + 28 over the three axes */
     kImageSide = 64,
+    kTimeEmbedDim = 256, /* the sinusoidal embedding width */
+    kChannels = 64,      /* the latent's in and out channels */
 };
 
 static const double kRelRmsTol = 1.0e-5;
@@ -184,6 +192,63 @@ static void ref_mlp_fused(float *out, const float *fused, uint32_t n,
             const double g = row[i];
             out[(size_t) t * n + i] =
                     (float)((double) row[n + i] * (g / (1.0 + exp(-g))));
+        }
+    }
+}
+
+/* dit.rs::silu, the same double form ref_mlp uses inside its gate. */
+static void ref_silu(float *x, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        const double v = x[i];
+        x[i] = (float)(v / (1.0 + exp(-v)));
+    }
+}
+
+/* dit.rs::timestep_embedding in the oracle's own f32 arithmetic: per column,
+ * feature j < dim/2 is cos(t * freq) and feature j >= dim/2 the same angle's
+ * sin, with freq = exp(-ln(theta) * j / (dim/2)).  The f32 rounding of the
+ * argument is the oracle's too, and it is why this table is host-built: the
+ * angles reach 1000 rad at the top of the flow grid, where an f32 argument
+ * already costs 6e-5, and the device's fast-math cosf adds 5.5e-4 on top. */
+static void ref_timestep_table(float *table, const float *times, uint32_t cols,
+                               uint32_t dim) {
+    const uint32_t half = dim / 2u;
+    const float log_period = logf(10000.0f);
+
+    for (uint32_t c = 0; c < cols; c++) {
+        for (uint32_t j = 0; j < half; j++) {
+            const float freq = expf(-log_period * (float) j / (float) half);
+            const float arg = times[c] * freq;
+            table[j + dim * c] = cosf(arg);
+            table[j + half + dim * c] = sinf(arg);
+        }
+    }
+}
+
+/* dit.rs::matmul_rows (dot8) in double: W is [m, k] row-major, x is
+ * feature-fastest [k, n] and the result is feature-fastest [m, n]. */
+static void ref_linear(float *out, const float *w, uint32_t k, uint32_t m,
+                       const float *x, uint32_t n) {
+    for (uint32_t t = 0; t < n; t++) {
+        for (uint32_t o = 0; o < m; o++) {
+            double sum = 0.0;
+            for (uint32_t i = 0; i < k; i++) {
+                sum += (double) w[(size_t) o * k + i] *
+                       (double) x[i + (size_t) k * t];
+            }
+            out[o + (size_t) m * t] = (float) sum;
+        }
+    }
+}
+
+/* dit.rs's patchify/unpatchify at a 1x1 patch: src [b, a] feature-fastest
+ * becomes dst [a, b] feature-fastest, dst[j + b*i] = src[i + a*j].  The
+ * caller picks which axis is which: patchify passes a = pixels, b = channels
+ * (and reads the latent), unpatchify the pair the other way round. */
+static void ref_transpose(float *dst, const float *src, uint32_t a, uint32_t b) {
+    for (uint32_t i = 0; i < a; i++) {
+        for (uint32_t j = 0; j < b; j++) {
+            dst[j + (size_t) b * i] = src[i + (size_t) a * j];
         }
     }
 }
@@ -613,6 +678,199 @@ static void test_attn_path(void) {
     free(pe);
 }
 
+/* In-place silu at the timestep path's real shape; the data span both tails. */
+static void test_silu(uint32_t dim, uint32_t rows) {
+    const size_t count = (size_t) dim * rows;
+    float *x = host_alloc(count);
+    float *want = host_alloc(count);
+    float *got = host_alloc(count);
+
+    fill_signed(x, count, 6.0f);
+    memcpy(want, x, count * sizeof(float));
+    ref_silu(want, count);
+
+    ds4_gpu_tensor *tx = device_alloc(count);
+    device_write(tx, x, count);
+    if (!ds4_gpu_qwen_image_silu_tensor(tx, dim, rows)) {
+        fprintf(stderr, "FAIL: silu launch refused\n");
+        exit(1);
+    }
+    device_read(tx, got, count);
+
+    char label[64];
+    snprintf(label, sizeof(label), "silu dim=%u rows=%u", dim, rows);
+    compare(label, got, want, count);
+
+    ds4_gpu_tensor_free(tx);
+    free(x);
+    free(want);
+    free(got);
+}
+
+/* With the zero timestep the table collapses to cos(0) = 1 over the low half
+ * of the feature axis and sin(0) = 0 over the high half, so its two columns
+ * must be bit-identical.  The device comparison cannot catch a swapped half
+ * or column -- both sides are fed this same table -- so the layout is pinned
+ * here instead. */
+static void check_zero_table(const float *table, uint32_t dim) {
+    const uint32_t half = dim / 2u;
+    int ok = 1;
+
+    for (uint32_t j = 0; j < half; j++) {
+        ok = ok && table[j] == 1.0f && table[j + half] == 0.0f;
+    }
+    for (uint32_t i = 0; i < dim; i++) {
+        ok = ok && table[i] == table[dim + i];
+    }
+    if (!ok) { g_failures++; }
+    printf("%-46s %s\n", "timestep table t=0: cos=1, sin=0, equal columns",
+           ok ? "ok" : "FAIL");
+}
+
+/* One denoise step's timestep path: the oracle's own f32 table for [t, 0]
+ * through linear_1 (256 -> 4096) -> silu -> linear_2 (4096 -> 4096) -> silu,
+ * the two GEMMs and both silus on the device.  Both Linears have n_tok = 2,
+ * so the f32 GEMM enters through the stable-rows entry: this box's default
+ * f32 entry is TF32 (measured 3.1e-4 rel RMS against an exact dot), three
+ * decades outside the gate. */
+static void test_timestep(float timestep, const void *map, uint64_t map_bytes,
+                          uint64_t w1_offset, uint64_t w2_offset) {
+    const uint32_t cols = 2; /* dit.rs: concat(timestep, 0) */
+    const size_t table_count = (size_t) kTimeEmbedDim * cols;
+    const size_t count = (size_t) kHidden * cols;
+    const float times[2] = { timestep, 0.0f };
+    const float *w1 = (const float *) ((const char *) map + w1_offset);
+    const float *w2 = (const float *) ((const char *) map + w2_offset);
+
+    float *table = host_alloc(table_count);
+    float *want = host_alloc(count);
+    float *want2 = host_alloc(count);
+    float *got = host_alloc(count);
+
+    ref_timestep_table(table, times, cols, kTimeEmbedDim);
+    if (timestep == 0.0f) { check_zero_table(table, kTimeEmbedDim); }
+
+    ref_linear(want, w1, kTimeEmbedDim, kHidden, table, cols);
+    ref_silu(want, count);
+    ref_linear(want2, w2, kHidden, kHidden, want, cols);
+    ref_silu(want2, count);
+
+    ds4_gpu_tensor *ttable = device_alloc(table_count);
+    ds4_gpu_tensor *th1 = device_alloc(count);
+    ds4_gpu_tensor *th2 = device_alloc(count);
+    device_write(ttable, table, table_count);
+
+    if (!ds4_gpu_matmul_f32_stable_rows_tensor(th1, map, map_bytes, w1_offset,
+                                               kTimeEmbedDim, kHidden, ttable,
+                                               cols) ||
+        !ds4_gpu_qwen_image_silu_tensor(th1, kHidden, cols)) {
+        fprintf(stderr, "FAIL: timestep linear_1/silu refused\n");
+        exit(1);
+    }
+    device_read(th1, got, count);
+
+    char label[64];
+    snprintf(label, sizeof(label), "timestep mlp hidden t=%g", (double) timestep);
+    compare(label, got, want, count);
+
+    if (!ds4_gpu_matmul_f32_stable_rows_tensor(th2, map, map_bytes, w2_offset,
+                                               kHidden, kHidden, th1, cols) ||
+        !ds4_gpu_qwen_image_silu_tensor(th2, kHidden, cols)) {
+        fprintf(stderr, "FAIL: timestep linear_2/silu refused\n");
+        exit(1);
+    }
+    device_read(th2, got, count);
+    snprintf(label, sizeof(label), "timestep mlp out t=%g", (double) timestep);
+    compare(label, got, want2, count);
+
+    ds4_gpu_tensor_free(ttable);
+    ds4_gpu_tensor_free(th1);
+    ds4_gpu_tensor_free(th2);
+    free(table);
+    free(want);
+    free(want2);
+    free(got);
+}
+
+/* Both directions of the 1x1 patch at one latent grid: a random latent
+ * through the patch entry and a random token matrix through the unpatch
+ * entry, each against the mirror.  Separate comparisons so a direction-
+ * specific index error cannot hide behind the other one. */
+static void test_patch(uint32_t channels, uint32_t pixels) {
+    const size_t count = (size_t) channels * pixels;
+    float *source = host_alloc(count);
+    float *want = host_alloc(count);
+    float *got = host_alloc(count);
+
+    ds4_gpu_tensor *tsrc = device_alloc(count);
+    ds4_gpu_tensor *tdst = device_alloc(count);
+    char label[80];
+
+    /* patchify: the latent [pixels, channels] gathered into [channels, pixels]. */
+    fill_signed(source, count, 1.0f);
+    ref_transpose(want, source, pixels, channels);
+
+    device_write(tsrc, source, count);
+    if (!ds4_gpu_qwen_image_patch_1x1_tensor(tdst, tsrc, channels, pixels)) {
+        fprintf(stderr, "FAIL: patch launch refused\n");
+        exit(1);
+    }
+    device_read(tdst, got, count);
+    snprintf(label, sizeof(label), "patch_1x1 channels=%u pixels=%u", channels,
+             pixels);
+    compare(label, got, want, count);
+
+    /* unpatch_crop: proj_out's [channels, pixels] back into the latent. */
+    fill_signed(source, count, 1.0f);
+    ref_transpose(want, source, channels, pixels);
+
+    device_write(tsrc, source, count);
+    if (!ds4_gpu_qwen_image_unpatch_crop_tensor(tdst, tsrc, channels, pixels)) {
+        fprintf(stderr, "FAIL: unpatch launch refused\n");
+        exit(1);
+    }
+    device_read(tdst, got, count);
+    snprintf(label, sizeof(label), "unpatch_crop channels=%u pixels=%u",
+             channels, pixels);
+    compare(label, got, want, count);
+
+    ds4_gpu_tensor_free(tsrc);
+    ds4_gpu_tensor_free(tdst);
+    free(source);
+    free(want);
+    free(got);
+}
+
+/* The timestep MLP's two Linears as one mapped blob, laid out the way the
+ * artifact holds them (row-major, ne0 = in fastest), then both timestep
+ * cases.  The map outlives the run and is freed by main after cleanup. */
+static void *test_timestep_path(void) {
+    const uint64_t off1 = 4096; /* aligned past the header the map may hold */
+    const uint64_t off2 = off1 + (uint64_t) kHidden * kTimeEmbedDim * sizeof(float);
+    const uint64_t bytes = off2 + (uint64_t) kHidden * kHidden * sizeof(float);
+
+    void *map = NULL;
+    if (posix_memalign(&map, off1, bytes)) {
+        fprintf(stderr, "FAIL: weight map allocation of %llu bytes\n",
+                (unsigned long long) bytes);
+        exit(1);
+    }
+    memset(map, 0, bytes);
+    fill_signed((float *) ((char *) map + off1),
+                (size_t) kHidden * kTimeEmbedDim, 0.35f);
+    fill_signed((float *) ((char *) map + off2), (size_t) kHidden * kHidden,
+                0.02f);
+
+    if (!ds4_gpu_set_model_map(map, bytes)) {
+        fprintf(stderr, "FAIL: weight map registration\n");
+        exit(1);
+    }
+
+    test_timestep(999.7f, map, bytes, off1, off2);
+    test_timestep(0.0f, map, bytes, off1, off2);
+    return map;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) {
         fprintf(stderr, "ds4_gpu_init failed\n");
@@ -636,7 +894,15 @@ int main(void) {
     printf("== Qwen-Image-2.1 DiT attention path (CUDA vs the oracle's host math) ==\n");
     test_attn_path();
 
+    printf("== Qwen-Image-2.1 DiT glue (CUDA vs the oracle's host math) ==\n");
+    test_silu(kHidden, 2);
+    void *weights = test_timestep_path();
+    test_patch(kChannels, 4096);  /* 64x64 latent, the reference run */
+    test_patch(kChannels, 16384); /* 128x128 latent */
+    test_patch(kChannels, 27556); /* 166x166 latent: a partial 32x32 tile */
+
     ds4_gpu_cleanup();
+    free(weights);
     printf("%s\n", g_failures ? "Qwen-Image checks FAILED"
                               : "all Qwen-Image checks passed");
     return g_failures ? 1 : 0;

@@ -349,21 +349,36 @@ absolute difference and relative RMS.
 Traps: the conv3d weight layout is `[kW, kH, kT, IC*OC]` in F16 with F32
 accumulation; the temporal pad is left-only; single group only.
 
-**Gate result (2026-10-03, two slices): the new DiT kernels pass.**
+**Gate result (2026-10-03, three slices): the new DiT kernels pass.**
 Slice 1: `cuda/qwen_image_primitives.cuh` adds `qwen_image_layernorm`,
 `qwen_image_modulate` and `qwen_image_mlp_gated` (unfused and fused). Slice 2:
 `cuda/qwen_image_attn.cuh` adds `qwen_image_rope3d` and `qwen_image_attn_segment`,
 exposed with the first three through `ds4_qwen_image_gpu.cuh` and six
-`ds4_gpu_qwen_image_*` entry points. `make test-qwen-image-primitives` compares
+`ds4_gpu_qwen_image_*` entry points. Slice 3 closes the DiT's own op set:
+`qwen_image_silu` (the timestep MLP's two activations) and the `transpose_2d`
+tile that is both directions of the 1x1 patch, exposed as three more
+`ds4_gpu_qwen_image_*` entries. The timestep embedding itself adds no kernel: the
+256-wide sinusoidal table is host-built (the device's fast-math `cosf` is the
+same 5.5e-4 as the `pe` table's) and uploaded into the tree's existing F32 GEMM,
+and the 1x1 patch is a pure permutation with no arithmetic, so patch and unpatch
+are one tiled kernel. `make test-qwen-image-primitives` compares
 each against a double host mirror of the oracle's own math at the real shapes
 (hidden 4096, intermediate 12288, 1 and 4224 joint tokens, 32 heads x 128, a
-128-token causal text prefix): max absolute difference <= 7.6e-6 and relative RMS
-<= 6.0e-8 against a stated bound of 1e-4 and 1e-5. The plain `modulate` cases and
+128-token causal text prefix). The slice-1 primitives: max absolute difference
+<= 7.6e-6 and relative RMS <= 6.0e-8 against a stated bound of 1e-4 and 1e-5. The
+plain `modulate` cases and
 both `rope3d` cases are bit-exact; the attention cases sit at 1.8e-7 abs / 1.1e-6
 rel RMS (the block-tree softmax reduction and fast-math `expf`). The segment mask
 was falsified in both directions (a no-op mask fails the causal text case at
 8.99e-1 rel RMS; an unconditional mask fails the image case at 1.62e0) and both
-were restored byte-exactly. `make ds4-server CUDA_ARCH=sm_89` links. The
+were restored byte-exactly. The glue cases sit at silu 4.8e-7 abs / 5.4e-8 rel
+RMS, the two timestep MLP stages 9.5e-7 / 1.6e-7, and all six patch/unpatch cases
+at 0.0/0.0 (the permutation is exact at 64x64, 128x128 and the partial-tile
+166x166 grid); they too were falsified once each — identity silu (1.02 rel RMS on
+its own case, 1.0-2.0 on the MLP stages), a no-transpose tile (1.39 on all six
+patch cases), and swapped table halves (the t=0 layout check fails while the MLP
+cases stay green, which is why that check exists) — each restored byte-exactly.
+`make ds4-server CUDA_ARCH=sm_89` links. The
 attention kernel is new, not vendored: this tree's prefill kernels are MQA with a
 different mask, layout and accumulation order, so only the block skeleton is
 shared. The `pe` table is built on the host with libm trig: under this tree's
@@ -371,9 +386,9 @@ shared. The `pe` table is built on the host with libm trig: under this tree's
 times the gate. Open: `kMaxSegmentKeys` is 8192 (the 4224-key span fits; a longer
 segment is refused by the entry, so a >8K-token DiT needs the online-softmax
 variant first). The fused MLP's chunk order (gate = chunk 0) was confirmed
-against the reference source (`qwen_image_2_1.hpp:229-240`). The timestep
-embedding, the patch/unpatch glue and the vendored convolution/upscale kernels
-remain for later slices.
+against the reference source (`qwen_image_2_1.hpp:229-240`). The DiT now has
+every primitive P3 needs; the VAE's vendored convolution, upscale, RMSNorm and
+attention kernels are the remaining P2 slice.
 
 ### P3 — DiT on CUDA: residency, graph, capture
 
@@ -504,8 +519,9 @@ made on the P6 numbers.
 
 ## 6. Size
 
-Estimates by content, not measurements — nothing beyond P1 has been built. They
-are judgements about volume of code and evidence, not schedules.
+Estimates by content, not measurements — P1 is built and P2 is in progress, its
+DiT side complete. They are judgements about volume of code and evidence, not
+schedules.
 
 The strategy is porting, not inventing, and that is what sets the size. Every
 piece of model code is a 1:1 translation of a working reference file, and every
@@ -537,7 +553,7 @@ Neither is a research problem.
 | S | **done — no gain** | `feat/image`, [phase-S report](qwen-image-2.1-phase-s.md) | three numbers measured; none capturable by the port (M1 0%, M2 0%, M3 <=5.5%) |
 | P0 | **done** | `feat/image`, this document section 4 | layout contract over both artifacts (297/229/68, 134), `--check-config` refuses all 11 AR controls by name |
 | P1 | **done** | `feat/image`, [P1 report](qwen-image-2.1-p1.md) | three stages: byte-identical noise and Euler step, DiT velocity correlation 0.999973, VAE image PSNR 70.2 dB vs `run1.png` |
-| P2 | **in progress** | `feat/image`, slices 1-2 in this document | `make test-qwen-image-primitives` passes: layernorm/modulate/mlp_gated (rel RMS <= 6.0e-8) and rope3d/attn_segment (rope bit-exact, attention <= 1.1e-6), both falsified |
+| P2 | **in progress** | `feat/image`, slices 1-3 in this document | `make test-qwen-image-primitives` passes: layernorm/modulate/mlp_gated (rel RMS <= 6.0e-8), rope3d/attn_segment (rope bit-exact, attention <= 1.1e-6) and the DiT glue (silu/timestep <= 1.6e-7, patch/unpatch exact), each slice falsified |
 | P3 | not started | — | — |
 | P4 | not started | — | — |
 | P5 | not started | — | — |

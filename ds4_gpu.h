@@ -5201,6 +5201,43 @@ int ds4_gpu_qwen_image_attn_segment_tensor(
         uint32_t              end,
         uint32_t              causal);
 
+/* In-place x = x / (1 + exp(-x)) over a feature-fastest [dim, rows] tensor:
+ * the two activations of the timestep path's 256 -> 4096 MLP.  The sinusoidal
+ * table that feeds that MLP is host-built and uploaded (dit.rs: per column,
+ * features [0, 128) are cos(t * 10000^(-j/128)), features [128, 256) the same
+ * angles' sin, column 0 the flow timestep, column 1 zero): device trig under
+ * --use_fast_math measured 5.5e-4 max abs over [0, 4224] rad, five times the
+ * 1e-4 gate, and the table is 512 floats per step.  The two Linears are the
+ * tree's existing GEMMs. */
+int ds4_gpu_qwen_image_silu_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        dim,
+        uint32_t        rows);
+
+/* The DiT's 1x1 patchify, dit.rs::forward's gather: the latent is
+ * channel-slowest, so element (channel c, pixel p) sits at p + pixels*c, and
+ * the token matrix the img_in GEMM wants is feature-fastest, element (c, p)
+ * at c + channels*p.  A pure permutation: dst[c + channels*p] =
+ * src[p + pixels*c].  channels 64 (in or out of the DiT), pixels = H*W of the
+ * latent grid (4096 at the reference run's 64x64). */
+int ds4_gpu_qwen_image_patch_1x1_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              channels,
+        uint32_t              pixels);
+
+/* The inverse of patch_1x1_tensor, dit.rs's unpatchify of proj_out's
+ * [channels, pixels] back into the latent's [pixels, channels]: the same
+ * permutation with the two tensors in the other roles.  The reference's
+ * unpatchify_and_crop crop is empty at a 1x1 patch for every grid (the pads
+ * are (1 - H%1)%1 = 0, so both slices span the full extent), which is why
+ * this entry takes no crop bounds. */
+int ds4_gpu_qwen_image_unpatch_crop_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *src,
+        uint32_t              channels,
+        uint32_t              pixels);
+
 #ifdef __cplusplus
 }
 #endif
