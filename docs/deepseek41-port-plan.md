@@ -51,7 +51,7 @@ Read over the gvfs mount of the Spark
 | base sha256 | `9469cfa9ff47c5b9f1e2bbf31b4226ef11b4de9ddb92a0c7641c4a9b623e4654` (`SHA256SUMS`; every part also hashed) |
 | sidecars | five domain dirs `…-grrb-{vqfin41_vqhalf_a_n8192,code_fit_n15360,law_fit_n15360,med_fit_n15360,sci_fit_n15360}-engine`, each `gr_Lnn.bin` (1,044,492 B) + `rb_Lnn.bin` + `manifest.txt` |
 | post-train | `posttrain-experimental-20260924/`: `gr_L39.bin` + `base.fnv` (20 B) |
-| engram | not in the artifact: two official shards `model-00047/48-of-00048.safetensors`, ~101.5 GB each, read in place via `--engram-dir` |
+| engram | not in the artifact: two official shards, read in place via `--engram-dir`. Present on the Spark at `/home/leandro/youngai/deepseek-engram`: `model-00047-of-00048.safetensors` 101,535,150,936 B and `model-00048-of-00048.safetensors` 101,537,926,640 B (190 GB, measured over sftp 2026-10-08) |
 | bins | `bin/ds4`, `bin/ds4-server`, built on the Spark with `make cuda-spark` |
 
 Engine invocation the port must be able to reproduce (artifact README §3, §7):
@@ -136,7 +136,7 @@ before any state-changing command.
 
 | phase | work | gate |
 | --- | --- | --- |
-| P0 | Freeze inputs: re-verify the 40 part hashes and the assembled sha256; capture the C engine's golden set (token stream + logits, temperature 0, fixed prompts); record the artifact's accepted tensor inventory | hashes re-verify; the golden set exists as a file with its own hash |
+| P0 | Freeze inputs: verify the assembled artifact hash (the 40 part files are deleted after assembly, so `SHA256SUMS`' part lines cannot resolve); capture the C engine's golden set with `tests/capture_ds41_golden.sh`, with the engram tables as the primary instrument and `NO_ENGRAM=1` as the fixture variant; record the artifact's accepted tensor inventory | hashes re-verify; the golden set exists as files with its own MANIFEST |
 | P1 | Tensor types 40-44 in `tensors.rs` and the VQ decode as a Rust oracle (CPU), codebook geometry read from the blob, not assumed | decoded weights byte-match `ds4vq_dequant_f32` on fixed tensors of both blob versions (v2 and v3) |
 | P2 | Loaders: engram metadata and table open, sidecar `gr`/`rb` reader, `base.fnv` check (parse-only, not applied) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
 | P3 | Routing and bind: a `Variant::V41` shape, the V4.1 keys, and the engram/sidecar state wired into session state | the loader accepts the artifact and the inventory diff is empty |

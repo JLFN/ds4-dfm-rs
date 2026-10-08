@@ -12,7 +12,8 @@
 # engine's own comment in cli_diag.c says re-tokenized text does not round
 # trip (79 vs 75 tokens measured 2026-09-20).
 #
-#   bash tests/capture_ds41_golden.sh
+#   bash tests/capture_ds41_golden.sh              # with the engram tables
+#   NO_ENGRAM=1 bash tests/capture_ds41_golden.sh  # fixture variant, no engram
 #
 # Output: $OUT/{<name>.ids,<name>.logits.bin,<name>.log,MANIFEST}
 set -euo pipefail
@@ -22,6 +23,20 @@ GGUF=${GGUF:-$MODEL_DIR/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf}
 SIDECAR=${SIDECAR:-$MODEL_DIR/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative-grrb-vqfin41_vqhalf_a_n8192-engine}
 BIN=${BIN:-$MODEL_DIR/bin/ds4}
 OUT=${OUT:-$MODEL_DIR/golden}
+# The two official n-gram shards, installed by install.sh. The deployed path
+# uses them (the README's server and CLI examples both pass --engram-dir);
+# NO_ENGRAM=1 captures the fixture variant instead.
+ENGRAM_DIR=${ENGRAM_DIR:-$HOME/youngai/deepseek-engram}
+ENGRAM_ARGS=()
+if [ "${NO_ENGRAM:-0}" = "1" ]; then
+  ENGRAM_ARGS=(--v41-no-engram)
+  OUT="$OUT/no-engram"
+elif [ -d "$ENGRAM_DIR" ]; then
+  ENGRAM_ARGS=(--engram-dir "$ENGRAM_DIR")
+else
+  echo "engram tables not found at $ENGRAM_DIR; use NO_ENGRAM=1 for the fixture variant" >&2
+  exit 1
+fi
 
 # Fixed prompt set: short English, code, factual, a longer passage, Chinese.
 NAMES=(p1 p2 p3 p4 p5)
@@ -50,7 +65,7 @@ for i in "${!NAMES[@]}"; do
   echo "$ids" > "$OUT/$name.ids"
 
   # Per-position logits for the exact id sequence.
-  "$BIN" --cuda -m "$GGUF" --zchain "$SIDECAR" --v41-no-engram \
+  "$BIN" --cuda -m "$GGUF" --zchain "$SIDECAR" "${ENGRAM_ARGS[@]}" \
       --score-ids "$OUT/$name.ids" --score-out "$OUT/$name.logits.bin" \
       2>&1 | tee "$OUT/$name.log"
 done
@@ -58,7 +73,8 @@ done
 # Manifest: every captured file, plus the inputs that pin the run.
 {
   echo "# DeepSeek V4.1 golden set, captured by tests/capture_ds41_golden.sh"
-  echo "# engine: $($BIN --help >/dev/null 2>&1 && echo "$BIN" || echo "$BIN")"
+  echo "# engine: $BIN"
+  echo "# engram: ${ENGRAM_ARGS[*]:-none}"
   sha256sum "$BIN" "$GGUF"
   sha256sum "$OUT"/*.ids "$OUT"/*.logits.bin "$OUT"/*.log
 } > "$OUT/MANIFEST"
