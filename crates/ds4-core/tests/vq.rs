@@ -200,6 +200,37 @@ fn gain_override_replaces_the_payload_gain() {
 }
 
 #[test]
+fn v2_matches_the_engine_decoder() {
+    // The engine's own host decoder is the authority for the v2 payload. The
+    // fixtures and the reference values are produced by
+    // tests/fixtures/vq/gen_v2_ref.c, which includes the vendored vq_fmt.h
+    // (copied verbatim from /data/YoungAi at 3946dbc) and calls
+    // ds4vq_dequant_f32. Regenerate with:
+    //   cc -O2 -D__fp16=float -I. gen_v2_ref.c -o gen_v2_ref && ./gen_v2_ref
+    // -D__fp16=float neutralizes the f16-output variant, which this harness
+    // never calls.
+    let cases: [(&[u8], &[u8]); 2] = [
+        (
+            include_bytes!("fixtures/vq/v2_nc256.blob"),
+            include_bytes!("fixtures/vq/v2_nc256.ref.f32"),
+        ),
+        (
+            include_bytes!("fixtures/vq/v2_nc4096.blob"),
+            include_bytes!("fixtures/vq/v2_nc4096.ref.f32"),
+        ),
+    ];
+    for (blob, rref) in cases {
+        let m = VqMatrix::open(blob, 0, 0, 16, 64).expect("open");
+        let got = m.dequant_f32(None);
+        assert_eq!(got.len() * 4, rref.len());
+        for (i, chunk) in rref.chunks_exact(4).enumerate() {
+            let want = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            assert_eq!(got[i].to_bits(), want.to_bits(), "value {i}");
+        }
+    }
+}
+
+#[test]
 fn blob_ok_rejects_bad_headers() {
     let good = blob_header(3, 1, &[40, 0, 0]);
     assert!(blob_ok(&good));
