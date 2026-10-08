@@ -46,6 +46,7 @@ Other recipes and dated gates retain their hardware and workload limits.
 | [MiMo RL](mimo2-serving-2026-09-25.md) | Recorded mixed serving, bank reuse and memory limits |
 | [MiMo MOPD](ds4-dfm-model-families.md#mimo-mopd) | Separate artifact, text performance and DFlash boundaries |
 | [Naive](naive-n05-flash.md) | MQ87, banks, disk KV, long-context gates and drafter limits |
+| [DeepSeek V4.1 Flash (plan)](deepseek41-port-plan.md) | Proposal: the vq8sh14 artifact, the C engine as source of truth, the gap inventory and the golden-set gate |
 
 ## Development
 
