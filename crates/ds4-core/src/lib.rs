@@ -41,6 +41,7 @@ mod step37_mtp;
 mod tensors;
 mod tok;
 mod validate;
+mod vq;
 
 pub use batch::{
     cont_sample_token, qwen_image_pixel_hash, qwen_image_probe, BankSnapshot, BatchCtx, ContAdmit,
@@ -125,6 +126,9 @@ pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, validate_qwen_inventory,
     ValidateError,
+};
+pub use vq::{
+    blob_nexp, blob_ok, blob_slot, blob_ver, e4m3fn_to_f32, f16_to_f32, VqError, VqMatrix,
 };
 
 use std::ffi::CString;
