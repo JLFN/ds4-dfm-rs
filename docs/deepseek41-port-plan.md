@@ -137,6 +137,7 @@ before any state-changing command.
 | phase | work | gate |
 | --- | --- | --- |
 | P0 | Freeze inputs: verify the assembled artifact hash (the 40 part files are deleted after assembly, so `SHA256SUMS`' part lines cannot resolve); capture the C engine's golden set with `tests/capture_ds41_golden.sh`, with the engram tables as the primary instrument and `NO_ENGRAM=1` as the fixture variant; record the artifact's accepted tensor inventory | hashes re-verify; the golden set exists as files with its own MANIFEST |
+| P0 | DONE 2026-10-08 | see 6.5 |
 | P1 | Tensor types 40-44 in `tensors.rs` and the VQ decode as a Rust oracle (CPU), codebook geometry read from the blob, not assumed | decoded weights byte-match `ds4vq_dequant_f32` on fixed tensors of both blob versions (v2 and v3) |
 | P2 | Loaders: engram metadata and table open, sidecar `gr`/`rb` reader, `base.fnv` check (parse-only, not applied) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
 | P3 | Routing and bind: a `Variant::V41` shape, the V4.1 keys, and the engram/sidecar state wired into session state | the loader accepts the artifact and the inventory diff is empty |
@@ -236,6 +237,29 @@ Working rules for the Spark, non-negotiable:
   long runs are left visible rather than backgrounded.
 - The memory budget is the guard: the engine refuses to start above
   `--mem-budget-mb 110000`, so a test run must not hold another large model.
+
+## 6.5 P0 evidence (2026-10-08, the Spark)
+
+Frozen inputs, all measured:
+
+| item | value |
+| --- | --- |
+| engine binary | `/home/leandro/youngai/model/bin/ds4`, sha256 `c03be9b4ac5de52b197b3740ba6ec60001b7454b7ab5d0f111cda3f3fee8a7f5` |
+| artifact | sha256 `9469cfa9ff47c5b9f1e2bbf31b4226ef11b4de9ddb92a0c7641c4a9b623e4654`, recomputed by the capture script and equal to the `SHA256SUMS` assembled line |
+| engram | `--engram-dir /home/leandro/youngai/deepseek-engram`, two shards, 190 GB |
+| golden set | `/home/leandro/youngai/model/golden/`, MANIFEST with every hash |
+
+Segment PPL of the five prompts (with engram): p1 112.0845 (S=8), p2 24.9582
+(S=11), p3 7.2809 (S=7), p4 14.3524 (S=18), p5 876.7182 (S=7, Chinese). The
+no-engram variant of p1 differs (104.3867), which is the expected effect of the
+subsystem and the reason the primary capture runs with the tables.
+
+Discovery worth the phase order: the score path writes a per-layer trace next
+to the logits — `x_L<nn>.bin` (the layer input, S x 5120 f32), `y_L<nn>.bin`,
+`hce_L01/L14.bin` and `erows_L01/L14.txt` for the engram layers. That is a
+layer-by-layer gate instrument, not just an end-of-model one, and the port
+should use it from P3 onward: a wrong layer shows up at its own layer index
+instead of being smeared into the final logits.
 
 ## 7. Numerics contract
 
