@@ -258,6 +258,7 @@ template <int NBIT, int V3, int EXT, int M>
 static int v41_vqg_optin(uint32_t cbb) {
     static uint32_t s_optin = 0u;
     if (s_optin >= cbb) return 1;
+    (void)cudaGetLastError();   /* the opt-in must not see a previously latched error (see ds41_vq_decode.cuh) */
     const bool ok = cudaFuncSetAttribute(v41_vqg_gateup_kernel<NBIT, V3, EXT, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess &&
                     cudaFuncSetAttribute(v41_vqg_down_kernel<NBIT, V3, EXT, M>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb) == cudaSuccess;
     (void)cudaGetLastError();

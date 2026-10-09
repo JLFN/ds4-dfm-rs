@@ -358,6 +358,7 @@ static int v41_vq_persist_n_go(int stage, uint16_t *h, float *part, const uint8_
                                uint32_t cbb, const float *gr, int nsm) {
     static uint32_t s_optin[2] = { 0u, 0u };
     if (s_optin[stage] < cbb) {
+        (void)cudaGetLastError();   /* the opt-in must not see a previously latched error (see ds41_vq_decode.cuh) */
         const cudaError_t e = stage == 0
             ? cudaFuncSetAttribute(v41_vq_gu_persist_n_kernel<NBIT, EXT, M, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb)
             : cudaFuncSetAttribute(v41_vq_dn_persist_n_kernel<NBIT, EXT, M, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)cbb);
@@ -407,6 +408,7 @@ static int v41_vq_persist_launch(int stage, uint16_t *h, float *part, const uint
         return 0;
     }
     if (s_optin[stage] < need) {
+        (void)cudaGetLastError();   /* the opt-in must not see a previously latched error (see ds41_vq_decode.cuh) */
         const cudaError_t e = stage == 0
             ? cudaFuncSetAttribute(v41_vq_gu_persist_kernel<NBIT, EXT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need)
             : cudaFuncSetAttribute(v41_vq_dn_persist_kernel<NBIT, EXT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)need);
