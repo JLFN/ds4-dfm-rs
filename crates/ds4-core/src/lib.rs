@@ -1561,6 +1561,32 @@ impl Model {
             .as_ref()
             .map(|w| w.engram_layers.iter().map(|&v| v as i32).collect())
             .unwrap_or_default();
+        // P4-3: the engram table wiring the native cannot re-read (the host
+        // ABI path never touches the metadata).  The shard paths are Rust
+        // Strings in the wire; the ABI carries NUL-terminated pointers that
+        // borrow these CStrings through the open call.
+        let v41_engram_rows: Vec<u64> = v41_wire
+            .as_ref()
+            .map(|w| w.engram_rows.clone())
+            .unwrap_or_default();
+        let v41_engram_weight_off: Vec<u64> = v41_wire
+            .as_ref()
+            .map(|w| w.engram_weight_off.clone())
+            .unwrap_or_default();
+        let v41_engram_scale_off: Vec<u64> = v41_wire
+            .as_ref()
+            .map(|w| w.engram_scale_off.clone())
+            .unwrap_or_default();
+        let v41_engram_paths: Vec<CString> = match v41_wire.as_ref() {
+            Some(w) => w
+                .engram_table_path
+                .iter()
+                .map(|p| cstring_path(p))
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let v41_engram_path_ptrs: Vec<*const c_char> =
+            v41_engram_paths.iter().map(|p| p.as_ptr()).collect();
         let ffi_shape = ds4_host_shape {
             variant: identified.shape.variant as u32,
             n_compress: compress.len() as u32,
@@ -1618,6 +1644,26 @@ impl Model {
                 .unwrap_or(0),
             v41_mtp_towers: v41_wire.as_ref().map(|w| w.mtp_towers).unwrap_or(0),
             v41_mtp_experts: v41_wire.as_ref().map(|w| w.mtp_experts).unwrap_or(0),
+            v41_engram_rows: if v41_engram_rows.is_empty() {
+                ptr::null()
+            } else {
+                v41_engram_rows.as_ptr()
+            },
+            v41_engram_weight_off: if v41_engram_weight_off.is_empty() {
+                ptr::null()
+            } else {
+                v41_engram_weight_off.as_ptr()
+            },
+            v41_engram_scale_off: if v41_engram_scale_off.is_empty() {
+                ptr::null()
+            } else {
+                v41_engram_scale_off.as_ptr()
+            },
+            v41_engram_table_path: if v41_engram_path_ptrs.is_empty() {
+                ptr::null()
+            } else {
+                v41_engram_path_ptrs.as_ptr()
+            },
         };
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;
         let mut ffi_bind = pack_host_bind_map(&bind_plan)?;

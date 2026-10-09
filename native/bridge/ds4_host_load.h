@@ -54,6 +54,17 @@ typedef struct {
     int32_t v41_candidate_block_size;
     uint32_t v41_mtp_towers;
     uint32_t v41_mtp_experts;
+    /* P4-3: the engram table on disk.  Per engram layer (v41_n_engram
+     * entries): the row count, the two plane offsets inside that layer's
+     * shard, and the shard path (NUL-terminated, shorter than the native
+     * 1024-byte buffer).  Borrowed for the open call; all four NULL when
+     * n_engram is 0, and the native then leaves its engram arrays zeroed.
+     * The Rust host fills these from V41Wire; the native copies without
+     * re-checking readability (the host owns the --engram-dir rewrite). */
+    const uint64_t *v41_engram_rows;
+    const uint64_t *v41_engram_weight_off;
+    const uint64_t *v41_engram_scale_off;
+    const char *const *v41_engram_table_path;
 } ds4_host_shape;
 
 void ds4_host_shape_install(const ds4_host_shape *s);

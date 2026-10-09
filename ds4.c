@@ -2609,9 +2609,9 @@ static void v41_report_wiring(int with_rows) {
     fprintf(stderr, "ds4: V4.1 wiring: kv sources %d / index sources %d / candidate L%d (%d blocks x %d) / engram %u layers",
             nk, ni, g_ds4_v41.candidate_source_layer, g_ds4_v41.candidate_topk_blocks, g_ds4_v41.candidate_block_size,
             g_ds4_v41.n_engram);
-    /* The row counts exist only on the metadata path; the host ABI does not
-     * carry them yet (P4-3), and printing zeros as if they were read would
-     * be a lie. */
+    /* The row counts ride both loaders since P4-3 (metadata and the host
+     * ABI); with_rows stays explicit so a caller that has not copied them
+     * yet cannot print zeros as if they were read. */
     if (with_rows) {
         fprintf(stderr, " (%llu+%llu rows on disk)\n",
                 (unsigned long long)(g_ds4_v41.n_engram > 0 ? g_ds4_v41.engram_rows[0] : 0),
@@ -2662,9 +2662,28 @@ static void model_apply_host_v41_wiring(const ds4_host_shape *s) {
     v->candidate_block_size   = s->v41_candidate_block_size;
     v->mtp_towers  = s->v41_mtp_towers;
     v->mtp_experts = s->v41_mtp_experts;
-    /* The engram shard paths, table row counts and the draft parameters are
-     * not on this ABI yet (P4-3/P5); nothing in this unit reads them. */
-    v41_report_wiring(0);
+    /* P4-3: the engram table wiring (rows, plane offsets, shard path).  A
+     * count without its arrays is a bridge bug, not an artifact property
+     * (same rule as the wiring arrays above). */
+    if (v->n_engram > 0 &&
+        (!s->v41_engram_rows || !s->v41_engram_weight_off ||
+         !s->v41_engram_scale_off || !s->v41_engram_table_path)) {
+        ds4_die("V4.1 host shape is missing its engram table wiring");
+    }
+    for (uint32_t i = 0; i < v->n_engram; i++) {
+        const char *p = s->v41_engram_table_path[i];
+        const size_t plen = p ? strlen(p) : 0;
+        if (plen == 0 || plen >= sizeof v->engram_table_path[i]) {
+            ds4_die("V4.1 host shape has an invalid engram table path");
+        }
+        v->engram_rows[i] = s->v41_engram_rows[i];
+        v->engram_weight_off[i] = s->v41_engram_weight_off[i];
+        v->engram_scale_off[i] = s->v41_engram_scale_off[i];
+        memcpy(v->engram_table_path[i], p, plen + 1);
+    }
+    /* The draft parameters (mtp block/targets) are still not on this ABI
+     * (P5); nothing reads them on this path. */
+    v41_report_wiring(1);
 }
 
 /* Host already ran config_validate.  Apply the pinned literal + the

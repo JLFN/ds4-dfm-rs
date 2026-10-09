@@ -372,6 +372,12 @@ pub struct ds4_host_shape {
     pub v41_candidate_block_size: i32,
     pub v41_mtp_towers: u32,
     pub v41_mtp_experts: u32,
+    /* P4-3: per-engram-layer table wiring (row count, the two plane offsets
+     * in the shard, the shard path).  Borrowed for the open call. */
+    pub v41_engram_rows: *const u64,
+    pub v41_engram_weight_off: *const u64,
+    pub v41_engram_scale_off: *const u64,
+    pub v41_engram_table_path: *const *const c_char,
 }
 
 #[repr(C)]
