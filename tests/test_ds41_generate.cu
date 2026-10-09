@@ -249,7 +249,20 @@ int main(int argc, char **argv) {
     gen_feed g;
     memset(&g.ref, 0, sizeof g.ref);
     g.np = (uint32_t)prompt.size();
+    /* THE E0 gate bug: the emit hook's row position is np + emitted, and
+     * emitted was never initialized — uninitialized stack garbage that is
+     * deterministic per binary (the 485e9c9 harness diverged at the first
+     * step, the b36a865 one passed; identical addresses, identical payload
+     * digests, so the garbage was invisible to every instrument).  Zero it,
+     * and keep DS41_EMIT_OFFSET as the deliberate reproduction: any nonzero
+     * offset shifts every live-hashed engram row the same way the garbage did. */
+    g.emitted = 0;
+    g.eos = 0;
     g.ids = NULL;
+    if (const char *eo = getenv("DS41_EMIT_OFFSET")) {
+        g.emitted = (uint32_t)atoi(eo);
+        printf("emit offset: %u (deliberate)\n", g.emitted);
+    }
     const int n_eng = ds4_v41_engram_count(e);
     if (!no_engram && n_eng > 0) {
         if (!engram_dir) { fprintf(stderr, "harness: the model has engram layers; pass --engram-dir <dir> (or --no-engram for the port-only debug mode)\n"); return 2; }
