@@ -53,6 +53,16 @@ int ds4_v41_engram_meta(void *engine, int k, uint32_t *il, char *path, int path_
                         uint64_t *rows, uint64_t *weight_off, uint64_t *scale_off,
                         uint32_t *head_dim, uint32_t *cols);
 
+/* Diagnostic (P4-4 head investigation): the forward's head block dumps the
+ * bytes a weight resolve returns (device range or mapped pointer) and the raw
+ * mapping bytes for the same span when DS41_DUMP_HEAD=<prefix> is set, so a
+ * wrong resolve shows up as a byte diff.  Both write `path` and return 1 on
+ * success. */
+int ds4_gpu_v41_debug_read_weight(const void *model_map, uint64_t model_size,
+                                  uint64_t offset, uint64_t bytes, const char *path);
+int ds4_gpu_v41_debug_dump_raw(const void *model_map, uint64_t model_size,
+                               uint64_t offset, uint64_t bytes, const char *path);
+
 #ifdef __cplusplus
 }
 #endif

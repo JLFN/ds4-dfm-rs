@@ -658,6 +658,21 @@ static bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
     if (!ds4_gpu_v41_hc_pre_tensor(st->x, st->hc, st->pre_mix, E, DS4_N_HC, n)) return false;
     if (!ds4_gpu_v41_rms_norm_tensor(st->xn, st->x, e->model.map, e->model.size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS)) return false;
     if (n > st->logits_rows) { fprintf(stderr, "ds4: [v41] head needs %u logits rows, buffer has %u\n", n, st->logits_rows); return false; }
+    if (getenv("DS41_DUMP_HEAD")) {
+        /* P4-4 head investigation: dump the head weights as the resolve serves
+         * them and the raw mapping bytes for the same spans (see ds41_forward.h). */
+        const char *pref = getenv("DS41_DUMP_HEAD");
+        char pa[512], pb[512];
+        snprintf(pa, sizeof pa, "%s.norm_dev.bin", pref);
+        snprintf(pb, sizeof pb, "%s.norm_raw.bin", pref);
+        ds4_gpu_v41_debug_read_weight(e->model.map, e->model.size, e->weights.output_norm->abs_offset, 20480u, pa);
+        ds4_gpu_v41_debug_dump_raw(e->model.map, e->model.size, e->weights.output_norm->abs_offset, 20480u, pb);
+        snprintf(pa, sizeof pa, "%s.w_dev.bin", pref);
+        snprintf(pb, sizeof pb, "%s.w_raw.bin", pref);
+        ds4_gpu_v41_debug_read_weight(e->model.map, e->model.size, e->weights.output->abs_offset, 1u << 20, pa);
+        ds4_gpu_v41_debug_dump_raw(e->model.map, e->model.size, e->weights.output->abs_offset, 1u << 20, pb);
+        fprintf(stderr, "ds4: [v41] head weights dumped to %s.*\n", pref);
+    }
     if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
     st->last_logit_row = n - 1u;
     if (g_ds4_v41_prof) {   /* per-layer ms: one glance shows which layer eats the time (engram L1/L14, sources L2/8/14/20) */

@@ -136,6 +136,43 @@ extern "C" int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_
     return 1;
 }
 
+/* Diagnostic (P4-4 head investigation): dump what a weight resolve actually
+ * returns.  read_weight resolves the span through the same cuda_model_range_ptr
+ * the head's kernels use and copies the bytes back; dump_raw writes the raw
+ * mapping bytes for the same span.  A wrong resolve (different range, stale
+ * copy) shows up as a byte diff between the two files.  DS41_DUMP_HEAD=<prefix>
+ * in the forward's head block triggers both. */
+extern "C" int ds4_gpu_v41_debug_read_weight(const void *model_map, uint64_t model_size,
+                                             uint64_t offset, uint64_t bytes, const char *path) {
+    if (!model_map || !path || offset > model_size || bytes > model_size - offset) return 0;
+    const char *p = cuda_model_range_ptr(model_map, offset, bytes, "ds41 debug weight");
+    fprintf(stderr, "ds4: [ds41-debug] resolve off %llu bytes %llu -> %p (map %p, delta %lld)\n",
+            (unsigned long long)offset, (unsigned long long)bytes, (const void *)p, model_map,
+            (long long)(p ? (intptr_t)p - (intptr_t)model_map : 0));
+    if (!p) return 0;
+    void *tmp = malloc((size_t)bytes);
+    if (!tmp) return 0;
+    if (cudaMemcpy(tmp, p, (size_t)bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fprintf(stderr, "ds4: [ds41-debug] readback failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        free(tmp);
+        return 0;
+    }
+    FILE *g = fopen(path, "wb");
+    if (g) { fwrite(tmp, 1, (size_t)bytes, g); fclose(g); }
+    free(tmp);
+    return 1;
+}
+
+extern "C" int ds4_gpu_v41_debug_dump_raw(const void *model_map, uint64_t model_size,
+                                          uint64_t offset, uint64_t bytes, const char *path) {
+    if (!model_map || !path || offset > model_size || bytes > model_size - offset) return 0;
+    FILE *g = fopen(path, "wb");
+    if (!g) return 0;
+    fwrite((const char *)model_map + offset, 1, (size_t)bytes, g);
+    fclose(g);
+    return 1;
+}
+
 /* Tensor-level decode entry for the forward (mirror of the engine's
  * ds4_gpu_v41_routed_moe_tensor, src/cuda/cuda_v41_3.inc.cu:156-230; the
  * prefill GEMM arm and the per-layer streaming registration are not ported:
