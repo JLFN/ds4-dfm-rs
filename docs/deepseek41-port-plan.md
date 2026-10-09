@@ -491,6 +491,7 @@ P4 unit order, each with its own gate:
 | P4-4 | forward bring-up on the golden prompts | G2: per-layer `x_Lnn`/`y_Lnn` traces first, then logits |
 | P4-5 | the sparse-attention tensor-core family: the two-pass seg decode, the single-pass prefill mma, the scalar split-K, the merge, and the entry's try order (`cuda/ds41_attn_mma.cuh`) | G2: the n<=8 prompts bit-exact vs the bare golden (§6.12); the prefill arm (n>=64) and the 9..63 scalar band gate with unit C's longer prompt |
 | P4-6 | the n>8 prefill arms: f32/bf16 dense GEMMs, the q4_K prefill GEMM, the VQ routed-MoE prefill (scheduler + the v2 fused arm + the v3 tensor-core vqm/vqs), and the cuBLAS-state fix (cublasSetStream before each ds41 GEMM, mirroring the engine's documented workspace reset) | G2: p1..p5 + p6k64 (n=64) bit-exact vs the bare golden, 258 zero-diff trace lines, zero nonzero (§6.13) |
+| P4-7 | the zchain sidecar: the gr/rb override stores (`ds4_gpu_v41_set_gr_override`, `ds4_gpu_v41_set_rb_override` + the router-entry consult), the decode-arm gr wiring, and the harness `--zchain` loader | G2: the with-sidecar golden (the ORIGINAL capture) bit-exact on p1..p5 (215 zero-diff lines, zero nonzero, PPLs exact), plus the bare no-op control unchanged (258 zero-diff lines) (§6.14) |
 
 ## 6.8 P4-1 evidence: the VQ decode family vs the host oracle (2026-10-09)
 
@@ -965,6 +966,73 @@ attention input, the attention kernel output, the o-projection output, the
 post-attention hc), in addition to the P4-4 set.
 
 Unit: C complete (P4-6)
+
+## 6.14 Unit D evidence: the zchain gr/rb sidecar (2026-10-09)
+
+Unit commit: e41b495 (the two stores, the decode-arm wiring, the harness
+loader).
+
+1. What was ported (engine-cited in the file headers). The gr store
+   `ds4_gpu_v41_set_gr_override` (cuda_vq_prefill.inc.cu:246-258: free the
+   old table, cudaMalloc n_expert*out_dim*4, H2D; host NULL unloads) next to
+   `g_v41_gr` in cuda/ds41_vq_prefill.cuh; the rb store
+   `ds4_gpu_v41_set_rb_override` (cuda_v41_3.inc.cu:48-77: the on-disk
+   exp_probs_b read by UVA cudaMemcpyDefault, + delta, a process-level
+   <=64-entry device table keyed by bias_offset, host NULL unloads all/one)
+   in cuda/ds41_router.cuh, with the router entry now consulting the table
+   (engine :85). The decode arm of `ds4_gpu_v41_routed_moe_tensor` passes
+   `g_v41_gr` exactly as the engine does (cuda_v41_3.inc.cu:189-192). The
+   consumers already existed from P4-1/P4-6 and match arm-for-arm: the
+   row-dot gain multiply `acc * f16(m.gr[r]) * (m.gov ? m.gov[r] : 1)` is
+   identical on both sides (ds41_vq_row.cuh:265-266 vs cuda_vq_row.inc.cu:248;
+   the prefill mma at ds41_vq_prefill_mma.cuh:210 and the vqs form at :447
+   vs cuda_vq_prefill_mma.inc.cu:192 / cuda_vq_reg_mma.inc.cu:191).
+
+2. The gate-side loader. The harness gains `--zchain <dir>`: a C mirror of
+   the engine's single-directory loader (core_v41_amp.c:44-117 — gr header
+   {n_expert, D, 1=f32 | 2=f16 | 43=fp4x32 storing s-1}, rb header
+   {n_expert, 1=f32}, fp4x32 = the 17-byte block decode of
+   ds4_quantfmt.c:28-40 over the ds4_fp8.h primitives), validating the
+   headers against the model shape through two new accessors
+   (`ds4_v41_shape`, `ds4_v41_router_bias_ref` — the engine's
+   model_find_tensor + m->map/m->size, core_v41_amp.c:104) and mounting in
+   the engine's order (rb unload-all first, v41_amp_load :227-229). A
+   present-but-broken file is a hard stop, never a skip. The real directory
+   mounts gr=39 rb=27 — the same counts the engine's own golden log printed
+   (golden/p1.log: "27 层挂上路由偏置侧车" / "39 层挂上逐专家增益覆盖").
+   Production keeps the Rust reader (sidecar.rs, P2); the C copy is the gate
+   driver only.
+
+3. Gate B — the with-sidecar golden (the ORIGINAL capture, `--zchain`): one
+   harness invocation, p1..p5, 215 zero-diff lines, zero
+   nonzero-diff/FAIL/mismatch: p1 (n=8) 0/1034240 diffs, argmax 8/8, PPL
+   112.0845; p2 (n=11) 0/1422080, 11/11, 24.9582; p3 (n=7) 0/904960, 7/7,
+   7.2809; p4 (n=18) 0/2327040, 18/18, 14.3524; p5 (n=7) 0/904960, 7/7,
+   876.7182 — every PPL equal to the golden's to the printed digit, every
+   x/y/hce trace bit-identical. This closes both halves at once: the gr
+   application (39 layers; the decode arm for p1/p3/p5, the prefill arm for
+   p2/p4) and the rb application (27 layers, routing moved through the
+   selection score).
+
+4. Gate A — the bare no-op control (no `--zchain`, the bare golden):
+   p1..p5 + p6k64 unchanged from unit C's numbers (46.8780 / 22.0679 /
+   9.5414 / 10.7011 / 6662.9080 / 8.1912), 258 zero-diff lines, zero
+   nonzero — the new code is inert when nothing is mounted (g_v41_gr
+   all-NULL, g_v41_rb_n = 0).
+
+5. Recorded limits. The amp half of the sidecar is not ported: the real
+   directory carries no amp_Lnn.bin (39 gr + 27 rb + manifest.txt, amp=0)
+   and no Spark directory does, so there is nothing to gate. Its apply point
+   is the engine's v41_layer tail (core_v41_forward.c:148-155, y += x·(B·A)
+   rounded to bf16; the towers take their own ampA at :149; the solve hook
+   :152 can end the forward) and its loader rides the same amp-directory
+   wiring (core_engine_open.c:122-124 → v41_amp_load, core_v41_amp.c:223) —
+   recorded for that future unit together with the base.fnv fingerprint gate
+   (v41_pt_base_ok, core_v41_amp.c:163: FNV-1a over gr_Lnn.bin in layer
+   order; missing warns and allows, mismatch stops). Single-directory
+   captures have no base.fnv, consistent with the per-file mount rule.
+
+Unit: D complete
 
 ## 7. Numerics contract
 
