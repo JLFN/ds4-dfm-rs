@@ -697,6 +697,95 @@ Contracts and notes:
 
 Next: P4-3 (fp8_32x32 decode and the engram read path).
 
+## 6.11 P4-3 evidence: fp8_32x32 and the engram chain on real rows (2026-10-09)
+
+Unit commits: 6b06531 (the engram wiring over the host ABI), de38264 (the
+device port + gates), deb785f (real-mode argv fix).
+
+Built:
+
+- Host ABI (step 2): `ds4_host_shape` gains `v41_engram_rows`,
+  `v41_engram_weight_off`, `v41_engram_scale_off` and
+  `v41_engram_table_path` (native/bridge/ds4_host_load.h + the ds4-sys
+  mirror), filled from `V41Wire` in ds4-core and consumed in
+  `model_apply_host_v41_wiring` (ds4.c) under the same count-without-arrays
+  rule as the wiring arrays; the shard paths travel as borrowed NUL-terminated
+  pointers bounded by the native's 1024-byte buffer. The stale "not on this
+  ABI yet (P4-3)" comment is gone and `v41_report_wiring` prints the row
+  counts on the host path too.
+- `cuda/ds41_fp8blk.cuh` (device): the fp8_32x32 decode family — the NT/XB
+  GEMV kernel, the grouped `grid.y` row-offset form, the wkv entry's
+  bf16+cuBLAS arm for n>8, the round_out pass and the engram row dequant;
+  sources cited per section in the file header. Named port deviation: no
+  `cublasSetStream` — the port does not compile with `--default-stream
+  per-thread`, so stream 0 is the legacy default for both our launches and
+  cuBLAS; the engine hands cuBLAS `cudaStreamPerThread` only because of PTDS
+  (`cuda_v41_1.inc.cu:56-58`). The split-K workspace prep follows the port's
+  S1.1a rule.
+- `cuda/ds41_engram.cuh`: the gate kernel (`cuda_v41_3.inc.cu:109-134`) and
+  the read path's device primitives — `ds4_gpu_host_alloc/free` (pinned
+  mapped), `ds4_gpu_host_flag_wait` (the 1-thread `__ldcv` spin with the ~5 s
+  timeout) and `ds4_gpu_tensor_write_zerocopy` (the `__ldcv` hostcopy
+  kernel), all from `cuda_decode_graph.inc.cu:118-171` /
+  `cuda_graphcap.inc.cu:254-259`. The host half of the read path is the P2
+  Rust reader (`EngramShard`, §6.6.2).
+
+The recon finding that corrects the gate line: §6.7's P4-3 row said "erows
+and the wkv matmul against the golden `hce_L01/L14` traces", but the golden
+`hce` is the engram OUTPUT (hc after the update — the engine dumps it after
+the gate, `core_v41_engram.c:471-475`), and reproducing it needs `hc_before`
+(the layer-entry hc), which no golden file carries (the set has per-layer
+x/y, erows, hce and logits only; the layer-entry hc exists solely in the
+ptrain save path, `core_v41_forward.c:190-191`). The hce end-to-end
+comparison therefore lands in P4-4's G2, where the port produces `hc_before`
+itself. P4-3 gates what its inputs allow, on the engine's own row ids: the
+erows against the golden files, then the real rows -> decode -> wkv chain
+against an f64 emulation of the same bytes.
+
+Gates:
+
+1. Local (RTX 4070 SUPER, sm_89), `make test-ds41-fp8` 9/9 PASS: onehot
+   cases bit-exact (plain n=1, round n=2 with round_out, grouped n=2);
+   dense n=1/n=2 at 1.6e-7/1.1e-7 relative (the f32 GEMV vs the f64
+   emulation); n=12 (the >8 bf16+cuBLAS arm) at 2.2e-6; the round_out dense
+   case 2.0e-3 with 3 diffs, covered by the recorded allowance: max |delta|
+   <= max(1e-3 * max|ref|, one bf16 quantum at max|ref|).
+2. Local, `make test-ds41-engram`: rows bit-exact (1280 values); the read
+   path live (pinned zero-copy upload, host flag wait); gate cases: absorb
+   and zero bit-exact, dense within the term-relative bound
+   (1e-5 * max(|got|,|want|,|h|,|val|) + one bf16 ulp at the output). The
+   measured worst dense element: |d| 9.5e-7 at a 1.5e-4 output where h and
+   gate*val cancel (val 0.32) — 3e-6 relative to the update scale; a bound
+   on the output's own ulp alone would fail a correct kernel at 2 grid
+   steps there.
+3. Spark (sm_121): `make test-ds41-fp8` 9/9, numbers identical to sm_89
+   (the >8 cuBLAS arm's accumulation differs slightly across archs:
+   1.38e-6 vs 2.20e-6, both far inside the criterion); `make
+   test-ds41-engram` PASS with identical numbers; the regression
+   `make test-ds41-vq` 70/70 and `make test-ds41-moe` 8/8.
+4. Spark, erows re-run with the P4-3 ABI in place (`ds41_inspect
+   --engram-dir ... --ids golden/p1.ids --erows-out`): diff against
+   `golden/p1.logits.bin.erows_L01/L14.txt` gives EROWS-L01-IDENTICAL and
+   EROWS-L14-IDENTICAL.
+5. Spark, the real chain (`ds41_engram_real.rs` preads the golden row ids
+   through EngramShard and reads the layer's wkv tensor from the GGUF; the
+   test's `--real` mode runs the device rows + wkv on those exact bytes):
+   L01 rows 49152 values bit-exact, wkv max rel 9.25e-8 (max abs 7.6e-6 at
+   scale 82.5); L14 rows bit-exact, wkv max rel 8.2e-8 (max abs 1.5e-5 at
+   scale 185.8).
+
+Fixture notes (kept): the fp8/engram images are page-aligned with
+page-aligned tensor offsets, because the range resolver's register tier
+page-rounds ranges and a 16-byte-aligned base makes neighbor registrations
+overlap — the source then straddles a boundary and the cold copy fails with
+invalid argument (the engine's documented kv_rms_weight shape,
+`ds4_cuda.cu:1795-1803`; the first fixture version failed its grouped cases
+exactly there). The engram fixture uses the artifact's own geometry (E=5120,
+HC=4, head_dim=256, eps=1e-20) at n=2.
+
+Next: P4-4 (the forward bring-up; G2: per-layer x/y traces first, then
+logits — where hce_L01/L14 joins the comparison via hc_before).
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
