@@ -864,6 +864,17 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
     return ok ? 0 : 1;
 }
 
+/* The DS41_GEN_LOGITS dump (see the generate entry): one full logits row per
+ * emitted position, in emission order. */
+static void v41_gen_dump_row(ds4_v41_state *st, FILE *fd) {
+    if (!fd) return;
+    float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
+    if (row && ds4_gpu_tensor_read(st->logits, (uint64_t)st->last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
+        fwrite(row, 4, DS4_N_VOCAB, fd);
+    }
+    free(row);
+}
+
 /* ---- the greedy generate entry (core_v41_api.c:426-470 + the round drive
  * :175-425, the non-spec eager subset) ----
  * Prompt prefill in chunks (the shared v41_prefill_chunk), then n=1 decode
@@ -892,6 +903,11 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     st.head_last_only = 1;
     st.no_engram = no_engram;   /* the gate's compare-only mode (the engine's --v41-no-engram) */
     st.efeed = feed;            /* live rows: the caller refreshes them per step (emit hook) */
+    /* Diagnostic (kept): DS41_GEN_LOGITS=<path> appends the full logits row of
+     * every emitted position (f32, DS4_N_VOCAB per row) so the step path can
+     * be diffed against the score path on the same sequence. */
+    const char *gen_lg = getenv("DS41_GEN_LOGITS");
+    FILE *gen_fd = gen_lg ? fopen(gen_lg, "wb") : NULL;
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(16u);   /* the engine's 16 B device slot; argmax writes the first int */
     int rc = 1;
     int32_t tok = 0;
@@ -908,6 +924,7 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
         if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
             ds4_gpu_synchronize() == 0 ||
             ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) break;
+        v41_gen_dump_row(&st, gen_fd);
         {   /* the engine's one-shot argmax self-check (core_v41_api.c:193-200):
              * a wrong kernel would silently emit wrong tokens, so compare the
              * device index against a host scan of the same row once. */
@@ -929,8 +946,10 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
                 ds4_gpu_synchronize() == 0 ||
                 ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) { rc = 1; break; }
+            v41_gen_dump_row(&st, gen_fd);
         }
     } while (0);
+    if (gen_fd) fclose(gen_fd);
     if (am) ds4_gpu_tensor_free(am);
     v41_state_free(&st);
     return rc;

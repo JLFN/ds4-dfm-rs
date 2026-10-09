@@ -250,6 +250,32 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < g.np; i++) if (!feed_fill(&g, i, (int64_t)i)) { fprintf(stderr, "harness: prompt feed fill failed at %u\n", i); return 1; }
         printf("engram feed: %zu layers, cols %u, head_dim %u, %u prompt rows hashed\n",
                g.layers.size(), g.layers.empty() ? 0 : g.layers[0].cols, g.layers.empty() ? 0 : g.layers[0].hd, g.np);
+        /* Self-check: the engine's own captured rows for this prompt (the
+         * golden erows next to the ids file, written by the score capture)
+         * must equal what this harness's hash produces — the P2 instrument,
+         * re-run here so a hash bug can never masquerade as a port bug. */
+        for (uint32_t k = 0; k < g.layers.size(); k++) {
+            std::string ids_path_s = ids_path;
+            const size_t dot = ids_path_s.rfind(".ids");
+            const std::string base = (dot == std::string::npos) ? ids_path_s : ids_path_s.substr(0, dot);
+            char ep[4600];
+            snprintf(ep, sizeof ep, "%s.logits.bin.erows_L%02u.txt", base.c_str(), g.layers[k].il);
+            FILE *ef = fopen(ep, "r");
+            if (!ef) { printf("hash self-check L%02u: %s absent, skipped\n", g.layers[k].il, ep); continue; }
+            std::vector<int64_t> erows;
+            long long v;
+            while (fscanf(ef, "%lld", &v) == 1) erows.push_back(v);
+            fclose(ef);
+            size_t bad = 0;
+            const size_t want = (size_t)g.np * g.layers[k].cols;
+            if (erows.size() != want) { printf("hash self-check L%02u: golden %zu rows != %zu expected\n", g.layers[k].il, erows.size(), want); continue; }
+            std::vector<int64_t> rows;
+            for (uint32_t i = 0; i < g.np; i++) {
+                ehash_rows(&g, (int64_t)i, k, &rows);
+                for (uint32_t c = 0; c < g.layers[k].cols; c++) if (rows[c] != erows[(size_t)i * g.layers[k].cols + c]) bad++;
+            }
+            printf("hash self-check L%02u: %zu/%zu rows differ vs the golden erows\n", g.layers[k].il, bad, want);
+        }
     }
 
     std::vector<int> oids;
