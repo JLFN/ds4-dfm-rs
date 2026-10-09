@@ -38,7 +38,6 @@ const PLANE_FLAG: u32 = 2;
 
 struct Payload {
     which: usize,
-    off: u64,
     nc: u32,
     rows: u32,
     cols: u32,
@@ -105,7 +104,7 @@ fn run(gguf: &str, abs: u64, expert: usize, outdir: &Path) -> Result<(), String>
         }
         len += 8; /* the payload tail pad */
         let bytes = read_at(&mut f, abs + off, len)?;
-        pays.push(Payload { which, off, nc, rows, cols, bytes });
+        pays.push(Payload { which, nc, rows, cols, bytes });
     }
     if pays.is_empty() {
         return Err(format!("expert {expert}: no payloads"));

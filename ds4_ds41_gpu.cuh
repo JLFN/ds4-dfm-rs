@@ -97,6 +97,16 @@ extern "C" int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_
         return 0;
     }
     const cudaStream_t st = ds4_cuda_moe_stream();
+    /* Order the probe after the caller's uploads. The moe stream is created
+     * cudaStreamNonBlocking, so it does not inherit the legacy default
+     * stream's ordering, and a pageable H2D cudaMemcpy returns once staged —
+     * its device-side DMA may still be in flight (CUDA runtime API contract).
+     * Without this event the xpack can read the previous probe's activation;
+     * measured on the Spark: 2/35 probes returned the previous probe's x
+     * bit-for-bit before the ordering was added. */
+    static cudaEvent_t ev = NULL;
+    if (!ev) (void)cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    if (ev && cudaEventRecord(ev, 0) == cudaSuccess) (void)cudaStreamWaitEvent(st, ev, 0);
     uint16_t *xb = (uint16_t *)v41_grow(&g_v41_rowprobe_x, (uint64_t)cols * 2u, "v41 row probe x");
     if (!xb) return 0;
     v41_vq_xpack_kernel<<<(unsigned)((cols + 255u) / 256u), 256, 0, st>>>(xb, x, cols);
