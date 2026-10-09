@@ -370,10 +370,10 @@ static int v41_vq_persist_n_go(int stage, uint16_t *h, float *part, const uint8_
     }
     if (stage == 0) {
         v41_pdl_register((const void *)v41_vq_gu_persist_n_kernel<NBIT, EXT, M, NW>);   /* v41_pdl_wait before touching sel/order/x */
-        v41_vq_gu_persist_n_kernel<NBIT, EXT, M, NW><<<(unsigned)nsm, NW * 32, cbb, ds4_cuda_moe_stream()>>>(h, blob, sel, ord, xb, IN, MID, K, np, clamp, cbb);
+        v41_vq_gu_persist_n_kernel<NBIT, EXT, M, NW><<<(unsigned)nsm, NW * 32, cbb, ds4_current_stream()>>>(h, blob, sel, ord, xb, IN, MID, K, np, clamp, cbb);
     } else {
         v41_pdl_register((const void *)v41_vq_dn_persist_n_kernel<NBIT, EXT, M, NW>);
-        v41_vq_dn_persist_n_kernel<NBIT, EXT, M, NW><<<(unsigned)nsm, NW * 32, cbb, ds4_cuda_moe_stream()>>>(part, blob, sel, ord, (const uint32_t *)h, MID, OUT, np, cbb, gr);
+        v41_vq_dn_persist_n_kernel<NBIT, EXT, M, NW><<<(unsigned)nsm, NW * 32, cbb, ds4_current_stream()>>>(part, blob, sel, ord, (const uint32_t *)h, MID, OUT, np, cbb, gr);
     }
     return cuda_ok(cudaGetLastError(), stage == 0 ? "v41 vq gateup persist (verify batch)" : "v41 vq down persist (verify batch)");
 }
@@ -419,7 +419,7 @@ static int v41_vq_persist_launch(int stage, uint16_t *h, float *part, const uint
     }
     v41_pdl_register((const void *)v41_vq_gu_persist_kernel<NBIT, EXT>);   /* both kernels v41_pdl_wait before sel/x/h */
     v41_pdl_register((const void *)v41_vq_dn_persist_kernel<NBIT, EXT>);
-    if (stage == 0) v41_vq_gu_persist_kernel<NBIT, EXT><<<(unsigned)s_nsm, V41_VQ_WARPS * 32u, need, ds4_cuda_moe_stream()>>>(h, blob, sel, xb, IN, MID, np, clamp, cbb);
-    else v41_vq_dn_persist_kernel<NBIT, EXT><<<(unsigned)s_nsm, V41_VQ_WARPS * 32u, need, ds4_cuda_moe_stream()>>>(part, blob, sel, (const uint32_t *)h, MID, OUT, np, cbb, gr);
+    if (stage == 0) v41_vq_gu_persist_kernel<NBIT, EXT><<<(unsigned)s_nsm, V41_VQ_WARPS * 32u, need, ds4_current_stream()>>>(h, blob, sel, xb, IN, MID, np, clamp, cbb);
+    else v41_vq_dn_persist_kernel<NBIT, EXT><<<(unsigned)s_nsm, V41_VQ_WARPS * 32u, need, ds4_current_stream()>>>(part, blob, sel, (const uint32_t *)h, MID, OUT, np, cbb, gr);
     return cuda_ok(cudaGetLastError(), stage == 0 ? "v41 vq gateup persist" : "v41 vq down persist");
 }

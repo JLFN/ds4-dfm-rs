@@ -18,6 +18,7 @@
 /tests/test_ling3vl_mla
 /tests/test_ling3vl_q5pair
 /tests/test_ds41_vq
+/tests/test_ds41_moe
 /tests/test_ling3vl_moefuse
 /tests/parity/kv_c_oracle
 /tests/parity/web_c_oracle

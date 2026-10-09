@@ -229,15 +229,15 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
     if (!h || !part || !xb) return 0;
     {   /* pack the activation to bf16: once per layer, negligible next to the expert kernels */
         const uint64_t nx = (uint64_t)n_tok * IN;
-        v41_vq_xpack_kernel<<<(unsigned)((nx + 255) / 256), 256, 0, ds4_cuda_moe_stream()>>>(xb, x, nx);
+        v41_vq_xpack_kernel<<<(unsigned)((nx + 255) / 256), 256, 0, ds4_current_stream()>>>(xb, x, nx);
         if (!cuda_ok(cudaGetLastError(), "v41 vq xpack")) return 0;
         extern int g_ds4_v41_prof;
         if (g_ds4_v41_prof) {
             uint32_t *c = (uint32_t *)v41_grow(&g_v41_vq_ogc, 4, "v41 vq offgrid");
             uint32_t hc = 0;
-            if (c && cudaMemsetAsync(c, 0, 4, ds4_cuda_moe_stream()) == cudaSuccess) {
-                v41_vq_offgrid_kernel<<<(unsigned)((nx + 255) / 256), 256, 0, ds4_cuda_moe_stream()>>>(c, x, nx);
-                if (cudaStreamSynchronize(ds4_cuda_moe_stream()) == cudaSuccess &&
+            if (c && cudaMemsetAsync(c, 0, 4, ds4_current_stream()) == cudaSuccess) {
+                v41_vq_offgrid_kernel<<<(unsigned)((nx + 255) / 256), 256, 0, ds4_current_stream()>>>(c, x, nx);
+                if (cudaStreamSynchronize(ds4_current_stream()) == cudaSuccess &&
                     cudaMemcpy(&hc, c, 4, cudaMemcpyDeviceToHost) == cudaSuccess) {
                     static uint64_t tot = 0, bad = 0;
                     tot += nx; bad += hc;
@@ -301,7 +301,7 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
     if (n_tok >= 2u) {
         ord = (int32_t *)v41_grow(&g_v41_vq_ord, np * 4, "v41 vq order");
         if (!ord) return 0;
-        v41_vq_order_kernel<<<1, (unsigned)np, 0, ds4_cuda_moe_stream()>>>(ord, sel, (uint32_t)np);
+        v41_vq_order_kernel<<<1, (unsigned)np, 0, ds4_current_stream()>>>(ord, sel, (uint32_t)np);
         if (!cuda_ok(cudaGetLastError(), "v41 vq order")) return 0;
     }
     /* Drain upstream errors before launching: CUDA errors are sticky, so
@@ -320,12 +320,17 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
         grp = v41_vq_grp_launch<NBIT, V3, EXT>(0, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np);
         if (grp < 0) return 0;
     }
-    const bool per = n_tok == 1u && V3 && shg && shd;
+    /* P4-2 debugging aid (remove when the unit closes): DS41_VQ_NO_PERSIST=1
+     * forces the plain kernels so the two paths can be compared on the same
+     * case.  Note: on sm_89 the plain gateup kernel currently compiles to 92
+     * registers and cannot launch at 1024 threads ("too many resources"); the
+     * persist kernels are pinned by __launch_bounds__(1024, 1) and launch. */
+    const bool per = n_tok == 1u && V3 && shg && shd && getenv("DS41_VQ_NO_PERSIST") == NULL;
     if (pern) { /* already launched */ }
     else if (per) { if (!v41_vq_persist_launch<NBIT, EXT>(0, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, (uint32_t)np, clamp, cbb, gr)) return 0; }
-    else if (ord) v41_vq_gateup_kernel<NBIT, V3, EXT, 1><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, ds4_cuda_moe_stream()>>>(
+    else if (ord) v41_vq_gateup_kernel<NBIT, V3, EXT, 1><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, ds4_current_stream()>>>(
         h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u, ord, (uint32_t)np, grp > 0 ? 1u : 0u);
-    else v41_vq_gateup_kernel<NBIT, V3, EXT, 0><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, ds4_cuda_moe_stream()>>>(
+    else v41_vq_gateup_kernel<NBIT, V3, EXT, 0><<<dim3((MID + rg - 1u) / rg, (unsigned)np), tg, shg ? cbb : 0u, ds4_current_stream()>>>(
         h, blob, sel, (const uint32_t *)xb, IN, MID, K, clamp, shg ? cbb : 0u, NULL, 0u, 0u);
     if (!per && !pern && !cuda_ok(cudaGetLastError(), "v41 vq gateup")) {
         /* Log the launch parameters with the failure: "invalid argument" alone
@@ -344,13 +349,13 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
     if (grp > 0 && v41_vq_grp_launch<NBIT, V3, EXT>(1, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np) < 0) return 0;
     if (pern) { if (!v41_vq_persist_n_launch<NBIT, EXT>(1, n_tok, h, part, blob, sel, ord, (const uint32_t *)xb, IN, MID, OUT, K, (uint32_t)np, clamp, cbb, gr)) return 0; }
     else if (per) { if (!v41_vq_persist_launch<NBIT, EXT>(1, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, (uint32_t)np, clamp, cbb, gr)) return 0; }
-    else if (ord) v41_vq_down_kernel<NBIT, V3, EXT, 1><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, ds4_cuda_moe_stream()>>>(
+    else if (ord) v41_vq_down_kernel<NBIT, V3, EXT, 1><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, ds4_current_stream()>>>(
         part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr, ord, (uint32_t)np, grp > 0 ? 1u : 0u);
-    else v41_vq_down_kernel<NBIT, V3, EXT, 0><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, ds4_cuda_moe_stream()>>>(
+    else v41_vq_down_kernel<NBIT, V3, EXT, 0><<<dim3((OUT + rd - 1u) / rd, (unsigned)np), td, shd ? cbb : 0u, ds4_current_stream()>>>(
         part, blob, sel, (const uint32_t *)h, MID, OUT, K, shd ? cbb : 0u, gr, NULL, 0u, 0u);
     if (!per && !pern && !cuda_ok(cudaGetLastError(), "v41 vq down")) return 0;
     if (!out) return 1;   /* the caller folds the routed sum and the shared expert later via ds4_gpu_v41_moe_tail_tensor */
-    v41_vq_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tok), 256, 0, ds4_cuda_moe_stream()>>>(out, part, w, K, OUT);
+    v41_vq_reduce_kernel<<<dim3((OUT + 255u) / 256u, n_tok), 256, 0, ds4_current_stream()>>>(out, part, w, K, OUT);
     return cuda_ok(cudaGetLastError(), "v41 vq reduce");
 }
 
@@ -370,7 +375,7 @@ __global__ static void v41_vq_tail_kernel(float *y, const float *partial, const 
 extern "C" int ds4_gpu_v41_moe_tail_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *so, const ds4_gpu_tensor *weights,
                                            uint32_t n_tok, uint32_t n_used, uint32_t out_dim) {
     if (!y || !so || !weights || !g_v41_vq_part.p || g_v41_vq_part.cap < (uint64_t)n_tok * n_used * out_dim * 4) return 0;
-    v41_vq_tail_kernel<<<dim3((out_dim + 255u) / 256u, n_tok), 256, 0, ds4_cuda_moe_stream()>>>(
+    v41_vq_tail_kernel<<<dim3((out_dim + 255u) / 256u, n_tok), 256, 0, ds4_current_stream()>>>(
         (float *)y->ptr, (const float *)g_v41_vq_part.p, (const float *)weights->ptr, (const float *)so->ptr, n_used, out_dim);
     return cuda_ok(cudaGetLastError(), "v41 moe tail");
 }

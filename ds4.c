@@ -19026,6 +19026,14 @@ static bool metal_graph_matmul_plain_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+static bool plain_graph_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_model        *model,
+        const ds4_tensor       *w,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
 
 /* One decode HC stage (attn or ffn side): rms_norm_plain(flat_hc) ->
  * hc fn matmul (hc_mix) -> sinkhorn split + weighted residual sum (+ fused
@@ -19157,10 +19165,13 @@ static bool metal_graph_encode_decode_layer_impl(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    /* V4.1 routes through one VQ blob per layer; the per-expert tensors do
+     * not exist, so its dims come from the shape (E -> FF -> E). */
+    const bool v41 = DS4_MODEL_VARIANT == DS4_VARIANT_V41;
+    const uint64_t expert_in_dim = v41 ? DS4_N_EMBD : layer->ffn_gate_exps->dim[0];
+    const uint64_t expert_mid_dim = v41 ? DS4_N_FF_EXP : layer->ffn_gate_exps->dim[1];
+    const uint64_t down_in_dim = v41 ? DS4_N_FF_EXP : layer->ffn_down_exps->dim[0];
+    const uint64_t routed_out_dim = v41 ? DS4_N_EMBD : layer->ffn_down_exps->dim[1];
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
@@ -20035,9 +20046,9 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_row_bytes = v41 ? 0u : routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_row_bytes = v41 ? 0u : routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok) ok = metal_graph_decode_router(g, model, layer, token);
     DS4_METAL_PROFILE_DECODE_STAGE("router");
@@ -20047,7 +20058,21 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok && v41) {
+        /* V4.1 routed experts: one VQ blob per layer through the fused ds41
+         * worker (engine: ds4_gpu_v41_routed_moe_tensor, cuda_v41_3.inc.cu). */
+        ok = ds4_gpu_v41_routed_moe_tensor(g->routed_out,
+                                             model->map, model->size,
+                                             layer->ffn_exps_vq->abs_offset,
+                                             layer->ffn_exps_vq->bytes,
+                                             (uint32_t)expert_in_dim,
+                                             (uint32_t)down_in_dim,
+                                             (uint32_t)routed_out_dim,
+                                             g->router_selected, g->router_weights,
+                                             DS4_N_EXPERT,
+                                             DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                             il, 1) != 0;
+    } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -20086,8 +20111,18 @@ static bool metal_graph_encode_decode_layer_impl(
     }
     const bool fuse_shared_gate_up =
         !g->quality &&
-        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
-    if (ok && fuse_shared_gate_up) {
+        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL &&
+        !v41;
+    if (ok && v41) {
+        /* V4.1's shared expert is fp4x32/q4_K, not Q8_0; the type-dispatched
+         * plain matmul serves the skeleton (plain_graph_matmul_tensor). */
+        ok = plain_graph_matmul_tensor(g->shared_gate, model, layer->ffn_gate_shexp,
+                                       DS4_N_EMBD, shared_dim, g->ffn_norm, 1) &&
+             plain_graph_matmul_tensor(g->shared_up, model, layer->ffn_up_shexp,
+                                       DS4_N_EMBD, shared_dim, g->ffn_norm, 1) &&
+             ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                   shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+    } else if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
                                                          g->shared_mid,
@@ -20114,8 +20149,11 @@ static bool metal_graph_encode_decode_layer_impl(
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
-    if (ok && fuse_shared_down_hc) {
+        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc() && !v41;
+    if (ok && v41) {
+        ok = plain_graph_matmul_tensor(g->shared_out, model, layer->ffn_down_shexp,
+                                       shared_dim, DS4_N_EMBD, g->shared_mid, 1);
+    } else if (ok && fuse_shared_down_hc) {
         ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
                                                          g->shared_out,
                                                          model->map,

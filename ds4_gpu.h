@@ -5206,6 +5206,21 @@ int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_t ver, uint
         int32_t e, int which, uint32_t row, uint32_t rows, uint32_t cols,
         const float *x, uint32_t n);
 
+/* DeepSeek V4.1 routed MoE, decode width (n_tok <= 8).  `model_map` is the
+ * host mmap the blob lives in; the entry reads the version/codebook word
+ * count from the host-side blob header, resolves the device pointer through
+ * the native range resolver, and runs the fused VQ worker.  `out` receives
+ * the f32 weighted sum (n_tok x out_dim) or may be NULL to leave the partial
+ * sums for a tail.  `layer` is the gr (sidecar gain) slot, unused until the
+ * sidecar store lands.  n_tok > 8 (the prefill GEMM) is not ported and is
+ * refused by name.  Returns 1 on success. */
+int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t blob_offset, uint64_t blob_bytes,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok);
+
 #ifdef __cplusplus
 }
 #endif

@@ -55,9 +55,9 @@ static void v41_f16range_probe(const float *src, const uint16_t *b16, uint64_t n
     static unsigned long long tot[2][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
     static uint64_t calls[2] = { 0, 0 };
     if (!c || slot < 0 || slot > 1) return;
-    if (cudaMemsetAsync(c, 0, 32, ds4_cuda_moe_stream()) != cudaSuccess) return;
-    v41_f16range_kernel<<<(unsigned)((n + 255) / 256), 256, 0, ds4_cuda_moe_stream()>>>(c, src, b16, n);
-    if (cudaStreamSynchronize(ds4_cuda_moe_stream()) != cudaSuccess) return;
+    if (cudaMemsetAsync(c, 0, 32, ds4_current_stream()) != cudaSuccess) return;
+    v41_f16range_kernel<<<(unsigned)((n + 255) / 256), 256, 0, ds4_current_stream()>>>(c, src, b16, n);
+    if (cudaStreamSynchronize(ds4_current_stream()) != cudaSuccess) return;
     if (cudaMemcpy(h, c, 32, cudaMemcpyDeviceToHost) != cudaSuccess) return;
     for (int i = 0; i < 4; i++) tot[slot][i] += h[i];
     if ((++calls[slot] % 200u) == 0u)

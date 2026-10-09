@@ -281,7 +281,7 @@ template <int NBIT, int V3, int EXT, int M>
 static int v41_vqg_launch_gu(uint16_t *h, const uint8_t *blob, const int32_t *sel, const uint32_t *xb, uint32_t IN, uint32_t MID, uint32_t K,
                              float clamp, uint32_t cbb, const int32_t *ord, uint32_t np, uint32_t mlo) {
     const uint32_t rg = V41_VQG_WARPS * V41_VQG_ITERS_GU;
-    v41_vqg_gateup_kernel<NBIT, V3, EXT, M><<<dim3((MID + rg - 1u) / rg, np), V41_VQG_THREADS, cbb, ds4_cuda_moe_stream()>>>(
+    v41_vqg_gateup_kernel<NBIT, V3, EXT, M><<<dim3((MID + rg - 1u) / rg, np), V41_VQG_THREADS, cbb, ds4_current_stream()>>>(
         h, blob, sel, xb, IN, MID, K, clamp, cbb, ord, np, mlo);
     return cuda_ok(cudaGetLastError(), "v41 vq gateup (grouped)");
 }
@@ -290,7 +290,7 @@ template <int NBIT, int V3, int EXT, int M>
 static int v41_vqg_launch_dn(float *part, const uint8_t *blob, const int32_t *sel, const uint16_t *h, uint32_t MID, uint32_t OUT, uint32_t K,
                              uint32_t cbb, const float *gr, const int32_t *ord, uint32_t np, uint32_t mlo) {
     const uint32_t rd = V41_VQG_WARPS * V41_VQG_ITERS_DN;
-    v41_vqg_down_kernel<NBIT, V3, EXT, M><<<dim3((OUT + rd - 1u) / rd, np), V41_VQG_THREADS, cbb, ds4_cuda_moe_stream()>>>(
+    v41_vqg_down_kernel<NBIT, V3, EXT, M><<<dim3((OUT + rd - 1u) / rd, np), V41_VQG_THREADS, cbb, ds4_current_stream()>>>(
         part, blob, sel, (const uint32_t *)h, MID, OUT, K, cbb, gr, ord, np, mlo);
     return cuda_ok(cudaGetLastError(), "v41 vq down (grouped)");
 }

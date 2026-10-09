@@ -113,7 +113,7 @@ endif
         test-solar-gates test-solar-kv test-solar-tokenizer \
         test-solar-forward test-solar-session \
         test-exaone-ref test-exaone-kernels test-exaone-batch \
-        pq2-0-test test-qwen35-rows test-ds41-vq \
+        pq2-0-test test-qwen35-rows test-ds41-vq test-ds41-moe \
         rust-bridge ds4-rs ds4-bench-rs ds4-agent-rs ds4-server-rs test-kv-parity test-web-parity test-dist-parity test-route-parity test-server-parity test-catalog-parity test-tokenizer-parity test-agent-parity test-session-parity
 
 ifeq ($(UNAME_S),Darwin)
@@ -924,6 +924,22 @@ test-ds41-vq: tests/test_ds41_vq
 	./tests/test_ds41_vq tests/fixtures/ds41/vq/v3_12b.blob tests/fixtures/ds41/vq/v3_12b.probes.txt tests/fixtures/ds41/vq/v3_12b.ref.f32
 	./tests/test_ds41_vq tests/fixtures/ds41/vq/v2_12b.blob tests/fixtures/ds41/vq/v2_12b.probes.txt
 	./tests/test_ds41_vq tests/fixtures/ds41/vq/v2_11b.blob tests/fixtures/ds41/vq/v2_11b.probes.txt
+
+# DeepSeek V4.1 (ds41) routed-MoE gate: the tensor-level entry (host blob
+# header read, range-resolved device pointer, the fused VQ worker) against the
+# Rust emulation (crates/ds4-core/examples/ds41_moe_ref.rs). onehot cases
+# bit-exact, random cases within the recorded tolerance. The reference is
+# checked in; regenerate with:
+#   python3 tests/fixtures/ds41/vq/gen_moe.py
+#   cargo run -p ds4-core --release --example ds41_moe_ref -- \
+#     tests/fixtures/ds41/vq/moe.blob tests/fixtures/ds41/vq/moe.cases.txt \
+#     tests/fixtures/ds41/vq/moe.ref.f32
+tests/test_ds41_moe: tests/test_ds41_moe.cu ds4_gpu.h $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ tests/test_ds41_moe.cu $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: test-ds41-moe
+test-ds41-moe: tests/test_ds41_moe
+	./tests/test_ds41_moe tests/fixtures/ds41/vq/moe.blob tests/fixtures/ds41/vq/moe.cases.txt tests/fixtures/ds41/vq/moe.ref.f32
 
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its

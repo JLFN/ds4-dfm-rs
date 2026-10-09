@@ -10,9 +10,11 @@
  *
  * Scope of this unit (P4-1): the V4.1 VQ expert decode path, n=1..8 tokens.
  * The prefill GEMM family, the backward files and the retired/probe-only paths
- * stay behind until their units. The launcher here is the raw entry the native
- * test drives; the tensor-level entry (model-range pointer resolution, the
- * gain-override store) lands with the P4-2 forward wiring.
+ * stay behind until their units. P4-2 adds the tensor-level entry
+ * (ds4_gpu_v41_routed_moe_tensor: host blob-header read + range-resolved
+ * device pointer) below the row probe.  Every launch in this family runs on
+ * ds4_current_stream() — the engine's g_cur_stream convention (stream 0
+ * outside capture, the capture stream inside).
  */
 #pragma once
 
@@ -96,17 +98,14 @@ extern "C" int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_
                 cols, row, n, rows);
         return 0;
     }
-    const cudaStream_t st = ds4_cuda_moe_stream();
-    /* Order the probe after the caller's uploads. The moe stream is created
-     * cudaStreamNonBlocking, so it does not inherit the legacy default
-     * stream's ordering, and a pageable H2D cudaMemcpy returns once staged —
-     * its device-side DMA may still be in flight (CUDA runtime API contract).
-     * Without this event the xpack can read the previous probe's activation;
-     * measured on the Spark: 2/35 probes returned the previous probe's x
-     * bit-for-bit before the ordering was added. */
-    static cudaEvent_t ev = NULL;
-    if (!ev) (void)cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-    if (ev && cudaEventRecord(ev, 0) == cudaSuccess) (void)cudaStreamWaitEvent(st, ev, 0);
+    const cudaStream_t st = ds4_current_stream();
+    /* Ordering with the caller's uploads: the whole ds41 family launches on
+     * ds4_current_stream() — stream 0 outside capture, the capture stream
+     * inside — which is the engine's g_cur_stream convention.  The P4-1
+     * fix (84301f8) treated the symptom with a legacy-stream event; its root
+     * cause was this port's original ds4_cuda_moe_stream() choice, a separate
+     * non-blocking stream the eager path never ordered against.  Fixed here;
+     * the event is gone. */
     uint16_t *xb = (uint16_t *)v41_grow(&g_v41_rowprobe_x, (uint64_t)cols * 2u, "v41 row probe x");
     if (!xb) return 0;
     v41_vq_xpack_kernel<<<(unsigned)((cols + 255u) / 256u), 256, 0, st>>>(xb, x, cols);
@@ -125,4 +124,61 @@ extern "C" int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_
         return 0;
     }
     return 1;
+}
+
+/* Tensor-level decode entry for the forward (mirror of the engine's
+ * ds4_gpu_v41_routed_moe_tensor, src/cuda/cuda_v41_3.inc.cu:156-230; the
+ * prefill GEMM arm and the per-layer streaming registration are not ported:
+ * n_tok > V41_GEMV_MAX_TOK refuses by name, and the device pointer comes from
+ * the native range resolver, which owns this tree's memory policy).
+ *
+ * ver and nc are read from the HOST-side blob header — a wrong version is a
+ * load-time error, never a guess (cuda_v41_3.inc.cu:164-175).  A bad header
+ * is fatal: a wrong layout decodes silently and only shows as garbage.
+ * gr (the zchain per-expert gain override, the engine's g_v41_gr) is NULL
+ * until the sidecar gain store lands; named deviation. */
+extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                             uint64_t blob_offset, uint64_t blob_bytes,
+                                             uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+                                             const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+                                             uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
+                                             const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok) {
+    (void)n_total_expert;
+    (void)layer;   /* the gr slot indexes by layer; the sidecar store lands with serving */
+    if (!selected || !weights || !x || n_tok == 0) return 0;
+    if (n_tok > V41_GEMV_MAX_TOK) {
+        fprintf(stderr, "ds4: [ds41] MoE prefill (n_tok %u > %u) is not ported yet\n", n_tok, V41_GEMV_MAX_TOK);
+        return 0;
+    }
+    if (blob_offset > model_size || blob_bytes > model_size - blob_offset) return 0;
+    const uint8_t *bh = (const uint8_t *)model_map + blob_offset;
+    if (!ds4vq_blob_ok(bh, (size_t)blob_bytes)) {
+        fprintf(stderr, "ds4: [ds41] expert blob header is invalid (magic/version/expert count); "
+                        "this engine accepts DQVL v%u..v%u\n", DS4VQ_BLOB_VER_MIN, DS4VQ_BLOB_VER_MAX);
+        exit(1);
+    }
+    const uint32_t ver = ds4vq_blob_ver(bh);
+    uint32_t nc = 0;
+    uint64_t off0 = 0;
+    memcpy(&off0, bh + 16, 8);
+    if (off0 && off0 + 8 <= blob_bytes) { uint16_t n16; memcpy(&n16, bh + off0 + 6, 2); nc = n16; }
+    const uint8_t *blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "v41 vq blob");
+    if (!blob) return 0;
+    const int rc = ds4_gpu_v41_vq_decode_raw(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim,
+                                     (const int32_t *)selected->ptr, (const float *)weights->ptr,
+                                     n_expert_used, clamp, (const float *)x->ptr, n_tok, nc, NULL, ver);
+    /* P4-2 debugging aid (remove when the unit closes): DS41_MOE_DUMP_MID=1
+     * writes the worker's mid scratch (bf16, np x mid_dim) to a file so the
+     * persist path's h can be compared against the emulation. */
+    if (getenv("DS41_MOE_DUMP_MID") && g_v41_vq_h.p) {
+        (void)cudaDeviceSynchronize();
+        const uint64_t bytes = (uint64_t)n_tok * n_expert_used * mid_dim * 2u;
+        void *tmp = malloc(bytes);
+        if (tmp && cudaMemcpy(tmp, g_v41_vq_h.p, bytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            FILE *g = fopen("/tmp/ds41_mid_dump.bin", "wb");
+            if (g) { fwrite(tmp, 1, bytes, g); fclose(g); }
+        }
+        free(tmp);
+    }
+    return rc;
 }
