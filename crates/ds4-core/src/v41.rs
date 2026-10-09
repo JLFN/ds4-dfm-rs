@@ -36,9 +36,11 @@ const KEY_COMPRESS_RATIOS: &str = "deepseek4.attention.compress_ratios";
 const KEY_KV_SOURCE_LAYERS: &str = "deepseek4.attention.kv_source_layers";
 const KEY_INDEX_SOURCE_LAYERS: &str = "deepseek4.attention.index_source_layers";
 const KEY_ENGRAM_LAYER_IDS: &str = "deepseek4.engram.layer_ids";
+const KEY_ENGRAM_ROWS: &str = "deepseek4.engram.num_embeddings";
 const KEY_ENGRAM_MAX_NGRAM: &str = "deepseek4.engram.max_ngram_size";
 const KEY_ENGRAM_HEADS: &str = "deepseek4.engram.head_count";
 const KEY_ENGRAM_HEAD_DIM: &str = "deepseek4.engram.head_dim";
+const KEY_ENGRAM_PAD: &str = "deepseek4.engram.pad_id_compressed";
 const KEY_MTP_TOWER_COUNT: &str = "deepseek4.mtp.tower_count";
 const KEY_MTP_EXPERT_COUNT: &str = "deepseek4.mtp.expert_count";
 const KEY_MTP_TARGET_LAYERS: &str = "deepseek4.mtp.target_layers";
@@ -48,11 +50,14 @@ const KEY_MTP_MARKOV_RANK: &str = "deepseek4.mtp.markov_rank";
 pub enum V41WireError {
     NotV41,
     MissingKey(&'static str),
+    /// A key whose name carries the engram index (`deepseek4.engram.<i>.*`).
+    MissingKeyAt(String),
     ArrayType(&'static str),
     ArrayLen(&'static str),
     LayerRange(&'static str, i64),
     NoSourceBefore(u32),
     KvSourceNotIndexSource(u32),
+    EngramRowsMismatch,
     TowerLimit,
 }
 
@@ -61,6 +66,7 @@ impl V41WireError {
         match self {
             V41WireError::NotV41 => "v41-not-v41".into(),
             V41WireError::MissingKey(k) => format!("v41-missing-key {k}"),
+            V41WireError::MissingKeyAt(k) => format!("v41-missing-key {k}"),
             V41WireError::ArrayType(k) => format!("v41-array-type {k}"),
             V41WireError::ArrayLen(k) => format!("v41-array-len {k}"),
             V41WireError::LayerRange(k, id) => format!("v41-layer-range {k} {id}"),
@@ -68,6 +74,7 @@ impl V41WireError {
             V41WireError::KvSourceNotIndexSource(il) => {
                 format!("v41-kv-source-not-index-source {il}")
             }
+            V41WireError::EngramRowsMismatch => "v41-engram-rows-mismatch".into(),
             V41WireError::TowerLimit => "v41-tower-limit".into(),
         }
     }
@@ -107,6 +114,22 @@ pub struct V41Wire {
     pub engram_heads: u32,
     /// `deepseek4.engram.head_dim` (256 in the artifact).
     pub engram_head_dim: u32,
+    /// `deepseek4.engram.num_embeddings` per layer; the table row count.
+    pub engram_rows: Vec<u64>,
+    /// `deepseek4.engram.<i>.weight_offset` / `.scale_offset`, byte offsets
+    /// of the two row planes in that layer's shard
+    /// (`core_validate_v41.c:147-148`).
+    pub engram_weight_off: Vec<u64>,
+    pub engram_scale_off: Vec<u64>,
+    /// `deepseek4.engram.<i>.table_path`, absolute as the converter wrote it
+    /// (`core_validate_v41.c:126-141`). The published GGUF must not be
+    /// rewritten for a new machine, so `apply_engram_dir` swaps the directory
+    /// and keeps the file name.
+    pub engram_table_path: Vec<String>,
+    /// `deepseek4.engram.pad_id_compressed`: the hash's filler for positions
+    /// before the start of the sequence and for out-of-vocab tokens
+    /// (`core_v41_engram.c:104-107`).
+    pub engram_pad: u32,
     /// `deepseek4.mtp.tower_count`; 0 = the GGUF carries no towers and the
     /// engine decodes one token at a time (`core_validate_v41.c:85-90`).
     pub mtp_towers: u32,
@@ -231,6 +254,54 @@ impl V41Wire {
         let engram_head_dim = g
             .get_u32(KEY_ENGRAM_HEAD_DIM)
             .ok_or(V41WireError::MissingKey(KEY_ENGRAM_HEAD_DIM))?;
+        let engram_pad = g
+            .get_u32(KEY_ENGRAM_PAD)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_PAD))?;
+
+        // One u64 row count per engram layer, and per-layer offsets into the
+        // shard (core_validate_v41.c:119-148).
+        let rows_arr = g
+            .get_array(KEY_ENGRAM_ROWS)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_ROWS))?;
+        if rows_arr.typ != crate::gguf::GGUF_VALUE_UINT64 {
+            return Err(V41WireError::ArrayType(KEY_ENGRAM_ROWS));
+        }
+        let mut engram_rows = Vec::with_capacity(rows_arr.len as usize);
+        {
+            let data = g.as_bytes();
+            let mut pos = rows_arr.data_pos;
+            for _ in 0..rows_arr.len {
+                let b = data
+                    .get(pos..pos + 8)
+                    .ok_or(V41WireError::ArrayLen(KEY_ENGRAM_ROWS))?;
+                engram_rows.push(u64::from_le_bytes(b.try_into().unwrap()));
+                pos += 8;
+            }
+        }
+        if engram_rows.len() != engram_layers.len() {
+            return Err(V41WireError::EngramRowsMismatch);
+        }
+        let mut engram_weight_off = Vec::with_capacity(engram_layers.len());
+        let mut engram_scale_off = Vec::with_capacity(engram_layers.len());
+        let mut engram_table_path = Vec::with_capacity(engram_layers.len());
+        for i in 0..engram_layers.len() {
+            let key = format!("deepseek4.engram.{i}.table_path");
+            let s = g
+                .get_string(&key)
+                .filter(|s| !s.is_empty())
+                .ok_or(V41WireError::MissingKeyAt(key.clone()))?;
+            engram_table_path.push(String::from_utf8_lossy(s).into_owned());
+            let key = format!("deepseek4.engram.{i}.weight_offset");
+            engram_weight_off.push(
+                g.get_u64_compat(&key)
+                    .ok_or(V41WireError::MissingKeyAt(key.clone()))?,
+            );
+            let key = format!("deepseek4.engram.{i}.scale_offset");
+            engram_scale_off.push(
+                g.get_u64_compat(&key)
+                    .ok_or(V41WireError::MissingKeyAt(key.clone()))?,
+            );
+        }
 
         // Towers are optional: a GGUF converted before 2026-09-15 carries
         // none, and the engine then decodes one token at a time
@@ -258,11 +329,28 @@ impl V41Wire {
             engram_max_ngram,
             engram_heads,
             engram_head_dim,
+            engram_rows,
+            engram_weight_off,
+            engram_scale_off,
+            engram_table_path,
+            engram_pad,
             mtp_towers,
             mtp_experts,
             mtp_targets,
             mtp_markov_rank,
         })
+    }
+
+    /// `--engram-dir`: the converter wrote the converting machine's absolute
+    /// paths, so the loader swaps the directory and keeps the file name
+    /// instead of rewriting the published GGUF (`core_validate_v41.c:11-13,
+    /// 134-141`). The C caps the result at 1024 bytes; a Rust `String` has no
+    /// fixed buffer to overflow.
+    pub fn apply_engram_dir(&mut self, dir: &str) {
+        for path in &mut self.engram_table_path {
+            let name = path.rsplit('/').next().unwrap_or(path.as_str());
+            *path = format!("{dir}/{name}");
+        }
     }
 
     /// The tower expert form: one VQ blob per tower, or per-expert FP4

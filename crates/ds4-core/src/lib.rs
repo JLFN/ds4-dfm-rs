@@ -12,6 +12,7 @@ mod batch;
 mod bind;
 pub mod chat_template;
 mod dots3_mtp;
+mod engram;
 mod gguf;
 mod identify;
 mod inkling;
@@ -57,6 +58,9 @@ pub use bind::{
     glm53_layer_is_kda, host_bind_lookup, match_plans, solar_layer_is_gqa, variant_from_bind_name,
     BindError, BindName, BindNeed, BindPlan, BindSlot, HostBindLook, SupportCatalog,
     DSPARK_MARKOV_RANK, DSPARK_N_LAYER, HOST_BIND_MISS,
+};
+pub use engram::{
+    EngramError, EngramHash, EngramRow, EngramShard, EDIO_ALIGN,
 };
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};

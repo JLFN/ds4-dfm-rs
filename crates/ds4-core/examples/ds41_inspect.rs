@@ -62,8 +62,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
-        .ok_or("usage: ds41_inspect <model.gguf> [--tensors]")?;
-    let list_tensors = args.next().as_deref() == Some("--tensors");
+        .ok_or("usage: ds41_inspect <model.gguf> [--tensors] [--engram-dir <dir>] [--ids <file>] [--erows-out <prefix>]")?;
+    let mut list_tensors = false;
+    let mut engram_dir: Option<String> = None;
+    let mut ids_path: Option<String> = None;
+    let mut erows_out: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tensors" => list_tensors = true,
+            "--engram-dir" => engram_dir = args.next(),
+            "--ids" => ids_path = args.next(),
+            "--erows-out" => erows_out = args.next(),
+            other => return Err(format!("unknown argument {other}").into()),
+        }
+    }
     let p = Path::new(&path);
 
     let g = GgufFile::open(p)?;
@@ -133,9 +145,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // V4.1 resolves through the metadata wire (source layers, engram
             // layers, tower form), not from the shape alone; its layout is
             // checked from the same wire.
+            let mut wire: Option<ds4_core::V41Wire> = None;
             let plan = if id.shape.variant == ds4_core::Variant::DeepSeek41Flash {
                 match ds4_core::V41Wire::load(&g, &id.shape) {
-                    Ok(w) => {
+                    Ok(mut w) => {
+                        if let Some(dir) = engram_dir.as_deref() {
+                            w.apply_engram_dir(dir);
+                        }
                         println!(
                             "v41 wire: kv-sources={:?} index-sources={:?} engram={:?} \
                              towers={} experts={} targets={:?} markov-rank={:?}",
@@ -162,6 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(()) => println!("layout: ok"),
                             Err(e) => println!("layout: {}", e.token()),
                         }
+                        wire = Some(w);
                         plan
                     }
                     Err(e) => {
@@ -187,6 +204,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             for name in missing.iter().take(12) {
                 println!("  missing: {name}");
+            }
+
+            // Engram: open the shards in place (--engram-dir), check the row
+            // span and read row 0; with --ids, recompute the hash rows for
+            // every position so they can be diffed against the engine's own
+            // golden capture (--erows-out <prefix> writes
+            // <prefix>.erows_L<nn>.txt, the golden file naming).
+            if let Some(w) = &wire {
+                for (ei, path) in w.engram_table_path.iter().enumerate() {
+                    let shard = match ds4_core::EngramShard::open(Path::new(path)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            println!("engram shard {ei}: {}", e.token());
+                            continue;
+                        }
+                    };
+                    let head_dim = u64::from(w.engram_head_dim);
+                    if let Err(e) = shard.check_span(
+                        w.engram_weight_off[ei],
+                        w.engram_scale_off[ei],
+                        w.engram_rows[ei],
+                        head_dim,
+                    ) {
+                        println!("engram shard {ei}: span {}", e.token());
+                        continue;
+                    }
+                    match shard.row(
+                        w.engram_weight_off[ei],
+                        w.engram_scale_off[ei],
+                        0,
+                        w.engram_head_dim,
+                    ) {
+                        Ok(row) => println!(
+                            "engram shard {ei}: size={} direct={} rows={} row0 w[0..8]={:02x?} scale={:02x?}",
+                            shard.size(),
+                            shard.is_direct(),
+                            w.engram_rows[ei],
+                            &row.weights[..8],
+                            row.scale
+                        ),
+                        Err(e) => println!("engram shard {ei}: row0 {}", e.token()),
+                    }
+                }
+                if let (Some(ids_path), Some(prefix)) = (ids_path.as_deref(), erows_out.as_deref())
+                {
+                    let ids: Vec<i32> = std::fs::read_to_string(ids_path)?
+                        .split_whitespace()
+                        .map(|v| v.parse().unwrap())
+                        .collect();
+                    match ds4_core::EngramHash::load(&g, &inv, w, id.shape.n_vocab) {
+                        Ok(Some(h)) => {
+                            for (ei, layer) in w.engram_layers.iter().enumerate() {
+                                let file = format!("{prefix}.erows_L{layer:02}.txt");
+                                let mut out = String::new();
+                                for p in 0..ids.len() {
+                                    let rows = h.rows(&ids, p as i64, ei as u32);
+                                    let line: Vec<String> =
+                                        rows.iter().map(|r| r.to_string()).collect();
+                                    out.push_str(&line.join(" "));
+                                    out.push('\n');
+                                }
+                                std::fs::write(&file, out)?;
+                                println!("erows: wrote {file}");
+                            }
+                        }
+                        Ok(None) => println!("erows: no engram layers"),
+                        Err(e) => println!("erows: {}", e.token()),
+                    }
+                }
             }
         }
         Err(e) => println!("identify failed: {e}"),

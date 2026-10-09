@@ -38,7 +38,10 @@ const ENGRAM_LAYERS: &[i32] = &[1, 14];
 
 enum Val<'a> {
     U32(u32),
+    U64(u64),
+    Str(&'a str),
     ArrayI32(&'a [i32]),
+    ArrayU64(&'a [u64]),
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -65,9 +68,25 @@ fn write_gguf(path: &Path, kvs: &[(&str, Val<'_>)]) {
                 put_u32(&mut buf, 4);
                 buf.extend_from_slice(&v.to_le_bytes());
             }
+            Val::U64(v) => {
+                put_u32(&mut buf, 10);
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            Val::Str(s) => {
+                put_u32(&mut buf, 8);
+                put_str(&mut buf, s);
+            }
             Val::ArrayI32(items) => {
                 put_u32(&mut buf, 9);
                 put_u32(&mut buf, 5);
+                put_u64(&mut buf, items.len() as u64);
+                for x in *items {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            Val::ArrayU64(items) => {
+                put_u32(&mut buf, 9);
+                put_u32(&mut buf, 10);
                 put_u64(&mut buf, items.len() as u64);
                 for x in *items {
                     buf.extend_from_slice(&x.to_le_bytes());
@@ -102,9 +121,26 @@ fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFil
             ("deepseek4.attention.kv_source_layers", Val::ArrayI32(kv)),
             ("deepseek4.attention.index_source_layers", Val::ArrayI32(idx)),
             ("deepseek4.engram.layer_ids", Val::ArrayI32(ENGRAM_LAYERS)),
+            (
+                "deepseek4.engram.num_embeddings",
+                Val::ArrayU64(&[384_006_168, 384_016_682]),
+            ),
             ("deepseek4.engram.max_ngram_size", Val::U32(4)),
             ("deepseek4.engram.head_count", Val::U32(8)),
             ("deepseek4.engram.head_dim", Val::U32(256)),
+            ("deepseek4.engram.pad_id_compressed", Val::U32(2)),
+            (
+                "deepseek4.engram.0.table_path",
+                Val::Str("/home/fodelf/ds4-main/hf/model-00047-of-00048.safetensors"),
+            ),
+            ("deepseek4.engram.0.weight_offset", Val::U64(664)),
+            ("deepseek4.engram.0.scale_offset", Val::U64(98_305_579_672)),
+            (
+                "deepseek4.engram.1.table_path",
+                Val::Str("/home/fodelf/ds4-main/hf/model-00048-of-00048.safetensors"),
+            ),
+            ("deepseek4.engram.1.weight_offset", Val::U64(664)),
+            ("deepseek4.engram.1.scale_offset", Val::U64(98_305_852_864)),
             ("deepseek4.mtp.tower_count", Val::U32(3)),
             ("deepseek4.mtp.expert_count", Val::U32(128)),
             ("deepseek4.mtp.target_layers", Val::ArrayI32(&[37, 38, 39])),
@@ -222,10 +258,29 @@ fn wire_matches_the_artifacts_wiring() {
     assert_eq!(w.engram_index_of[1], 0);
     assert_eq!(w.engram_index_of[14], 1);
     assert_eq!(w.engram_index_of[13], -1);
+    // The engram table: two layers, two shard paths, two row planes each.
+    assert_eq!(w.engram_rows, vec![384_006_168, 384_016_682]);
+    assert_eq!(w.engram_weight_off[0], 664);
+    assert_eq!(w.engram_pad, 2);
+    assert!(w.engram_table_path[0].ends_with("model-00047-of-00048.safetensors"));
     // The tower experts are the blob form in this artifact.
     let inv = inventory_from(&artifact_names());
     assert!(w.tower_uses_blob(&inv, 0));
     assert!(w.tower_uses_blob(&inv, 2));
+}
+
+#[test]
+fn engram_dir_override_keeps_only_the_file_name() {
+    let mut w = artifact_wire();
+    w.apply_engram_dir("/home/leandro/youngai/deepseek-engram");
+    assert_eq!(
+        w.engram_table_path[0],
+        "/home/leandro/youngai/deepseek-engram/model-00047-of-00048.safetensors"
+    );
+    assert_eq!(
+        w.engram_table_path[1],
+        "/home/leandro/youngai/deepseek-engram/model-00048-of-00048.safetensors"
+    );
 }
 
 #[test]
