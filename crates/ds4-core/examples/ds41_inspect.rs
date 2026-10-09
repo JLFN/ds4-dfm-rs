@@ -11,10 +11,35 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The keys the engine reads for V4.1 (core_validate_v41.c), plus the plain
-/// identity keys. A missing one here is a loader gap, not a curiosity.
+/// identity keys and the dims `select_shape_from_metadata` matches on. A
+/// missing one here is a loader gap, not a curiosity.
 const V41_KEYS: &[&str] = &[
     "general.architecture",
     "general.name",
+    // dims: what ds4_select_shape_from_metadata compares (core_shape_select.c:166)
+    "deepseek4.block_count",
+    "deepseek4.embedding_length",
+    "deepseek4.vocab_size",
+    "deepseek4.attention.head_count",
+    "deepseek4.attention.head_count_kv",
+    "deepseek4.attention.key_length",
+    "deepseek4.attention.value_length",
+    "deepseek4.rope.dimension_count",
+    "deepseek4.attention.q_lora_rank",
+    "deepseek4.attention.output_lora_rank",
+    "deepseek4.attention.output_group_count",
+    "deepseek4.expert_count",
+    "deepseek4.expert_used_count",
+    "deepseek4.expert_feed_forward_length",
+    "deepseek4.expert_shared_count",
+    "deepseek4.hash_layer_count",
+    "deepseek4.attention.sliding_window",
+    "deepseek4.attention.indexer.head_count",
+    "deepseek4.attention.indexer.key_length",
+    "deepseek4.attention.indexer.top_k",
+    "deepseek4.hyper_connection.count",
+    "deepseek4.hyper_connection.sinkhorn_iterations",
+    // V4.1 additions (core_validate_v41.c:46-154)
     "deepseek4.context_length",
     "deepseek4.attention.kv_source_layers",
     "deepseek4.attention.index_source_layers",

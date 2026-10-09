@@ -1225,6 +1225,7 @@ impl ServingCaps {
             Variant::Mimo26Flash => "mimo2",
             Variant::Qwen35_27B => "qwen35",
             Variant::NaiveN05Flash => "naive_n05_flash",
+            Variant::DeepSeek41Flash => "deepseek4-v41-flash",
         }
     }
 }

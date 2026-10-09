@@ -1985,6 +1985,7 @@ pub fn dump_validate(path: &std::path::Path) -> String {
                         Variant::Ling30FlashVl => crate::shape::SHAPE_LING30_FLASH_VL,
                         Variant::Mimo26Flash => crate::shape::SHAPE_MIMO26_FLASH,
                         Variant::NaiveN05Flash => crate::shape::SHAPE_NAIVE_N05_FLASH,
+                        Variant::DeepSeek41Flash => crate::shape::SHAPE_V41_FLASH,
                         Variant::Flash => SHAPE_FLASH,
                         Variant::Pro => SHAPE_PRO,
                     };

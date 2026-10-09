@@ -90,6 +90,7 @@ pub enum Variant {
     Mimo26Flash = 12,
     Qwen35_27B = 14,
     NaiveN05Flash = 13,
+    DeepSeek41Flash = 15,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -302,13 +303,19 @@ fn shape_matches_metadata(s: &Shape, d: &DeepSeekDims) -> bool {
         && s.n_hc_sinkhorn_iter == d.n_hc_sinkhorn_iter
 }
 
-/// C `ds4_select_shape_from_metadata`. Flash first, then Pro.
+/// C `ds4_select_shape_from_metadata`. Flash first, then Pro, then the V4.1
+/// Flash table (the C engine appends it third for exactly this reason: the
+/// three tables differ in enough fields to be unambiguous, and the order keeps
+/// the older artifacts resolving to their own tables).
 pub fn select_shape_from_metadata(d: &DeepSeekDims) -> Option<Shape> {
     if shape_matches_metadata(&SHAPE_FLASH, d) {
         return Some(SHAPE_FLASH);
     }
     if shape_matches_metadata(&SHAPE_PRO, d) {
         return Some(SHAPE_PRO);
+    }
+    if shape_matches_metadata(&SHAPE_V41_FLASH, d) {
+        return Some(SHAPE_V41_FLASH);
     }
     None
 }
@@ -359,6 +366,7 @@ pub fn shape_for_variant(v: Variant) -> Shape {
         Variant::Mimo26Flash => SHAPE_MIMO26_FLASH,
         Variant::Qwen35_27B => SHAPE_QWEN35,
         Variant::NaiveN05Flash => SHAPE_NAIVE_N05_FLASH,
+        Variant::DeepSeek41Flash => SHAPE_V41_FLASH,
     }
 }
 
@@ -539,6 +547,70 @@ pub const SHAPE_PRO: Shape = Shape {
     kda_gate_clamp_min: 0.0,
     hc_eps: DEFAULT_HC_EPS,
     expert_weight_scale: 2.5,
+    swiglu_clamp_exp: DEFAULT_SWIGLU_CLAMP_EXP,
+    rope_freq_base: DEFAULT_ROPE_FREQ_BASE,
+    rope_freq_base_swa: 0.0,
+    rope_scale_factor: DEFAULT_ROPE_SCALE_FACTOR,
+    rope_yarn_beta_fast: DEFAULT_ROPE_YARN_BETA_FAST,
+    rope_yarn_beta_slow: DEFAULT_ROPE_YARN_BETA_SLOW,
+    compress_rope_freq_base: DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+    rope_orig_ctx: DEFAULT_ROPE_ORIG_CTX,
+};
+
+/// DeepSeek V4.1 Flash, transcribed field by field from the engine's
+/// `DS4_SHAPE_V41_FLASH` (`src/core/core_shape_select.c:81-114`). Its comment
+/// there is worth keeping: rms_eps 1e-20 is the official config's real value,
+/// not a typo, and route scale 1.5 matches V4. Fields the C table does not set
+/// are zero in C (static const), so they are zero here too - notably
+/// n_hash_layer, which V4.1 drops.
+pub const SHAPE_V41_FLASH: Shape = Shape {
+    name: "DeepSeek V4.1 Flash",
+    family: ModelFamily::DeepSeek4,
+    variant: Variant::DeepSeek41Flash,
+    n_layer: 40,
+    n_embd: 5120,
+    n_vocab: 129280,
+    n_head: 64,
+    n_head_kv: 1,
+    n_noise_head: 0,
+    n_head_dim: 512,
+    n_value_dim: 512,
+    n_rot: 64,
+    n_out_group: 8,
+    n_lora_q: 1280,
+    n_lora_o: 1024,
+    n_expert: 384,
+    n_expert_used: 6,
+    n_expert_shared: 1,
+    n_ff_exp: 2304,
+    n_ff_dense: 0,
+    n_ff_shexp: 0,
+    n_hash_layer: 0,
+    n_swa: 128,
+    n_swa_period: 0,
+    n_indexer_head: 32,
+    n_indexer_head_dim: 128,
+    n_indexer_top_k: 512,
+    n_hc: 4,
+    n_hc_sinkhorn_iter: 20,
+    n_nextn_predict: 0,
+    n_leading_dense: 0,
+    n_kv_lora: 0,
+    n_key_mla: 0,
+    n_value_mla: 0,
+    n_swa_head: 0,
+    n_swa_kv_lora: 0,
+    n_swa_key_mla: 0,
+    n_full_attn_count: 0,
+    n_kda_head_dim: 0,
+    n_ssm_conv: 0,
+    use_rope: true,
+    use_qk_norm: false,
+    rms_eps: 1.0e-20,
+    kda_l2_eps: 0.0,
+    kda_gate_clamp_min: 0.0,
+    hc_eps: DEFAULT_HC_EPS,
+    expert_weight_scale: 1.5,
     swiglu_clamp_exp: DEFAULT_SWIGLU_CLAMP_EXP,
     rope_freq_base: DEFAULT_ROPE_FREQ_BASE,
     rope_freq_base_swa: 0.0,
