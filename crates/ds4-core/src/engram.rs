@@ -216,8 +216,16 @@ pub struct EngramShard {
 mod sys {
     use std::os::raw::c_int;
 
-    /// `<asm-generic/fcntl.h>`: the same value on x86_64 and aarch64.
+    /// `<arch>/include/uapi/asm/fcntl.h`: aarch64 defines its own O_DIRECT
+    /// (0o200000, with 0o40000 being O_DIRECTORY there), while x86_64 and the
+    /// asm-generic ports use 0o40000. The wrong value fails the open with
+    /// ENOTDIR rather than silently doing nothing, which is how the Spark
+    /// caught it: the fallback path ran and reported `direct=false`.
+    #[cfg(target_arch = "aarch64")]
+    pub const O_DIRECT: c_int = 0o200000;
+    #[cfg(not(target_arch = "aarch64"))]
     pub const O_DIRECT: c_int = 0o40000;
+
     pub const POSIX_FADV_RANDOM: c_int = 1;
 
     extern "C" {
