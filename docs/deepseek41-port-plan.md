@@ -119,7 +119,7 @@ subsystem (VQ, engram and sidecars, MTP draft, core and serving).
 | G1 | GGUF tensor types 40-44 (`go1b` 256/34, `go2b` 256/68, `vqblob` 1/1, `fp4x32` 32/17, `fp8_32x32` 1024/1025) unknown: the host table is 31 entries covering ids 0-30 plus `pq2_0`=142 (`crates/ds4-core/src/tensors.rs:55-96`) (v) | `src/core/core_gguf.c:89-104`; engine enum `ds4_internal.h:177-181` (a) |
 | G2 | VQ expert decode absent. `DQVL` blob header, v2 `DQVQ` per-matrix payload (own codebook) and v3 `DQV3` (per-layer codebook + 12-bit main stream + 1-bit plane, E4M3 codewords, per-row f16 gain) | `vq_fmt.h:1-20`, decode `vq_fmt.h:57`/`:91` (v); device geometry `src/cuda/cuda_vq_row.inc.cu:19-47`; dispatch by (version, bit width) `cuda_vq_decode_launch.inc.cu:21-30` (a) |
 | G3 | MTP draft towers absent: 3 towers reusing the layer struct, per-expert `fp4x32` or a single `ffn_exps_vq.blob`, five shared heads | bind `src/core/core_bind_v41.c:101-145`; tower types `core_draft_tower_types.h`; forward `core_v41_draft.c:1-11` (a) |
-| G3b | The expert tensors are not the ones this host expects: the artifact carries one `blk.L.ffn_exps_vq.blob` per layer and binds no `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` at all. The bind side is DONE (`0d3378d`: `bind_names_v41` requires the blob, and the plan binds 1000/1000); the layout side still expects the V4 names (`layout.rs:2383-2692`) and is the next unit | `core_bind_v41.c:41` (a), inventory §1 |
+| G3b | DONE 2026-10-09 (`0d3378d`, `356a100`): the artifact carries one `blk.L.ffn_exps_vq.blob` per layer and no `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`; the V4.1 bind and layout require the blob, and the plan binds the artifact's 1000 tensors with `layout: ok` | `core_bind_v41.c:41` (a), inventory §1 |
 | G4 | Speculative verify/rollback for V4.1 absent. Note the engine has TWO drafters: the V4-era DSpark (`dspark.*`, `cuda_dspark.inc.cu`) which this host already mirrors, and the V4.1 three-tower MTP (`mtp.*`, `core_v41_draft.c`) which is the one this artifact needs | `v41_spec_snapshot` `src/core/core_v41_forward.c:241`, `v41_spec_rollback` `:267`; round drive `core_v41_api.c:322`, `:365`; tower contract and the two rollback cautions: inventory §8 (a) |
 | G5 | Engram absent: two tables, 264 B rows (256 B fp8 e4m3 + 8 B ue8m0 scale), rolling 4-gram hash, O_DIRECT per-row reads | `src/core/core_v41_engram.c:6`, `:21`, `:30`, `:63`; metadata `core_validate_v41.c:118-154`; flag `--engram-dir` `src/cli/cli_opts.c:269`, `--v41-no-engram` `:371` (a) |
 | G6 | Domain sidecars absent: `gr_Lnn.bin` per-row gains, `rb_Lnn.bin` router bias, `amp_Lnn.bin`, the `base.fnv` pair fingerprint, `--zchain`, `--posttrain` | `src/core/core_v41_amp.c:41`, `:88`, `:125-147`, `:160-186`, `:227`; fingerprint `src/common/ds4_gr_fnv.h`; flags `cli_opts.c:258-268` (a) |
@@ -140,7 +140,7 @@ before any state-changing command.
 | P0 | DONE 2026-10-08 | see 6.5 |
 | P1 | DONE 2026-10-08 (`c1fdc04`, `7c21279`): tensor types 40-44 in `tensors.rs`, the VQ decode oracle, the type table | v2 decode bit-exact against `ds4vq_dequant_f32` (fixtures in `tests/fixtures/vq`); v3 at unit level (12-bit, 13-bit plane); types match `core_gguf.c:89-104` |
 | P2 | Loaders: engram metadata and table open, sidecar `gr`/`rb` reader, `base.fnv` check (parse-only, not applied) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
-| P3 | IN PROGRESS: the `Variant::V41` shape (`d53079b`), the metadata wire and the bind arm (`0d3378d`) are done; the layout arm and the engram/sidecar session state remain | the loader accepts the artifact and the inventory diff is empty; the bind side is measured `slots=1000 bound=1000 required-missing=0` (§6.6.1) |
+| P3 | DONE for the loader half (2026-10-09): the `Variant::V41` shape (`d53079b`), the metadata wire, the bind arm (`0d3378d`) and the layout table (`356a100`); the engram/sidecar session state remains (P2) | the loader accepts the artifact: `identify` + `validate: ok` + `layout: ok` + `bind: slots=1000 bound=1000 required-missing=0` on the real file (§6.6.1) |
 | P4 | CUDA: VQ MoE decode (mirror `v41_vq_open` geometry), the fp8_32x32 skeleton path, and the engram read path | G2 on device: logits match the golden set |
 | P5 | MTP towers and DSpark verify/rollback | byte-identical greedy output with drafting on and off at N=1; cache-frontier gate at N>1. The engine's own cautions: the main-hidden ring trim in rollback, and the compressor pending-row snapshot taken before the shift |
 | P6 | Serving: the flags, the sampling profile for this family, the four API contracts, the DSML tool path | a served tool call, end to end, no shim |
@@ -278,9 +278,9 @@ the only blocker), and the blob count confirms the tower contract: 40 layers
 plus 3 towers, one blob each. Types 40, 41 and 43 do not occur in this
 artifact; the towers use blobs too.
 
-The V4.1 arm landed in two steps after this check: the variant/shape
-(`d53079b`) and the metadata wire with the bind (`0d3378d`, §6.6.1). The layout
-arm for the blob-form experts (G3b) is the remaining loader unit.
+The V4.1 arm landed in three steps after this check: the variant/shape
+(`d53079b`), the metadata wire with the bind (`0d3378d`) and the layout table
+(`356a100`), all recorded in §6.6.1. The loader now accepts the artifact.
 
 ### 6.6.1 The V4.1 tensor contract, read from the artifact
 
@@ -332,6 +332,23 @@ the wiring derivation, the refusals, and both tower expert forms.
 Next unit: the V4.1 layout arm (`expected_deepseek` branching on the variant,
 driven by the same wire), which is what `validate_layouts` needs before
 `probe_model_artifact` accepts the artifact end to end.
+
+The layout arm is DONE (2026-10-09, `356a100`): `expected_layouts_v41` and
+`validate_layouts_v41` take the same wire and inventory, the new classes are
+`v41-skel` (q4_K or fp4x32, `expect_skel`), `v41-dense` (the `v41_tproj`
+dispatch set), `v41-blob` (ndim only: the single dim is the per-layer byte
+size) and `v41-ndim` (the shared draft heads the engine checks nothing for),
+and `open_bind_plan` resolves, refuses and validates in one place for both open
+paths. Gate: the table matches the artifact's own tensor directory, type and
+dims for all 1000 tensors, as a model-free test over
+`tests/fixtures/v41/artifact-tensors.txt`; on the Spark against the real file
+the inspector now prints `layout: ok` and `bind: slots=1000 bound=1000
+required-missing=0` after `identify` and `validate: ok`.
+
+The loader half of P3 is therefore closed: the host accepts the artifact's
+metadata, names, types and dims. Next: P2's remaining loaders (engram metadata
+and table open, the sidecar `gr`/`rb` reader, the `base.fnv` check) and the
+engram/sidecar state.
 
 ## 7. Numerics contract
 
