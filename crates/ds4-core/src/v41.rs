@@ -1,0 +1,236 @@
+//! DeepSeek V4.1 wiring: the `deepseek4.*` metadata keys the engine keeps in
+//! `g_ds4_v41` and the conditionals the V4.1 bind and layout arms are driven
+//! by.
+//!
+//! Source of truth is the C engine at `/data/YoungAi` (commit 3946dbc):
+//!
+//! - `core_validate_v41.c:46-154` `v41_load_metadata`: the keys, the array
+//!   types, the source-layer wiring derivation and its hard stops. A missing
+//!   key is a hard stop, never a default (`core_validate_v41.c:8`).
+//! - `core_validate.c:5-46` `validate_compress_ratio_metadata`: the ratios are
+//!   metadata truth for V4.1 (0/1/2, no formula), loaded once per model.
+//! - `core_globals.c:75-95` `ds4_layer_compress_ratio` /
+//!   `ds4_expected_layer_compress_ratio`: V4.1 returns the metadata value.
+//! - `core_bind_v41.c:41-145`: what consumes the wiring at bind time.
+//!
+//! V4.1 differs from V4 Flash in wiring, not dimensions: only the kv source
+//! layers compress and hold compressed KV (the rest read the nearest earlier
+//! source layer), only index source layers run the indexer, engram lives on
+//! two layers, and the three draft towers mirror a layer with either one VQ
+//! blob or per-expert FP4 tensors.
+
+use crate::gguf::{GgufFile, GGUF_VALUE_INT32, GGUF_VALUE_UINT32};
+use crate::shape::{Shape, Variant};
+use crate::tensors::TensorInventory;
+
+/// `DS4_V41_MAX_ENGRAM` (`ds4_internal.h:53`).
+pub const V41_MAX_ENGRAM: usize = 4;
+/// `DS4_MTP_MAX_TOWERS` (`ds4_internal.h:54`); the real count is metadata.
+pub const MTP_MAX_TOWERS: u32 = 4;
+/// `DS4_MTP_MAX_EXPERTS` (`ds4_internal.h:55`); the real count is metadata.
+pub const MTP_MAX_EXPERTS: u32 = 256;
+/// V4.1 compression ratios are 0/1/2 (`core_validate.c:31-37`).
+pub const V41_MAX_COMPRESS_RATIO: u32 = 2;
+
+const KEY_COMPRESS_RATIOS: &str = "deepseek4.attention.compress_ratios";
+const KEY_KV_SOURCE_LAYERS: &str = "deepseek4.attention.kv_source_layers";
+const KEY_INDEX_SOURCE_LAYERS: &str = "deepseek4.attention.index_source_layers";
+const KEY_ENGRAM_LAYER_IDS: &str = "deepseek4.engram.layer_ids";
+const KEY_MTP_TOWER_COUNT: &str = "deepseek4.mtp.tower_count";
+const KEY_MTP_EXPERT_COUNT: &str = "deepseek4.mtp.expert_count";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum V41WireError {
+    NotV41,
+    MissingKey(&'static str),
+    ArrayType(&'static str),
+    ArrayLen(&'static str),
+    LayerRange(&'static str, i64),
+    NoSourceBefore(u32),
+    KvSourceNotIndexSource(u32),
+    TowerLimit,
+}
+
+impl V41WireError {
+    pub fn token(&self) -> String {
+        match self {
+            V41WireError::NotV41 => "v41-not-v41".into(),
+            V41WireError::MissingKey(k) => format!("v41-missing-key {k}"),
+            V41WireError::ArrayType(k) => format!("v41-array-type {k}"),
+            V41WireError::ArrayLen(k) => format!("v41-array-len {k}"),
+            V41WireError::LayerRange(k, id) => format!("v41-layer-range {k} {id}"),
+            V41WireError::NoSourceBefore(il) => format!("v41-no-source-before {il}"),
+            V41WireError::KvSourceNotIndexSource(il) => {
+                format!("v41-kv-source-not-index-source {il}")
+            }
+            V41WireError::TowerLimit => "v41-tower-limit".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for V41WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.token())
+    }
+}
+
+impl std::error::Error for V41WireError {}
+
+/// The V4.1 wiring table, per layer and per tower.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V41Wire {
+    /// `deepseek4.attention.compress_ratios`, first `n_layer` entries (V4.1:
+    /// 0/1/2). `core_validate.c:14-46`.
+    pub compress_ratios: Vec<u32>,
+    /// `deepseek4.attention.kv_source_layers` as a per-layer flag
+    /// (`core_validate_v41.c:59-63`).
+    pub is_kv_source: Vec<bool>,
+    /// Layer -> the kv source it reads; -1 when the layer does not compress
+    /// (`core_validate_v41.c:69-83`).
+    pub kv_source_of: Vec<i16>,
+    /// `deepseek4.attention.index_source_layers` as a per-layer flag.
+    pub is_index_source: Vec<bool>,
+    /// Layer -> the index source it reuses; -1 when it does not compress.
+    pub index_source_of: Vec<i16>,
+    /// `deepseek4.engram.layer_ids`, in metadata order.
+    pub engram_layers: Vec<u32>,
+    /// Layer -> engram index, -1 = none (`core_validate_v41.c:118-125`).
+    pub engram_index_of: Vec<i16>,
+    /// `deepseek4.mtp.tower_count`; 0 = the GGUF carries no towers and the
+    /// engine decodes one token at a time (`core_validate_v41.c:85-90`).
+    pub mtp_towers: u32,
+    /// `deepseek4.mtp.expert_count`; per-expert form only.
+    pub mtp_experts: u32,
+}
+
+/// C `v41_arr_i32`: an INT32 or UINT32 array, read signed. Returns the values.
+fn i32_array(
+    g: &GgufFile,
+    key: &'static str,
+) -> Result<Vec<i32>, V41WireError> {
+    let arr = g.get_array(key).ok_or(V41WireError::MissingKey(key))?;
+    if arr.typ != GGUF_VALUE_INT32 && arr.typ != GGUF_VALUE_UINT32 {
+        return Err(V41WireError::ArrayType(key));
+    }
+    let data = g.as_bytes();
+    let mut out = Vec::with_capacity(arr.len.min(1024) as usize);
+    let mut pos = arr.data_pos;
+    for _ in 0..arr.len {
+        let b = data.get(pos..pos + 4).ok_or(V41WireError::ArrayLen(key))?;
+        out.push(i32::from_le_bytes(b.try_into().unwrap()));
+        pos += 4;
+    }
+    Ok(out)
+}
+
+fn layer_ids(
+    g: &GgufFile,
+    key: &'static str,
+    n_layer: u32,
+) -> Result<Vec<u32>, V41WireError> {
+    let raw = i32_array(g, key)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for id in raw {
+        if id < 0 || id as u32 >= n_layer {
+            return Err(V41WireError::LayerRange(key, i64::from(id)));
+        }
+        out.push(id as u32);
+    }
+    Ok(out)
+}
+
+impl V41Wire {
+    /// Load the wiring from the artifact's metadata. Hard stops mirror
+    /// `v41_load_metadata`; the compress ratios are read here because the
+    /// bind and layout conditionals need them per layer, and the range rule
+    /// (0/1/2) stays in `validate_compress` (`validate.rs:257`), which every
+    /// load path runs first.
+    pub fn load(g: &GgufFile, shape: &Shape) -> Result<Self, V41WireError> {
+        if shape.variant != Variant::DeepSeek41Flash {
+            return Err(V41WireError::NotV41);
+        }
+        let n = shape.n_layer as usize;
+
+        let ratios = i32_array(g, KEY_COMPRESS_RATIOS)?;
+        if ratios.len() < n {
+            return Err(V41WireError::ArrayLen(KEY_COMPRESS_RATIOS));
+        }
+        let compress_ratios: Vec<u32> = ratios[..n].iter().map(|&v| v.max(0) as u32).collect();
+
+        let mut is_kv_source = vec![false; n];
+        for id in layer_ids(g, KEY_KV_SOURCE_LAYERS, shape.n_layer)? {
+            is_kv_source[id as usize] = true;
+        }
+        let mut is_index_source = vec![false; n];
+        for id in layer_ids(g, KEY_INDEX_SOURCE_LAYERS, shape.n_layer)? {
+            is_index_source[id as usize] = true;
+        }
+
+        // A compressing layer reads the nearest source at or before it, and a
+        // kv source must also be an index source because the indexer keys come
+        // from its latent (core_validate_v41.c:69-83).
+        let mut kv_source_of = vec![-1i16; n];
+        let mut index_source_of = vec![-1i16; n];
+        let mut last_kv: i16 = -1;
+        let mut last_idx: i16 = -1;
+        for il in 0..n {
+            if is_kv_source[il] {
+                last_kv = il as i16;
+            }
+            if is_index_source[il] {
+                last_idx = il as i16;
+            }
+            if compress_ratios[il] == 0 {
+                continue;
+            }
+            if last_kv < 0 || last_idx < 0 {
+                return Err(V41WireError::NoSourceBefore(il as u32));
+            }
+            kv_source_of[il] = last_kv;
+            index_source_of[il] = last_idx;
+            if is_kv_source[il] && !is_index_source[il] {
+                return Err(V41WireError::KvSourceNotIndexSource(il as u32));
+            }
+        }
+
+        let engram_layers = layer_ids(g, KEY_ENGRAM_LAYER_IDS, shape.n_layer)?;
+        if engram_layers.len() > V41_MAX_ENGRAM {
+            return Err(V41WireError::ArrayLen(KEY_ENGRAM_LAYER_IDS));
+        }
+        let mut engram_index_of = vec![-1i16; n];
+        for (i, &il) in engram_layers.iter().enumerate() {
+            engram_index_of[il as usize] = i as i16;
+        }
+
+        // Towers are optional: a GGUF converted before 2026-09-15 carries
+        // none, and the engine then decodes one token at a time
+        // (core_validate_v41.c:85-90).
+        let mtp_towers = g.get_u32(KEY_MTP_TOWER_COUNT).unwrap_or(0);
+        let mtp_experts = g.get_u32(KEY_MTP_EXPERT_COUNT).unwrap_or(0);
+        if mtp_towers > MTP_MAX_TOWERS || mtp_experts > MTP_MAX_EXPERTS {
+            return Err(V41WireError::TowerLimit);
+        }
+
+        Ok(Self {
+            compress_ratios,
+            is_kv_source,
+            kv_source_of,
+            is_index_source,
+            index_source_of,
+            engram_layers,
+            engram_index_of,
+            mtp_towers,
+            mtp_experts,
+        })
+    }
+
+    /// The tower expert form: one VQ blob per tower, or per-expert FP4
+    /// tensors. The engine probes the blob and requires the per-expert set
+    /// only when it is absent (core_bind_v41.c:126-134), so the choice is an
+    /// inventory fact, not a metadata one.
+    pub fn tower_uses_blob(&self, inventory: &TensorInventory, tower: u32) -> bool {
+        inventory
+            .find(&format!("mtp.{tower}.ffn_exps_vq.blob"))
+            .is_some()
+    }
+}

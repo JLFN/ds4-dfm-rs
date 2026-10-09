@@ -254,7 +254,8 @@ fn motif3_layer_is_full_attention(shape: &Shape, il: u32) -> bool {
         && (il % shape.n_swa_period) == 0
 }
 
-fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {    let key = "deepseek4.attention.compress_ratios";
+fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
+    let key = "deepseek4.attention.compress_ratios";
     let arr = g
         .get_array(key)
         .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;

@@ -130,7 +130,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Bind: every required name must find a tensor, and the plan
             // should consume the published inventory rather than leave it.
-            let plan = ds4_core::BindPlan::resolve_catalog(None, id.shape, &inv);
+            // V4.1 resolves through the metadata wire (source layers, engram
+            // layers, tower form), not from the shape alone.
+            let plan = if id.shape.variant == ds4_core::Variant::DeepSeek41Flash {
+                match ds4_core::V41Wire::load(&g, &id.shape) {
+                    Ok(wire) => {
+                        println!(
+                            "v41 wire: kv-sources={:?} index-sources={:?} engram={:?} \
+                             towers={} experts={}",
+                            wire.is_kv_source
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, &b)| b)
+                                .map(|(i, _)| i)
+                                .collect::<Vec<_>>(),
+                            wire.is_index_source
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, &b)| b)
+                                .map(|(i, _)| i)
+                                .collect::<Vec<_>>(),
+                            wire.engram_layers,
+                            wire.mtp_towers,
+                            wire.mtp_experts,
+                        );
+                        ds4_core::BindPlan::resolve_v41(id.shape, &wire, &inv)
+                    }
+                    Err(e) => {
+                        println!("v41 wire failed: {}", e.token());
+                        ds4_core::BindPlan::resolve_catalog(None, id.shape, &inv)
+                    }
+                }
+            } else {
+                ds4_core::BindPlan::resolve_catalog(None, id.shape, &inv)
+            };
             let missing: Vec<&str> = plan
                 .slots
                 .iter()

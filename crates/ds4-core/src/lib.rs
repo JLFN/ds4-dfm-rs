@@ -40,6 +40,7 @@ mod step37;
 mod step37_mtp;
 mod tensors;
 mod tok;
+mod v41;
 mod validate;
 mod vq;
 
@@ -49,7 +50,7 @@ pub use batch::{
     StaticBatchResult, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE,
 };
 pub use bind::{
-    bind_dspark_names, bind_mtp_names, bind_names, catalog_from_bind_name,
+    bind_dspark_names, bind_mtp_names, bind_names, bind_names_v41, catalog_from_bind_name,
     dots3_layer_is_full_attention, dump_bind_check_oracle, dump_bind_dspark_shape,
     dump_bind_lookup_tapes, dump_bind_match_oracle, dump_bind_mtp_shape, dump_bind_names,
     dump_bind_names_shape, dump_bind_names_variant, dump_bind_support, expected_compress_ratio,
@@ -123,6 +124,10 @@ pub use tensors::{
     TensorInfo, TensorInventory,
 };
 pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
+pub use v41::{
+    V41Wire, V41WireError, MTP_MAX_EXPERTS, MTP_MAX_TOWERS, V41_MAX_COMPRESS_RATIO,
+    V41_MAX_ENGRAM,
+};
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, validate_qwen_inventory,
     ValidateError,
@@ -1057,6 +1062,24 @@ fn pack_sibling_ffi(attach: &SiblingAttach) -> Result<FfiSupport> {
 //   model_id / routed_quant_bits
 // MOVE later (production already left):
 //   ds4_bridge_model_run_distributed_worker -> assemble_worker (oracle FFI)
+/// The bind plan for an artifact: every family resolves from the shape alone
+/// except V4.1, whose source-layer conditionals and tower expert form come
+/// from the `deepseek4.*` metadata wire (`V41Wire::load`, `bind_names_v41`).
+fn resolve_bind_plan(
+    g: &GgufFile,
+    shape: Shape,
+    inventory: &TensorInventory,
+) -> Result<BindPlan> {
+    if shape.variant != Variant::DeepSeek41Flash {
+        return Ok(BindPlan::resolve(shape, inventory));
+    }
+    let wire = V41Wire::load(g, &shape).map_err(|e| Error {
+        code: 1,
+        message: format!("v41 wire failed: {}", e.token()),
+    })?;
+    Ok(BindPlan::resolve_v41(shape, &wire, inventory))
+}
+
 /// Everything `Model::open` checks before it touches the device: identify,
 /// family validation, vocab, chat template, tensor inventory, required
 /// tensors and layouts. `--check-config` runs it so an artifact that cannot
@@ -1111,7 +1134,7 @@ pub fn probe_model_artifact(path: &str) -> Result<()> {
             message: e.to_string(),
         })?;
     }
-    let bind_plan = BindPlan::resolve(identified.shape, &inventory);
+    let bind_plan = resolve_bind_plan(&g, identified.shape, &inventory)?;
     if let Some(name) = bind_plan.missing_required().first() {
         return Err(Error {
             code: 1,
@@ -1355,7 +1378,7 @@ impl Model {
                 })?;
             }
         }
-        let bind_plan = BindPlan::resolve(identified.shape, &inventory);
+        let bind_plan = resolve_bind_plan(&g, identified.shape, &inventory)?;
         if let Some(name) = bind_plan.missing_required().first() {
             return Err(Error {
                 code: 1,
