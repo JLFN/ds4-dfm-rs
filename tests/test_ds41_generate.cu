@@ -270,6 +270,11 @@ int main(int argc, char **argv) {
             if (L.fd < 0) { fprintf(stderr, "harness: cannot open engram shard %s\n", shard.c_str()); return 1; }
             L.raw = ds4_gpu_host_alloc((uint64_t)g.np * cols * L.stride);
             if (!L.raw) { fprintf(stderr, "harness: pinned feed allocation failed\n"); return 1; }
+            if (getenv("DS41_ADDR_DUMP")) {   /* the A/B layout discriminator: identical addresses rule the layout class out */
+                void *dva = NULL;
+                (void)cudaHostGetDevicePointer(&dva, L.raw, 0);
+                printf("addr feed k %u host %p dev %p\n", k, L.raw, dva);
+            }
             g.layers.push_back(L);
         }
         for (uint32_t i = 0; i < g.np; i++) if (!feed_fill(&g, i, (int64_t)i)) { fprintf(stderr, "harness: prompt feed fill failed at %u\n", i); return 1; }

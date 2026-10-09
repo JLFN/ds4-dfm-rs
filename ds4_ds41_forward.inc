@@ -939,6 +939,13 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
         for (uint32_t c0 = 0; ok && c0 < np;) ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);
         if (!ok) break;
         fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, now_sec() - t0, (double)np / (now_sec() - t0 + 1e-9));
+        if (getenv("DS41_ADDR_DUMP")) {   /* the A/B layout discriminator (see the harness) */
+            fprintf(stderr, "addr am %p logits %p x %p xn %p tok %p pos %p\n", (void *)am->ptr, (void *)st.logits->ptr,
+                    (void *)st.x->ptr, (void *)st.xn->ptr, (void *)st.tok->ptr, (void *)st.pos->ptr);
+            for (uint32_t k = 0; k < g_ds4_v41.n_engram; k++)
+                if (st.eraw[k]) fprintf(stderr, "addr eraw[%u] %p\n", k, (void *)st.eraw[k]->ptr);
+            if (st.erows) fprintf(stderr, "addr erows %p ekv %p\n", (void *)st.erows->ptr, st.ekv ? (void *)st.ekv->ptr : NULL);
+        }
         /* the last prefill position's logits -> the first token (last_logit_row
          * says which row the head wrote; row 0 under head_last_only) */
         if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
