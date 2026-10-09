@@ -145,6 +145,30 @@ extern "C" int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_
 extern "C" int ds4_gpu_v41_debug_read_weight(const void *model_map, uint64_t model_size,
                                              uint64_t offset, uint64_t bytes, const char *path) {
     if (!model_map || !path || offset > model_size || bytes > model_size - offset) return 0;
+    /* Range-table forensics: every registered range that covers the span. */
+    for (size_t i = 0; i < g_model_ranges.size(); i++) {
+        const cuda_model_range &r = g_model_ranges[i];
+        if (r.host_base != model_map) continue;
+        const int contains = r.offset <= offset && offset + bytes <= r.offset + r.bytes;
+        const int exact = r.offset == offset;
+        if (!contains && !exact) continue;
+        fprintf(stderr, "ds4: [ds41-debug] range[%zu] off %llu bytes %llu dev %p registered %d contains %d exact %d\n",
+                i, (unsigned long long)r.offset, (unsigned long long)r.bytes,
+                (const void *)r.device_ptr, r.host_registered, contains, exact);
+    }
+    {
+        const int src = cuda_mem_src_index(model_map);
+        const uint32_t nu = (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_n[src] : 0;
+        const ds4_phys_unit *units = (src >= 0 && src < DS4_MSRC_MAX) ? g_model_units_v[src] : NULL;
+        for (uint32_t i = 0; units && i < nu; i++) {
+            const ds4_phys_unit *u = &units[i];
+            if (u->src_off <= offset && offset + bytes <= u->src_off + u->src_bytes) {
+                fprintf(stderr, "ds4: [ds41-debug] unit[%u] off %llu bytes %llu policy %u alloc %u\n",
+                        i, (unsigned long long)u->src_off, (unsigned long long)u->src_bytes,
+                        (unsigned)u->policy, (unsigned)u->allocator);
+            }
+        }
+    }
     const char *p = cuda_model_range_ptr(model_map, offset, bytes, "ds41 debug weight");
     fprintf(stderr, "ds4: [ds41-debug] resolve off %llu bytes %llu -> %p (map %p, delta %lld)\n",
             (unsigned long long)offset, (unsigned long long)bytes, (const void *)p, model_map,
