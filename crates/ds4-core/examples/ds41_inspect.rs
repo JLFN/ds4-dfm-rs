@@ -69,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut erows_out: Option<String> = None;
     let mut zchain: Option<String> = None;
     let mut posttrain: Option<String> = None;
+    let mut zchain_scale = 1.0f32;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--tensors" => list_tensors = true,
@@ -77,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--erows-out" => erows_out = args.next(),
             "--zchain" => zchain = args.next(),
             "--posttrain" => posttrain = args.next(),
+            "--zchain-scale" => {
+                zchain_scale = args.next().ok_or("--zchain-scale needs a value")?.parse()?
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -279,55 +283,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Sidecars: read the ② directory (--zchain) layer by layer and
-            // its fingerprint, then the ③ directory's base.fnv gate
-            // (--posttrain). Both are admission checks, not weights.
+            // Sidecars: the ②/③ directories are merged the way the engine
+            // merges them at load (V41Zchain::load: base.fnv gate, rb from ②
+            // only, gains multiplied, amp ranks concatenated), then the ②
+            // directory's fingerprint is recomputed for the base.fnv
+            // evidence. Both are admission checks, not weights.
             let (n_expert, n_embd, n_layer) =
                 (id.shape.n_expert, id.shape.n_embd, id.shape.n_layer);
-            if let Some(zdir) = zchain.as_deref() {
-                let dir = Path::new(zdir);
-                let (mut n_gr, mut n_rb, mut n_amp) = (0u32, 0u32, 0u32);
-                let mut sample = String::from("none");
-                for il in 0..n_layer {
-                    match ds4_core::GrSidecar::read(
-                        &dir.join(format!("gr_L{il:02}.bin")),
-                        n_expert,
-                        n_embd,
-                    ) {
-                        Ok(Some(gr)) => {
-                            n_gr += 1;
-                            if sample == "none" {
-                                sample = format!(
-                                    "gr_L{il:02} type={} factor[0]={:.6}",
-                                    gr.typ, gr.factor[0]
-                                );
+            if zchain.is_some() || posttrain.is_some() {
+                let geom = ds4_core::ZchainGeom {
+                    n_layer,
+                    n_expert,
+                    n_embd,
+                };
+                match ds4_core::V41Zchain::load(
+                    zchain.as_deref().map(Path::new),
+                    posttrain.as_deref().map(Path::new),
+                    geom,
+                    zchain_scale,
+                ) {
+                    Ok(Some(z)) => {
+                        let base = match &z.base {
+                            ds4_core::BaseFingerprint::Absent => "absent".to_string(),
+                            ds4_core::BaseFingerprint::Checked { hash, files } => {
+                                format!("ok {hash:016x}/{files}")
                             }
+                        };
+                        let k = match z.k_range() {
+                            Some((lo, hi)) => format!("{lo}..{hi}"),
+                            None => "none".to_string(),
+                        };
+                        println!(
+                            "zchain-merge: gr={} rb={} amp={} k={k} base={base} beta={}",
+                            z.n_gr_layers(),
+                            z.n_rb_layers(),
+                            z.n_amp_layers(),
+                            z.beta
+                        );
+                        // The layer both directories carry (the product), with
+                        // factor bits for a bit-exact external comparison.
+                        if let Some((il, g)) = z.gr.iter().enumerate().find_map(|(il, g)| {
+                            g.as_ref().filter(|g| g.from2 && g.from3).map(|g| (il, g))
+                        }) {
+                            let f = &g.factor;
+                            let nz = f.iter().take(4096).filter(|&&v| v != 1.0).count();
+                            println!(
+                                "zchain-merge: merged L{il:02} f[0]={:#010x} f[100]={:#010x} f[1000]={:#010x} f[4095]={:#010x} nonzero={nz}/4096",
+                                f[0].to_bits(),
+                                f[100].to_bits(),
+                                f[1000].to_bits(),
+                                f[4095].to_bits()
+                            );
                         }
-                        Ok(None) => {}
-                        Err(e) => println!("zchain gr_L{il:02}: {}", e.token()),
-                    }
-                    match ds4_core::RbSidecar::read(&dir.join(format!("rb_L{il:02}.bin")), n_expert)
-                    {
-                        Ok(Some(rb)) => {
-                            n_rb += 1;
-                            if sample == "none" {
-                                sample = format!("rb_L{il:02} bias[0]={:.6}", rb.bias[0]);
-                            }
+                        if let Some((il, g)) =
+                            z.gr.iter()
+                                .enumerate()
+                                .find_map(|(il, g)| g.as_ref().map(|g| (il, g)))
+                        {
+                            println!(
+                                "zchain-merge: first gr L{il:02} from2={} from3={} f[0]={:.9}",
+                                g.from2, g.from3, g.factor[0]
+                            );
                         }
-                        Ok(None) => {}
-                        Err(e) => println!("zchain rb_L{il:02}: {}", e.token()),
+                        if let Some((il, a)) = z
+                            .amp
+                            .iter()
+                            .enumerate()
+                            .find_map(|(il, a)| a.as_ref().map(|a| (il, a)))
+                        {
+                            println!(
+                                "zchain-merge: first amp L{il:02} k2={} k3={} typ={}/{}",
+                                a.k2, a.k3, a.typ2, a.typ3
+                            );
+                        }
                     }
-                    match ds4_core::AmpSidecar::read(&dir.join(format!("amp_L{il:02}.bin")), n_embd)
-                    {
-                        Ok(Some(_)) => n_amp += 1,
-                        Ok(None) => {}
-                        Err(e) => println!("zchain amp_L{il:02}: {}", e.token()),
-                    }
+                    Ok(None) => println!("zchain-merge: no directories"),
+                    Err(e) => println!("zchain-merge: {}", e.token()),
                 }
-                let (hash, files) = ds4_core::gr_dir_fnv(dir, n_layer);
-                println!(
-                    "zchain: gr={n_gr} rb={n_rb} amp={n_amp} fnv={hash:016x}/{files} sample[{sample}]"
-                );
+            }
+            if let Some(zdir) = zchain.as_deref() {
+                let (hash, files) = ds4_core::gr_dir_fnv(Path::new(zdir), n_layer);
+                println!("zchain: fnv={hash:016x}/{files}");
             }
             if let Some(pdir) = posttrain.as_deref() {
                 let dir = Path::new(pdir);

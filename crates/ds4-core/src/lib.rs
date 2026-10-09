@@ -45,6 +45,7 @@ mod tok;
 mod v41;
 mod validate;
 mod vq;
+mod zchain;
 
 pub use batch::{
     cont_sample_token, qwen_image_pixel_hash, qwen_image_probe, BankSnapshot, BatchCtx, ContAdmit,
@@ -142,6 +143,7 @@ pub use validate::{
 pub use vq::{
     blob_nexp, blob_ok, blob_slot, blob_ver, e4m3fn_to_f32, f16_to_f32, VqError, VqMatrix,
 };
+pub use zchain::{load_dirs, AmpMerge, GrMerge, V41Zchain, ZchainGeom};
 
 use std::ffi::CString;
 use std::marker::PhantomData;

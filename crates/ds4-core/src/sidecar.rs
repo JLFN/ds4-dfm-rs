@@ -51,6 +51,14 @@ pub enum SidecarError {
         have: u64,
         have_files: u32,
     },
+    /// Neither directory holds any amp, gr or rb file (`core_v41_amp.c:259-263`).
+    Empty,
+    /// The ② + ③ rank sum exceeds `AMP_MAX_RANK` (`core_v41_amp.c:242`).
+    RankOver {
+        layer: u32,
+        k2: u32,
+        k3: u32,
+    },
 }
 
 impl SidecarError {
@@ -61,6 +69,10 @@ impl SidecarError {
             SidecarError::Type(p) => format!("sidecar-type {p}"),
             SidecarError::Truncated(p) => format!("sidecar-truncated {p}"),
             SidecarError::BaseMismatch { .. } => "sidecar-base-mismatch".into(),
+            SidecarError::Empty => "zchain-empty".into(),
+            SidecarError::RankOver { layer, k2, k3 } => {
+                format!("zchain-rank-over L{layer:02} {k2}+{k3}")
+            }
         }
     }
 }
