@@ -489,6 +489,7 @@ P4 unit order, each with its own gate:
 | P4-2 | MoE launcher wiring in the native forward for variant 16 | one-hot probes bit-exact; the worker's routed sum against a Rust emulation within the recorded tolerance |
 | P4-3 | fp8_32x32 decode and the engram read path | erows and the wkv matmul against the golden `hce_L01/L14` traces |
 | P4-4 | forward bring-up on the golden prompts | G2: per-layer `x_Lnn`/`y_Lnn` traces first, then logits |
+| P4-5 | the sparse-attention tensor-core family: the two-pass seg decode, the single-pass prefill mma, the scalar split-K, the merge, and the entry's try order (`cuda/ds41_attn_mma.cuh`) | G2: the n<=8 prompts bit-exact vs the bare golden (§6.12); the prefill arm (n>=64) and the 9..63 scalar band gate with unit C's longer prompt |
 
 ## 6.8 P4-1 evidence: the VQ decode family vs the host oracle (2026-10-09)
 
@@ -785,6 +786,96 @@ HC=4, head_dim=256, eps=1e-20) at n=2.
 
 Next: P4-4 (the forward bring-up; G2: per-layer x/y traces first, then
 logits — where hce_L01/L14 joins the comparison via hc_before).
+
+## 6.12 P4-4 evidence: the forward bit-exact on the golden (2026-10-09)
+
+Unit commits: 1e7eb72 (the eager forward + trace harness; the kernel
+families e877471/6b59081), then the blob-residency fixes 3d8779f, ac21f4c,
+dd4ac05, 4b2b3e5, bb74bc0; the mma attention family (P4-5) landed as
+6ad1ace.
+
+Built: the eager single-state forward (`ds4_ds41_forward.inc`, the engine's
+`core_v41_forward.c` driver) and the trace harness
+(`tests/test_ds41_forward.cu`: golden ids -> the score entry -> per-layer
+`x_Lnn`/`y_Lnn` + `hce_Lnn` + logits compared against the golden dir,
+argmax + both PPLs). The golden must be the BARE variant (the capture's
+NO_ZCHAIN=1): the port does not apply the zchain sidecar yet (unit D), so
+the with-sidecar golden would measure the sidecar, not the port. Bare
+values: p1 46.8780 (S=8), p2 22.0679 (S=11), p3 9.5414 (S=7), p4 10.7011
+(S=18), p5 6662.9080 (S=7).
+
+Root cause 1 (nondeterminism + 3-13 s forwards): the flat 24 GiB cache
+budget (`WEIGHT_CACHE_LIMIT_GB`) funded only 37/85 units (23.97 GiB); the
+~96 GiB of VQ blobs stayed on the reclaimable mapping, and GB10 HMM does
+not mlock `cudaHostRegisterMapped` (the port's own note, ds4_cuda.cu
+~4601-4618), so cold pages read through the mapping are slow and can
+return garbage. Fixed by porting the engine's unified budget rule
+(unified memory -> total_phys - 8 GiB; `cuda_q8_repack_1.inc.cu:399-417`)
+and the eager source-page drop (`cuda_modelmap.inc.cu:330-343`). Evidence:
+with the mechanism forced through the existing knobs
+(`DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=100 DS4_CUDA_EAGER_SOURCE_DISCARD=1`),
+two runs gave bit-identical logits and all 40 layer dumps.
+
+Root cause 2 (deterministic garbage logits, PPL 372234.9112, identical
+across four runs): the unit compiler merged the mtp.2 VQ blob (DQVL v3,
+nexp 128) with ~132 MB of trailing tensors (markov_embd/head, confidence,
+both out_norms) into one 938 MiB unit; the aligned copy relocated the whole
+mixed span, and the head's output_norm resolved into the relocated image.
+Fixed by the engine's "a blob is its own span" rule: `DS4_TCAT_VQ_BLOB` +
+never-merge (`core_model_map.c:113-115, 184`) with a compiler self-test
+(ds4_server.c). `DS41_DUMP_HEAD` forensics proved it: unit[83] off
+112199472480 bytes 984322592; the norm served from 0x1ea0000000 +
+984302112 = its exact source delta (/tmp/p44h2.log).
+
+The vq-align mechanism (the engine's `cuda_vq_align.inc.cu`): each VQ
+blob's payloads relocate to 128 B bitstream alignment into a device-
+resident image. v1 copied straight from the cold mapping and wedged the
+boot (100% user spin, idle GPU, frozen at 32.54 GiB); v2 (ac21f4c) builds
+the image on the host and uploads it pageable. `DS4_CUDA_NO_VQ_ALIGN=1`
+is the flat-path kill switch (clean cold). Boot cost recorded: 76-117 s
+aligned vs ~62 s flat; revisit if it matters.
+
+The P4-5 mma family (6ad1ace): ported the engine's live decode family
+(`cuda_sparse_attn_mma.inc.cu`, `cuda_v41_attn_split.inc.cu`,
+`cuda_v41_attn_mma_decode.inc.cu`) and the entry's try order
+(`cuda_v41_2.inc.cu:229-303`: mma decode for n<=8 at any key count, the
+draft-block arm, scalar split-K, prefill mma n>=64, scalar fallback). The
+P4-4 named deviation (scalar-only attention) is closed for n<=8; the
+scalar kernel remains exactly where the engine keeps it (the 9..63 band
+and refused shapes). The family is not bit-equal to the scalar kernel by
+construction (tensor-core accumulation order, different online-softmax
+grouping) — which is why the delta below is the measurement that matters.
+
+Gates:
+
+1. Determinism (before P4-5, at bb74bc0; default config, no env knobs):
+   E8-E12, five runs into unique /tmp dirs — 87 units funded 87/87,
+   populated 105.75 GiB, [vq-align] active, every run bit-identical
+   (logits + all 80 layer dumps), every PPL 47.6362, every forward 0.1 s.
+   That PPL was the scalar-attention value; the delta vs the golden
+   46.8780 (1.6%) was the recorded scalar-vs-mma accumulation-order gap.
+2. The P4-5 gate (6ad1ace, this session; default config): p1 (n=8) logits
+   0/1034240 diffs, argmax 8/8, PPL 46.8780 == golden; p3 (n=7) 0/904960,
+   7/7, 9.5414; p5 (n=7) 0/904960, 7/7, 6662.9080; every layer
+   `x_Lnn`/`y_Lnn` and `hce_L01/L14` zero-diff (129 zero-diff lines, zero
+   nonzero-diff/FAIL/mismatch lines in /tmp/p45a + /tmp/p45c). Boot 76.0 s
+   with vq-align; "[attn] decode tensor-core shared 41 KB enabled". The
+   1.6% delta collapsed to 0.00%: the attention family was the only
+   accumulation-order difference between port and engine on this path.
+3. p2 (n=11) and p4 (n=18) are blocked by unit C, not by this unit: the
+   forward hits "f32 prefill (n_tok 11 > 8) is not ported yet" at the MoE
+   router gate (ds4_ds41_forward.inc:543 ->
+   ds4_gpu_v41_matmul_f32_tensor, ds41_dense.cuh:199-200). The n>8 arms
+   (unit C) also unlock the 9..63 scalar attention band's gate.
+
+Local gates (this session): ds4_cuda.o builds for sm_89;
+test-ds41-vq / -moe / -fp8 / -engram all pass.
+
+Diagnostics kept (env-gated): `DS41_DUMP_HEAD` (head resolve + raw bytes +
+covering ranges/units), `ds4_gpu_v41_debug_read_weight` /
+`ds4_gpu_v41_debug_dump_raw`, `DS4_CUDA_NO_VQ_ALIGN`.
+
+Unit: P4-4 complete
 
 ## 7. Numerics contract
 
