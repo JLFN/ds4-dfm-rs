@@ -51,11 +51,14 @@ static bool parse_ids(const char *path, std::vector<int> *ids) {
 static bool parse_engine_emit(const char *path, std::vector<int> *pos, std::vector<int> *ids) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "harness: cannot read %s\n", path); return false; }
-    char line[512];
+    char line[4096];
     while (fgets(line, sizeof line, f)) {
-        unsigned p; int t;
-        if (sscanf(line, " [emit] %u %d", &p, &t) == 2 || sscanf(line, "[emit] %u %d", &p, &t) == 2) {
-            pos->push_back((int)p);
+        /* the CLI's token text goes to stdout and [emit] to stderr, both into
+         * one file: "[emit] 8 455\nThe[emit] 9 8397" — find the marker anywhere */
+        const char *p = strstr(line, "[emit]");
+        unsigned pp; int t;
+        if (p && sscanf(p, "[emit] %u %d", &pp, &t) == 2) {
+            pos->push_back((int)pp);
             ids->push_back(t);
         }
     }
@@ -251,8 +254,12 @@ int main(int argc, char **argv) {
 
     std::vector<int> oids;
     g.ids = &oids;
+    ds41_engram_feed feed;
+    memset(&feed, 0, sizeof feed);
+    for (uint32_t k = 0; k < g.layers.size(); k++) feed.raw[k] = g.layers[k].raw;   /* k == the engram index (ds41_forward.h) */
     const int rc = ds4_v41_generate_argmax(e, prompt.data(), (int)prompt.size(), n_predict,
-                                           no_engram || n_eng == 0 ? 1 : 0, emit_feed, &g);
+                                           no_engram || n_eng == 0 ? 1 : 0,
+                                           g.layers.empty() ? NULL : &feed, emit_feed, &g);
     if (rc != 0) { fprintf(stderr, "harness: generate entry failed\n"); return 1; }
 
     size_t diffs = 0, first = SIZE_MAX;

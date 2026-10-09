@@ -47,10 +47,11 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
  * order (nonzero return stops, the CLI's EOS convention); the entry itself
  * also stops at EOS and at the context edge.  Greedy only — sampling, the
  * penalties, the DSpark spec round and the decode graph are their own units.
- * no_engram mirrors the engine's --v41-no-engram; with engram layers and no
- * feed the forward refuses by name. */
+ * no_engram mirrors the engine's --v41-no-engram; the engine's generate path
+ * has no such switch, so the gate runs with the engram live and the caller
+ * refreshes `feed` per step (its emit hook owns the hash + pread). */
 int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
-                            int (*emit)(int token, void *ud), void *ud);
+                            const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud);
 
 /* Engram table metadata for the feed builder: the engine's C loader filled it
  * from the GGUF, so a caller that hashes + preads rows itself (the Rust host,

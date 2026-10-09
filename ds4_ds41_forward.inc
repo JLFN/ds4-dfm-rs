@@ -874,7 +874,7 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
  * and the emit-trace diagnostics are not ported (their units); no_engram
  * mirrors the engine's --v41-no-engram. */
 int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
-                            int (*emit)(int token, void *ud), void *ud) {
+                            const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud) {
     ds4_engine *e = (ds4_engine *)engine;
     if (!e || !prompt || n_prompt < 1 || DS4_MODEL_VARIANT != DS4_VARIANT_V41) return 1;
     const uint32_t np = (uint32_t)n_prompt;
@@ -891,6 +891,7 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;
     st.head_last_only = 1;
     st.no_engram = no_engram;   /* the gate's compare-only mode (the engine's --v41-no-engram) */
+    st.efeed = feed;            /* live rows: the caller refreshes them per step (emit hook) */
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(16u);   /* the engine's 16 B device slot; argmax writes the first int */
     int rc = 1;
     int32_t tok = 0;
