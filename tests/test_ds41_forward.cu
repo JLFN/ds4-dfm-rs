@@ -155,6 +155,11 @@ int main(int argc, char **argv) {
     memset(&opt, 0, sizeof opt);
     opt.model_path = gguf;
     opt.backend = DS4_BACKEND_CUDA;
+    /* The boot prewarm runs a throwaway session sync; V4.1 has no session
+     * graph in the port yet (the serving unit), so it segfaults there.  The
+     * engine's own option is exactly for callers that do not want it: the
+     * first request pays the one-time driver costs instead. */
+    opt.defer_boot_prewarm = true;
     ds4_engine *e = NULL;
     if (ds4_engine_open(&e, &opt) != 0) { fprintf(stderr, "harness: engine open failed\n"); return 1; }
 
