@@ -540,6 +540,82 @@ Two findings the gate produced:
   possibly still in flight. Fixed in 84301f8 (event on the legacy stream, the
   moe stream waits on it); post-fix 50/50 runs clean.
 
+## 6.9 P4-0 evidence: the native opens the artifact (2026-10-09)
+
+Unit commit 06ba7b2. Before it the native could not open the artifact at all:
+variant 16 died in `model_apply_host_shape`, the V4 bind required per-expert
+tensors that do not exist in V4.1, and the type table lacked ids 40-44 so the
+C path could not even parse the file. What landed: variant 16, the
+`DS4_SHAPE_V41_FLASH` literal (core_shape_select.c:81), the metadata selector
+arm, the wiring state `g_ds4_v41` (mirror of ds4_internal.h:57-82), the C-path
+wiring loader (core_validate_v41.c:46-154, keys included), the V4.1 bind and
+layout arms (core_bind_v41.c:41-202: blob experts, engram triples,
+source-layer compressor/indexer names with no ape and no gate at ratio 1, no
+`output_hc_*`), the draft towers' native home
+(core_draft_tower_types.h:13-32), the five type-table entries, and a
+`DS4_HOST_BIND_CENSUS=1` diagnostic that counts the native's own name
+resolutions against the host plan.
+
+The ABI-delta table (the P4-0 contract; ds4_host_shape in
+native/bridge/ds4_host_load.h, mirror crates/ds4-sys/src/lib.rs, filled in
+crates/ds4-core/src/lib.rs from V41Wire, consumed by
+`model_apply_host_v41_wiring`): the three existing fields keep their order;
+appended, borrowed and n_layer long, NULL/0 for other variants:
+`v41_kv_source` (bind: compressor/indexer names per layer), `v41_index_source`,
+`v41_kv_source_of` / `v41_index_source_of` (stored; forward P4-2),
+`v41_engram_index_of` (bind: engram triples), `v41_n_engram`,
+`v41_engram_layers`, `v41_engram_max_ngram`/`heads`/`head_dim` (layout dims),
+`v41_engram_pad`, the candidate triple (stored; P4-2), `v41_mtp_towers` /
+`v41_mtp_experts` (bind: tower names). Not carried yet, named: engram
+rows/weight_off/scale_off/table_path (P4-3), ctx, the DSpark draft parameters
+(P5).
+
+Two findings this unit produced:
+
+- `host_compress_ratios` derives the V4 formula, which returns zeros for
+  V4.1; the ABI now carries the metadata ratios (`wire.compress_ratios`), or
+  the native would have dropped the ratio-2 compressor gates and bound the
+  wrong tensor set.
+- The artifact's indexer key projection is `blk.L.indexer.wk.weight`; the V4
+  field for that role is `indexer_attn_k`, so the layer struct gained
+  `indexer_wk` (the engine's V4.1 name, core_bind_v41.c:76).
+
+Gates, both on the Spark against the real artifact (logs /tmp/p4_0_c_gate.log
+and /tmp/p4_0_rs_gate.log):
+
+C path, `DS4_HOST_BIND_CENSUS=1 ./ds4-c --inspect --model <artifact>` (the
+metadata loader, bind and layout; no host plan):
+
+    ds4: engram table 0 not readable at /home/fodelf/... (warn only; the converter's path)
+    ds4: engram table 1 not readable at /home/fodelf/... (warn only)
+    ds4: V4.1 wiring: kv sources 4 / index sources 8 / candidate L20 (2048 blocks x 8) / engram 2 layers (384006168+384016682 rows on disk)
+    ds4: [v41] layout ok (skel q4_K/fp4x32, 40 layers, 3 towers)
+    ds4: bind census: bound=1000 required-missing=0 optional-missing=0 asks=1000 (no host plan)
+
+plus the model summary (DeepSeek V4.1 Flash, 1000 tensors, train context
+1048576, vqblob 43 / fp8_32x32 27). The wiring line equals the Rust plan's
+(§6.6: kv sources [2,8,14,20], index sources [2,8,14,20,24,28,32,36], engram
+[1,14]), and asks=1000 proves the native's ask set is exactly the plan's
+1000 slots.
+
+Rust host path, `DS4_HOST_BIND_CENSUS=1 ./ds4 --model <artifact> --cpu
+--lifecycle -c 4096` (the extended ABI; the native never re-reads the
+metadata on this path):
+
+    ds4: V4.1 wiring: kv sources 4 / index sources 8 / candidate L20 (2048 blocks x 8) / engram 2 layers
+    ds4: bind census: slots=1000 resolved=1000 bound=1000 required-missing=0 optional-missing=0 asks=1000 fallback=0
+    lifecycle ok backend=Cpu ctx=4096 pos=0
+
+`resolved=1000` is a bitset count of DISTINCT plan entries, so it cannot be
+inflated by duplicates; `fallback=0` proves every name the native asked was in
+the plan. The census equals the Rust plan's line (`bind: slots=1000 bound=1000
+required-missing=0`, §6.6.1) exactly. Local (RTX 4070 SUPER): the sm_89 link
+(`make ds4`) and the model-free suites (v41 11/11, catalog 5/5, ds4-core 362
+passed) are green; the one ds4-core failure seen once is the pre-existing
+`cpu_quote_uses_ram_not_discrete_fb` meminfo race (passes standalone).
+
+Next: P4-2 (the MoE launcher wiring in the native forward for variant 16).
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
