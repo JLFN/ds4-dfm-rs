@@ -5221,6 +5221,44 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
         uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok);
 
+/* DeepSeek V4.1 fp8_32x32 (e4m3 plane + one ue8m0 per 32x32 tile; see
+ * cuda/ds41_fp8blk.cuh).  `weight_offset` addresses the e4m3 plane in the
+ * model map; the scale plane follows it.  n_tok <= 8 runs the fused GEMV;
+ * the wkv entry's larger batches expand to bf16 + cuBLAS (in_dim % 512 == 0
+ * chooses GEMV at n <= 8, cuda_v41_1.inc.cu:348).  round_out rounds the
+ * whole output through bf16 once, the shared contract with the fp4 arm.
+ * Returns 1 on success. */
+int ds4_gpu_v41_matmul_fp8blk_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_v41_matmul_fp8blk_round_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok, int round_out);
+int ds4_gpu_v41_grouped_matmul_fp8blk_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim, uint64_t rank,
+        const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out);
+/* The bf16 round-back (the fp4 arm folds it into its kernel; this is the fp8
+ * side's own pass). */
+int ds4_gpu_v41_round_bf16_tensor(ds4_gpu_tensor *x, uint64_t n);
+/* Engram table rows: raw[rows][head_dim + head_dim/32] (e4m3 row + its ue8m0
+ * tail) -> bf16 grid stored as f32, rows*head_dim values. */
+int ds4_gpu_v41_engram_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *raw, uint32_t n_rows, uint32_t head_dim);
+
+/* The engram gate (official Engram.forward): per (token, hc row) updates
+ * hc in place from kv (the wkv output, [n_tok][n_hc+1][n_embd]) and the q/k
+ * weights addressed by offset in the model map.  n_hc blocks per token. */
+int ds4_gpu_v41_engram_gate_tensor(ds4_gpu_tensor *hc, const ds4_gpu_tensor *kv, const void *model_map, uint64_t model_size,
+        uint64_t q_w_offset, uint64_t k_w_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
+
+/* The engram read path's device side (the host half lives in Rust: shard
+ * open, O_DIRECT pread, per-layer rounds).  Pinned mapped host memory; the
+ * flag the graph's spin kernel waits on; the pinned->device zero-copy
+ * upload.  See cuda/ds41_engram.cuh for the why of each. */
+void *ds4_gpu_host_alloc(uint64_t bytes);
+void ds4_gpu_host_free(void *p);
+int ds4_gpu_host_flag_wait(const void *flag_pinned, const void *want_pinned, void *err_pinned);
+int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset, const void *pinned, uint64_t bytes);
+
 #ifdef __cplusplus
 }
 #endif

@@ -113,7 +113,7 @@ endif
         test-solar-gates test-solar-kv test-solar-tokenizer \
         test-solar-forward test-solar-session \
         test-exaone-ref test-exaone-kernels test-exaone-batch \
-        pq2-0-test test-qwen35-rows test-ds41-vq test-ds41-moe \
+        pq2-0-test test-qwen35-rows test-ds41-vq test-ds41-moe test-ds41-fp8 test-ds41-engram \
         rust-bridge ds4-rs ds4-bench-rs ds4-agent-rs ds4-server-rs test-kv-parity test-web-parity test-dist-parity test-route-parity test-server-parity test-catalog-parity test-tokenizer-parity test-agent-parity test-session-parity
 
 ifeq ($(UNAME_S),Darwin)
@@ -940,6 +940,38 @@ tests/test_ds41_moe: tests/test_ds41_moe.cu ds4_gpu.h $(DS4_CUDA_CORE_OBJS)
 .PHONY: test-ds41-moe
 test-ds41-moe: tests/test_ds41_moe
 	./tests/test_ds41_moe tests/fixtures/ds41/vq/moe.blob tests/fixtures/ds41/vq/moe.cases.txt tests/fixtures/ds41/vq/moe.ref.f32
+
+# DeepSeek V4.1 (ds41) fp8_32x32 gate: the tower/engram-wkv entries
+# (plain, round-out, grouped) against the Rust emulation
+# (crates/ds4-core/examples/ds41_fp8_ref.rs). onehot cases bit-exact, dense
+# cases within the recorded tolerance. The reference is checked in; regenerate
+# with:
+#   python3 tests/fixtures/ds41/fp8/gen_fp8.py
+#   cargo run -p ds4-core --release --example ds41_fp8_ref -- \
+#     tests/fixtures/ds41/fp8/fp8.img tests/fixtures/ds41/fp8/fp8.cases.txt \
+#     tests/fixtures/ds41/fp8/fp8.ref.f32
+tests/test_ds41_fp8: tests/test_ds41_fp8.cu ds4_gpu.h $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ tests/test_ds41_fp8.cu $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: test-ds41-fp8
+test-ds41-fp8: tests/test_ds41_fp8
+	./tests/test_ds41_fp8 tests/fixtures/ds41/fp8/fp8.img tests/fixtures/ds41/fp8/fp8.cases.txt tests/fixtures/ds41/fp8/fp8.ref.f32
+
+# DeepSeek V4.1 (ds41) engram gate: the gate kernel and the row dequant
+# against the Rust emulation (crates/ds4-core/examples/ds41_engram_ref.rs),
+# plus the read path's device primitives (pinned alloc, zero-copy upload,
+# spin-flag wait). The reference is checked in; regenerate with:
+#   python3 tests/fixtures/ds41/engram/gen_engram.py
+#   cargo run -p ds4-core --release --example ds41_engram_ref -- \
+#     tests/fixtures/ds41/engram/engram.img tests/fixtures/ds41/engram/engram.cases.txt \
+#     tests/fixtures/ds41/engram/engram.ref.f32 tests/fixtures/ds41/engram/rows.bin \
+#     tests/fixtures/ds41/engram/rows.ref.f32
+tests/test_ds41_engram: tests/test_ds41_engram.cu ds4_gpu.h $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ tests/test_ds41_engram.cu $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: test-ds41-engram
+test-ds41-engram: tests/test_ds41_engram
+	./tests/test_ds41_engram tests/fixtures/ds41/engram/engram.img tests/fixtures/ds41/engram/engram.cases.txt tests/fixtures/ds41/engram/engram.ref.f32 tests/fixtures/ds41/engram/rows.bin tests/fixtures/ds41/engram/rows.ref.f32
 
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its

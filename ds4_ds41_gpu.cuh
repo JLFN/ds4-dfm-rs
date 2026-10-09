@@ -12,7 +12,9 @@
  * The prefill GEMM family, the backward files and the retired/probe-only paths
  * stay behind until their units. P4-2 adds the tensor-level entry
  * (ds4_gpu_v41_routed_moe_tensor: host blob-header read + range-resolved
- * device pointer) below the row probe.  Every launch in this family runs on
+ * device pointer) below the row probe.  P4-3 adds the fp8_32x32 decode family
+ * (cuda/ds41_fp8blk.cuh: the tower/engram-wkv matmuls and the engram row
+ * dequant).  Every launch in this family runs on
  * ds4_current_stream() — the engine's g_cur_stream convention (stream 0
  * outside capture, the capture stream inside).
  */
@@ -31,6 +33,8 @@ int g_ds4_v41_vq_group = 1;
 #include "cuda/ds41_vq_group.cuh"
 #include "cuda/ds41_vq_persist.cuh"
 #include "cuda/ds41_vq_launch.cuh"
+#include "cuda/ds41_fp8blk.cuh"   /* P4-3: fp8_32x32 decode (towers + engram wkv) */
+#include "cuda/ds41_engram.cuh"   /* P4-3: the engram gate + read-path device pieces */
 
 /* Raw decode entry for tests and the P4-2 forward wiring: all pointers are
  * device pointers; `nc` and `ver` come from the blob header (ds4vq_blob_nexp /
