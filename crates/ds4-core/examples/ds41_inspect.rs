@@ -118,5 +118,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {}", t.dump_line());
         }
     }
+
+    // Identification and validation: the two steps that decide whether this
+    // host can accept the artifact at all.
+    match ds4_core::identify_file(&g) {
+        Ok(id) => {
+            println!("identify: {}", id.identify_line());
+            match ds4_core::validate_file(&g, &id.shape) {
+                Ok(()) => println!("validate: ok"),
+                Err(e) => println!("validate: {}", e.token()),
+            }
+        }
+        Err(e) => println!("identify failed: {e}"),
+    }
     Ok(())
 }
