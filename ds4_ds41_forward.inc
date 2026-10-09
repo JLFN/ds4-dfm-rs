@@ -594,7 +594,7 @@ static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint32_t n = st->n, E = DS4_N_EMBD;
     static int tr_on = -1;
     if (tr_on < 0) tr_on = getenv("DS41_FWD_TRACE") ? 1 : 0;
-    static int l0_on = -1;   /* temporary unit-C diagnostic: layer-0 stage dumps */
+    static int l0_on = -1;   /* DS41_DUMP_L0=1: layer-0 stage dumps (the n>=17 divergence instrument, kept) */
     if (l0_on < 0) l0_on = getenv("DS41_DUMP_L0") ? 1 : 0;
     const int l0 = l0_on && il == 0u && st->dump_prefix != NULL;
     const int tr = tr_on && il >= 27u;

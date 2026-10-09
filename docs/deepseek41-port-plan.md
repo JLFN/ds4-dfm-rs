@@ -490,6 +490,7 @@ P4 unit order, each with its own gate:
 | P4-3 | fp8_32x32 decode and the engram read path | erows and the wkv matmul against the golden `hce_L01/L14` traces |
 | P4-4 | forward bring-up on the golden prompts | G2: per-layer `x_Lnn`/`y_Lnn` traces first, then logits |
 | P4-5 | the sparse-attention tensor-core family: the two-pass seg decode, the single-pass prefill mma, the scalar split-K, the merge, and the entry's try order (`cuda/ds41_attn_mma.cuh`) | G2: the n<=8 prompts bit-exact vs the bare golden (§6.12); the prefill arm (n>=64) and the 9..63 scalar band gate with unit C's longer prompt |
+| P4-6 | the n>8 prefill arms: f32/bf16 dense GEMMs, the q4_K prefill GEMM, the VQ routed-MoE prefill (scheduler + the v2 fused arm + the v3 tensor-core vqm/vqs), and the cuBLAS-state fix (cublasSetStream before each ds41 GEMM, mirroring the engine's documented workspace reset) | G2: p1..p5 + p6k64 (n=64) bit-exact vs the bare golden, 258 zero-diff trace lines, zero nonzero (§6.13) |
 
 ## 6.8 P4-1 evidence: the VQ decode family vs the host oracle (2026-10-09)
 
@@ -876,6 +877,94 @@ covering ranges/units), `ds4_gpu_v41_debug_read_weight` /
 `ds4_gpu_v41_debug_dump_raw`, `DS4_CUDA_NO_VQ_ALIGN`.
 
 Unit: P4-4 complete
+
+## 6.13 P4-6 evidence: the n>8 prefill arms + the cuBLAS-state fix (2026-10-09)
+
+Unit commits: cc10fb2 (the four prefill families), d34b3ba (the long-prompt
+fixture), 27b285d (the cuBLAS-state fix), 451862c (the layer-0 stage-dump
+instrument, kept).
+
+1. What was ported (all engine-cited in the file headers). The f32 and bf16
+   dense prefill arms (cuda_v41_1.inc.cu:291-296, :308-330); the q4_K prefill
+   GEMM with its to-bf16 kernel and the row tiling by V41_BF16_STAGE_ELEMS
+   (cuda_v41_q4k.inc.cu:183-205, :330-390; the engine's v41_wc_* weight cache
+   is training-only and is a named omission); the VQ routed-MoE prefill as
+   three files — the scheduler (cuda_vq_prefill.inc.cu: header cache, stable
+   counting sort, fixed-pick reduce), the v2 fused arm
+   (cuda_vq_prefill_fused.inc.cu) and the v3 tensor-core arms
+   (cuda_vq_prefill_mma.inc.cu vqm + cuda_vq_reg_mma.inc.cu vqs, selected by
+   the engine's own shape and alignment checks; vqs's sm_90+ L2 bulk prefetch
+   is compiled out below sm_90, a hint only). The retired NVFP4 path and the
+   backward capture are not ported (named). The routed_moe entry now takes
+   the engine's n<=8 decode / n>8 prefill split.
+
+2. The divergence that this unit's gate first exposed, and its root cause.
+   With the four families in, p1/p2/p3/p5 were bit-exact but p4 (n=18)
+   diverged: x_L00 differed in 71 values (K=17: 69), rows 1..15, all on the
+   bf16 grid, 1-4 bf16 ulps, PPL 12.35 vs the golden 10.70. Bisection on the
+   Spark (fresh engine runs on truncated ids; the engine is causal and
+   deterministic): bit-exact at K=12 and K=16, divergent at K=17/18. Both
+   sides switch at n=17 (the engine's own K=16 vs K=18[:16] delta is 11199
+   values, the port's 11203; K=17 == K=18[:17] exactly on both sides), and
+   the two sides' 16->18 deltas disagree in 62 positions. Layer-0 stage
+   dumps (DS41_DUMP_L0) put the switch inside v41_attention: the attention
+   input is width-invariant (l0axn 0 diffs at 16/17/18), the attention
+   output switches (l0ao 18038). No n=17 threshold exists in either tree
+   (checked: 8/64/1/2048 are the only gates); the 16->17 change is cuBLAS's
+   own N-dependent kernel pick, which both sides inherit because they load
+   the same libcublas.so.13. Root cause of the residual 62: the engine calls
+   cublasSetStream(g_cublas, v41_cublas_stream()) before every V4.1 GEMM
+   (cuda_v41_1.inc.cu:219,259,292,318,360; cuda_v41_q4k.inc.cu:359), and per
+   the cuBLAS docs (2.4.7) that call unconditionally resets the bound
+   workspace to the default workspace pool — so the engine's GEMMs actually
+   run on the default pool, not on the 32 MB user buffer its init installs
+   (cuda_lifecycle.inc.cu:25-28). The port never made the call and kept its
+   user workspace bound; cuBLAS keys algorithm selection on the bound
+   workspace, so the two sides picked different kernels at N>=17. The fix
+   (27b285d) mirrors the call in the four ds41 GEMM entries (f32, bf16, q4k,
+   fp8blk wkv; the grouped q4K entry reaches it through v41_q4k_gemm). The
+   port's stream is the legacy default, so ordering is unchanged;
+   cuda_cublas_ws_prep now only touches the unbound user buffer. Measured
+   proof, same session: pre-fix at K=17 vs the engine 69 x_L00 diffs;
+   post-fix K=16/17/18 vs fresh engine runs bit-identical (logits and
+   x_L00); pre-fix vs post-fix differ. A local sm_89 sweep of the same
+   shapes found the binding inert there — the heuristic's bucket differs by
+   arch; sm_121 is where it bites.
+
+3. The gate (post-fix, one invocation, bare golden + the long-prompt
+   fixture): p1 (n=8) 0/1034240 diffs, PPL 46.8780; p2 (n=11) 0/1422080,
+   22.0679; p3 (n=7) 0/904960, 9.5414; p4 (n=18) 0/2327040, argmax 18/18,
+   10.7011; p5 (n=7) 0/904960, 6662.9080; p6k64 (n=64) 0/8273920, argmax
+   64/64, 8.1912. 258 zero-diff lines across the x/y/hce traces, zero
+   nonzero-diff/FAIL/mismatch. p6k64 = the first 64 ids of the 835-token
+   fixture (tests/ds41-long-prompt.txt, captured with the engine like
+   p1..p5): n=64 exercises the sparse-attn prefill mma at its exact
+   threshold and the VQ prefill at 384 pairs. p2 and p4 also pass the
+   9..63 scalar attention band's gate, deferred by P4-5.
+
+4. External review, on the record: three independent reviewers (two peer
+   open-grok sessions — the engine's own YoungAi session and a second
+   ds4-dfm-rs session — plus a GPT ASTRA 6 subagent) converged on the same
+   candidate from the source and the vendor doc; the sm_89 measurement said
+   inert, the sm_121 measurement settled it. The peer sessions' enumerations
+   (no 16/17 threshold anywhere; the workspace as the only GEMM-affecting
+   state difference; the prefill-mma/9..63 arm matching arm-for-arm) are
+   consistent with the measurement.
+
+5. Recorded gap: a >64-token logits gate. The engine's own trace gate
+   (core_v41_score.c:36 sets dump_prefix only when n <= 64) withholds both
+   the per-layer traces and the engram erows for longer prompts, so the
+   835-token fixture cannot be fed to the harness (no rows) nor compared
+   (no traces). Gating it needs the engram row-hash ported into the harness
+   (validated against the golden erows at n<=64) — a future instrument, not
+   a port unit. The multi-slice vqs/vqm work items (an expert with >8 tokens
+   of the batch) therefore remain ungated; they need that instrument.
+
+Diagnostics kept (env-gated): `DS41_DUMP_L0` (layer-0 stage dumps: the
+attention input, the attention kernel output, the o-projection output, the
+post-attention hc), in addition to the P4-4 set.
+
+Unit: C complete (P4-6)
 
 ## 7. Numerics contract
 
