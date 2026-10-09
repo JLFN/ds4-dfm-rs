@@ -19,6 +19,9 @@ fn tmpdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join("ds4-zchain");
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let p = dir.join(format!("{n}-{name}"));
+    // A previous run of this binary left the same paths behind; the tests
+    // that assert emptiness need a genuinely fresh directory.
+    let _ = fs::remove_dir_all(&p);
     fs::create_dir_all(&p).unwrap();
     p
 }

@@ -98,12 +98,14 @@ impl V41Zchain {
         if zchain.is_none() && posttrain.is_none() {
             return Ok(None);
         }
+        // The ③-alone note comes from the state attach, before the gate
+        // (core_v41_state.c:79-83), so a refusal still warns.
+        warn_posttrain_alone(zchain, posttrain);
         let beta = if beta > 0.0 { beta } else { 1.0 };
         let base = match posttrain {
             Some(pt) => check_base_fnv(pt, zchain, geom.n_layer)?,
             None => BaseFingerprint::Absent,
         };
-        warn_posttrain_alone(zchain, posttrain);
 
         let nl = geom.n_layer as usize;
         let mut gr = Vec::with_capacity(nl);
