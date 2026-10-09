@@ -22,12 +22,16 @@ use crate::shape::{
 };
 use crate::tensors::TensorInventory;
 
-const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";
-const DOTS3_SHA: &[u8] = b"99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833";
+const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";const DOTS3_SHA: &[u8] = b"99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833";
 const QWEN_REVISIONS: [&[u8]; 2] = [
     b"f5d08274bafd880402bd16f5e3e6c514136ec06c",
     b"8336e613ea508b13c2159bd0f68965d97a606b95",
 ];
+
+/// V4.1 gives the compression ratio per layer from the official config and
+/// there is no formula to match, so only the range 0..=2 is enforced
+/// (core_validate.c:26-33). The older tables keep the derived expectation.
+const V41_MAX_COMPRESS_RATIO: u32 = 2;
 const QWEN_CONFIG_SHA: &[u8] = b"889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b";
 const QWEN_LICENSE_SHA: &[u8] = b"a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08";
 
@@ -250,8 +254,7 @@ fn motif3_layer_is_full_attention(shape: &Shape, il: u32) -> bool {
         && (il % shape.n_swa_period) == 0
 }
 
-fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
-    let key = "deepseek4.attention.compress_ratios";
+fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {    let key = "deepseek4.attention.compress_ratios";
     let arr = g
         .get_array(key)
         .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;
@@ -261,6 +264,10 @@ fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     if arr.len < u64::from(shape.n_layer) {
         return Err(ValidateError::TokenKey("array-short", key.into()));
     }
+    // V4.1 gives the ratio per layer from the official config (0/1/2) with no
+    // formula to match, so only the range is checked
+    // (core_validate.c:26-33). The older tables keep the derived expectation.
+    let range_only = shape.variant == Variant::DeepSeek41Flash;
     if arr.typ == GGUF_VALUE_INT32 {
         let mut c_pos = arr.data_pos;
         let data = g.as_bytes();
@@ -273,9 +280,15 @@ fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
                 return Err(ValidateError::Token("negative-array"));
             }
             let got = v as u32;
-            let want = expected_compress_ratio(shape.variant, shape.n_layer, il);
-            if got != want {
-                return Err(ValidateError::TokenLayer("compress-ratio", il));
+            if range_only {
+                if got > V41_MAX_COMPRESS_RATIO {
+                    return Err(ValidateError::TokenLayer("compress-ratio-range", il));
+                }
+            } else {
+                let want = expected_compress_ratio(shape.variant, shape.n_layer, il);
+                if got != want {
+                    return Err(ValidateError::TokenLayer("compress-ratio", il));
+                }
             }
             c_pos += 4;
         }
@@ -284,6 +297,12 @@ fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     let vals = g.array_le_u32s(&arr)?;
     for il in 0..shape.n_layer {
         let got = vals[il as usize];
+        if range_only {
+            if got > V41_MAX_COMPRESS_RATIO {
+                return Err(ValidateError::TokenLayer("compress-ratio-range", il));
+            }
+            continue;
+        }
         let want = expected_compress_ratio(shape.variant, shape.n_layer, il);
         if got != want {
             return Err(ValidateError::TokenLayer("compress-ratio", il));
