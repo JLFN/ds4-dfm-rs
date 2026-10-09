@@ -119,7 +119,7 @@ subsystem (VQ, engram and sidecars, MTP draft, core and serving).
 | G1 | GGUF tensor types 40-44 (`go1b` 256/34, `go2b` 256/68, `vqblob` 1/1, `fp4x32` 32/17, `fp8_32x32` 1024/1025) unknown: the host table is 31 entries covering ids 0-30 plus `pq2_0`=142 (`crates/ds4-core/src/tensors.rs:55-96`) (v) | `src/core/core_gguf.c:89-104`; engine enum `ds4_internal.h:177-181` (a) |
 | G2 | VQ expert decode absent. `DQVL` blob header, v2 `DQVQ` per-matrix payload (own codebook) and v3 `DQV3` (per-layer codebook + 12-bit main stream + 1-bit plane, E4M3 codewords, per-row f16 gain) | `vq_fmt.h:1-20`, decode `vq_fmt.h:57`/`:91` (v); device geometry `src/cuda/cuda_vq_row.inc.cu:19-47`; dispatch by (version, bit width) `cuda_vq_decode_launch.inc.cu:21-30` (a) |
 | G3 | MTP draft towers absent: 3 towers reusing the layer struct, per-expert `fp4x32` or a single `ffn_exps_vq.blob`, five shared heads | bind `src/core/core_bind_v41.c:101-145`; tower types `core_draft_tower_types.h`; forward `core_v41_draft.c:1-11` (a) |
-| G3b | The expert tensors are not the ones this host expects: the artifact carries one `blk.L.ffn_exps_vq.blob` per layer and binds no `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` at all, while the Rust bind plan requires those three (`bind.rs:693`, `layout.rs:2672-2692`) | `core_bind_v41.c:41` (a), inventory §1 |
+| G3b | The expert tensors are not the ones this host expects: the artifact carries one `blk.L.ffn_exps_vq.blob` per layer and binds no `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` at all. The bind side is DONE (`0d3378d`: `bind_names_v41` requires the blob, and the plan binds 1000/1000); the layout side still expects the V4 names (`layout.rs:2383-2692`) and is the next unit | `core_bind_v41.c:41` (a), inventory §1 |
 | G4 | Speculative verify/rollback for V4.1 absent. Note the engine has TWO drafters: the V4-era DSpark (`dspark.*`, `cuda_dspark.inc.cu`) which this host already mirrors, and the V4.1 three-tower MTP (`mtp.*`, `core_v41_draft.c`) which is the one this artifact needs | `v41_spec_snapshot` `src/core/core_v41_forward.c:241`, `v41_spec_rollback` `:267`; round drive `core_v41_api.c:322`, `:365`; tower contract and the two rollback cautions: inventory §8 (a) |
 | G5 | Engram absent: two tables, 264 B rows (256 B fp8 e4m3 + 8 B ue8m0 scale), rolling 4-gram hash, O_DIRECT per-row reads | `src/core/core_v41_engram.c:6`, `:21`, `:30`, `:63`; metadata `core_validate_v41.c:118-154`; flag `--engram-dir` `src/cli/cli_opts.c:269`, `--v41-no-engram` `:371` (a) |
 | G6 | Domain sidecars absent: `gr_Lnn.bin` per-row gains, `rb_Lnn.bin` router bias, `amp_Lnn.bin`, the `base.fnv` pair fingerprint, `--zchain`, `--posttrain` | `src/core/core_v41_amp.c:41`, `:88`, `:125-147`, `:160-186`, `:227`; fingerprint `src/common/ds4_gr_fnv.h`; flags `cli_opts.c:258-268` (a) |
@@ -138,9 +138,9 @@ before any state-changing command.
 | --- | --- | --- |
 | P0 | Freeze inputs: verify the assembled artifact hash (the 40 part files are deleted after assembly, so `SHA256SUMS`' part lines cannot resolve); capture the C engine's golden set with `tests/capture_ds41_golden.sh`, with the engram tables as the primary instrument and `NO_ENGRAM=1` as the fixture variant; record the artifact's accepted tensor inventory | hashes re-verify; the golden set exists as files with its own MANIFEST |
 | P0 | DONE 2026-10-08 | see 6.5 |
-| P1 | Tensor types 40-44 in `tensors.rs` and the VQ decode as a Rust oracle (CPU), codebook geometry read from the blob, not assumed | decoded weights byte-match `ds4vq_dequant_f32` on fixed tensors of both blob versions (v2 and v3) |
+| P1 | DONE 2026-10-08 (`c1fdc04`, `7c21279`): tensor types 40-44 in `tensors.rs`, the VQ decode oracle, the type table | v2 decode bit-exact against `ds4vq_dequant_f32` (fixtures in `tests/fixtures/vq`); v3 at unit level (12-bit, 13-bit plane); types match `core_gguf.c:89-104` |
 | P2 | Loaders: engram metadata and table open, sidecar `gr`/`rb` reader, `base.fnv` check (parse-only, not applied) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
-| P3 | Routing and bind: a `Variant::V41` shape, the V4.1 keys, and the engram/sidecar state wired into session state | the loader accepts the artifact and the inventory diff is empty |
+| P3 | IN PROGRESS: the `Variant::V41` shape (`d53079b`), the metadata wire and the bind arm (`0d3378d`) are done; the layout arm and the engram/sidecar session state remain | the loader accepts the artifact and the inventory diff is empty; the bind side is measured `slots=1000 bound=1000 required-missing=0` (§6.6.1) |
 | P4 | CUDA: VQ MoE decode (mirror `v41_vq_open` geometry), the fp8_32x32 skeleton path, and the engram read path | G2 on device: logits match the golden set |
 | P5 | MTP towers and DSpark verify/rollback | byte-identical greedy output with drafting on and off at N=1; cache-frontier gate at N>1. The engine's own cautions: the main-hidden ring trim in rollback, and the compressor pending-row snapshot taken before the shift |
 | P6 | Serving: the flags, the sampling profile for this family, the four API contracts, the DSML tool path | a served tool call, end to end, no shim |
@@ -278,9 +278,9 @@ the only blocker), and the blob count confirms the tower contract: 40 layers
 plus 3 towers, one blob each. Types 40, 41 and 43 do not occur in this
 artifact; the towers use blobs too.
 
-What is still missing to load it is the V4.1 arm itself: metadata
-interpretation, the variant/shape, and the bind and layout for the blob-form
-experts (G3b), which is the next unit.
+The V4.1 arm landed in two steps after this check: the variant/shape
+(`d53079b`) and the metadata wire with the bind (`0d3378d`, §6.6.1). The layout
+arm for the blob-form experts (G3b) is the remaining loader unit.
 
 ### 6.6.1 The V4.1 tensor contract, read from the artifact
 
@@ -294,8 +294,8 @@ Spark at `~/youngai/model/golden/ds41-names.txt`), not from the engine's list:
   `attn_q_b`, `attn_kv`, `attn_kv_a_norm`, `attn_sinks`, `attn_output_a`,
   `attn_output_b`, `hc_ffn_fn|scale|base`, `ffn_norm`, `ffn_gate_inp`,
   `exp_probs_b.bias`, **`ffn_exps_vq.blob`**, `ffn_gate_shexp`, `ffn_up_shexp`,
-  `ffn_down_shexp`. The three per-expert tensors this host requires today do
-  not exist in the artifact at all.
+  `ffn_down_shexp`. The three per-expert tensors the V4 host bound do not exist
+  in the artifact at all; the V4.1 catalog requires the blob instead.
 - Source layers carry extra names, and which layers those are comes from
   metadata arrays, not a formula: `blk.20` (the candidate source) has
   `attn_compressor_kv`, `attn_compressor_norm`, `indexer.wk`, `indexer.k_norm`,
@@ -307,14 +307,31 @@ Spark at `~/youngai/model/golden/ds41-names.txt`), not from the engine's list:
   the shared heads `mtp.main_proj`, `mtp.main_norm`, and the rest of the five
   named in the engine's bind; 72 `mtp.*` tensors in total.
 
-Bind work item: `bind_names(shape)` is shape-only, but the source-layer
-conditionals need the metadata arrays, so the V4.1 arm needs either the lists
-passed in or the conditionals made optional and checked separately against the
-metadata. Decide when implementing, and keep the published-tensor catalogs
-(`bind_plan_requires_every_published_tensor`) in agreement.
+The bind work item this section opened is DONE (2026-10-09, `0d3378d`): the
+V4.1 catalog is resolved from the metadata wire, not the shape. `V41Wire::load`
+mirrors `v41_load_metadata` (hard stop on a missing key, nearest-source wiring,
+the two wiring checks) and `bind_names_v41` mirrors `weights_bind_v41` (blob
+experts, source-layer compressor/indexer names with no ape and no gate at ratio
+1, engram triples, three towers with the blob-or-per-expert form chosen by the
+inventory). `resolve_bind_plan` dispatches both open paths; the shape-only
+`bind_names` keeps returning the V4 catalog.
 
-Current measured state: `bind: slots=966 bound=843 required-missing=123`, and
-every one of the 123 is one of the two differences above.
+Measured state, before and after, on the Spark against the real artifact:
+
+| run | result |
+| --- | --- |
+| before (`d9dadfb`) | `bind: slots=966 bound=843 required-missing=123` |
+| after (`0d3378d`) | `bind: slots=1000 bound=1000 required-missing=0`, `v41 wire: kv-sources=[2,8,14,20] index-sources=[2,8,14,20,24,28,32,36] engram=[1,14] towers=3 experts=128` |
+
+The catalog equals the artifact's published 1000 tensors in both directions;
+`crates/ds4-core/tests/v41.rs` holds that gate model-free (the artifact's names
+are a fixture, `tests/fixtures/v41/artifact-names.txt`, sha256
+`a8b4a0e0385230df2e411c51c6586b92419867b5fa4b62fbf684ff249b0a2400`), and covers
+the wiring derivation, the refusals, and both tower expert forms.
+
+Next unit: the V4.1 layout arm (`expected_deepseek` branching on the variant,
+driven by the same wire), which is what `validate_layouts` needs before
+`probe_model_artifact` accepts the artifact end to end.
 
 ## 7. Numerics contract
 
