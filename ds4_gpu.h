@@ -5322,6 +5322,12 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
         uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring,
         uint32_t win_lo, const ds4_gpu_tensor *posd, uint32_t pos_cap);
+/* Call once before capturing a decode graph: grow the decode tensor-core
+ * attention's local tiles to cap-segments x n_tok rows (no allocation is
+ * allowed inside a capture).  n_tok is the graph's row count (1 for pure
+ * decode, 1+k for the verify batch); one row short and the verify batch
+ * re-grows inside the capture and voids the whole graph. */
+int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t head_dim);
 int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
         const ds4_gpu_tensor *posd);
 

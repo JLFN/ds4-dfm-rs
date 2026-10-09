@@ -14,14 +14,11 @@
  *   - the SWA window ring commit: src/cuda/cuda_kv_ring.inc.cu:20-56.
  *   - v41_pow2_ceil_log2 and v41_win_row: src/cuda/cuda_v41_1.inc.cu:130-151.
  *
- * ★Named port deviation (P4-4): the scalar sparse-attention kernel only.  The
- * engine's live decode path is the tensor-core family (cuda_v41_attn_mma_decode
- * + the split helpers + the merge kernel: it tiles keys by 64 with wmma and
- * groups the online softmax differently) — the engine's own header says the
- * two are NOT bit-equal and gates the mma cut by NLL/quality, not cmp.  The
- * port's traces therefore compare against the golden set within a recorded
- * tolerance, not bit-for-bit, until the mma family lands (P4-5, where spec
- * decode's "draft == decode" same-track gate needs it). */
+ * The sparse-attention tensor-core family (decode seg, prefill, split-K,
+ * merge) and the ds4_gpu_v41_sparse_attn_tensor entry live in
+ * cuda/ds41_attn_mma.cuh (P4-5); this file keeps the scalar kernel that the
+ * entry's dispatch falls back to (the engine's own fallback for the 9..63
+ * token band and refused shapes). */
 #pragma once
 
 /* Packed-KV group geometry (ds4_gpu_v41.h:229-234): the main KV stores 512
@@ -313,37 +310,10 @@ __global__ static void v41_sparse_attn_kernel(float *o, const float *q, const fl
         for (uint32_t e = 0; e < per; e++) o[((uint64_t)i * n_head + h) * hd + lane * per + e] = v41_bf16r(acc[hh][e] / den);
     }
 }
-extern "C" int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win,
-                                              const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
-                                              const void *model_map, uint64_t model_size, uint64_t sink_offset,
-                                              uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                              uint32_t ratio,
-                                              uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring,
-                                              uint32_t win_lo, const ds4_gpu_tensor *posd, uint32_t pos_cap) {
-    (void)ratio; (void)pos_cap;
-    if (!o || !q || !kv_win || n_head != 64u || head_dim != 512u) { fprintf(stderr, "ds4: [v41] sparse attn only implements 64 heads x 512\n"); return 0; }
-    /* The window clamp only exists in the prefill kernel; at decode (n <= 8)
-     * it must be a no-op — refuse rather than silently read dirty slots. */
-    const uint32_t lo_first = pos0 + 1u > window ? pos0 + 1u - window : 0u;
-    if (win_lo > lo_first && n_tok <= 8u && !full_block) {
-        fprintf(stderr, "ds4: *[v41] sparse attn: decode kernel has no window clamp, but pos0 %u's window lower bound %u < win_lo %u*\n",
-                pos0, lo_first, win_lo);
-        return 0;
-    }
-    if (posd) { fprintf(stderr, "ds4: [ds41] sparse attn: the graph path (device position) is not ported yet\n"); return 0; }
-    if (!full_block && !ring) { fprintf(stderr, "ds4: [v41] sparse attn: the main path's window must be a ring\n"); return 0; }
-    if (kv_win->bytes < (uint64_t)(window + n_tok) * head_dim * 4) { fprintf(stderr, "ds4: [v41] window buffer short %u+%u rows\n", window, n_tok); return 0; }
-    const float *sink = (const float *)cuda_model_range_ptr(model_map, sink_offset, (uint64_t)n_head * 4, "v41 sink");
-    if (!sink) return 0;
-    /* Named port deviation: the engine tries its tensor-core decode family
-     * first (cuda_v41_attn_mma_decode; see the file header); the port runs
-     * the scalar kernel for every shape. */
-    v41_sparse_attn_kernel<<<dim3(n_tok, n_head / V41_ATTN_HEADS_PER_BLOCK), V41_ATTN_HEADS_PER_BLOCK * 16u, 0, ds4_current_stream()>>>(
-        (float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
-        kv_comp ? (const uint8_t *)kv_comp->ptr : NULL, idx ? (const int32_t *)idx->ptr : NULL, sink, pos0, window, ng,
-        (kv_comp && idx) ? topk : 0u, n_head, head_dim, scale, full_block ? n_tok : 0u, ring ? 1u : 0u, win_lo);
-    return cuda_ok(cudaGetLastError(), "v41 sparse attn");
-}
+/* The ds4_gpu_v41_sparse_attn_tensor entry (cuda_v41_2.inc.cu:229-303) moved
+ * to cuda/ds41_attn_mma.cuh (P4-5) so its dispatch can mirror the engine's
+ * try order: mma decode -> draft-block mma -> scalar split-K -> prefill mma
+ * -> this scalar kernel. */
 
 /* ---- SWA window ring commit (cuda_kv_ring.inc.cu:20-56) ----
  * The batch's rows sit in [window, window+n) until committed; committing i
