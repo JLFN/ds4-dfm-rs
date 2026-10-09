@@ -140,7 +140,7 @@ before any state-changing command.
 | P0 | DONE 2026-10-08 | see 6.5 |
 | P1 | DONE 2026-10-08 (`c1fdc04`, `7c21279`): tensor types 40-44 in `tensors.rs`, the VQ decode oracle, the type table | v2 decode bit-exact against `ds4vq_dequant_f32` (fixtures in `tests/fixtures/vq`); v3 at unit level (12-bit, 13-bit plane); types match `core_gguf.c:89-104` |
 | P2 | DONE 2026-10-09: the engram half (`79756c0` + `0af1d10`, §6.6.2) and the sidecar half (`dac818e`, §6.6.3: gr/rb/amp readers, the fp4x32 decoder, the `base.fnv` gate, both directions verified on the real directories) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
-| P3 | DONE for the loader half (2026-10-09): the `Variant::V41` shape (`d53079b`), the metadata wire, the bind arm (`0d3378d`) and the layout table (`356a100`); the engram/sidecar session state remains (P2) | the loader accepts the artifact: `identify` + `validate: ok` + `layout: ok` + `bind: slots=1000 bound=1000 required-missing=0` on the real file (§6.6.1) |
+| P3 | DONE 2026-10-09 (`a73fe31`, `bd393ad`): the `Variant::V41` shape (`d53079b`), the metadata wire, the bind arm (`0d3378d`), the layout table (`356a100`) and the ②/③ zchain merge (§6.6.4); the engram session state moves with P4's read path | the loader accepts the artifact: `identify` + `validate: ok` + `layout: ok` + `bind: slots=1000 bound=1000 required-missing=0` on the real file (§6.6.1), and the real sidecar pair merges bit-exact (§6.6.4) |
 | P4 | CUDA: VQ MoE decode (mirror `v41_vq_open` geometry), the fp8_32x32 skeleton path, and the engram read path | G2 on device: logits match the golden set |
 | P5 | MTP towers and DSpark verify/rollback | byte-identical greedy output with drafting on and off at N=1; cache-frontier gate at N>1. The engine's own cautions: the main-hidden ring trim in rollback, and the compressor pending-row snapshot taken before the shift |
 | P6 | Serving: the flags, the sampling profile for this family, the four API contracts, the DSML tool path | a served tool call, end to end, no shim |
@@ -389,6 +389,38 @@ files are what the post-train solver wrote into
 `posttrain-experimental-20260924/base.fnv`, and the Rust FNV lands on it
 exactly. The reader also decoded the real fp4x32 `gr_L00.bin` (`factor[0] =
 1.125000` = stored `s-1` restored to `1+raw`). P2 is closed.
+
+### 6.6.4 P3: the ②/③ zchain merge (2026-10-09, `a73fe31`, `bd393ad`)
+
+`V41Zchain::load` mirrors `v41_amp_load` (`core_v41_amp.c:227-270`): the
+`base.fnv` gate before any read, router biases from the ② directory only
+(`v41_rb_load` is never called with ③), per-layer gains as the element-wise
+product starting from 1 (② then ③), and the low-rank pairs concatenated by
+rank, ② rows first, with β scaling ②'s A rows only and the rank sum capped at
+8192. No directory is the naked base (`Ok(None)`); a directory pair holding
+nothing at all is refused, and a broken file refuses the whole load instead of
+half-loading. The ③-alone note fires before the gate, from the state attach
+(`core_v41_state.c:79-83`), so a refusal still warns.
+
+Gates:
+
+| gate | result |
+| --- | --- |
+| model-free tests (`tests/zchain.rs`, 8) | the ②×③ product, fp4 `s-1` through the merge, rb ②-only (a ③ rb file is ignored), amp concatenation with β on ②'s A only (B and ③ untouched), the 8192 rank-sum refusal, a broken ② file stopping before ③ is read, the gate refusing before any layer file |
+| the Spark, real pair ② `…-grrb-vqfin41_vqhalf_a_n8192-engine` + ③ `posttrain-experimental-20260924` | `zchain-merge: gr=39 rb=27 amp=0 k=none base=ok f4a3fd3988135e75/66 beta=1` |
+| merged L39 (the only layer both directories carry) against an independent python f32 computation of `(1+r₂)×(1+r₃)` | bit-identical at f[0]/f[100]/f[1000]/f[4095] (`0x3f800000`/`0x3f810000`/`0x3f7ef400`/`0x3f7b0400`) and `nonzero=3246/4096` on both sides |
+| the Spark, wrong ② `…-grrb-code_fit_n15360-engine` | `zchain-merge: sidecar-base-mismatch`, refused before any layer file |
+| the Spark, ③ alone | the note, then the gate refusal with the seed/0 expectation (`have 14650fb0739d0383/0`) |
+
+The `first gr L00 from2=true from3=false f[0]=1.125000000` line reproduces the
+§6.6.3 sample through the merge. What has no live data: no directory on the
+Spark carries `amp_Lnn.bin`, so the rank concatenation and β are covered
+model-free only; their live gate arrives with P4's device upload. The engram
+session state (the token history and the prefetch pipeline) stays with P4's
+read path: the host-side pieces that are data and policy — the hash constants,
+the row addressing, the shard open policy and the span checks — are already in
+`engram.rs` and proven against the golden rows (§6.6.2), and the pipeline
+itself is execution.
 
 ## 7. Numerics contract
 
