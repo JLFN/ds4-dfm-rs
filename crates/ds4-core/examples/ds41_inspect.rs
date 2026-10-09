@@ -128,6 +128,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => println!("validate: ok"),
                 Err(e) => println!("validate: {}", e.token()),
             }
+            // Bind: every required name must find a tensor, and the plan
+            // should consume the published inventory rather than leave it.
+            let plan = ds4_core::BindPlan::resolve_catalog(None, id.shape, &inv);
+            let missing: Vec<&str> = plan
+                .slots
+                .iter()
+                .filter(|s| s.need == ds4_core::BindNeed::Required && s.tensor.is_none())
+                .map(|s| s.name.as_str())
+                .collect();
+            let bound = plan.slots.iter().filter(|s| s.tensor.is_some()).count();
+            println!(
+                "bind: slots={} bound={} required-missing={}",
+                plan.slots.len(),
+                bound,
+                missing.len()
+            );
+            for name in missing.iter().take(12) {
+                println!("  missing: {name}");
+            }
         }
         Err(e) => println!("identify failed: {e}"),
     }
