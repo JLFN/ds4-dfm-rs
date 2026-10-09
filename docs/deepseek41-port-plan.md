@@ -282,6 +282,40 @@ What is still missing to load it is the V4.1 arm itself: metadata
 interpretation, the variant/shape, and the bind and layout for the blob-form
 experts (G3b), which is the next unit.
 
+### 6.6.1 The V4.1 tensor contract, read from the artifact
+
+Names dumped from the artifact itself (`ds41_inspect --tensors`, saved on the
+Spark at `~/youngai/model/golden/ds41-names.txt`), not from the engine's list:
+
+- Globals: `token_embd.weight`, `output_norm.weight`, `output.weight`,
+  `engram.token_map|multipliers|primes|offsets`. There is no `output_hc_*`:
+  the head reuses the last `ffn_pre`, exactly as the engine's bind comments say.
+- Every layer: `hc_attn_fn|scale|base`, `attn_norm`, `attn_q_a`, `attn_q_a_norm`,
+  `attn_q_b`, `attn_kv`, `attn_kv_a_norm`, `attn_sinks`, `attn_output_a`,
+  `attn_output_b`, `hc_ffn_fn|scale|base`, `ffn_norm`, `ffn_gate_inp`,
+  `exp_probs_b.bias`, **`ffn_exps_vq.blob`**, `ffn_gate_shexp`, `ffn_up_shexp`,
+  `ffn_down_shexp`. The three per-expert tensors this host requires today do
+  not exist in the artifact at all.
+- Source layers carry extra names, and which layers those are comes from
+  metadata arrays, not a formula: `blk.20` (the candidate source) has
+  `attn_compressor_kv`, `attn_compressor_norm`, `indexer.wk`, `indexer.k_norm`,
+  `indexer.attn_q_b`, `indexer.proj`. Note what is absent: no
+  `attn_compressor_ape`, no `attn_compressor_gate`. Layers with source tensors:
+  1, 2, 8, 14, 20, 24, 28, 32, 36.
+- Engram layers (1 and 14) add `engram_wkv` (fp8_32x32), `engram_q`, `engram_k`.
+- Towers: `mtp.{0,1,2}.` mirror a layer's set including `ffn_exps_vq.blob`, plus
+  the shared heads `mtp.main_proj`, `mtp.main_norm`, and the rest of the five
+  named in the engine's bind; 72 `mtp.*` tensors in total.
+
+Bind work item: `bind_names(shape)` is shape-only, but the source-layer
+conditionals need the metadata arrays, so the V4.1 arm needs either the lists
+passed in or the conditionals made optional and checked separately against the
+metadata. Decide when implementing, and keep the published-tensor catalogs
+(`bind_plan_requires_every_published_tensor`) in agreement.
+
+Current measured state: `bind: slots=966 bound=843 required-missing=123`, and
+every one of the 123 is one of the two differences above.
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
