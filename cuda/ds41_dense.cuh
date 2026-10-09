@@ -200,6 +200,7 @@ extern "C" int ds4_gpu_v41_matmul_f32_tensor(ds4_gpu_tensor *out, const void *mo
     /* Prefill (cuda_v41_1.inc.cu:291-296): one Sgemm straight off the mmap'd
      * f32 table.  The GEMV above is the decode/small-batch arm because cuBLAS
      * splits an n=1 Sgemm into 200+ small kernels (the GEMV header's account). */
+    (void)cublasSetStream(g_cublas, ds4_current_stream());   /* the engine's call (cuda_v41_1.inc.cu:292): cuBLAS keys its algorithm on the bound workspace, and this call resets it to the default pool (docs 2.4.7) -- the state the engine's GEMMs actually run in */
     cuda_cublas_ws_prep(ds4_current_stream());
     const float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t st = cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
@@ -227,6 +228,7 @@ extern "C" int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *m
     if (!xb) return 0;
     v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, ds4_current_stream()>>>(xb, (const float *)x->ptr, xn);
     if (!cuda_ok(cudaGetLastError(), "v41 x->bf16")) return 0;
+    (void)cublasSetStream(g_cublas, ds4_current_stream());   /* the engine's call (cuda_v41_1.inc.cu:318): resets the workspace to the default pool (docs 2.4.7) */
     cuda_cublas_ws_prep(ds4_current_stream());
     const float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,

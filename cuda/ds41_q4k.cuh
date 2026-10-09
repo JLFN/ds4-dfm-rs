@@ -307,6 +307,7 @@ static int v41_q4k_gemm(const void *model_map, uint64_t model_size, uint64_t off
     if (!cuda_ok(cudaGetLastError(), "v41 q4k x->bf16")) return 0;
     const float alpha = 1.0f, beta = 0.0f;
     const dim3 dblk(32, 8);
+    (void)cublasSetStream(g_cublas, ds4_current_stream());   /* the engine's call (cuda_v41_q4k.inc.cu:359): cuBLAS keys its algorithm on the bound workspace, and this call resets it to the default pool (docs 2.4.7) -- the state the engine's GEMMs actually run in */
     cuda_cublas_ws_prep(ds4_current_stream());
     if (n_groups > 1u) {
         v41_q4k_to_bf16_kernel<<<(unsigned)((nblk + 7) / 8), dblk, 0, ds4_current_stream()>>>(wb, w, nblk);

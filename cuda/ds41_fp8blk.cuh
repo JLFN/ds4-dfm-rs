@@ -356,11 +356,14 @@ extern "C" int ds4_gpu_v41_matmul_fp8blk_tensor(ds4_gpu_tensor *out, const void 
     if (!xb) return 0;
     v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, ds4_current_stream()>>>(xb, (const float *)x->ptr, xn);
     if (!cuda_ok(cudaGetLastError(), "v41 wkv x->bf16")) return 0;
-    /* The port has no cublasSetStream: stream 0 is the legacy default for both
-     * our launches (no --default-stream per-thread) and cuBLAS, so they agree
-     * by construction; the engine needs cudaStreamPerThread here only because
-     * it compiles with PTDS (cuda_v41_1.inc.cu:56-58). Split-K workspace
-     * zeroed first, the port's S1.1a rule (ds4_cuda.cu cuda_cublas_ws_prep). */
+    /* The engine calls cublasSetStream before every V4.1 GEMM
+     * (cuda_v41_1.inc.cu:360 here), and per the cuBLAS docs (2.4.7) that call
+     * unconditionally resets the bound workspace to the default pool — so the
+     * engine's GEMMs actually run on the default pool, not on its 32 MB user
+     * buffer.  Mirror the call (the port's stream is the legacy default, so
+     * ordering is unchanged); cuda_cublas_ws_prep (the port's S1.1a rule,
+     * ds4_cuda.cu) then only touches the now-unbound user buffer. */
+    (void)cublasSetStream(g_cublas, ds4_current_stream());
     cuda_cublas_ws_prep(ds4_current_stream());
     const float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
