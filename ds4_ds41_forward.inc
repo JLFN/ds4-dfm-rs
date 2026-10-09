@@ -295,6 +295,26 @@ static bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const v41_engram_feed *fd = st->efeed;
     if (!fd || !fd->raw[ei]) { fprintf(stderr, "ds4: [v41] engram layer L%u has no row feed (host hash + pread missing)\n", il); return false; }
     if (!ds4_gpu_tensor_write_zerocopy(st->eraw[ei], 0, fd->raw[ei], (uint64_t)n * cols * stride)) return false;
+    /* Diagnostic (kept): DS41_FEED_DIGEST=<path> appends the FNV-1a of the
+     * exact bytes this upload put on the device.  The row-id self-check
+     * cannot see a payload error (right ids, wrong bytes); the caller prints
+     * the host-side digest of the same range and the two must match. */
+    {
+        const char *fdg = getenv("DS41_FEED_DIGEST");
+        if (fdg) {
+            static FILE *dfp = NULL;
+            const uint64_t bytes = (uint64_t)n * cols * stride;
+            uint8_t *tmp = (uint8_t *)xmalloc(bytes);
+            if (!dfp) dfp = fopen(fdg, "a");
+            if (dfp && tmp && ds4_gpu_tensor_read(st->eraw[ei], 0, tmp, bytes)) {
+                uint64_t h = 0xcbf29ce484222325ull;
+                for (uint64_t q = 0; q < bytes; q++) { h ^= tmp[q]; h *= 0x100000001b3ull; }
+                fprintf(dfp, "dev pos0 %u n %u k %u fnv %016llx\n", st->pos0, n, ei, (unsigned long long)h);
+                fflush(dfp);
+            }
+            free(tmp);
+        }
+    }
     if (st->dump_prefix && fd->rows[ei]) {   /* compare fixture: row ids to <prefix>.erows_Lnn.txt */
         char p[4400]; snprintf(p, sizeof p, "%s.erows_L%02u.txt", st->dump_prefix, il);
         FILE *df = fopen(p, "w");

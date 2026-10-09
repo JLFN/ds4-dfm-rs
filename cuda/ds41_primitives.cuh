@@ -42,6 +42,11 @@ static void *v41_grow(v41_scratch *s, uint64_t bytes, const char *what) {
     }
     s->cap = bytes;
     g_v41_scratch_gen++;
+    /* A grow mid-run re-resolves every consumer's pointer; print it so a
+     * reallocation can never hide inside a quiet gate log (a grow landing
+     * between decode steps is a determinism lead, not noise). */
+    fprintf(stderr, "ds4: [ds41] grow %s -> %.1f MB (gen %llu)\n", what, (double)bytes / 1048576.0,
+            (unsigned long long)g_v41_scratch_gen);
     return s->p;
 }
 

@@ -259,6 +259,12 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
      * instantiation, which is exactly per (NBIT,V3,EXT). */
     static uint32_t s_gu_optin = 0u, s_dn_optin = 0u;
     if (s_gu_optin < cbb || s_dn_optin < cbb) {
+        /* Clear any error a previous call left latched BEFORE the opt-in:
+         * the runtime reports a latched error to a later call, and a failed
+         * cudaFuncSetAttribute silently drops this layer set to the other
+         * arm (global gather — a different accumulation order).  The arm
+         * must depend on the device alone, never on prior error state. */
+        (void)cudaGetLastError();
         int cap = 0; (void)cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
         int sh_sm = 0, thr_sm = 0, nsm = 0, regs_sm = 0;
         (void)cudaDeviceGetAttribute(&sh_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0);

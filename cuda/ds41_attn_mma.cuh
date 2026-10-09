@@ -317,6 +317,7 @@ static int ds4_sparse_attn_mma_launch(float *o, const float *q, const float *kvw
     static int s_ok = 0;   /* 0 untried / 1 usable / -1 shared cannot be raised */
     const size_t smem = ds4_attn_mma_smem_bytes();
     if (s_ok == 0) {
+        (void)cudaGetLastError();   /* the opt-in must not see a previously latched error (see ds41_vq_decode.cuh) */
         s_ok = cudaFuncSetAttribute(ds4_sparse_attn_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem) == cudaSuccess ? 1 : -1;
         (void)cudaGetLastError();
@@ -654,6 +655,7 @@ static int v41_attn_mma_decode(float *o, const float *q, const float *kvw, const
     static int s_ok = 0;                             /* 0 untried / 1 usable / -1 cannot be raised */
     const size_t smem = ds4_attn_mma_seg_smem_bytes();   /* the seg kernel keeps the old qs+ks two-slab layout; the prefill kernel's shared account differs */
     if (s_ok == 0) {
+        (void)cudaGetLastError();   /* the opt-in must not see a previously latched error (see ds41_vq_decode.cuh) */
         s_ok = cudaFuncSetAttribute(v41_attn_mma_seg_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     (int)smem) == cudaSuccess ? 1 : -1;
         (void)cudaGetLastError();

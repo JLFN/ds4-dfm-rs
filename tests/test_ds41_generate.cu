@@ -29,6 +29,7 @@
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <cuda_runtime.h>
 
 extern "C" {
@@ -171,6 +172,22 @@ static bool feed_fill(gen_feed *g, uint32_t slot, int64_t pos) {
     return true;
 }
 
+/* FNV-1a 64 over a byte range (the digest both sides print for the payload
+ * check: DS41_FEED_DIGEST). */
+static uint64_t fnv1a(const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+
+static FILE *feed_digest_file(void) {
+    static FILE *f = NULL;
+    static int tried = 0;
+    if (!tried) { tried = 1; const char *p = getenv("DS41_FEED_DIGEST"); if (p) f = fopen(p, "a"); }
+    return f;
+}
+
 /* The emit hook: record the token, then refresh every engram layer's row 0
  * with the rows for this token's position — the forward's next step (n=1)
  * reads exactly that slot. */
@@ -179,6 +196,14 @@ static int emit_feed(int token, void *ud) {
     const int64_t pos = (int64_t)g->np + g->emitted;
     g->hist[(size_t)pos] = token;
     if (!g->layers.empty() && !feed_fill(g, 0, pos)) { fprintf(stderr, "harness: feed refresh failed at pos %lld\n", (long long)pos); return 1; }
+    FILE *df = feed_digest_file();
+    if (df) {
+        for (uint32_t k = 0; k < g->layers.size(); k++) {
+            const engram_layer &L = g->layers[k];
+            fprintf(df, "host pos %lld k %u fnv %016llx\n", (long long)pos, k, (unsigned long long)fnv1a(L.raw, (size_t)L.cols * L.stride));
+        }
+        fflush(df);
+    }
     g->ids->push_back(token);
     g->emitted++;
     return 0;
@@ -250,11 +275,25 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < g.np; i++) if (!feed_fill(&g, i, (int64_t)i)) { fprintf(stderr, "harness: prompt feed fill failed at %u\n", i); return 1; }
         printf("engram feed: %zu layers, cols %u, head_dim %u, %u prompt rows hashed\n",
                g.layers.size(), g.layers.empty() ? 0 : g.layers[0].cols, g.layers.empty() ? 0 : g.layers[0].hd, g.np);
+        {   /* host-side digest of the prompt region the prefill will upload (dev pos0 0 n np) */
+            FILE *df = feed_digest_file();
+            if (df) {
+                for (uint32_t k = 0; k < g.layers.size(); k++) {
+                    const engram_layer &L = g.layers[k];
+                    fprintf(df, "host prefill k %u n %u fnv %016llx\n", k, g.np,
+                            (unsigned long long)fnv1a(L.raw, (size_t)g.np * L.cols * L.stride));
+                }
+                fflush(df);
+            }
+        }
         /* Self-check: the engine's own captured rows for this prompt (the
          * golden erows next to the ids file, written by the score capture)
          * must equal what this harness's hash produces — the P2 instrument,
-         * re-run here so a hash bug can never masquerade as a port bug. */
-        for (uint32_t k = 0; k < g.layers.size(); k++) {
+         * re-run here so a hash bug can never masquerade as a port bug.
+         * DS41_SKIP_SELFCHECK=1 disables it (the A/B discrimination test:
+         * binary A differed from B only by this block). */
+        const int skip_sc = getenv("DS41_SKIP_SELFCHECK") != NULL;
+        for (uint32_t k = 0; !skip_sc && k < g.layers.size(); k++) {
             std::string ids_path_s = ids_path;
             const size_t dot = ids_path_s.rfind(".ids");
             const std::string base = (dot == std::string::npos) ? ids_path_s : ids_path_s.substr(0, dot);
@@ -283,6 +322,16 @@ int main(int argc, char **argv) {
     ds41_engram_feed feed;
     memset(&feed, 0, sizeof feed);
     for (uint32_t k = 0; k < g.layers.size(); k++) feed.raw[k] = g.layers[k].raw;   /* k == the engram index (ds41_forward.h) */
+    /* DS41_GEN_DELAY_MS=<n>: a bare delay before the generate call (the
+     * timing-vs-content discriminator; no reads, no allocations). */
+    if (const char *dm = getenv("DS41_GEN_DELAY_MS")) {
+        const int ms = atoi(dm);
+        if (ms > 0) {
+            struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+            printf("pre-generate delay: %d ms\n", ms);
+        }
+    }
     const int rc = ds4_v41_generate_argmax(e, prompt.data(), (int)prompt.size(), n_predict,
                                            no_engram || n_eng == 0 ? 1 : 0,
                                            g.layers.empty() ? NULL : &feed, emit_feed, &g);
