@@ -35,6 +35,10 @@ int g_ds4_v41_vq_group = 1;
 #include "cuda/ds41_vq_launch.cuh"
 #include "cuda/ds41_fp8blk.cuh"   /* P4-3: fp8_32x32 decode (towers + engram wkv) */
 #include "cuda/ds41_engram.cuh"   /* P4-3: the engram gate + read-path device pieces */
+#include "cuda/ds41_q4k.cuh"      /* P4-4: the q4_K skeleton GEMV + embedding */
+#include "cuda/ds41_dense.cuh"    /* P4-4: f32/bf16 GEMVs, rms_norm, add, expand_hc */
+#include "cuda/ds41_hc.cuh"       /* P4-4: the hyper-connection family (mHC) */
+#include "cuda/ds41_attn.cuh"     /* P4-4: rope, act_quant, KV pack, sparse attn, window ring */
 
 /* Raw decode entry for tests and the P4-2 forward wiring: all pointers are
  * device pointers; `nc` and `ver` come from the blob header (ds4vq_blob_nexp /

@@ -5259,6 +5259,66 @@ void ds4_gpu_host_free(void *p);
 int ds4_gpu_host_flag_wait(const void *flag_pinned, const void *want_pinned, void *err_pinned);
 int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset, const void *pinned, uint64_t bytes);
 
+/* DeepSeek V4.1 forward primitives (P4-4).  The q4_K skeleton family
+ * (cuda/ds41_q4k.cuh), the dense GEMVs and elementwise kernels
+ * (cuda/ds41_dense.cuh), the hyper-connection family (cuda/ds41_hc.cuh) and
+ * the attention primitives (cuda/ds41_attn.cuh).  All entries take n_tok <= 8
+ * (the decode width); the n > 8 prefill arms are not ported yet and refuse by
+ * name. */
+int ds4_gpu_v41_matmul_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok, int round_out);
+int ds4_gpu_v41_grouped_matmul_q4k_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_groups, uint64_t group_dim, uint64_t rank,
+        const ds4_gpu_tensor *heads, uint32_t n_tok, int round_out);
+int ds4_gpu_v41_embed_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint64_t n_vocab, uint32_t n_tok, uint64_t dim);
+int ds4_gpu_v41_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_v41_embed_fp4x32_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t n_vocab, uint32_t n_tok, uint32_t n_embd);
+int ds4_gpu_v41_rms_norm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t dim, uint32_t n_tok, float eps);
+int ds4_gpu_v41_add_tensor(ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint64_t n);
+int ds4_gpu_v41_expand_hc_tensor(ds4_gpu_tensor *hc, const ds4_gpu_tensor *x, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+int ds4_gpu_v41_hc_mix_tensor(ds4_gpu_tensor *mix, const ds4_gpu_tensor *hc, const void *model_map, uint64_t model_size,
+        uint64_t fn_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
+int ds4_gpu_v41_hc_split_tensor(ds4_gpu_tensor *pre, ds4_gpu_tensor *post, ds4_gpu_tensor *comb,
+        const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t iters, float eps, uint32_t n_tok);
+int ds4_gpu_v41_hc_pre_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, const ds4_gpu_tensor *pre,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+int ds4_gpu_v41_hc_fused_tensor(ds4_gpu_tensor *pre, ds4_gpu_tensor *post, ds4_gpu_tensor *comb,
+        ds4_gpu_tensor *x, ds4_gpu_tensor *xn, const ds4_gpu_tensor *mix, const ds4_gpu_tensor *hc,
+        const ds4_gpu_tensor *pre_in, const void *model_map, uint64_t model_size,
+        uint64_t scale_offset, uint64_t base_offset, uint64_t norm_offset,
+        uint32_t n_embd, uint32_t n_hc, uint32_t iters, float hc_eps, float norm_eps, uint32_t n_tok);
+int ds4_gpu_v41_hc_post_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *y, const ds4_gpu_tensor *res,
+        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+int ds4_gpu_v41_rope_tensor(ds4_gpu_tensor *x, const ds4_gpu_tensor *pos, uint32_t n_tok, uint32_t n_head,
+        uint32_t head_dim, uint32_t n_rot, float theta, uint32_t original_seq_len,
+        float factor, float beta_fast, float beta_slow, bool inverse);
+int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score,
+        uint32_t n_tok, uint32_t ratio, uint32_t dim);
+int ds4_gpu_v41_act_quant_fp8_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block);
+int ds4_gpu_v41_act_quant_fp4_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block, bool e4m3_scale);
+int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
+        const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t g_trash, uint32_t nbatch);
+int ds4_gpu_v41_idxk_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
+        const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t g_trash, uint32_t nbatch);
+int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, const ds4_gpu_tensor *kv_win,
+        const ds4_gpu_tensor *kv_comp, const ds4_gpu_tensor *idx,
+        const void *model_map, uint64_t model_size, uint64_t sink_offset,
+        uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim, float scale, int full_block, int ring,
+        uint32_t win_lo, const ds4_gpu_tensor *posd, uint32_t pos_cap);
+int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+        const ds4_gpu_tensor *posd);
+
 #ifdef __cplusplus
 }
 #endif

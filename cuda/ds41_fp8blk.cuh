@@ -47,6 +47,104 @@ __device__ __forceinline__ static float ds4_e8m0_to_f32(uint8_t e) {
     return result;
 }
 
+/* ---- the encode-side primitives (ds4_fp8.h:52-164) ----
+ * P4-4's act_quant / KV pack need the round and encode halves, not just the
+ * decoders: the FP4/E4M3 magnitude tables, nearest-rounding (ties to even
+ * mantissa), the nibble map and the byte encoders.  One copy each, shared by
+ * act_quant and the pack kernels (a second copy would drift, and the packed
+ * bytes must equal what act_quant writes). */
+__device__ __forceinline__ static float ds4_e4m3fn_value(int i) {
+    static const float exp_scale[16] = {
+        0.0f, 0.015625f, 0.03125f, 0.0625f,
+        0.125f, 0.25f, 0.5f, 1.0f,
+        2.0f, 4.0f, 8.0f, 16.0f,
+        32.0f, 64.0f, 128.0f, 256.0f,
+    };
+    const int exp = (i >> 3) & 0x0f;
+    const int mant = i & 0x07;
+    return exp == 0
+        ? (float)mant * 0.001953125f
+        : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
+}
+__device__ __forceinline__ static float ds4_e4m3fn_round(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0;
+    int hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (ds4_e4m3fn_value(mid) <= ax) lo = mid;
+        else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = fabsf(ax - ds4_e4m3fn_value(best));
+        const float next_diff = fabsf(ax - ds4_e4m3fn_value(best + 1));
+        if (next_diff < best_diff ||
+            (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
+            best++;
+        }
+    }
+    return sign * ds4_e4m3fn_value(best);
+}
+__device__ __forceinline__ static float ds4_e2m1fn_value(int i) {
+    static const float values[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    };
+    return values[i & 7];
+}
+__device__ __forceinline__ static float ds4_e2m1fn_round(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - ds4_e2m1fn_value(0));
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(ax - ds4_e2m1fn_value(i));
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * ds4_e2m1fn_value(best);
+}
+/* FP4 nibble (with sign, 0..15) -> f32 (ds4_fp8.h:122-127; slot 8 is -0.0f).
+ * The engine's measured verdict stands: the table beats a bit-trick version
+ * (the decode kernels are memory-latency bound and the LDC replays are hidden;
+ * the bit version measured 8% slower decode, 2026-09-15). */
+__device__ __forceinline__ static float ds4_fp4_nibble_to_f32(uint8_t n) {
+    static const float t[16] = {
+        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+       -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    return t[n & 15];
+}
+__device__ __forceinline__ static uint8_t ds4_fp4_f32_to_nibble(float x) {
+    const float v = ds4_e2m1fn_round(x);
+    const float av = fabsf(v);
+    uint8_t n = 0;
+    for (int i = 1; i < 8; i++) {
+        if (av == ds4_e2m1fn_value(i)) { n = (uint8_t)i; break; }   /* exact table values, equality is safe */
+    }
+    return n == 0 ? (uint8_t)0 : (uint8_t)(v < 0.0f ? (n | 8u) : n);
+}
+__device__ __forceinline__ static uint8_t ds4_e8m0_f32_to_byte(float s) {
+    uint32_t bits;
+    memcpy(&bits, &s, sizeof(bits));
+    if (bits == 0x00400000u) return 0;
+    return (uint8_t)((bits >> 23) & 0xffu);
+}
+__device__ __forceinline__ static uint8_t ds4_e4m3fn_f32_to_byte(float x) {
+    const float v = ds4_e4m3fn_round(x);
+    const float av = fabsf(v);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (ds4_e4m3fn_value(mid) <= av) lo = mid;
+        else hi = mid - 1;
+    }
+    return (uint8_t)((v < 0.0f && av != 0.0f) ? (lo | 0x80) : lo);
+}
+
 /* f32 -> bf16 (cuda_v41_1.inc.cu:154-157) and the RNE round-back kernel
  * (:158-162; the port's v41_bf16r lives in ds41_primitives.cuh:53). */
 __global__ static void v41_x_to_bf16_kernel(__nv_bfloat16 *out, const float *x, uint64_t n) {
