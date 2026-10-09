@@ -5369,6 +5369,12 @@ int ds4_gpu_v41_set_rb_override(const void *model_map, uint64_t model_size, uint
  * (the engine's expression, cuda_v41_3.inc.cu:189-192). */
 int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_expert, uint32_t out_dim);
 
+/* Device argmax for the generate loop (ds4_ds41_gpu.cuh, the engine's
+ * src/cuda/cuda_v41_4.inc.cu:349-365): index of the largest logit in
+ * logits[row][0..n_vocab) to idx[0]; larger value wins, ties take the lower
+ * index. */
+int ds4_gpu_v41_argmax_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *logits, uint32_t row, uint32_t n_vocab);
+
 #ifdef __cplusplus
 }
 #endif

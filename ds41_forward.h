@@ -41,6 +41,17 @@ typedef struct {
 int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_path,
                       int no_engram, int chunk, const ds41_engram_feed *feed);
 
+/* Greedy generate (the engine's ds4_engine_v41_generate_argmax,
+ * core_v41_api.c:426-470 + the round drive): prompt prefill in chunks, then
+ * n=1 decode steps with device argmax.  emit is called per produced token in
+ * order (nonzero return stops, the CLI's EOS convention); the entry itself
+ * also stops at EOS and at the context edge.  Greedy only — sampling, the
+ * penalties, the DSpark spec round and the decode graph are their own units.
+ * no_engram mirrors the engine's --v41-no-engram; with engram layers and no
+ * feed the forward refuses by name. */
+int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
+                            int (*emit)(int token, void *ud), void *ud);
+
 /* Engram table metadata for the feed builder: the engine's C loader filled it
  * from the GGUF, so a caller that hashes + preads rows itself (the Rust host,
  * or this port's C harness) does not re-parse the metadata.  count = how many
@@ -61,6 +72,26 @@ int ds4_v41_engram_meta(void *engine, int k, uint32_t *il, char *path, int path_
  * calls the two GPU stores. */
 int ds4_v41_shape(void *engine, uint32_t *n_layer, uint32_t *n_expert, uint32_t *n_embd);
 int ds4_v41_router_bias_ref(void *engine, uint32_t il, const void **map, uint64_t *size, uint64_t *offset);
+
+/* Engram hash reference (unit E): the four hash-constant tensors and the
+ * scalar parameters, so the C generate harness can hash rows live (the engine
+ * hashes per step; production owns this on the Rust host,
+ * crates/ds4-core/src/engram.rs, verified against the golden erows).  Offsets
+ * are absolute in the model map.  Layouts (the engine's, core_v41_engram.c:94-116):
+ * token_map i32[n_vocab]; multipliers i64[max_ngram * n_engram] read
+ * layer-major (mult[ei*g + k]); primes/offsets i64[(max_ngram-1) * heads *
+ * n_engram] read [(ei*(g-1) + i-1)*heads + head]. */
+typedef struct {
+    const void *map;
+    uint64_t size;
+    uint64_t token_map_off, token_map_bytes;
+    uint64_t mult_off, mult_bytes;
+    uint64_t prim_off, prim_bytes;
+    uint64_t off_off, off_bytes;
+    uint32_t max_ngram, heads, n_engram, n_vocab;
+    int32_t pad;
+} ds41_engram_hash_ref;
+int ds4_v41_engram_hash_ref(void *engine, ds41_engram_hash_ref *ref);
 
 /* Diagnostic (P4-4 head investigation): the forward's head block dumps the
  * bytes a weight resolve returns (device range or mapped pointer) and the raw

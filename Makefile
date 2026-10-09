@@ -992,6 +992,22 @@ test-ds41-forward: tests/test_ds41_forward
 	    $${ENGRAM_DIR:+--engram-dir "$(ENGRAM_DIR)"} $${ZCHAIN:+--zchain "$(ZCHAIN)"} $(NAMES); \
 	fi
 
+# DeepSeek V4.1 (ds41) greedy-generate gate (unit E, E0): the port's generate
+# entry against the engine's own --emit-trace capture. Artifact- and
+# Spark-only, so the runner takes the paths from the environment:
+#   make test-ds41-generate MODEL=<gguf> IDS=<ids file> ENGLOG=<engine log> \
+#        [NPRED=64] [NO_ENGRAM=1]
+tests/test_ds41_generate: tests/test_ds41_generate.cu ds4_gpu.h ds41_forward.h $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ tests/test_ds41_generate.cu $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: test-ds41-generate
+test-ds41-generate: tests/test_ds41_generate
+	@if [ -z "$(MODEL)" ] || [ -z "$(IDS)" ] || [ -z "$(ENGLOG)" ]; then \
+	  echo "usage: make test-ds41-generate MODEL=<gguf> IDS=<ids file> ENGLOG=<engine --emit-trace log> [NPRED=64] [NO_ENGRAM=1]"; \
+	else \
+	  ./tests/test_ds41_generate "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$${NPRED:-64}" $${NO_ENGRAM:+--no-engram}; \
+	fi
+
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its
 # load-time configuration is not the C validator's: this gate pins the two

@@ -55,6 +55,20 @@ extern "C" int ds4_gpu_v41_vq_decode_raw(float *out, const uint8_t *blob, uint32
     return v41_vq_fused_moe(out, blob, IN, MID, OUT, sel, w, K, clamp, x, n_tok, nc, gr, ver);
 }
 
+/* Device argmax for the generate loop, the engine's ds4_gpu_v41_argmax_tensor
+ * (cuda_v41_4.inc.cu:349-365): one block over logits[row][0..n_vocab), the
+ * winning index written to idx[0].  The kernel is the port's existing
+ * argmax_kernel (ds4_cuda.cu:19977): same strided scan and shared-memory
+ * reduction, same tie-break (larger value, lower index) as the engine's
+ * v41_argmax_kernel — audited line-for-line when this entry landed. */
+extern "C" int ds4_gpu_v41_argmax_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *logits, uint32_t row, uint32_t n_vocab) {
+    if (!idx || !logits || n_vocab == 0u || idx->bytes < 4u ||
+        logits->bytes < ((uint64_t)row + 1u) * n_vocab * 4u) return 0;
+    argmax_kernel<<<1, 1024, 0, ds4_current_stream()>>>((int32_t *)idx->ptr,
+                                                        (const float *)logits->ptr + (uint64_t)row * n_vocab, n_vocab);
+    return cuda_ok(cudaGetLastError(), "v41 argmax");
+}
+
 /* Row probe for the P4-1 gate (tests/test_ds41_vq.cu): dot n consecutive rows
  * of matrix (e, which), starting at `row`, against ONE activation x and write
  * the n raw row_dot results (gain included, no bf16 rounding).

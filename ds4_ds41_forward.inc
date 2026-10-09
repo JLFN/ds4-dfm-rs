@@ -51,9 +51,9 @@ static int g_ds4_v41_decoder_full = 0;
 typedef ds41_engram_feed v41_engram_feed;
 
 /* The eager single-state V4.1 state (core_v41.h:64-167, the inference
- * subset).  Dropped from the engine's struct: tsave, graph, snap_*,
- * mainh/draft, amp*, samp/spec_q, eg_* counters, eshard/ejob (host pread is
- * outside), n_direct*, head_last_only/xlast (no generate path yet). */
+ * subset).  Dropped from the engine's struct: tsave, graph, snap_*, mainh/draft,
+ * amp*, samp/spec_q, eg_* counters, eshard/ejob (host pread is outside),
+ * n_direct*. */
 typedef struct {
     uint32_t cap_tok, ctx;      /* max tokens per block / position capacity */
     uint32_t n_past;            /* positions already committed */
@@ -79,6 +79,11 @@ typedef struct {
     ds4_gpu_tensor *logits;     /* [logits_rows][V]: the score path opens cap rows */
     uint32_t logits_rows;
     uint32_t last_logit_row;
+    /* Generate path (core_v41.h:104-110): prefill blocks compute ONE logits
+     * row — the last position's normed input goes to xlast and the head runs
+     * the decode-style GEMV on it; last_logit_row then points at row 0. */
+    int head_last_only;
+    ds4_gpu_tensor *xlast;      /* [1][E] the last position's normed head input */
     ds4_gpu_tensor *eraw[DS4_V41_MAX_ENGRAM], *erows, *ekv;   /* engram: raw row bytes [cap][cols][stride], decoded rows, wkv output */
     const v41_engram_feed *efeed;    /* caller-supplied rows (hash + pread are host work) */
     int no_engram;              /* compare-only mode: skip the engram layers */
@@ -116,6 +121,7 @@ static void v41_alloc_dense(ds4_v41_state *st, uint32_t cap, uint32_t logits_row
     /* logits only for the rows the caller reads (0 = every position, the score path) */
     st->logits_rows = (logits_rows && logits_rows < cap) ? logits_rows : cap;
     st->logits = v41_alloc((uint64_t)st->logits_rows * DS4_N_VOCAB * 4, ok);
+    st->xlast = v41_alloc((uint64_t)E * 4, ok);   /* core_v41_state.c:37 */
 }
 
 /* core_v41_state.c:42-47 — attention projection rows (q path / kv / o / low). */
@@ -144,7 +150,7 @@ static void v41_free_list(ds4_gpu_tensor ***list, size_t n) {
 #define V41_FREE(...) do { ds4_gpu_tensor **l_[] = { __VA_ARGS__ }; v41_free_list(l_, sizeof(l_) / sizeof(l_[0])); } while (0)
 static void v41_free_dense(ds4_v41_state *st) {
     V41_FREE(&st->tok, &st->pos, &st->hc, &st->hc2, &st->mix, &st->pre, &st->post, &st->comb, &st->pre_mix, &st->x, &st->xn, &st->attn_out,
-             &st->glog, &st->sel, &st->rw, &st->routed, &st->sg, &st->su, &st->sh, &st->so, &st->y, &st->logits);
+             &st->glog, &st->sel, &st->rw, &st->routed, &st->sg, &st->su, &st->sh, &st->so, &st->y, &st->logits, &st->xlast);
 }
 static void v41_free_attn(ds4_v41_state *st) {
     V41_FREE(&st->posg, &st->qr, &st->qrn, &st->q, &st->kv, &st->kvn, &st->ckv, &st->csc, &st->pooled, &st->latent, &st->ktmp,
@@ -663,7 +669,6 @@ static bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
     /* head: h = hc_pre(hc, pre_mix) -> norm -> output projection (f32 logits) */
     if (!ds4_gpu_v41_hc_pre_tensor(st->x, st->hc, st->pre_mix, E, DS4_N_HC, n)) return false;
     if (!ds4_gpu_v41_rms_norm_tensor(st->xn, st->x, e->model.map, e->model.size, e->weights.output_norm->abs_offset, E, n, DS4_RMS_EPS)) return false;
-    if (n > st->logits_rows) { fprintf(stderr, "ds4: [v41] head needs %u logits rows, buffer has %u\n", n, st->logits_rows); return false; }
     if (getenv("DS41_DUMP_HEAD")) {
         /* P4-4 head investigation: dump the head weights as the resolve serves
          * them and the raw mapping bytes for the same spans (see ds41_forward.h). */
@@ -679,8 +684,23 @@ static bool v41_forward_body(ds4_engine *e, ds4_v41_state *st) {
         ds4_gpu_v41_debug_dump_raw(e->model.map, e->model.size, e->weights.output->abs_offset, 1u << 20, pb);
         fprintf(stderr, "ds4: [v41] head weights dumped to %s.*\n", pref);
     }
-    if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
-    st->last_logit_row = n - 1u;
+    if (st->head_last_only && n > DS4_V41_GEMV_MAX_TOK) {
+        /* core_v41_forward.c:334-342: the generate path reads only the last
+         * position, so a prefill block runs the decode-style GEMV head on
+         * xlast instead of the full GEMM.  Deliberately NOT bit-identical to
+         * the GEMM head (the engine's own note, 2026-09-29): the GEMV keeps
+         * the q4_K head weights unrounded — this IS the generate path's
+         * reference, and the port mirrors it for exactly that reason.  The
+         * logits buffer only needs the rows the caller reads (logits_rows),
+         * so the n > logits_rows guard stays on the full-GEMM arm only. */
+        if (!ds4_gpu_tensor_copy(st->xlast, 0, st->xn, (uint64_t)(n - 1u) * E * 4, (uint64_t)E * 4)) return false;
+        if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xlast, 1, 0)) return false;
+        st->last_logit_row = 0;
+    } else {
+        if (n > st->logits_rows) { fprintf(stderr, "ds4: [v41] head needs %u logits rows, buffer has %u\n", n, st->logits_rows); return false; }
+        if (!v41_tproj(&e->model, st->logits, e->weights.output, E, DS4_N_VOCAB, st->xn, n, 0)) return false;
+        st->last_logit_row = n - 1u;
+    }
     if (g_ds4_v41_prof) {   /* per-layer ms: one glance shows which layer eats the time (engram L1/L14, sources L2/8/14/20) */
         if (ds4_gpu_flush_commands() == 0) return false;
         lt[DS4_N_LAYER] = now_sec() - tprev;
@@ -773,6 +793,26 @@ int ds4_v41_router_bias_ref(void *engine, uint32_t il, const void **map, uint64_
     return 1;
 }
 
+int ds4_v41_engram_hash_ref(void *engine, ds41_engram_hash_ref *ref) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !ref) return 0;
+    const ds4_tensor *tm = e->weights.engram_token_map, *mu = e->weights.engram_multipliers;
+    const ds4_tensor *pr = e->weights.engram_primes, *of = e->weights.engram_offsets;
+    if (!tm || !mu || !pr || !of) return 0;
+    ref->map = e->model.map;
+    ref->size = e->model.size;
+    ref->token_map_off = tm->abs_offset; ref->token_map_bytes = tm->bytes;
+    ref->mult_off = mu->abs_offset;      ref->mult_bytes = mu->bytes;
+    ref->prim_off = pr->abs_offset;      ref->prim_bytes = pr->bytes;
+    ref->off_off = of->abs_offset;       ref->off_bytes = of->bytes;
+    ref->max_ngram = g_ds4_v41.engram_max_ngram;
+    ref->heads = g_ds4_v41.engram_heads;
+    ref->n_engram = g_ds4_v41.n_engram;
+    ref->n_vocab = DS4_N_VOCAB;
+    ref->pad = (int32_t)g_ds4_v41.engram_pad;
+    return 1;
+}
+
 /* ---- the score entry (core_v41_score.c:27-110) ----
  * Teacher-forced scoring; the aux outputs (--score-nll/--score-topk/--score-rms)
  * and the deployment-split mode are not ported (the golden capture used the
@@ -822,4 +862,75 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
                     n, DS4_N_VOCAB, out_path, n, n > 1 ? exp(nll / (double)(n - 1)) : 0.0, now_sec() - t0);
     v41_state_free(&st);
     return ok ? 0 : 1;
+}
+
+/* ---- the greedy generate entry (core_v41_api.c:426-470 + the round drive
+ * :175-425, the non-spec eager subset) ----
+ * Prompt prefill in chunks (the shared v41_prefill_chunk), then n=1 decode
+ * steps: device argmax on the last logits row -> emit -> next token.  The
+ * engine's generate path sets head_last_only so a prefill block computes ONE
+ * logits row (the head GEMV on xlast, core_v41_forward.c:334-342).  Named
+ * limits: sampling and the penalties, the DSpark spec round, the decode graph
+ * and the emit-trace diagnostics are not ported (their units); no_engram
+ * mirrors the engine's --v41-no-engram. */
+int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
+                            int (*emit)(int token, void *ud), void *ud) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !prompt || n_prompt < 1 || DS4_MODEL_VARIANT != DS4_VARIANT_V41) return 1;
+    const uint32_t np = (uint32_t)n_prompt;
+    uint32_t ctx = g_ds4_v41.ctx;
+    if (ctx == 0u) { fprintf(stderr, "ds4: [v41] model metadata has no deepseek4.context_length\n"); return 1; }
+    if (np + 1u > ctx) { fprintf(stderr, "ds4: [v41] prompt %u tokens over context %u\n", np, ctx); return 1; }
+    /* allocate only what this run can reach (core_v41_api.c:120-135) */
+    const uint64_t need = (uint64_t)np + (uint64_t)(n_predict > 0 ? n_predict : 0) + DS4_MTP_MAX_BLOCK + 2u;
+    if ((uint64_t)ctx > need) ctx = (uint32_t)need;
+    const int room = ctx > np ? (int)(ctx - np) : 0;
+    if (n_predict > room) n_predict = room;
+    const uint32_t cap = DS4_V41_CHUNK < np ? DS4_V41_CHUNK : np;
+    ds4_v41_state st;
+    if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;
+    st.head_last_only = 1;
+    st.no_engram = no_engram;   /* the gate's compare-only mode (the engine's --v41-no-engram) */
+    ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(16u);   /* the engine's 16 B device slot; argmax writes the first int */
+    int rc = 1;
+    int32_t tok = 0;
+    int produced = 0;
+    do {
+        if (!am) break;
+        const double t0 = now_sec();
+        bool ok = true;
+        for (uint32_t c0 = 0; ok && c0 < np;) ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);
+        if (!ok) break;
+        fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, now_sec() - t0, (double)np / (now_sec() - t0 + 1e-9));
+        /* the last prefill position's logits -> the first token (last_logit_row
+         * says which row the head wrote; row 0 under head_last_only) */
+        if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
+            ds4_gpu_synchronize() == 0 ||
+            ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) break;
+        {   /* the engine's one-shot argmax self-check (core_v41_api.c:193-200):
+             * a wrong kernel would silently emit wrong tokens, so compare the
+             * device index against a host scan of the same row once. */
+            float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
+            if (row && ds4_gpu_tensor_read(st.logits, (uint64_t)st.last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
+                uint32_t best = 0;
+                for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (row[v] > row[best]) best = v;
+                if ((int32_t)best != tok) fprintf(stderr, "ds4: *[v41] argmax kernel %d != host %u*\n", tok, best);
+            }
+            free(row);
+        }
+        rc = 0;
+        while (produced < n_predict) {
+            produced++;
+            if (emit && emit((int)tok, ud) != 0) break;   /* the CLI's EOS convention: nonzero = stop */
+            if ((int)tok == ds4_token_eos(e)) break;      /* the engine's own check when emit does not stop */
+            if (st.n_past + 1u > st.ctx) { fprintf(stderr, "[v41] context full %u\n", st.ctx); break; }
+            if (!v41_forward(e, &st, &tok, 1)) { rc = 1; break; }
+            if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
+                ds4_gpu_synchronize() == 0 ||
+                ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) { rc = 1; break; }
+        }
+    } while (0);
+    if (am) ds4_gpu_tensor_free(am);
+    v41_state_free(&st);
+    return rc;
 }
