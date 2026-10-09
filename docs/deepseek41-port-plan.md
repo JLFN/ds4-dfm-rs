@@ -139,7 +139,7 @@ before any state-changing command.
 | P0 | Freeze inputs: verify the assembled artifact hash (the 40 part files are deleted after assembly, so `SHA256SUMS`' part lines cannot resolve); capture the C engine's golden set with `tests/capture_ds41_golden.sh`, with the engram tables as the primary instrument and `NO_ENGRAM=1` as the fixture variant; record the artifact's accepted tensor inventory | hashes re-verify; the golden set exists as files with its own MANIFEST |
 | P0 | DONE 2026-10-08 | see 6.5 |
 | P1 | DONE 2026-10-08 (`c1fdc04`, `7c21279`): tensor types 40-44 in `tensors.rs`, the VQ decode oracle, the type table | v2 decode bit-exact against `ds4vq_dequant_f32` (fixtures in `tests/fixtures/vq`); v3 at unit level (12-bit, 13-bit plane); types match `core_gguf.c:89-104` |
-| P2 | IN PROGRESS: the engram half is DONE (2026-10-09, `79756c0` + `0af1d10`, §6.6.2: hash and table reader with engine parity and the golden-row gate); the sidecar `gr`/`rb` reader and the `base.fnv` check remain | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
+| P2 | DONE 2026-10-09: the engram half (`79756c0` + `0af1d10`, §6.6.2) and the sidecar half (`dac818e`, §6.6.3: gr/rb/amp readers, the fp4x32 decoder, the `base.fnv` gate, both directions verified on the real directories) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
 | P3 | DONE for the loader half (2026-10-09): the `Variant::V41` shape (`d53079b`), the metadata wire, the bind arm (`0d3378d`) and the layout table (`356a100`); the engram/sidecar session state remains (P2) | the loader accepts the artifact: `identify` + `validate: ok` + `layout: ok` + `bind: slots=1000 bound=1000 required-missing=0` on the real file (§6.6.1) |
 | P4 | CUDA: VQ MoE decode (mirror `v41_vq_open` geometry), the fp8_32x32 skeleton path, and the engram read path | G2 on device: logits match the golden set |
 | P5 | MTP towers and DSpark verify/rollback | byte-identical greedy output with drafting on and off at N=1; cache-frontier gate at N>1. The engine's own cautions: the main-hidden ring trim in rollback, and the compressor pending-row snapshot taken before the shift |
@@ -370,6 +370,25 @@ with ENOTDIR and silently took the FADV_RANDOM fallback (`direct=false` in the
 run). `0af1d10` fixes the constant per arch and the comment records the
 symptom; the fallback is a reproducibility risk (page-cache churn), not a
 performance note.
+
+### 6.6.3 P2: the sidecar readers and the base.fnv gate (2026-10-09, `dac818e`)
+
+`GrSidecar`, `RbSidecar`, `AmpSidecar`, `deq_fp4x32` and `gr_dir_fnv` +
+`check_base_fnv` mirror `core_v41_amp.c:27-223` and `ds4_gr_fnv.h:18-33`.
+Gates:
+
+| gate | result |
+| --- | --- |
+| the engine's own `ds4_deq_fp4x32` as a C harness (`fixtures/sidecar/gen_fp4_ref.c` with the vendored `ds4_fp8.h`) | bit for bit, including the e=0 and e=255 scale edges |
+| the three readers against synthetic files of every storage type, plus header/type/truncation refusals | model-free tests |
+| the Spark, real ② directory `…-grrb-vqfin41_vqhalf_a_n8192-engine`: `--zchain` | `gr=39 rb=27 amp=0 fnv=f4a3fd3988135e75/66`; `posttrain: base.fnv ok f4a3fd3988135e75/66` |
+| the Spark, wrong ② directory `…-grrb-code_fit_n15360-engine` | `base.fnv MISMATCH want f4a3fd3988135e75/66 have 4530bf1df4ebeeaf/68`, refused |
+
+The fingerprint check is a real-data end-to-end one: `f4a3fd3988135e75` and 66
+files are what the post-train solver wrote into
+`posttrain-experimental-20260924/base.fnv`, and the Rust FNV lands on it
+exactly. The reader also decoded the real fp4x32 `gr_L00.bin` (`factor[0] =
+1.125000` = stored `s-1` restored to `1+raw`). P2 is closed.
 
 ## 7. Numerics contract
 
