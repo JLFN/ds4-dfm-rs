@@ -127,9 +127,9 @@ static int real_main(int argc, char **argv) {
         fprintf(stderr, "usage: %s --real <wkv.img> <rows.bin> <erows.ref.f32> <wkv.ref.f32> <in_dim> <out_dim> <n_tok>\n", argv[0]);
         return 2;
     }
-    const uint32_t in_dim = (uint32_t)strtoul(argv[5], NULL, 10);
-    const uint32_t out_dim = (uint32_t)strtoul(argv[6], NULL, 10);
-    const uint32_t n_tok = (uint32_t)strtoul(argv[7], NULL, 10);
+    const uint32_t in_dim = (uint32_t)strtoul(argv[6], NULL, 10);
+    const uint32_t out_dim = (uint32_t)strtoul(argv[7], NULL, 10);
+    const uint32_t n_tok = (uint32_t)strtoul(argv[8], NULL, 10);
     const uint32_t hd = 256;
     if (!in_dim || !out_dim || !n_tok || (in_dim % hd) || (in_dim % 512u)) {
         fprintf(stderr, "test_ds41_engram: bad geometry\n");
@@ -139,7 +139,7 @@ static int real_main(int argc, char **argv) {
     void *img = xread(argv[2], &img_bytes);
     uint8_t *rows = (uint8_t *)xread(argv[3], &rows_bytes);
     float *erows_ref = (float *)xread(argv[4], &erows_ref_bytes);
-    float *wkv_ref = (float *)xread(argv[8], &wkv_ref_bytes);
+    float *wkv_ref = (float *)xread(argv[5], &wkv_ref_bytes);
     const uint32_t n_rows = n_tok * (in_dim / hd);
     const uint64_t stride = hd + hd / 32u;
     if (rows_bytes != (uint64_t)n_rows * stride || erows_ref_bytes != (uint64_t)n_rows * hd * 4 ||
