@@ -181,6 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             w.mtp_targets,
                             w.mtp_markov_rank,
                         );
+                        println!("v41 compress-ratios: {:?}", w.compress_ratios);
                         let plan = ds4_core::BindPlan::resolve_v41(id.shape, &w, &inv);
                         match ds4_core::validate_layouts_v41(&plan, &w, &inv) {
                             Ok(()) => println!("layout: ok"),
