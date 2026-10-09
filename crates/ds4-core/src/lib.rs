@@ -35,6 +35,7 @@ mod serving_cuda;
 mod serving_host;
 mod session;
 mod shape;
+mod sidecar;
 mod sibling;
 mod spec;
 mod step37;
@@ -120,6 +121,11 @@ pub use shape::{
     SHAPE_QWEN38_FLASH_NEXT, SHAPE_SOLAR_OPEN2_250B,
 };
 pub use sibling::{probe_dspark_sidecar, probe_mtp_sidecar, probe_vision_sidecar, SiblingAttach};
+pub use sidecar::{
+    check_base_fnv, deq_fp4x32, e8m0_to_f32, fp4_nibble_to_f32, gr_dir_fnv, AmpSidecar,
+    BaseFingerprint, GrSidecar, RbSidecar, SidecarError, AMP_MAX_RANK, FNV_PRIME, FNV_SEED,
+    TYPE_F16, TYPE_F32, TYPE_FP4X32,
+};
 pub use spec::{snapshot_spec, SpecMetrics};
 pub use step37::{Step37Error, Step37Layer, Step37Plan, Step37Sidecar, Step37SidecarPlan};
 pub use tensors::{

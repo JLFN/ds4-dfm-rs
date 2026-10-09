@@ -67,12 +67,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engram_dir: Option<String> = None;
     let mut ids_path: Option<String> = None;
     let mut erows_out: Option<String> = None;
+    let mut zchain: Option<String> = None;
+    let mut posttrain: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--tensors" => list_tensors = true,
             "--engram-dir" => engram_dir = args.next(),
             "--ids" => ids_path = args.next(),
             "--erows-out" => erows_out = args.next(),
+            "--zchain" => zchain = args.next(),
+            "--posttrain" => posttrain = args.next(),
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -272,6 +276,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(None) => println!("erows: no engram layers"),
                         Err(e) => println!("erows: {}", e.token()),
                     }
+                }
+            }
+
+            // Sidecars: read the ② directory (--zchain) layer by layer and
+            // its fingerprint, then the ③ directory's base.fnv gate
+            // (--posttrain). Both are admission checks, not weights.
+            let (n_expert, n_embd, n_layer) =
+                (id.shape.n_expert, id.shape.n_embd, id.shape.n_layer);
+            if let Some(zdir) = zchain.as_deref() {
+                let dir = Path::new(zdir);
+                let (mut n_gr, mut n_rb, mut n_amp) = (0u32, 0u32, 0u32);
+                let mut sample = String::from("none");
+                for il in 0..n_layer {
+                    match ds4_core::GrSidecar::read(
+                        &dir.join(format!("gr_L{il:02}.bin")),
+                        n_expert,
+                        n_embd,
+                    ) {
+                        Ok(Some(gr)) => {
+                            n_gr += 1;
+                            if sample == "none" {
+                                sample = format!(
+                                    "gr_L{il:02} type={} factor[0]={:.6}",
+                                    gr.typ, gr.factor[0]
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => println!("zchain gr_L{il:02}: {}", e.token()),
+                    }
+                    match ds4_core::RbSidecar::read(
+                        &dir.join(format!("rb_L{il:02}.bin")),
+                        n_expert,
+                    ) {
+                        Ok(Some(rb)) => {
+                            n_rb += 1;
+                            if sample == "none" {
+                                sample = format!("rb_L{il:02} bias[0]={:.6}", rb.bias[0]);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => println!("zchain rb_L{il:02}: {}", e.token()),
+                    }
+                    match ds4_core::AmpSidecar::read(
+                        &dir.join(format!("amp_L{il:02}.bin")),
+                        n_embd,
+                    ) {
+                        Ok(Some(_)) => n_amp += 1,
+                        Ok(None) => {}
+                        Err(e) => println!("zchain amp_L{il:02}: {}", e.token()),
+                    }
+                }
+                let (hash, files) = ds4_core::gr_dir_fnv(dir, n_layer);
+                println!(
+                    "zchain: gr={n_gr} rb={n_rb} amp={n_amp} fnv={hash:016x}/{files} sample[{sample}]"
+                );
+            }
+            if let Some(pdir) = posttrain.as_deref() {
+                let dir = Path::new(pdir);
+                match ds4_core::check_base_fnv(
+                    dir,
+                    zchain.as_deref().map(Path::new),
+                    n_layer,
+                ) {
+                    Ok(ds4_core::BaseFingerprint::Absent) => {
+                        println!("posttrain: base.fnv ABSENT (warn and pass)")
+                    }
+                    Ok(ds4_core::BaseFingerprint::Checked { hash, files }) => {
+                        println!("posttrain: base.fnv ok {hash:016x}/{files}")
+                    }
+                    Err(ds4_core::SidecarError::BaseMismatch {
+                        want,
+                        want_files,
+                        have,
+                        have_files,
+                    }) => println!(
+                        "posttrain: base.fnv MISMATCH want {want:016x}/{want_files} have {have:016x}/{have_files}"
+                    ),
+                    Err(e) => println!("posttrain: {}", e.token()),
+                }
+                match ds4_core::GrSidecar::read(&dir.join("gr_L39.bin"), n_expert, n_embd) {
+                    Ok(Some(gr)) => println!(
+                        "posttrain: gr_L39 type={} factor[0]={:.6}",
+                        gr.typ, gr.factor[0]
+                    ),
+                    Ok(None) => println!("posttrain: no gr_L39.bin"),
+                    Err(e) => println!("posttrain: gr_L39 {}", e.token()),
                 }
             }
         }
