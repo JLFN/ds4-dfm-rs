@@ -120,11 +120,19 @@ fn parse_cases(path: &str, in_dim: usize) -> Vec<Case> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() != 3 {
-        eprintln!("usage: ds41_moe_ref <moe.blob> <moe.cases.txt> <moe.ref.f32>");
+    if args.len() != 3 && args.len() != 6 {
+        eprintln!("usage: ds41_moe_ref <moe.blob> <moe.cases.txt> <moe.ref.f32> [IN MID OUT]");
         std::process::exit(2);
     }
-    let (in_dim, mid_dim, out_dim) = (2048u32, 2048u32, 512u32);
+    let (in_dim, mid_dim, out_dim) = if args.len() == 6 {
+        (
+            args[3].parse::<u32>().expect("IN"),
+            args[4].parse::<u32>().expect("MID"),
+            args[5].parse::<u32>().expect("OUT"),
+        )
+    } else {
+        (2048u32, 2048u32, 512u32)
+    };
     let blob = std::fs::read(&args[0]).expect("blob");
     let cases = parse_cases(&args[1], in_dim as usize);
     let mut out_bytes: Vec<u8> = Vec::new();

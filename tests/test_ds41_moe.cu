@@ -25,9 +25,11 @@
 
 #include "ds4_gpu.h"
 
-#define IN_DIM 2048u
-#define MID_DIM 2048u
-#define OUT_DIM 512u
+/* Geometry: the synthetic fixture's defaults; the real layer-0 payload case
+ * (R=20/9) passes IN/MID/OUT on the command line. */
+static uint32_t IN_DIM = 2048u;
+static uint32_t MID_DIM = 2048u;
+static uint32_t OUT_DIM = 512u;
 #define NEXP 2u
 /* Random cases: max |delta| against the reference vector's own scale; see the
  * criterion comment at the compare (P4-2 evidence: worst measured 2.6e-4). */
@@ -98,9 +100,18 @@ static moe_case *parse_cases(const char *path, uint32_t *n_cases) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <moe.blob> <moe.cases.txt> <moe.ref.f32>\n", argv[0]);
+    if (argc != 4 && argc != 7) {
+        fprintf(stderr, "usage: %s <moe.blob> <moe.cases.txt> <moe.ref.f32> [IN MID OUT]\n", argv[0]);
         return 2;
+    }
+    if (argc == 7) {
+        IN_DIM = (uint32_t)strtoul(argv[4], NULL, 10);
+        MID_DIM = (uint32_t)strtoul(argv[5], NULL, 10);
+        OUT_DIM = (uint32_t)strtoul(argv[6], NULL, 10);
+        if (!IN_DIM || !MID_DIM || !OUT_DIM || (IN_DIM % 256u) || (MID_DIM % 256u) || (OUT_DIM % 256u)) {
+            fprintf(stderr, "test_ds41_moe: IN/MID/OUT must be nonzero multiples of 256\n");
+            return 2;
+        }
     }
     uint64_t blob_bytes = 0, ref_bytes = 0;
     void *blob = xread(argv[1], &blob_bytes);
@@ -117,7 +128,8 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor *w_t = ds4_gpu_tensor_alloc(64 * 4);      /* K <= 64 in this fixture */
     ds4_gpu_tensor *sel_t = ds4_gpu_tensor_alloc(64 * 4);
     ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(OUT_DIM * 4);
-    if (!x_t || !w_t || !sel_t || !out_t) { fprintf(stderr, "test_ds41_moe: tensor alloc\n"); return 2; }
+    float *got = (float *)malloc(OUT_DIM * 4);
+    if (!x_t || !w_t || !sel_t || !out_t || !got) { fprintf(stderr, "test_ds41_moe: tensor alloc\n"); return 2; }
 
     int n_fail = 0;
     float worst_rel = 0.0f;
@@ -131,7 +143,6 @@ int main(int argc, char **argv) {
                                                      IN_DIM, MID_DIM, OUT_DIM, sel_t, w_t, NEXP, c->k,
                                                      10.0f, x_t, 0, 1);
         if (!rc) { fprintf(stderr, "test_ds41_moe: case %u: entry refused\n", ci); n_fail++; continue; }
-        float got[OUT_DIM];
         ds4_gpu_tensor_read(out_t, 0, got, OUT_DIM * 4);
         const float *want = ref + (uint64_t)ci * OUT_DIM;
 
