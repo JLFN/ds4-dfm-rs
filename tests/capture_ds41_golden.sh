@@ -14,6 +14,7 @@
 #
 #   bash tests/capture_ds41_golden.sh              # with the engram tables
 #   NO_ENGRAM=1 bash tests/capture_ds41_golden.sh  # fixture variant, no engram
+#   NO_ZCHAIN=1 bash tests/capture_ds41_golden.sh  # bare variant (no --zchain) -> $OUT/bare
 #
 # Output: $OUT/{<name>.ids,<name>.logits.bin,<name>.log,MANIFEST}
 set -euo pipefail
@@ -36,6 +37,16 @@ elif [ -d "$ENGRAM_DIR" ]; then
 else
   echo "engram tables not found at $ENGRAM_DIR; use NO_ENGRAM=1 for the fixture variant" >&2
   exit 1
+fi
+
+# Sidecar axis: the default capture ran the engine WITH --zchain (the gr/rb
+# repair).  The port's forward does not apply the sidecar yet, so its trace
+# gate needs the BARE variant (same ids, same engram, no --zchain):
+#   NO_ZCHAIN=1 bash tests/capture_ds41_golden.sh   # -> $OUT/bare
+ZCHAIN_ARGS=(--zchain "$SIDECAR")
+if [ "${NO_ZCHAIN:-0}" = "1" ]; then
+  ZCHAIN_ARGS=()
+  OUT="$OUT/bare"
 fi
 
 # Fixed prompt set: short English, code, factual, a longer passage, Chinese.
@@ -65,7 +76,7 @@ for i in "${!NAMES[@]}"; do
   echo "$ids" > "$OUT/$name.ids"
 
   # Per-position logits for the exact id sequence.
-  "$BIN" --cuda -m "$GGUF" --zchain "$SIDECAR" "${ENGRAM_ARGS[@]}" \
+  "$BIN" --cuda -m "$GGUF" "${ZCHAIN_ARGS[@]}" "${ENGRAM_ARGS[@]}" \
       --score-ids "$OUT/$name.ids" --score-out "$OUT/$name.logits.bin" \
       2>&1 | tee "$OUT/$name.log"
 done
@@ -75,6 +86,7 @@ done
   echo "# DeepSeek V4.1 golden set, captured by tests/capture_ds41_golden.sh"
   echo "# engine: $BIN"
   echo "# engram: ${ENGRAM_ARGS[*]:-none}"
+  echo "# zchain: ${ZCHAIN_ARGS[*]:-none}"
   sha256sum "$BIN" "$GGUF"
   sha256sum "$OUT"/*.ids "$OUT"/*.logits.bin "$OUT"/*.log
 } > "$OUT/MANIFEST"

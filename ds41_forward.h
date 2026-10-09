@@ -1,0 +1,59 @@
+/* ds41_forward.h — the V4.1 (ds41) native forward's public surface (P4-4).
+ *
+ * The score entry is the C-side gate driver: it runs the teacher-forced
+ * forward over `ids` and writes the logits file (header {n, vocab} then n rows
+ * of f32) plus, for n <= 64 single-block runs, the per-layer dumps
+ * <out>.x_Lnn.bin / <out>.y_Lnn.bin (MoE in/out), <out>.hce_Lnn.bin (hc after
+ * the engram) and <out>.erows_Lnn.txt (the engram row ids) — the same golden
+ * capture protocol the engine's --score-ids uses.
+ *
+ * Engram rows are host work by design: the port keeps the hash + pread on the
+ * Rust host and the native forward consumes a pinned feed (the engine's
+ * background pool / io_uring path stays behind; the port's first unit is the
+ * eager single-state forward).  raw buffers MUST come from
+ * ds4_gpu_host_alloc — the upload is a pinned zero-copy write.
+ */
+#ifndef DS41_FORWARD_H
+#define DS41_FORWARD_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define DS41_MAX_ENGRAM 4
+
+typedef struct {
+    /* Per engram layer: pinned host bytes [n][cols][head_dim + head_dim/32]
+     * (the raw table row: the e4m3 plane followed by its ue8m0 tail) and the
+     * row ids the caller hashed, [n][cols].  rows may be NULL (it only feeds
+     * the erows dump). */
+    const void *raw[DS41_MAX_ENGRAM];
+    const int64_t *rows[DS41_MAX_ENGRAM];
+} ds41_engram_feed;
+
+/* Teacher-forced scoring of `ids` through an opened V4.1 engine.  Writes the
+ * logits file to out_path and prints the segment PPL; returns 0 on success.
+ * no_engram skips the engram layers (the compare-only mode); when the model
+ * has engram layers and no feed is supplied, the forward refuses by name
+ * rather than silently scoring without them. */
+int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_path,
+                      int no_engram, int chunk, const ds41_engram_feed *feed);
+
+/* Engram table metadata for the feed builder: the engine's C loader filled it
+ * from the GGUF, so a caller that hashes + preads rows itself (the Rust host,
+ * or this port's C harness) does not re-parse the metadata.  count = how many
+ * engram layers the model carries.  k indexes them (k is also the engram
+ * index used in ds41_engram_feed).  The path is the GGUF's converter path;
+ * a caller with the shards elsewhere keeps the basename and prefixes its own
+ * directory (the engine's --engram-dir rule). */
+int ds4_v41_engram_count(void *engine);
+int ds4_v41_engram_meta(void *engine, int k, uint32_t *il, char *path, int path_cap,
+                        uint64_t *rows, uint64_t *weight_off, uint64_t *scale_off,
+                        uint32_t *head_dim, uint32_t *cols);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

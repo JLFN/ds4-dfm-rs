@@ -27,13 +27,9 @@
 /* Packed-KV group geometry (ds4_gpu_v41.h:229-234): the main KV stores 512
  * dims as 256 B nibbles + 32 B E4M3 scales = 288 B/group; the index key
  * stores 128 dims as 64 B nibbles + 4 B E8M0 scales = 68 B padded to 72 (8
- * aligned: 68 makes a warp's 64 B read straddle two 32 B sectors). */
-#define DS4_V41_CKV_BLK    16u
-#define DS4_V41_CKV_NIB   256u
-#define DS4_V41_CKV_BYTES 288u
-#define DS4_V41_IDXK_BLK   32u
-#define DS4_V41_IDXK_NIB   64u
-#define DS4_V41_IDXK_BYTES 72u
+ * aligned: 68 makes a warp's 64 B read straddle two 32 B sectors).  The
+ * constants live in ds41_kvfmt.h so the host allocator uses the same copy. */
+#include "../ds41_kvfmt.h"
 
 /* fast_round_scale's exponent: 2^ceil(log2 v) (cuda_v41_1.inc.cu:130-133).
  * act_quant and the KV pack share this one copy — a drift here would make the

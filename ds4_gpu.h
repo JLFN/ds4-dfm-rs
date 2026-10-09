@@ -5220,6 +5220,11 @@ int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, ui
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok);
+/* The decode-batch MoE tail (cuda_vq_decode.inc.cu:414): folds the routed
+ * partial sums the out==NULL routed call left in the worker scratch and adds
+ * the shared expert in one launch (the engine's tail==1 path). */
+int ds4_gpu_v41_moe_tail_tensor(ds4_gpu_tensor *y, const ds4_gpu_tensor *so, const ds4_gpu_tensor *weights,
+        uint32_t n_tok, uint32_t n_used, uint32_t out_dim);
 
 /* DeepSeek V4.1 fp8_32x32 (e4m3 plane + one ue8m0 per 32x32 tile; see
  * cuda/ds41_fp8blk.cuh).  `weight_offset` addresses the e4m3 plane in the
@@ -5284,6 +5289,7 @@ int ds4_gpu_v41_embed_fp4x32_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *t
 int ds4_gpu_v41_rms_norm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map,
         uint64_t model_size, uint64_t weight_offset, uint32_t dim, uint32_t n_tok, float eps);
 int ds4_gpu_v41_add_tensor(ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint64_t n);
+int ds4_gpu_v41_scale_round_tensor(ds4_gpu_tensor *x, uint64_t n, float s);
 int ds4_gpu_v41_expand_hc_tensor(ds4_gpu_tensor *hc, const ds4_gpu_tensor *x, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 int ds4_gpu_v41_hc_mix_tensor(ds4_gpu_tensor *mix, const ds4_gpu_tensor *hc, const void *model_map, uint64_t model_size,
         uint64_t fn_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);

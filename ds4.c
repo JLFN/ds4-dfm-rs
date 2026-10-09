@@ -60,6 +60,7 @@
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#include "ds41_forward.h"
 #endif
 
 /* Keep the runtime-KV selection available to CPU-only placement/accounting
@@ -78807,3 +78808,9 @@ int ds4_session_iquest_commit(ds4_session *s, int keep, char *err, size_t errlen
     if (errlen) { snprintf(err, errlen, "IQuest-Q1 requires CUDA"); } return 1;
 }
 #endif
+
+/* DeepSeek V4.1 native forward (P4-4): the eager single-state score path.
+ * Guarded out of CPU-only builds; ds4_v41_score_ids is the C gate driver. */
+#ifndef DS4_NO_GPU
+#include "ds4_ds41_forward.inc"
+#endif /* DS4_NO_GPU */

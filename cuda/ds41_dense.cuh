@@ -284,3 +284,18 @@ extern "C" int ds4_gpu_v41_expand_hc_tensor(ds4_gpu_tensor *hc, const ds4_gpu_te
     v41_expand_hc_kernel<<<dim3((n_embd + 255) / 256, n_tok), 256, 0, ds4_current_stream()>>>((float *)hc->ptr, (const float *)x->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "v41 expand hc");
 }
+
+/* ---- in-place x = bf16(x*s) (cuda_v41_4.inc.cu:336-346) ----
+ * The indexer weights scale (softmax_scale * n_heads^-1/2): the official
+ * model multiplies on bf16, so the multiply lands on the bf16 grid.  Used to
+ * be a host round trip (517 KB read back per layer). */
+__global__ static void v41_scale_round_kernel(float *x, uint64_t n, float s) {
+    v41_pdl_wait();   /* PDL: first instruction waits for the upstream; no-op when not launched through PDL */
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = v41_bf16r(x[i] * s);
+}
+extern "C" int ds4_gpu_v41_scale_round_tensor(ds4_gpu_tensor *x, uint64_t n, float s) {
+    if (!x || x->bytes < n * 4) return 0;
+    v41_scale_round_kernel<<<(unsigned)((n + 255) / 256), 256, 0, ds4_current_stream()>>>((float *)x->ptr, n, s);
+    return cuda_ok(cudaGetLastError(), "v41 scale round");
+}
