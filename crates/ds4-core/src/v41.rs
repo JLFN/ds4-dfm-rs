@@ -36,8 +36,13 @@ const KEY_COMPRESS_RATIOS: &str = "deepseek4.attention.compress_ratios";
 const KEY_KV_SOURCE_LAYERS: &str = "deepseek4.attention.kv_source_layers";
 const KEY_INDEX_SOURCE_LAYERS: &str = "deepseek4.attention.index_source_layers";
 const KEY_ENGRAM_LAYER_IDS: &str = "deepseek4.engram.layer_ids";
+const KEY_ENGRAM_MAX_NGRAM: &str = "deepseek4.engram.max_ngram_size";
+const KEY_ENGRAM_HEADS: &str = "deepseek4.engram.head_count";
+const KEY_ENGRAM_HEAD_DIM: &str = "deepseek4.engram.head_dim";
 const KEY_MTP_TOWER_COUNT: &str = "deepseek4.mtp.tower_count";
 const KEY_MTP_EXPERT_COUNT: &str = "deepseek4.mtp.expert_count";
+const KEY_MTP_TARGET_LAYERS: &str = "deepseek4.mtp.target_layers";
+const KEY_MTP_MARKOV_RANK: &str = "deepseek4.mtp.markov_rank";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum V41WireError {
@@ -96,11 +101,25 @@ pub struct V41Wire {
     pub engram_layers: Vec<u32>,
     /// Layer -> engram index, -1 = none (`core_validate_v41.c:118-125`).
     pub engram_index_of: Vec<i16>,
+    /// `deepseek4.engram.max_ngram_size` (4 in the artifact).
+    pub engram_max_ngram: u32,
+    /// `deepseek4.engram.head_count` (8 in the artifact).
+    pub engram_heads: u32,
+    /// `deepseek4.engram.head_dim` (256 in the artifact).
+    pub engram_head_dim: u32,
     /// `deepseek4.mtp.tower_count`; 0 = the GGUF carries no towers and the
     /// engine decodes one token at a time (`core_validate_v41.c:85-90`).
     pub mtp_towers: u32,
     /// `deepseek4.mtp.expert_count`; per-expert form only.
     pub mtp_experts: u32,
+    /// `deepseek4.mtp.target_layers` (the layers whose attention input feeds
+    /// `main_proj`); empty when the key is absent. The engine reads the same
+    /// array when the draft parameters are complete
+    /// (`core_validate_v41.c:100-110`).
+    pub mtp_targets: Vec<u32>,
+    /// `deepseek4.mtp.markov_rank`; None when absent. The markov head and the
+    /// confidence head are shaped by it.
+    pub mtp_markov_rank: Option<u32>,
 }
 
 /// C `v41_arr_i32`: an INT32 or UINT32 array, read signed. Returns the values.
@@ -201,6 +220,17 @@ impl V41Wire {
         for (i, &il) in engram_layers.iter().enumerate() {
             engram_index_of[il as usize] = i as i16;
         }
+        // The engram table dimensions are required even with zero engram
+        // layers, mirroring required_u32 (core_validate_v41.c:149-154).
+        let engram_max_ngram = g
+            .get_u32(KEY_ENGRAM_MAX_NGRAM)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_MAX_NGRAM))?;
+        let engram_heads = g
+            .get_u32(KEY_ENGRAM_HEADS)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_HEADS))?;
+        let engram_head_dim = g
+            .get_u32(KEY_ENGRAM_HEAD_DIM)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_HEAD_DIM))?;
 
         // Towers are optional: a GGUF converted before 2026-09-15 carries
         // none, and the engine then decodes one token at a time
@@ -210,6 +240,12 @@ impl V41Wire {
         if mtp_towers > MTP_MAX_TOWERS || mtp_experts > MTP_MAX_EXPERTS {
             return Err(V41WireError::TowerLimit);
         }
+        let mtp_targets = if g.get_array(KEY_MTP_TARGET_LAYERS).is_some() {
+            layer_ids(g, KEY_MTP_TARGET_LAYERS, shape.n_layer)?
+        } else {
+            Vec::new()
+        };
+        let mtp_markov_rank = g.get_u32(KEY_MTP_MARKOV_RANK);
 
         Ok(Self {
             compress_ratios,
@@ -219,8 +255,13 @@ impl V41Wire {
             index_source_of,
             engram_layers,
             engram_index_of,
+            engram_max_ngram,
+            engram_heads,
+            engram_head_dim,
             mtp_towers,
             mtp_experts,
+            mtp_targets,
+            mtp_markov_rank,
         })
     }
 

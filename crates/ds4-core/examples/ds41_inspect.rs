@@ -131,30 +131,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Bind: every required name must find a tensor, and the plan
             // should consume the published inventory rather than leave it.
             // V4.1 resolves through the metadata wire (source layers, engram
-            // layers, tower form), not from the shape alone.
+            // layers, tower form), not from the shape alone; its layout is
+            // checked from the same wire.
             let plan = if id.shape.variant == ds4_core::Variant::DeepSeek41Flash {
                 match ds4_core::V41Wire::load(&g, &id.shape) {
-                    Ok(wire) => {
+                    Ok(w) => {
                         println!(
                             "v41 wire: kv-sources={:?} index-sources={:?} engram={:?} \
-                             towers={} experts={}",
-                            wire.is_kv_source
+                             towers={} experts={} targets={:?} markov-rank={:?}",
+                            w.is_kv_source
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, &b)| b)
                                 .map(|(i, _)| i)
                                 .collect::<Vec<_>>(),
-                            wire.is_index_source
+                            w.is_index_source
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, &b)| b)
                                 .map(|(i, _)| i)
                                 .collect::<Vec<_>>(),
-                            wire.engram_layers,
-                            wire.mtp_towers,
-                            wire.mtp_experts,
+                            w.engram_layers,
+                            w.mtp_towers,
+                            w.mtp_experts,
+                            w.mtp_targets,
+                            w.mtp_markov_rank,
                         );
-                        ds4_core::BindPlan::resolve_v41(id.shape, &wire, &inv)
+                        let plan = ds4_core::BindPlan::resolve_v41(id.shape, &w, &inv);
+                        match ds4_core::validate_layouts_v41(&plan, &w, &inv) {
+                            Ok(()) => println!("layout: ok"),
+                            Err(e) => println!("layout: {}", e.token()),
+                        }
+                        plan
                     }
                     Err(e) => {
                         println!("v41 wire failed: {}", e.token());

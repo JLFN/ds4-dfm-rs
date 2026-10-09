@@ -63,9 +63,9 @@ pub use identify::{dump_parse, identify_file, identify_gguf, Identified, Identif
 pub use layout::{
     dump_expected_dspark_shape, dump_expected_layouts, dump_expected_layouts_shape,
     dump_expected_layouts_variant, dump_expected_mtp_shape, dump_expected_support,
-    dump_layout_check_tapes, expected_dspark_layouts, expected_layouts, expected_mtp_layouts,
-    validate_dspark_layouts, validate_layouts, validate_mtp_layouts, validate_support_layouts,
-    LayoutError, LayoutSpec, TypeClass,
+    dump_layout_check_tapes, expected_dspark_layouts, expected_layouts, expected_layouts_v41,
+    expected_mtp_layouts, validate_dspark_layouts, validate_layouts, validate_layouts_v41,
+    validate_mtp_layouts, validate_support_layouts, LayoutError, LayoutSpec, TypeClass,
 };
 pub use ling3vl::{Ling3VlError, Ling3VlLayer, Ling3VlPlan, Ling3VlVisionPlan};
 pub use mem::{
@@ -1062,22 +1062,38 @@ fn pack_sibling_ffi(attach: &SiblingAttach) -> Result<FfiSupport> {
 //   model_id / routed_quant_bits
 // MOVE later (production already left):
 //   ds4_bridge_model_run_distributed_worker -> assemble_worker (oracle FFI)
-/// The bind plan for an artifact: every family resolves from the shape alone
-/// except V4.1, whose source-layer conditionals and tower expert form come
-/// from the `deepseek4.*` metadata wire (`V41Wire::load`, `bind_names_v41`).
-fn resolve_bind_plan(
-    g: &GgufFile,
-    shape: Shape,
-    inventory: &TensorInventory,
-) -> Result<BindPlan> {
-    if shape.variant != Variant::DeepSeek41Flash {
-        return Ok(BindPlan::resolve(shape, inventory));
+/// The bind plan for an artifact, resolved and validated: every family goes
+/// from the shape alone except V4.1, whose source-layer conditionals, engram
+/// layers and tower expert form come from the `deepseek4.*` metadata wire
+/// (`V41Wire::load`, `bind_names_v41`, `expected_layouts_v41`).
+fn open_bind_plan(g: &GgufFile, shape: Shape, inventory: &TensorInventory) -> Result<BindPlan> {
+    let wire = if shape.variant == Variant::DeepSeek41Flash {
+        Some(V41Wire::load(g, &shape).map_err(|e| Error {
+            code: 1,
+            message: format!("v41 wire failed: {}", e.token()),
+        })?)
+    } else {
+        None
+    };
+    let plan = match &wire {
+        Some(w) => BindPlan::resolve_v41(shape, w, inventory),
+        None => BindPlan::resolve(shape, inventory),
+    };
+    if let Some(name) = plan.missing_required().first() {
+        return Err(Error {
+            code: 1,
+            message: format!("required tensor is missing: {name}"),
+        });
     }
-    let wire = V41Wire::load(g, &shape).map_err(|e| Error {
+    let layout = match &wire {
+        Some(w) => validate_layouts_v41(&plan, w, inventory),
+        None => validate_layouts(&plan),
+    };
+    layout.map_err(|e| Error {
         code: 1,
-        message: format!("v41 wire failed: {}", e.token()),
+        message: format!("layout failed: {}", e.token()),
     })?;
-    Ok(BindPlan::resolve_v41(shape, &wire, inventory))
+    Ok(plan)
 }
 
 /// Everything `Model::open` checks before it touches the device: identify,
@@ -1134,17 +1150,8 @@ pub fn probe_model_artifact(path: &str) -> Result<()> {
             message: e.to_string(),
         })?;
     }
-    let bind_plan = resolve_bind_plan(&g, identified.shape, &inventory)?;
-    if let Some(name) = bind_plan.missing_required().first() {
-        return Err(Error {
-            code: 1,
-            message: format!("required tensor is missing: {name}"),
-        });
-    }
-    validate_layouts(&bind_plan).map_err(|e| Error {
-        code: 1,
-        message: format!("layout failed: {}", e.token()),
-    })
+    open_bind_plan(&g, identified.shape, &inventory)?;
+    Ok(())
 }
 
 impl Model {
@@ -1378,17 +1385,7 @@ impl Model {
                 })?;
             }
         }
-        let bind_plan = resolve_bind_plan(&g, identified.shape, &inventory)?;
-        if let Some(name) = bind_plan.missing_required().first() {
-            return Err(Error {
-                code: 1,
-                message: format!("required tensor is missing: {name}"),
-            });
-        }
-        validate_layouts(&bind_plan).map_err(|e| Error {
-            code: 1,
-            message: format!("layout failed: {}", e.token()),
-        })?;
+        let bind_plan = open_bind_plan(&g, identified.shape, &inventory)?;
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;
         let mut ffi_bind = pack_host_bind_map(&bind_plan)?;
         let mut ffi_dir = pack_tensor_dir(&inventory)?;

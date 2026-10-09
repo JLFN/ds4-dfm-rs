@@ -19,8 +19,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ds4_core::{
-    bind_names_v41, shape_for_variant, BindNeed, BindPlan, GgufFile, Shape, TensorInfo,
-    TensorInventory, V41Wire, V41WireError, Variant,
+    bind_names_v41, expected_layouts_v41, shape_for_variant, validate_layouts_v41, BindNeed,
+    BindPlan, GgufFile, Shape, TensorInfo, TensorInventory, V41Wire, V41WireError, Variant,
 };
 
 fn shape() -> Shape {
@@ -81,10 +81,15 @@ fn write_gguf(path: &Path, kvs: &[(&str, Val<'_>)]) {
     fs::write(path, buf).unwrap();
 }
 
+/// Each call gets its own file: the GGUF reader mmaps it, and tests run in
+/// parallel threads, so a shared name would truncate a live mapping (SIGBUS).
 fn tmp(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join("ds4-v41");
     fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{n}-{name}"))
 }
 
 /// The artifact's metadata, with the arrays overridable for the refusal cases.
@@ -97,8 +102,13 @@ fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFil
             ("deepseek4.attention.kv_source_layers", Val::ArrayI32(kv)),
             ("deepseek4.attention.index_source_layers", Val::ArrayI32(idx)),
             ("deepseek4.engram.layer_ids", Val::ArrayI32(ENGRAM_LAYERS)),
+            ("deepseek4.engram.max_ngram_size", Val::U32(4)),
+            ("deepseek4.engram.head_count", Val::U32(8)),
+            ("deepseek4.engram.head_dim", Val::U32(256)),
             ("deepseek4.mtp.tower_count", Val::U32(3)),
             ("deepseek4.mtp.expert_count", Val::U32(128)),
+            ("deepseek4.mtp.target_layers", Val::ArrayI32(&[37, 38, 39])),
+            ("deepseek4.mtp.markov_rank", Val::U32(256)),
         ],
     );
     GgufFile::open(&path).unwrap()
@@ -147,6 +157,47 @@ fn inventory_from(names: &[String]) -> TensorInventory {
 fn artifact_names() -> Vec<String> {
     let raw = include_str!("fixtures/v41/artifact-names.txt");
     raw.lines().map(|s| s.to_string()).collect()
+}
+
+/// The artifact's real tensor directory (name, type, dims), dumped from the
+/// GGUF on 2026-10-08. This is the layout gate's ground truth: every spec
+/// must match the type and dims the artifact actually carries.
+fn artifact_inventory() -> TensorInventory {
+    let raw = include_str!("fixtures/v41/artifact-tensors.txt");
+    let tensors = raw
+        .lines()
+        .map(|line| {
+            let mut f = line.split('\t');
+            let name = f.next().unwrap().to_string();
+            let typ: u32 = f.next().unwrap().parse().unwrap();
+            let dims: Vec<u64> = f
+                .next()
+                .unwrap()
+                .split('x')
+                .map(|d| d.parse().unwrap())
+                .collect();
+            let mut dim = [0u64; 8];
+            dim[..dims.len()].copy_from_slice(&dims);
+            TensorInfo {
+                name,
+                ndim: dims.len() as u32,
+                dim,
+                typ,
+                rel_offset: 0,
+                abs_offset: 0,
+                elements: dims.iter().product(),
+                bytes: 0,
+                shard: 0,
+            }
+        })
+        .collect();
+    TensorInventory {
+        shards: Vec::new(),
+        tensors,
+        data_pos: 0,
+        alignment: 32,
+        page: 4096,
+    }
 }
 
 #[test]
@@ -262,4 +313,57 @@ fn a_tower_with_neither_expert_form_is_refused() {
     let missing = plan.missing_required();
     assert!(missing.contains(&"mtp.0.ffn_exp.0.gate.weight"));
     assert!(missing.contains(&"mtp.main_proj.weight"));
+}
+
+#[test]
+fn layout_matches_the_artifact_tensor_types_and_dims() {
+    let wire = artifact_wire();
+    let inv = artifact_inventory();
+    let plan = BindPlan::resolve_v41(shape(), &wire, &inv);
+    assert_eq!(plan.missing_required(), Vec::<&str>::new());
+    validate_layouts_v41(&plan, &wire, &inv).expect("layout matches the artifact");
+
+    // Spec coverage must equal the plan exactly; expect_specs only walks the
+    // specs, so an extra plan name would otherwise go unchecked.
+    let specs = expected_layouts_v41(&shape(), &wire, &inv);
+    let spec_names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    let plan_names: HashSet<&str> = plan.slots.iter().map(|s| s.name.as_str()).collect();
+    let without_spec: Vec<_> = plan_names.difference(&spec_names).collect();
+    let without_slot: Vec<_> = spec_names.difference(&plan_names).collect();
+    assert!(
+        without_spec.is_empty(),
+        "plan names without a layout spec: {without_spec:?}"
+    );
+    assert!(
+        without_slot.is_empty(),
+        "layout specs without a plan name: {without_slot:?}"
+    );
+    assert_eq!(specs.len(), 1000);
+}
+
+#[test]
+fn a_wrong_type_or_dim_is_refused() {
+    let wire = artifact_wire();
+    let mut inv = artifact_inventory();
+    // The artifact's attn_q_a is q4_K; fp8_32x32 is not in the skeleton set.
+    let t = inv
+        .tensors
+        .iter_mut()
+        .find(|t| t.name == "blk.0.attn_q_a.weight")
+        .unwrap();
+    t.typ = 44;
+    let plan = BindPlan::resolve_v41(shape(), &wire, &inv);
+    let err = validate_layouts_v41(&plan, &wire, &inv).expect_err("fp8 skeleton");
+    assert_eq!(err.token(), "type blk.0.attn_q_a.weight");
+
+    let mut inv = artifact_inventory();
+    let t = inv
+        .tensors
+        .iter_mut()
+        .find(|t| t.name == "blk.5.ffn_exps_vq.blob")
+        .unwrap();
+    t.ndim = 2;
+    let plan = BindPlan::resolve_v41(shape(), &wire, &inv);
+    let err = validate_layouts_v41(&plan, &wire, &inv).expect_err("blob ndim");
+    assert_eq!(err.token(), "ndim blk.5.ffn_exps_vq.blob");
 }
