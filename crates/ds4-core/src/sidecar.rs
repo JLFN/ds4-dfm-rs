@@ -84,7 +84,11 @@ pub fn fp4_nibble_to_f32(n: u8) -> f32 {
 /// `ds4_e8m0_to_f32` (`ds4_fp8.h:39-44`): e == 0 is the 0x00400000 bit pattern
 /// (2^-127 subnormal), everything else is 2^(e-127).
 pub fn e8m0_to_f32(e: u8) -> f32 {
-    let bits: u32 = if e == 0 { 0x0040_0000 } else { u32::from(e) << 23 };
+    let bits: u32 = if e == 0 {
+        0x0040_0000
+    } else {
+        u32::from(e) << 23
+    };
     f32::from_bits(bits)
 }
 
@@ -127,11 +131,7 @@ pub struct GrSidecar {
 
 impl GrSidecar {
     /// `v41_gr_accum_layer` (`core_v41_amp.c:44-84`). `None` = no file.
-    pub fn read(
-        path: &Path,
-        n_expert: u32,
-        n_embd: u32,
-    ) -> Result<Option<Self>, SidecarError> {
+    pub fn read(path: &Path, n_expert: u32, n_embd: u32) -> Result<Option<Self>, SidecarError> {
         let Ok(bytes) = fs::read(path) else {
             return Ok(None);
         };
@@ -323,7 +323,10 @@ pub enum BaseFingerprint {
     /// No `base.fnv`: an experimental post-train build; the engine warns and
     /// passes, and so does this.
     Absent,
-    Checked { hash: u64, files: u32 },
+    Checked {
+        hash: u64,
+        files: u32,
+    },
 }
 
 /// C `v41_pt_base_ok`: recompute the ② directory's fingerprint and compare it

@@ -119,7 +119,10 @@ fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFil
         &[
             ("deepseek4.attention.compress_ratios", Val::ArrayI32(ratios)),
             ("deepseek4.attention.kv_source_layers", Val::ArrayI32(kv)),
-            ("deepseek4.attention.index_source_layers", Val::ArrayI32(idx)),
+            (
+                "deepseek4.attention.index_source_layers",
+                Val::ArrayI32(idx),
+            ),
             ("deepseek4.engram.layer_ids", Val::ArrayI32(ENGRAM_LAYERS)),
             (
                 "deepseek4.engram.num_embeddings",
@@ -152,12 +155,7 @@ fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFil
 
 fn artifact_wire() -> V41Wire {
     V41Wire::load(
-        &artifact_gguf(
-            "artifact.gguf",
-            KV_SOURCES,
-            INDEX_SOURCES,
-            COMPRESS_RATIOS,
-        ),
+        &artifact_gguf("artifact.gguf", KV_SOURCES, INDEX_SOURCES, COMPRESS_RATIOS),
         &shape(),
     )
     .unwrap()
@@ -304,7 +302,10 @@ fn kv_source_must_also_be_an_index_source() {
 fn a_layer_id_outside_the_shape_is_refused() {
     let g = artifact_gguf("layer-range.gguf", &[2, 40], INDEX_SOURCES, COMPRESS_RATIOS);
     let err = V41Wire::load(&g, &shape()).expect_err("layer 40 in a 40-layer model");
-    assert_eq!(err, V41WireError::LayerRange("deepseek4.attention.kv_source_layers", 40));
+    assert_eq!(
+        err,
+        V41WireError::LayerRange("deepseek4.attention.kv_source_layers", 40)
+    );
 }
 
 #[test]
@@ -325,7 +326,10 @@ fn bind_catalog_equals_the_artifact_tensor_set() {
     let artifact_set: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
     let missing: Vec<_> = artifact_set.difference(&catalog_set).collect();
     let extra: Vec<_> = catalog_set.difference(&artifact_set).collect();
-    assert!(missing.is_empty(), "artifact tensors not in catalog: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "artifact tensors not in catalog: {missing:?}"
+    );
     assert!(extra.is_empty(), "catalog names not in artifact: {extra:?}");
     assert_eq!(catalog.len(), 1000);
     assert!(catalog.iter().all(|n| n.need == BindNeed::Required));
@@ -348,9 +352,7 @@ fn per_expert_towers_swap_the_blob_for_every_expert() {
     }
     let inv = inventory_from(&names);
     let catalog = bind_names_v41(&shape(), &wire, &inv);
-    assert!(!catalog
-        .iter()
-        .any(|n| n.name == "mtp.0.ffn_exps_vq.blob"));
+    assert!(!catalog.iter().any(|n| n.name == "mtp.0.ffn_exps_vq.blob"));
     assert!(catalog
         .iter()
         .any(|n| n.name == "mtp.2.ffn_exp.127.down.weight"));

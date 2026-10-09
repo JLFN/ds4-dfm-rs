@@ -106,11 +106,7 @@ fn tensor_i64(
         .collect())
 }
 
-fn tensor_i32(
-    g: &GgufFile,
-    inv: &TensorInventory,
-    name: &str,
-) -> Result<Vec<i32>, EngramError> {
+fn tensor_i32(g: &GgufFile, inv: &TensorInventory, name: &str) -> Result<Vec<i32>, EngramError> {
     let t = inv
         .find(name)
         .ok_or_else(|| EngramError::MissingTensor(name.into()))?;
@@ -257,7 +253,8 @@ impl EngramShard {
                 });
             }
         }
-        let file = File::open(path).map_err(|e| EngramError::Open(format!("{}: {e}", path.display())))?;
+        let file =
+            File::open(path).map_err(|e| EngramError::Open(format!("{}: {e}", path.display())))?;
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;

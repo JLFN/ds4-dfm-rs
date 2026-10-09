@@ -132,8 +132,15 @@ fn hash_reproduces_the_golden_prompt_rows() {
         let lines: Vec<&str> = golden.lines().collect();
         assert_eq!(lines.len(), ids.len(), "one row line per position");
         for (p, line) in lines.iter().enumerate() {
-            let want: Vec<i64> = line.split_whitespace().map(|v| v.parse().unwrap()).collect();
-            assert_eq!(h.rows(&ids, p as i64, ei), want, "golden rows ei={ei} p={p}");
+            let want: Vec<i64> = line
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            assert_eq!(
+                h.rows(&ids, p as i64, ei),
+                want,
+                "golden rows ei={ei} p={p}"
+            );
         }
     }
 }
@@ -170,13 +177,29 @@ fn shard_reads_the_two_row_planes() {
     let path = tmp("shard.bin");
     fs::write(&path, &bytes).unwrap();
     let shard = EngramShard::open(&path).expect("open shard");
-    shard.check_span(W_OFF, s_off, ROWS, HD as u64).expect("span");
+    shard
+        .check_span(W_OFF, s_off, ROWS, HD as u64)
+        .expect("span");
     let row = shard.row(W_OFF, s_off, 2, HD).expect("row 2");
     assert_eq!(row.weights.len(), HD as usize);
     assert_eq!(row.scale.len(), NSC as usize);
     assert_eq!(row.weights[0], (2 * 37) as u8);
     assert_eq!(row.weights[255], (2 * 37 + 255) as u8);
-    assert_eq!(row.scale, vec![0x80 | 2, 0x80 | 3, 0x80 | 4, 0x80 | 5, 0x80 | 6, 0x80 | 7, 0x80 | 8, 0x80 | 9]);
+    assert_eq!(
+        row.scale,
+        vec![
+            0x80 | 2,
+            0x80 | 3,
+            0x80 | 4,
+            0x80 | 5,
+            0x80 | 6,
+            0x80 | 7,
+            0x80 | 8,
+            0x80 | 9
+        ]
+    );
     // Well past the end is refused, exactly like the engine's span check.
-    assert!(shard.check_span(W_OFF, s_off, ROWS + 32, HD as u64).is_err());
+    assert!(shard
+        .check_span(W_OFF, s_off, ROWS + 32, HD as u64)
+        .is_err());
 }

@@ -146,10 +146,7 @@ pub struct V41Wire {
 }
 
 /// C `v41_arr_i32`: an INT32 or UINT32 array, read signed. Returns the values.
-fn i32_array(
-    g: &GgufFile,
-    key: &'static str,
-) -> Result<Vec<i32>, V41WireError> {
+fn i32_array(g: &GgufFile, key: &'static str) -> Result<Vec<i32>, V41WireError> {
     let arr = g.get_array(key).ok_or(V41WireError::MissingKey(key))?;
     if arr.typ != GGUF_VALUE_INT32 && arr.typ != GGUF_VALUE_UINT32 {
         return Err(V41WireError::ArrayType(key));
@@ -165,11 +162,7 @@ fn i32_array(
     Ok(out)
 }
 
-fn layer_ids(
-    g: &GgufFile,
-    key: &'static str,
-    n_layer: u32,
-) -> Result<Vec<u32>, V41WireError> {
+fn layer_ids(g: &GgufFile, key: &'static str, n_layer: u32) -> Result<Vec<u32>, V41WireError> {
     let raw = i32_array(g, key)?;
     let mut out = Vec::with_capacity(raw.len());
     for id in raw {

@@ -35,8 +35,8 @@ mod serving_cuda;
 mod serving_host;
 mod session;
 mod shape;
-mod sidecar;
 mod sibling;
+mod sidecar;
 mod spec;
 mod step37;
 mod step37_mtp;
@@ -60,9 +60,7 @@ pub use bind::{
     BindError, BindName, BindNeed, BindPlan, BindSlot, HostBindLook, SupportCatalog,
     DSPARK_MARKOV_RANK, DSPARK_N_LAYER, HOST_BIND_MISS,
 };
-pub use engram::{
-    EngramError, EngramHash, EngramRow, EngramShard, EDIO_ALIGN,
-};
+pub use engram::{EngramError, EngramHash, EngramRow, EngramShard, EDIO_ALIGN};
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};
 pub use layout::{
@@ -135,8 +133,7 @@ pub use tensors::{
 };
 pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use v41::{
-    V41Wire, V41WireError, MTP_MAX_EXPERTS, MTP_MAX_TOWERS, V41_MAX_COMPRESS_RATIO,
-    V41_MAX_ENGRAM,
+    V41Wire, V41WireError, MTP_MAX_EXPERTS, MTP_MAX_TOWERS, V41_MAX_COMPRESS_RATIO, V41_MAX_ENGRAM,
 };
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, validate_qwen_inventory,

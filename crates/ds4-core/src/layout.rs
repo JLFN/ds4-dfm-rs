@@ -2794,7 +2794,13 @@ pub fn expected_layouts_v41(
     let ehd = wire.engram_head_dim as u64;
     let n_engram = wire.engram_layers.len() as u64;
 
-    spec(&mut out, "token_embd.weight", TypeClass::V41Skel, 2, [e, v, 0, 0]);
+    spec(
+        &mut out,
+        "token_embd.weight",
+        TypeClass::V41Skel,
+        2,
+        [e, v, 0, 0],
+    );
     spec(
         &mut out,
         "output_norm.weight",
@@ -2802,7 +2808,13 @@ pub fn expected_layouts_v41(
         1,
         [e, 0, 0, 0],
     );
-    spec(&mut out, "output.weight", TypeClass::V41Skel, 2, [e, v, 0, 0]);
+    spec(
+        &mut out,
+        "output.weight",
+        TypeClass::V41Skel,
+        2,
+        [e, v, 0, 0],
+    );
     if n_engram != 0 {
         spec(
             &mut out,
@@ -2837,73 +2849,451 @@ pub fn expected_layouts_v41(
     }
 
     for il in 0..shape.n_layer {
-        specf(&mut out, "blk.%u.hc_attn_fn.weight", il, TypeClass::Exact(T_F32), 2, [hc_dim, hc_mix, 0, 0]);
-        specf(&mut out, "blk.%u.hc_attn_scale.weight", il, TypeClass::Exact(T_F32), 1, [3, 0, 0, 0]);
-        specf(&mut out, "blk.%u.hc_attn_base.weight", il, TypeClass::Exact(T_F32), 1, [hc_mix, 0, 0, 0]);
-        specf(&mut out, "blk.%u.attn_norm.weight", il, TypeClass::Exact(T_F32), 1, [e, 0, 0, 0]);
-        specf(&mut out, "blk.%u.attn_q_a.weight", il, TypeClass::V41Skel, 2, [e, lq, 0, 0]);
-        specf(&mut out, "blk.%u.attn_q_a_norm.weight", il, TypeClass::Exact(T_F32), 1, [lq, 0, 0, 0]);
-        specf(&mut out, "blk.%u.attn_q_b.weight", il, TypeClass::V41Skel, 2, [lq, q_dim, 0, 0]);
-        specf(&mut out, "blk.%u.attn_kv.weight", il, TypeClass::V41Skel, 2, [e, hd, 0, 0]);
-        specf(&mut out, "blk.%u.attn_kv_a_norm.weight", il, TypeClass::Exact(T_F32), 1, [hd, 0, 0, 0]);
-        specf(&mut out, "blk.%u.attn_sinks.weight", il, TypeClass::Exact(T_F32), 1, [shape.n_head as u64, 0, 0, 0]);
-        specf(&mut out, "blk.%u.attn_output_a.weight", il, TypeClass::V41Skel, 2, [grp_in, out_low, 0, 0]);
-        specf(&mut out, "blk.%u.attn_output_b.weight", il, TypeClass::V41Skel, 2, [out_low, e, 0, 0]);
+        specf(
+            &mut out,
+            "blk.%u.hc_attn_fn.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            2,
+            [hc_dim, hc_mix, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.hc_attn_scale.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [3, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.hc_attn_base.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [hc_mix, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_norm.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [e, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_q_a.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [e, lq, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_q_a_norm.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [lq, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_q_b.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [lq, q_dim, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_kv.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [e, hd, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_kv_a_norm.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [hd, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_sinks.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [shape.n_head as u64, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_output_a.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [grp_in, out_low, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.attn_output_b.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [out_low, e, 0, 0],
+        );
         if wire.is_kv_source[il as usize] {
-            specf(&mut out, "blk.%u.attn_compressor_kv.weight", il, TypeClass::Exact(T_BF16), 2, [e, hd, 0, 0]);
+            specf(
+                &mut out,
+                "blk.%u.attn_compressor_kv.weight",
+                il,
+                TypeClass::Exact(T_BF16),
+                2,
+                [e, hd, 0, 0],
+            );
             if wire.compress_ratios[il as usize] > 1 {
-                specf(&mut out, "blk.%u.attn_compressor_gate.weight", il, TypeClass::Exact(T_BF16), 2, [e, hd, 0, 0]);
+                specf(
+                    &mut out,
+                    "blk.%u.attn_compressor_gate.weight",
+                    il,
+                    TypeClass::Exact(T_BF16),
+                    2,
+                    [e, hd, 0, 0],
+                );
             }
-            specf(&mut out, "blk.%u.attn_compressor_norm.weight", il, TypeClass::Exact(T_F32), 1, [hd, 0, 0, 0]);
-            specf(&mut out, "blk.%u.indexer.wk.weight", il, TypeClass::Exact(T_BF16), 2, [hd, id, 0, 0]);
-            specf(&mut out, "blk.%u.indexer.k_norm.weight", il, TypeClass::Exact(T_F32), 1, [id, 0, 0, 0]);
+            specf(
+                &mut out,
+                "blk.%u.attn_compressor_norm.weight",
+                il,
+                TypeClass::Exact(T_F32),
+                1,
+                [hd, 0, 0, 0],
+            );
+            specf(
+                &mut out,
+                "blk.%u.indexer.wk.weight",
+                il,
+                TypeClass::Exact(T_BF16),
+                2,
+                [hd, id, 0, 0],
+            );
+            specf(
+                &mut out,
+                "blk.%u.indexer.k_norm.weight",
+                il,
+                TypeClass::Exact(T_F32),
+                1,
+                [id, 0, 0, 0],
+            );
         }
         if wire.is_index_source[il as usize] {
-            specf(&mut out, "blk.%u.indexer.attn_q_b.weight", il, TypeClass::V41Skel, 2, [lq, ie * id, 0, 0]);
-            specf(&mut out, "blk.%u.indexer.proj.weight", il, TypeClass::Exact(T_BF16), 2, [e, ie, 0, 0]);
+            specf(
+                &mut out,
+                "blk.%u.indexer.attn_q_b.weight",
+                il,
+                TypeClass::V41Skel,
+                2,
+                [lq, ie * id, 0, 0],
+            );
+            specf(
+                &mut out,
+                "blk.%u.indexer.proj.weight",
+                il,
+                TypeClass::Exact(T_BF16),
+                2,
+                [e, ie, 0, 0],
+            );
         }
-        specf(&mut out, "blk.%u.hc_ffn_fn.weight", il, TypeClass::Exact(T_F32), 2, [hc_dim, hc_mix, 0, 0]);
-        specf(&mut out, "blk.%u.hc_ffn_scale.weight", il, TypeClass::Exact(T_F32), 1, [3, 0, 0, 0]);
-        specf(&mut out, "blk.%u.hc_ffn_base.weight", il, TypeClass::Exact(T_F32), 1, [hc_mix, 0, 0, 0]);
-        specf(&mut out, "blk.%u.ffn_norm.weight", il, TypeClass::Exact(T_F32), 1, [e, 0, 0, 0]);
-        specf(&mut out, "blk.%u.ffn_gate_inp.weight", il, TypeClass::Exact(T_BF16), 2, [e, n_expert, 0, 0]);
-        specf(&mut out, "blk.%u.exp_probs_b.bias", il, TypeClass::Exact(T_F32), 1, [n_expert, 0, 0, 0]);
-        specf(&mut out, "blk.%u.ffn_exps_vq.blob", il, TypeClass::V41Blob, 1, [0, 0, 0, 0]);
-        specf(&mut out, "blk.%u.ffn_gate_shexp.weight", il, TypeClass::V41Skel, 2, [e, ff, 0, 0]);
-        specf(&mut out, "blk.%u.ffn_up_shexp.weight", il, TypeClass::V41Skel, 2, [e, ff, 0, 0]);
-        specf(&mut out, "blk.%u.ffn_down_shexp.weight", il, TypeClass::V41Skel, 2, [ff, e, 0, 0]);
+        specf(
+            &mut out,
+            "blk.%u.hc_ffn_fn.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            2,
+            [hc_dim, hc_mix, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.hc_ffn_scale.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [3, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.hc_ffn_base.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [hc_mix, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.ffn_norm.weight",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [e, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.ffn_gate_inp.weight",
+            il,
+            TypeClass::Exact(T_BF16),
+            2,
+            [e, n_expert, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.exp_probs_b.bias",
+            il,
+            TypeClass::Exact(T_F32),
+            1,
+            [n_expert, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.ffn_exps_vq.blob",
+            il,
+            TypeClass::V41Blob,
+            1,
+            [0, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.ffn_gate_shexp.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [e, ff, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.ffn_up_shexp.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [e, ff, 0, 0],
+        );
+        specf(
+            &mut out,
+            "blk.%u.ffn_down_shexp.weight",
+            il,
+            TypeClass::V41Skel,
+            2,
+            [ff, e, 0, 0],
+        );
         if wire.engram_index_of[il as usize] >= 0 {
-            specf(&mut out, "blk.%u.engram_wkv.weight", il, TypeClass::Exact(T_FP8_32X32), 2, [(ngram - 1) * eheads * ehd, e * (hc + 1), 0, 0]);
-            specf(&mut out, "blk.%u.engram_q.weight", il, TypeClass::Exact(T_F32), 2, [e, hc, 0, 0]);
-            specf(&mut out, "blk.%u.engram_k.weight", il, TypeClass::Exact(T_F32), 2, [e, hc, 0, 0]);
+            specf(
+                &mut out,
+                "blk.%u.engram_wkv.weight",
+                il,
+                TypeClass::Exact(T_FP8_32X32),
+                2,
+                [(ngram - 1) * eheads * ehd, e * (hc + 1), 0, 0],
+            );
+            specf(
+                &mut out,
+                "blk.%u.engram_q.weight",
+                il,
+                TypeClass::Exact(T_F32),
+                2,
+                [e, hc, 0, 0],
+            );
+            specf(
+                &mut out,
+                "blk.%u.engram_k.weight",
+                il,
+                TypeClass::Exact(T_F32),
+                2,
+                [e, hc, 0, 0],
+            );
         }
     }
 
     for t in 0..wire.mtp_towers {
         let ne = wire.mtp_experts as u64;
-        specf(&mut out, "mtp.%u.hc_attn_fn.weight", t, TypeClass::Exact(T_F32), 2, [hc_dim, hc_mix, 0, 0]);
-        specf(&mut out, "mtp.%u.hc_attn_scale.weight", t, TypeClass::Exact(T_F32), 1, [3, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.hc_attn_base.weight", t, TypeClass::Exact(T_F32), 1, [hc_mix, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_norm.weight", t, TypeClass::Exact(T_F32), 1, [e, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_q_a.weight", t, TypeClass::V41Dense, 2, [e, lq, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_q_a_norm.weight", t, TypeClass::Exact(T_F32), 1, [lq, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_q_b.weight", t, TypeClass::V41Dense, 2, [lq, q_dim, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_kv.weight", t, TypeClass::V41Dense, 2, [e, hd, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_kv_a_norm.weight", t, TypeClass::Exact(T_F32), 1, [hd, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_sinks.weight", t, TypeClass::Exact(T_F32), 1, [shape.n_head as u64, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_output_a.weight", t, TypeClass::V41Dense, 2, [grp_in, out_low, 0, 0]);
-        specf(&mut out, "mtp.%u.attn_output_b.weight", t, TypeClass::V41Dense, 2, [out_low, e, 0, 0]);
-        specf(&mut out, "mtp.%u.hc_ffn_fn.weight", t, TypeClass::Exact(T_F32), 2, [hc_dim, hc_mix, 0, 0]);
-        specf(&mut out, "mtp.%u.hc_ffn_scale.weight", t, TypeClass::Exact(T_F32), 1, [3, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.hc_ffn_base.weight", t, TypeClass::Exact(T_F32), 1, [hc_mix, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.ffn_norm.weight", t, TypeClass::Exact(T_F32), 1, [e, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.ffn_gate_inp.weight", t, TypeClass::Exact(T_BF16), 2, [e, ne, 0, 0]);
-        specf(&mut out, "mtp.%u.exp_probs_b.bias", t, TypeClass::Exact(T_F32), 1, [ne, 0, 0, 0]);
-        specf(&mut out, "mtp.%u.ffn_gate_shexp.weight", t, TypeClass::V41Dense, 2, [e, ff, 0, 0]);
-        specf(&mut out, "mtp.%u.ffn_up_shexp.weight", t, TypeClass::V41Dense, 2, [e, ff, 0, 0]);
-        specf(&mut out, "mtp.%u.ffn_down_shexp.weight", t, TypeClass::V41Dense, 2, [ff, e, 0, 0]);
+        specf(
+            &mut out,
+            "mtp.%u.hc_attn_fn.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            2,
+            [hc_dim, hc_mix, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.hc_attn_scale.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [3, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.hc_attn_base.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [hc_mix, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_norm.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [e, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_q_a.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [e, lq, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_q_a_norm.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [lq, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_q_b.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [lq, q_dim, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_kv.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [e, hd, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_kv_a_norm.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [hd, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_sinks.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [shape.n_head as u64, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_output_a.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [grp_in, out_low, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.attn_output_b.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [out_low, e, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.hc_ffn_fn.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            2,
+            [hc_dim, hc_mix, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.hc_ffn_scale.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [3, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.hc_ffn_base.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [hc_mix, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.ffn_norm.weight",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [e, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.ffn_gate_inp.weight",
+            t,
+            TypeClass::Exact(T_BF16),
+            2,
+            [e, ne, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.exp_probs_b.bias",
+            t,
+            TypeClass::Exact(T_F32),
+            1,
+            [ne, 0, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.ffn_gate_shexp.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [e, ff, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.ffn_up_shexp.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [e, ff, 0, 0],
+        );
+        specf(
+            &mut out,
+            "mtp.%u.ffn_down_shexp.weight",
+            t,
+            TypeClass::V41Dense,
+            2,
+            [ff, e, 0, 0],
+        );
         if wire.tower_uses_blob(inventory, t) {
-            specf(&mut out, "mtp.%u.ffn_exps_vq.blob", t, TypeClass::V41Blob, 1, [0, 0, 0, 0]);
+            specf(
+                &mut out,
+                "mtp.%u.ffn_exps_vq.blob",
+                t,
+                TypeClass::V41Blob,
+                1,
+                [0, 0, 0, 0],
+            );
             continue;
         }
         // The per-expert form is fp4x32 only: the draft MoE kernel has no
@@ -2941,22 +3331,76 @@ pub fn expected_layouts_v41(
         } else {
             wire.mtp_targets.len() as u64
         };
-        spec(&mut out, "mtp.main_proj.weight", TypeClass::V41Dense, 2, [e * n_target, e, 0, 0]);
-        spec(&mut out, "mtp.main_norm.weight", TypeClass::Exact(T_F32), 1, [e, 0, 0, 0]);
+        spec(
+            &mut out,
+            "mtp.main_proj.weight",
+            TypeClass::V41Dense,
+            2,
+            [e * n_target, e, 0, 0],
+        );
+        spec(
+            &mut out,
+            "mtp.main_norm.weight",
+            TypeClass::Exact(T_F32),
+            1,
+            [e, 0, 0, 0],
+        );
         match wire.mtp_markov_rank {
             Some(rank) => {
                 let r = u64::from(rank);
-                spec(&mut out, "mtp.markov_embd.weight", TypeClass::Exact(T_BF16), 2, [r, v, 0, 0]);
-                spec(&mut out, "mtp.markov_head.weight", TypeClass::Exact(T_BF16), 2, [r, v, 0, 0]);
-                spec(&mut out, "mtp.confidence.weight", TypeClass::Exact(T_BF16), 2, [e + r, 1, 0, 0]);
+                spec(
+                    &mut out,
+                    "mtp.markov_embd.weight",
+                    TypeClass::Exact(T_BF16),
+                    2,
+                    [r, v, 0, 0],
+                );
+                spec(
+                    &mut out,
+                    "mtp.markov_head.weight",
+                    TypeClass::Exact(T_BF16),
+                    2,
+                    [r, v, 0, 0],
+                );
+                spec(
+                    &mut out,
+                    "mtp.confidence.weight",
+                    TypeClass::Exact(T_BF16),
+                    2,
+                    [e + r, 1, 0, 0],
+                );
             }
             None => {
-                spec(&mut out, "mtp.markov_embd.weight", TypeClass::V41Ndim, 2, [0, 0, 0, 0]);
-                spec(&mut out, "mtp.markov_head.weight", TypeClass::V41Ndim, 2, [0, 0, 0, 0]);
-                spec(&mut out, "mtp.confidence.weight", TypeClass::V41Ndim, 2, [0, 0, 0, 0]);
+                spec(
+                    &mut out,
+                    "mtp.markov_embd.weight",
+                    TypeClass::V41Ndim,
+                    2,
+                    [0, 0, 0, 0],
+                );
+                spec(
+                    &mut out,
+                    "mtp.markov_head.weight",
+                    TypeClass::V41Ndim,
+                    2,
+                    [0, 0, 0, 0],
+                );
+                spec(
+                    &mut out,
+                    "mtp.confidence.weight",
+                    TypeClass::V41Ndim,
+                    2,
+                    [0, 0, 0, 0],
+                );
             }
         }
-        spec(&mut out, "mtp.out_norm.weight", TypeClass::Exact(T_F32), 1, [e, 0, 0, 0]);
+        spec(
+            &mut out,
+            "mtp.out_norm.weight",
+            TypeClass::Exact(T_F32),
+            1,
+            [e, 0, 0, 0],
+        );
     }
     out
 }
@@ -2969,7 +3413,10 @@ pub fn validate_layouts_v41(
     inventory: &TensorInventory,
 ) -> Result<(), LayoutError> {
     let by_name = plan_by_name(plan);
-    expect_specs(&expected_layouts_v41(&plan.shape, wire, inventory), &by_name)
+    expect_specs(
+        &expected_layouts_v41(&plan.shape, wire, inventory),
+        &by_name,
+    )
 }
 
 fn deepseek_block(out: &mut Vec<LayoutSpec>, prefix: &str, shape: &Shape) {

@@ -10,7 +10,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use ds4_core::{check_base_fnv, deq_fp4x32, gr_dir_fnv, AmpSidecar, BaseFingerprint, GrSidecar, RbSidecar, SidecarError};
+use ds4_core::{
+    check_base_fnv, deq_fp4x32, gr_dir_fnv, AmpSidecar, BaseFingerprint, GrSidecar, RbSidecar,
+    SidecarError,
+};
 
 fn tmp(name: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,11 +30,7 @@ fn fp4_decode_matches_the_engine_bit_for_bit() {
     let want = include_bytes!("fixtures/sidecar/fp4_ref.f32");
     let got = deq_fp4x32(blocks);
     assert_eq!(got.len() * 4, want.len());
-    for (i, (g, w)) in got
-        .iter()
-        .zip(want.chunks_exact(4))
-        .enumerate()
-    {
+    for (i, (g, w)) in got.iter().zip(want.chunks_exact(4)).enumerate() {
         let w = f32::from_le_bytes(w.try_into().unwrap());
         assert_eq!(g.to_bits(), w.to_bits(), "value {i}");
     }
@@ -94,7 +93,9 @@ fn gr_reads_all_three_storage_types() {
     assert!(gr.factor.iter().all(|&v| v == 1.5), "0.5 restored to 1.5");
 
     // No file is not an error; a wrong header is.
-    assert!(GrSidecar::read(&tmp("missing.bin"), 4, 3).unwrap().is_none());
+    assert!(GrSidecar::read(&tmp("missing.bin"), 4, 3)
+        .unwrap()
+        .is_none());
     let mut bad = f32_file.clone();
     bad[0] = 5;
     let p = tmp("gr_bad.bin");
@@ -121,7 +122,10 @@ fn rb_reads_and_refuses() {
     bad[4] = 2; // type must be 1
     let p = tmp("rb_bad.bin");
     fs::write(&p, &bad).unwrap();
-    assert!(matches!(RbSidecar::read(&p, 4), Err(SidecarError::Header(_))));
+    assert!(matches!(
+        RbSidecar::read(&p, 4),
+        Err(SidecarError::Header(_))
+    ));
     let p = tmp("rb_short.bin");
     fs::write(&p, &file[..12]).unwrap();
     assert!(matches!(
@@ -188,7 +192,10 @@ fn amp_reads_both_storage_types_and_refuses_bad_headers() {
     bad[8..12].copy_from_slice(&2i32.to_le_bytes());
     let p = tmp("amp_bad_ty.bin");
     fs::write(&p, &bad).unwrap();
-    assert!(matches!(AmpSidecar::read(&p, 1), Err(SidecarError::Type(_))));
+    assert!(matches!(
+        AmpSidecar::read(&p, 1),
+        Err(SidecarError::Type(_))
+    ));
 }
 
 #[test]
@@ -214,7 +221,12 @@ fn base_fnv_gate_matches_mutates_and_absents() {
     // One byte changes in the ② directory: the ③ corrections no longer match.
     fs::write(dir.join("gr_L02.bin"), [7u8]).unwrap();
     match check_base_fnv(&pt, Some(&dir), 40) {
-        Err(SidecarError::BaseMismatch { want, want_files, have_files, .. }) => {
+        Err(SidecarError::BaseMismatch {
+            want,
+            want_files,
+            have_files,
+            ..
+        }) => {
             assert_eq!(want, hash);
             assert_eq!(want_files, 3);
             assert_eq!(have_files, 3);
@@ -234,7 +246,11 @@ fn base_fnv_gate_matches_mutates_and_absents() {
     // files (core_v41_amp.c:167-168).
     let seed_only = tmp("seed");
     fs::create_dir_all(&seed_only).unwrap();
-    fs::write(seed_only.join("base.fnv"), format!("{:016x} 0", ds4_core::FNV_SEED)).unwrap();
+    fs::write(
+        seed_only.join("base.fnv"),
+        format!("{:016x} 0", ds4_core::FNV_SEED),
+    )
+    .unwrap();
     assert!(matches!(
         check_base_fnv(&seed_only, None, 40),
         Ok(BaseFingerprint::Checked { files: 0, .. })

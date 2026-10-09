@@ -306,10 +306,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(None) => {}
                         Err(e) => println!("zchain gr_L{il:02}: {}", e.token()),
                     }
-                    match ds4_core::RbSidecar::read(
-                        &dir.join(format!("rb_L{il:02}.bin")),
-                        n_expert,
-                    ) {
+                    match ds4_core::RbSidecar::read(&dir.join(format!("rb_L{il:02}.bin")), n_expert)
+                    {
                         Ok(Some(rb)) => {
                             n_rb += 1;
                             if sample == "none" {
@@ -319,10 +317,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(None) => {}
                         Err(e) => println!("zchain rb_L{il:02}: {}", e.token()),
                     }
-                    match ds4_core::AmpSidecar::read(
-                        &dir.join(format!("amp_L{il:02}.bin")),
-                        n_embd,
-                    ) {
+                    match ds4_core::AmpSidecar::read(&dir.join(format!("amp_L{il:02}.bin")), n_embd)
+                    {
                         Ok(Some(_)) => n_amp += 1,
                         Ok(None) => {}
                         Err(e) => println!("zchain amp_L{il:02}: {}", e.token()),

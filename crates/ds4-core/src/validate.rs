@@ -22,7 +22,8 @@ use crate::shape::{
 };
 use crate::tensors::TensorInventory;
 
-const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";const DOTS3_SHA: &[u8] = b"99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833";
+const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";
+const DOTS3_SHA: &[u8] = b"99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833";
 const QWEN_REVISIONS: [&[u8]; 2] = [
     b"f5d08274bafd880402bd16f5e3e6c514136ec06c",
     b"8336e613ea508b13c2159bd0f68965d97a606b95",

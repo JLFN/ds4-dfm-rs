@@ -111,8 +111,7 @@ fn gguf_type(typ: u32) -> Option<(&'static str, u32, u32)> {
     if typ == PQ2_0_TYPE {
         return Some(PQ2_0_TYPE_INFO);
     }
-    if let Some((_, name, block_elems, block_bytes)) =
-        DS41_TYPES.iter().find(|(id, ..)| *id == typ)
+    if let Some((_, name, block_elems, block_bytes)) = DS41_TYPES.iter().find(|(id, ..)| *id == typ)
     {
         return Some((name, *block_elems, *block_bytes));
     }
