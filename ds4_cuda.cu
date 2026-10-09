@@ -3711,6 +3711,11 @@ extern "C" int ds4_gpu_residency_failures_read(int role, int stage,
  *
  * Preconditions (any miss falls back to the caller's flat copy — relocating
  * the slot table without rewriting it would decode fake weights silently):
+ * the span is exactly one VQ blob (the unit compiler never merges a blob
+ * with neighbors, DS4_TCAT_VQ_BLOB — the engine's "自成一段" rule,
+ * core_model_map.c:113-115; a mixed span would serve its other tensors from
+ * displaced offsets, measured 2026-10-09: the mtp.2 blob + trailing tensors
+ * merged into one unit and the head's output_norm read the relocated tail),
  * v3 blob only (v2 payloads carry their own codebook), every payload carries
  * the DQV3 magic, slot offsets distinct and inside the blob, and each
  * payload's codebook (cb_off, nc*8 B) wholly inside the prefix before the
@@ -3718,9 +3723,9 @@ extern "C" int ds4_gpu_residency_failures_read(int role, int stage,
  *
  * Deviation from the engine, named: the engine flags the span as a blob from
  * the tensor NAME (`_exps_vq.`, core_model_map.c:184) before calling; this
- * port has no name at the unit-copy boundary, so the caller probes the header
- * instead and every check above runs self-validated (a non-blob unit would
- * have to pass all of them, including per-payload DQV3 magics).
+ * port stamps that name check as the unit trait and re-validates the header
+ * at the unit-copy boundary, where no name crosses (a non-blob unit would
+ * have to pass every check above, including per-payload DQV3 magics).
  *
  * Returns the device pointer (the caller publishes the range), NULL with
  * *flat=1 when not applicable (caller flat-copies), NULL with *flat=0 on a
