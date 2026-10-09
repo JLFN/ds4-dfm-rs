@@ -141,7 +141,7 @@ before any state-changing command.
 | P1 | DONE 2026-10-08 (`c1fdc04`, `7c21279`): tensor types 40-44 in `tensors.rs`, the VQ decode oracle, the type table | v2 decode bit-exact against `ds4vq_dequant_f32` (fixtures in `tests/fixtures/vq`); v3 at unit level (12-bit, 13-bit plane); types match `core_gguf.c:89-104` |
 | P2 | DONE 2026-10-09: the engram half (`79756c0` + `0af1d10`, §6.6.2) and the sidecar half (`dac818e`, §6.6.3: gr/rb/amp readers, the fp4x32 decoder, the `base.fnv` gate, both directions verified on the real directories) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
 | P3 | DONE 2026-10-09 (`a73fe31`, `bd393ad`): the `Variant::V41` shape (`d53079b`), the metadata wire, the bind arm (`0d3378d`), the layout table (`356a100`) and the ②/③ zchain merge (§6.6.4); the engram session state moves with P4's read path | the loader accepts the artifact: `identify` + `validate: ok` + `layout: ok` + `bind: slots=1000 bound=1000 required-missing=0` on the real file (§6.6.1), and the real sidecar pair merges bit-exact (§6.6.4) |
-| P4 | CUDA: VQ MoE decode (mirror `v41_vq_open` geometry), the fp8_32x32 skeleton path, and the engram read path | G2 on device: logits match the golden set |
+| P4 | Native V4.1: the variant skeleton (P4-0), the VQ decode family (P4-1; the artifact's real blob is DQVL v3 13-bit, measured), the fp8_32x32 path and the engram read path; units and gates in §6.7 | G2 on device: logits match the golden set |
 | P5 | MTP towers and DSpark verify/rollback | byte-identical greedy output with drafting on and off at N=1; cache-frontier gate at N>1. The engine's own cautions: the main-hidden ring trim in rollback, and the compressor pending-row snapshot taken before the shift |
 | P6 | Serving: the flags, the sampling profile for this family, the four API contracts, the DSML tool path | a served tool call, end to end, no shim |
 | P7 | Performance ledger: prefill and decode on the §2 prompts, cache reuse demonstrated | the ledger, published with its method |
@@ -421,6 +421,74 @@ read path: the host-side pieces that are data and policy — the hash constants,
 the row addressing, the shard open policy and the span checks — are already in
 `engram.rs` and proven against the golden rows (§6.6.2), and the pipeline
 itself is execution.
+
+## 6.7 P4 reconnaissance: the native side (2026-10-09)
+
+Three read-only passes mapped the ground before any kernel work (explore
+agents over both trees; every citation below is re-checkable).
+
+**ds4-dfm-rs native today — no V4.1 anywhere.** The DeepSeek arm is V4-shaped:
+`weights_bind` (ds4.c:9333-9398) binds the per-expert trio and `output_hc_*`;
+`weights_validate_layout` (6585-6650) validates them; decode runs
+`metal_graph_encode_decode_layer_impl` (18491) with the expert matmul chosen at
+19390-19402 (`ds4_gpu_routed_moe_one_tensor`); the variant reaches native only
+as `ds4_host_shape {variant, n_compress, compress}`
+(native/bridge/ds4_host_load.h:29-34), switched in `model_apply_host_shape`
+(ds4.c:2507-2561) — variant 16 currently dies at the default arm (2560). Source
+layers are ratio-derived there (compressor when ratio != 0, indexer when ratio
+== 4; ds4.c:18760/18893); V4.1 needs the explicit source tables threaded in. So
+the native port needs a variant skeleton before any kernel can be called.
+
+**Family conventions (ds4-dfm-rs).** Kernels live in `cuda/<family>_*.cuh`
+(device only); launchers in a root aggregator `ds4_<family>_gpu.cuh`
+(extern "C"), prototypes in `ds4_gpu.h`, Makefile deps beside ds4_cuda.o's rule
+(:803), ds4.c hooks via `ds4_<family>_{graph,bind,session,stub}.inc`. Tests are
+`tests/test_<family>_<aspect>.cu` with a Makefile rule and a runner; they may
+link `ds4_cuda_test_hooks.o` (ds4.c built with -DDS4_TEST_HOOKS) for reference
+oracles, and print PASS/FAIL with the exit code as the verdict.
+
+**The VQ decode contract (first kernel unit).** `v41_vq_fused_moe`
+(cuda_vq_decode_launch.inc.cu:12) dispatches by (version, nbit) to four
+instances; n=1 with v3 goes through the persist kernels
+(cuda_vq_persist.inc.cu), v2 through gateup+down (cuda_vq_decode.inc.cu);
+`v41_vq_reduce_kernel` folds the routed sum; the activation is packed to bf16
+by `v41_vq_xpack_kernel` first. Dependencies to bring: v41_scratch/v41_grow,
+v41_bf16r, `V41_GEMV_MAX_TOK` = 8, cuda_ok (already present, ds4_cuda.cu:1333),
+a stream (ds4_cuda_moe_stream() is the fit), v41_pdl_wait/register, the DQVL
+magics, g_v41_gr. The five decode scratch buffers are grow-only TU statics
+(cuda_vq_decode.inc.cu:221). Out of scope for the n=1 unit: the group kernels,
+the probe watchdogs, the order kernel, the whole prefill family, the backward
+files.
+
+**The artifact's real blob, measured on the Spark** (`blk.0.ffn_exps_vq.blob`,
+abs 456249888, 2,767,968,272 B): DQVL v3, 384 experts; payload DQV3 d=8
+nc=8192 rows=2304 cols=5120 flags=3 mnb=12 cb_off=9232 — **the v3 13-bit
+instance with the 13th-bit plane** (`<13,1,1>`), the hardest of the four. The
+layer codebook is 8192 E4M3 words shared by the layer's three matrices, at
+blob+9232.
+
+**The fp8_32x32 set** (27 tensors): the two `engram_wkv` (blk.1/14, 6144x25600)
+and the 25 tower dense tensors (`mtp.{0,1,2}` attn/shexp plus
+`mtp.main_proj`) — the fp8 path serves the engram wkv now and the towers in P5.
+
+**Workflow.** This workstation has nvcc 13.3 (sm_121 cross-compiles without a
+device) and an RTX 4070 SUPER (sm_89, 12 GB): kernel units can be developed,
+compiled for both archs and tested with synthetic payloads locally; the
+real-artifact gates stay on the Spark. One portability deviation is required
+and named: `v41_pdl_wait`'s `griddepcontrol.wait` is sm_90+ asm, so the port
+guards it with `__CUDA_ARCH__ >= 900` — identical code on sm_121, a no-op below
+it, where no PDL graph can exist (the engine's own comment says the wait
+returns immediately when the kernel is not launched through PDL).
+
+P4 unit order, each with its own gate:
+
+| unit | work | gate |
+| --- | --- | --- |
+| P4-0 | native V4.1 variant skeleton: variant 16, `DS4_SHAPE_V41_FLASH`, the host dispatch, the metadata selector/validation, the compress pattern, the source tables and engram wiring over the host-shape ABI, the bind/layout arm (blob experts, engram triples, no `output_hc_*`) | the native opens the real artifact and binds 1000/1000, equal to the Rust plan |
+| P4-1 | VQ decode family port (format header, primitives, row, decode, persist, launch; n=1) | device == Rust `vq.rs` on a synthetic v3 13-bit payload (local 4070) and on the real layer-0 payload (Spark) |
+| P4-2 | MoE launcher wiring in the native forward for variant 16 | one-hot probes bit-exact; the worker's routed sum against a Rust emulation within the recorded tolerance |
+| P4-3 | fp8_32x32 decode and the engram read path | erows and the wkv matmul against the golden `hce_L01/L14` traces |
+| P4-4 | forward bring-up on the golden prompts | G2: per-layer `x_Lnn`/`y_Lnn` traces first, then logits |
 
 ## 7. Numerics contract
 
