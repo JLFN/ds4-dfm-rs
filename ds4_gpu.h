@@ -5319,6 +5319,37 @@ int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_tensor *q, c
 int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
         const ds4_gpu_tensor *posd);
 
+/* DeepSeek V4.1 indexer (P4-4): score / candidate blocks / topk
+ * (cuda/ds41_indexer.cuh, src/cuda/cuda_v41_indexer.inc.cu).  The candidate
+ * list is the C2 compact form: [0] = selected block count, then ascending
+ * block numbers; when a list is passed to score/topk, score rows are the
+ * compact width ns = min(cand_cap*cand_bs, ng).  The s8 mma score variant
+ * (--idx-mma) is not ported: ds4_gpu_v41_set_indexer_mma records the flag and
+ * the score entry refuses by name while it is on. */
+int ds4_gpu_v41_indexer_score_tensor(ds4_gpu_tensor *score, const ds4_gpu_tensor *q, const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap,
+        uint32_t n_tok, uint32_t pos0, uint32_t ng, uint32_t n_head, uint32_t dk, uint32_t ratio,
+        const ds4_gpu_tensor *posd);
+int ds4_gpu_v41_candidate_blocks_tensor(ds4_gpu_tensor *cand_list, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t pos0,
+        uint32_t ng, uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
+        const ds4_gpu_tensor *posd);
+int ds4_gpu_v41_candidate_scratch_prepare(uint32_t n_tok, uint32_t nb);
+int ds4_gpu_v41_indexer_topk_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *score, uint32_t n_tok, uint32_t ng,
+        uint32_t topk, uint32_t ratio, const ds4_gpu_tensor *posd,
+        const ds4_gpu_tensor *cand_list, uint32_t cand_bs, uint32_t cand_cap);
+void ds4_gpu_v41_set_indexer_mma(int on);
+
+/* DeepSeek V4.1 router + SwiGLU (P4-4, cuda/ds41_router.cuh,
+ * src/cuda/cuda_v41_3.inc.cu:8-107).  The route-bias override store
+ * (ds4_gpu_v41_set_rb_override) refuses by name until the sidecar lands. */
+int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t n_tok, uint32_t n_expert, uint32_t topk, float route_scale);
+int ds4_gpu_v41_swiglu_tensor(ds4_gpu_tensor *h, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up,
+        uint32_t n_tok, uint32_t mid, float limit);
+int ds4_gpu_v41_set_rb_override(const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        const float *host_delta, uint32_t n_expert);
+
 #ifdef __cplusplus
 }
 #endif
