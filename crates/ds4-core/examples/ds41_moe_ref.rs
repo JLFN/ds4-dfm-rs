@@ -128,6 +128,9 @@ fn main() {
     let blob = std::fs::read(&args[0]).expect("blob");
     let cases = parse_cases(&args[1], in_dim as usize);
     let mut out_bytes: Vec<u8> = Vec::new();
+    let dump = std::env::var("DS41_MOE_REF_DUMP").is_ok();
+    let mut mid_dump: Vec<u8> = Vec::new();
+    let mut part_dump: Vec<u8> = Vec::new();
     for (n, c) in cases.iter().enumerate() {
         let k = c.sel.len();
         assert_eq!(c.w.len(), k);
@@ -146,9 +149,19 @@ fn main() {
                 let ui = bf16r(row_dot(&up, r, &xb));
                 mid[r] = swiglu(gv, ui);
             }
+            if dump {
+                for v in &mid {
+                    // the device stores the mid as bf16; dump in that form
+                    let u = bf16r(*v).to_bits() >> 16;
+                    mid_dump.extend_from_slice(&(u as u16).to_le_bytes());
+                }
+            }
             for o in 0..out_dim as usize {
                 let partial = bf16r(row_dot(&down, o, &mid));
                 acc[o] += c.w[kk] * partial;
+                if dump {
+                    part_dump.extend_from_slice(&partial.to_le_bytes());
+                }
             }
         }
         for v in &acc {
@@ -158,5 +171,10 @@ fn main() {
     }
     let mut f = std::fs::File::create(&args[2]).expect("ref out");
     f.write_all(&out_bytes).unwrap();
+    if dump {
+        std::fs::write("/tmp/ref_mid.bin", &mid_dump).unwrap();
+        std::fs::write("/tmp/ref_part.bin", &part_dump).unwrap();
+        println!("ds41_moe_ref: dumped mid {} B, part {} B", mid_dump.len(), part_dump.len());
+    }
     println!("ds41_moe_ref: {} cases, {} values", cases.len(), out_bytes.len() / 4);
 }

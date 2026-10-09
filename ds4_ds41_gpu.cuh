@@ -179,6 +179,13 @@ extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *mo
             if (g) { fwrite(tmp, 1, bytes, g); fclose(g); }
         }
         free(tmp);
+        const uint64_t pbytes = (uint64_t)n_tok * n_expert_used * out_dim * 4u;
+        void *ptmp = malloc(pbytes);
+        if (ptmp && g_v41_vq_part.p && cudaMemcpy(ptmp, g_v41_vq_part.p, pbytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            FILE *g = fopen("/tmp/ds41_part_dump.bin", "wb");
+            if (g) { fwrite(ptmp, 1, pbytes, g); fclose(g); }
+        }
+        free(ptmp);
     }
     return rc;
 }

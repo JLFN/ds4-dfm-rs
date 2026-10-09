@@ -29,7 +29,9 @@
 #define MID_DIM 2048u
 #define OUT_DIM 512u
 #define NEXP 2u
-#define TOL_REL 1e-3f   /* measured far below; see the P4-2 evidence */
+/* Random cases: max |delta| against the reference vector's own scale; see the
+ * criterion comment at the compare (P4-2 evidence: worst measured 2.6e-4). */
+#define TOL_SCALE 1e-3f
 
 typedef struct {
     char kind[16];
@@ -59,8 +61,12 @@ static moe_case *parse_cases(const char *path, uint32_t *n_cases) {
     if (!f) { fprintf(stderr, "test_ds41_moe: cannot open %s\n", path); exit(2); }
     moe_case *cases = NULL;
     uint32_t n = 0, cap = 0;
-    char line[8192];
-    while (fgets(line, sizeof line, f)) {
+    /* getline, not a fixed buffer: an x line is IN_DIM hex words ~ 9 B each
+     * (~18 KB at IN_DIM 2048), and a short fgets buffer silently truncates the
+     * activation — a one-hot past the cut reads as all-zero x. */
+    char *line = NULL;
+    size_t line_cap = 0;
+    while (getline(&line, &line_cap, f) > 0) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (strncmp(line, "case ", 5) == 0) {
             if (n == cap) { cap = cap ? cap * 2u : 8u; cases = (moe_case *)realloc(cases, cap * sizeof *cases); }
@@ -85,6 +91,7 @@ static moe_case *parse_cases(const char *path, uint32_t *n_cases) {
             for (uint32_t i = 0; i < IN_DIM && (tok = strtok(NULL, " \t\n")); i++) { uint32_t b = hex32(tok); memcpy(&c->x[i], &b, 4); }
         }
     }
+    free(line);
     fclose(f);
     *n_cases = n;
     return cases;
@@ -129,8 +136,9 @@ int main(int argc, char **argv) {
         const float *want = ref + (uint64_t)ci * OUT_DIM;
 
         int bit_exact = 1, n_diff = 0;
-        float max_rel = 0.0f, max_abs = 0.0f;
+        float max_rel = 0.0f, max_abs = 0.0f, max_ref = 0.0f;
         for (uint32_t o = 0; o < OUT_DIM; o++) {
+            if (fabsf(want[o]) > max_ref) max_ref = fabsf(want[o]);
             uint32_t a, b;
             memcpy(&a, &got[o], 4);
             memcpy(&b, &want[o], 4);
@@ -148,19 +156,30 @@ int main(int argc, char **argv) {
         }
         if (max_rel > worst_rel) worst_rel = max_rel;
         const int onehot = strcmp(c->kind, "onehot") == 0;
-        const int pass = onehot ? bit_exact : (max_rel <= TOL_REL);
+        /* Random cases: dense f32 sums whose accumulation order is not part of
+         * the arithmetic contract. The device (lane-split dot8 chains, FMA
+         * contraction, --use_fast_math expf) and the emulation (sequential
+         * sums) round a value sitting within ~1e-5 relative of a bf16
+         * quantization boundary to different sides: one gate dot flips a bf16
+         * ulp, the mid inherits it, a few down partials flip by <=5 bf16 ulps
+         * (each measured against the emulation's own partials), and the folded
+         * output moves by sum_k |w| * that quantum. Per-element relative error
+         * blows up wherever the weighted partials cancel, so the gate is the
+         * error against the vector's own scale: max |delta| <= TOL_SCALE *
+         * max |ref| (P4-2 evidence: worst measured 2.6e-4). */
+        const int pass = onehot ? bit_exact : (max_abs <= TOL_SCALE * max_ref);
         if (!pass && getenv("DS41_MOE_DEBUG")) {
             for (uint32_t o = 0; o < 8; o++)
                 printf("  dbg[%u] got %.6g want %.6g\n", o, (double)got[o], (double)want[o]);
         }
         if (!pass) n_fail++;
-        printf("case %u %-6s K=%u: %s%s (max rel %.3e max abs %.3e diffs %d)\n",
+        printf("case %u %-6s K=%u: %s%s (max rel %.3e max abs %.3e scale %.3e diffs %d)\n",
                ci, c->kind, c->k,
                pass ? "PASS" : "FAIL",
                onehot ? " bit-exact" : "",
-               max_rel, max_abs, n_diff);
+               max_rel, max_abs, max_ref > 0.0f ? max_abs / max_ref : 0.0f, n_diff);
     }
-    printf("DS41 MoE entry: %s (%u cases, worst rel %.3e, tol %.0e)\n",
-           n_fail ? "FAIL" : "PASS", n_cases, worst_rel, (double)TOL_REL);
+    printf("DS41 MoE entry: %s (%u cases, worst rel %.3e, scale tol %.0e)\n",
+           n_fail ? "FAIL" : "PASS", n_cases, worst_rel, (double)TOL_SCALE);
     return n_fail ? 1 : 0;
 }
