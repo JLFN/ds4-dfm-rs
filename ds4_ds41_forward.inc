@@ -594,12 +594,16 @@ static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint32_t n = st->n, E = DS4_N_EMBD;
     static int tr_on = -1;
     if (tr_on < 0) tr_on = getenv("DS41_FWD_TRACE") ? 1 : 0;
+    static int l0_on = -1;   /* temporary unit-C diagnostic: layer-0 stage dumps */
+    if (l0_on < 0) l0_on = getenv("DS41_DUMP_L0") ? 1 : 0;
+    const int l0 = l0_on && il == 0u && st->dump_prefix != NULL;
     const int tr = tr_on && il >= 27u;
     if (tr) v41_trace_probe(il, "hc_in", st->hc, (uint64_t)n * DS4_N_HC * E);
     if (!st->no_engram && g_ds4_v41.engram_index_of[il] >= 0) {
         if (!v41_engram(e, st, il)) return false;
     }
     if (!v41_hc_half(e, st, l, true)) return false;
+    if (l0) v41_dump_rows(st, st->xn, "l0axn", il, E);
     if (tr) {
         v41_trace_probe(il, "mix_attn", st->mix, (uint64_t)n * (2u * DS4_N_HC + DS4_N_HC * DS4_N_HC));
         v41_trace_probe(il, "comb_attn", st->comb, (uint64_t)n * DS4_N_HC * DS4_N_HC);
@@ -607,9 +611,11 @@ static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
         v41_trace_probe(il, "xn_attn", st->xn, (uint64_t)n * E);
     }
     if (!v41_attention(e, st, il)) return false;
+    if (l0) { v41_dump_rows(st, st->o, "l0ao", il, (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM); v41_dump_rows(st, st->attn_out, "l0aout", il, E); }
     if (tr) v41_trace_probe(il, "o", st->o, (uint64_t)n * DS4_N_HEAD * DS4_N_HEAD_DIM);
     if (!ds4_gpu_v41_hc_post_tensor(st->hc2, st->attn_out, st->hc, st->post, st->comb, E, DS4_N_HC, n)) return false;
     { ds4_gpu_tensor *t = st->hc; st->hc = st->hc2; st->hc2 = t; }
+    if (l0) v41_dump_rows(st, st->hc, "l0ahc", il, (uint64_t)DS4_N_HC * E);
     if (tr) v41_trace_probe(il, "hc_post_attn", st->hc, (uint64_t)n * DS4_N_HC * E);
     if (!v41_hc_half(e, st, l, false)) return false;
     if (tr) {
