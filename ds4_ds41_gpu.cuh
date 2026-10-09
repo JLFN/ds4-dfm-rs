@@ -213,10 +213,10 @@ extern "C" int ds4_gpu_v41_debug_dump_raw(const void *model_map, uint64_t model_
  * load-time error, never a guess (cuda_v41_3.inc.cu:164-175).  A bad header
  * is fatal: a wrong layout decodes silently and only shows as garbage.
  *
- * gr (the zchain per-expert gain override, the engine's g_v41_gr) is NULL on
- * the decode arm until the sidecar gain store lands (unit D); named
- * deviation.  The prefill arm reads g_v41_gr directly, the engine's
- * expression (all-NULL today, which is the BARE golden's state). */
+ * gr (the zchain per-expert gain override, the engine's g_v41_gr) is passed
+ * to the decode arm exactly as the engine does (cuda_v41_3.inc.cu:189-192);
+ * both arms read g_v41_gr, all-NULL until ds4_gpu_v41_set_gr_override mounts
+ * a table (the state the BARE golden was captured in). */
 extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t blob_offset, uint64_t blob_bytes,
                                              uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
@@ -243,7 +243,8 @@ extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *mo
                                         n_total_expert, n_expert_used, clamp, x, layer, n_tok, ver);
     const int rc = ds4_gpu_v41_vq_decode_raw(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim,
                                      (const int32_t *)selected->ptr, (const float *)weights->ptr,
-                                     n_expert_used, clamp, (const float *)x->ptr, n_tok, nc, NULL, ver);
+                                     n_expert_used, clamp, (const float *)x->ptr, n_tok, nc,
+                                     layer < 64u ? g_v41_gr[layer] : NULL, ver);
     /* Diagnostic switch, kept (P4-2): DS41_MOE_DUMP_MID=1 writes the worker's
      * mid scratch (bf16, np x mid_dim) and the down partials (f32, np x
      * out_dim) to /tmp so the persist path's values can be compared against

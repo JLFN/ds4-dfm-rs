@@ -8,11 +8,10 @@
  *   - the SwiGLU kernel and entry (:93-107, official Expert: up clamped to
  *     +-limit, gate clamped to max=limit, h = silu(gate)*up rounded to bf16).
  *
- * ★Named port deviation (P4-4)★: the route-bias override store
- * (ds4_gpu_v41_set_rb_override, :48-77) refuses by name.  It is a
- * serving-side unit (the zchain sidecar that feeds it lands with P5); the
- * router entry below therefore reads the on-disk exp_probs_b bias only.
- * Silently dropping a requested delta would be worse than refusing.
+ * The route-bias override store (ds4_gpu_v41_set_rb_override, :48-77) is the
+ * zchain sidecar's rb half: it keeps a per-layer device copy of (on-disk
+ * exp_probs_b + delta) and the router entry consults it by bias_offset.  No
+ * mounted table, no delta — the router then reads the on-disk bias unchanged.
  */
 #pragma once
 
@@ -60,14 +59,45 @@ __global__ static void v41_router_kernel(int32_t *sel, float *wts, const float *
         for (uint32_t r = 0; r < topk; r++) wts[(uint64_t)t * topk + r] = wts[(uint64_t)t * topk + r] / (wsum + 1e-20f) * route_scale;
 }
 
-/* Route-bias override (the engine's cuda_v41_3.inc.cu:48-77): adds
- * delta[n_expert] to the on-disk exp_probs_b for the layer whose file offset
- * matches; the selection score changes, the weight score does not.  Named
- * refusal: the sidecar store that feeds it is a serving-side unit (P5). */
+/* Route-bias override store (cuda_v41_3.inc.cu:48-77): per layer (keyed by
+ * the exp_probs_b file offset — the 40 main layers and each tower have
+ * distinct offsets, so the router signature does not change) a device copy of
+ * (on-disk bias + delta).  The delta moves the SELECTION score only; the
+ * weight score (the sqrtsoftplus probability) is untouched.  host_delta NULL
+ * unloads: bias_offset 0 unloads all, else just that layer.  The table is
+ * process-level, so a fresh mount unloads first (the engine's loader does).
+ * Mounted means 100% applied; the on-disk file is never written. */
+static struct { uint64_t off; float *dev; uint32_t n; } g_v41_rb[64];
+static uint32_t g_v41_rb_n = 0;
+
 extern "C" int ds4_gpu_v41_set_rb_override(const void *model_map, uint64_t model_size, uint64_t bias_offset, const float *host_delta, uint32_t n_expert) {
-    (void)model_map; (void)model_size; (void)bias_offset; (void)host_delta; (void)n_expert;
-    fprintf(stderr, "ds4: [ds41] route-bias override is not ported yet (serving-side sidecar, P5)\n");
-    return 0;
+    if (!host_delta) {   /* unload: offset 0 = all layers */
+        for (uint32_t i = 0; i < g_v41_rb_n;) {
+            if (bias_offset == 0 || g_v41_rb[i].off == bias_offset) { (void)cudaFree(g_v41_rb[i].dev); g_v41_rb[i] = g_v41_rb[--g_v41_rb_n]; }
+            else i++;
+        }
+        return 1;
+    }
+    if (!model_map || !n_expert || bias_offset > model_size || (uint64_t)n_expert * 4 > model_size - bias_offset) return 0;
+    const float *base = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * 4, "v41 rb base");
+    if (!base) return 0;
+    float *h = (float *)malloc((size_t)n_expert * 4);
+    if (!h) return 0;
+    /* the on-disk bias is a device copy or the host mapping: cudaMemcpyDefault
+     * reads by UVA pointer (the engine's comment, cuda_v41_3.inc.cu:64) */
+    if (cudaMemcpy(h, base, (size_t)n_expert * 4, cudaMemcpyDefault) != cudaSuccess) { (void)cudaGetLastError(); free(h); return 0; }
+    for (uint32_t e = 0; e < n_expert; e++) h[e] += host_delta[e];
+    uint32_t i = 0;
+    for (; i < g_v41_rb_n; i++) if (g_v41_rb[i].off == bias_offset) break;
+    if (i == g_v41_rb_n) {
+        if (g_v41_rb_n >= 64u) { free(h); return 0; }
+        if (cudaMalloc((void **)&g_v41_rb[i].dev, (size_t)n_expert * 4) != cudaSuccess) { (void)cudaGetLastError(); free(h); return 0; }
+        g_v41_rb[i].off = bias_offset; g_v41_rb[i].n = n_expert; g_v41_rb_n++;
+    } else if (g_v41_rb[i].n != n_expert) { free(h); return 0; }
+    const int ok = cudaMemcpy(g_v41_rb[i].dev, h, (size_t)n_expert * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    if (!ok) (void)cudaGetLastError();
+    free(h);
+    return ok;
 }
 
 extern "C" int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
@@ -76,6 +106,7 @@ extern "C" int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tenso
     if (!selected || !weights || !logits || topk > 16u || n_expert > 32u * V41_ROUTER_PER_LANE) return 0;
     const float *bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * 4, "v41 gate bias");
     if (!bias) return 0;
+    for (uint32_t i = 0; i < g_v41_rb_n; i++) if (g_v41_rb[i].off == bias_offset && g_v41_rb[i].n == n_expert) { bias = g_v41_rb[i].dev; break; }
     v41_router_kernel<<<(n_tok + 7u) / 8u, 256, 0, ds4_current_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr,
         (const float *)logits->ptr, bias, n_tok, n_expert, topk, route_scale);
     return cuda_ok(cudaGetLastError(), "v41 router");

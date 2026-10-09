@@ -20,12 +20,11 @@
  * sorted ys this file reduces.
  *
  * Scope: the inference scheduler.  The engine's backward capture
- * (g_vqp_last_*, ds4_gpu_v41_vq_capture_expert_out, :222-243) and the
- * gr-override store (ds4_gpu_v41_set_gr_override, :246-258) are not ported —
- * the port has no backward pass, and the store lands with the zchain sidecar
- * (unit D).  g_v41_gr exists as the engine's slot array so the prefill call
- * sites carry the engine's exact expression; it stays all-NULL, which is the
- * state the BARE golden (NO_ZCHAIN=1) was captured in.
+ * (g_vqp_last_*, ds4_gpu_v41_vq_capture_expert_out, :222-243) is not ported
+ * (the port has no backward pass).  The gr-override store
+ * (ds4_gpu_v41_set_gr_override, :246-258) is ported below; g_v41_gr stays
+ * all-NULL until the zchain sidecar is applied, which is the state the BARE
+ * golden (NO_ZCHAIN=1) was captured in.
  */
 #pragma once
 #include <stdint.h>
@@ -38,8 +37,25 @@
 
 /* zchain per-expert gain override (cuda_vq_prefill.inc.cu:19-21): [layer] ->
  * device s[n_expert][OUT] row gains for the down matrix, NULL = none for the
- * layer.  Only the down output consumes it.  Unit D fills it from the sidecar. */
+ * layer.  Only the down output consumes it (m.gov in ds41_vq_row.cuh); the
+ * store below mounts a table, the zchain sidecar's gr half. */
 static float *g_v41_gr[64];
+
+/* Mount/unmount one layer's gain table (cuda_vq_prefill.inc.cu:246-258).
+ * host NULL unloads; n_expert x out_dim must match the layer's real shape
+ * (the caller checks, as the engine's loader does).  A failed upload leaves
+ * the slot NULL and returns 0 — never a half-mounted table. */
+extern "C" int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_expert, uint32_t out_dim) {
+    if (layer >= 64u) return 0;
+    if (g_v41_gr[layer]) { (void)cudaFree(g_v41_gr[layer]); g_v41_gr[layer] = NULL; }
+    if (!host) return 1;
+    const size_t nb = (size_t)n_expert * out_dim * 4;
+    if (cudaMalloc((void **)&g_v41_gr[layer], nb) != cudaSuccess) { (void)cudaGetLastError(); g_v41_gr[layer] = NULL; return 0; }
+    if (cudaMemcpy(g_v41_gr[layer], host, nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void)cudaGetLastError(); (void)cudaFree(g_v41_gr[layer]); g_v41_gr[layer] = NULL; return 0;
+    }
+    return 1;
+}
 
 /* The NVFP4 prefill path's n-alignment pad (cuda_vq_prefill_nvfp4.inc.cu:24).
  * That path is retired in the engine itself (2026-09-20: measured 0.013 Σmin

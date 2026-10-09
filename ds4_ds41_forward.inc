@@ -750,6 +750,29 @@ int ds4_v41_engram_meta(void *engine, int k, uint32_t *il, char *path, int path_
     return 1;
 }
 
+/* Zchain gate support (unit D): the shape the sidecar headers must match and
+ * the per-layer router-bias reference (name -> tensor -> abs_offset, the
+ * engine's model_find_tensor(m, "blk.%u.exp_probs_b.bias") at
+ * core_v41_amp.c:104). */
+int ds4_v41_shape(void *engine, uint32_t *n_layer, uint32_t *n_expert, uint32_t *n_embd) {
+    if (!engine) return 0;
+    if (n_layer) *n_layer = DS4_N_LAYER;
+    if (n_expert) *n_expert = DS4_N_EXPERT;
+    if (n_embd) *n_embd = DS4_N_EMBD;
+    return 1;
+}
+
+int ds4_v41_router_bias_ref(void *engine, uint32_t il, const void **map, uint64_t *size, uint64_t *offset) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !map || !size || !offset || il >= DS4_N_LAYER) return 0;
+    const ds4_tensor *t = e->weights.layer[il].ffn_exp_probs_b;
+    if (!t) return 0;
+    *map = e->model.map;
+    *size = e->model.size;
+    *offset = t->abs_offset;
+    return 1;
+}
+
 /* ---- the score entry (core_v41_score.c:27-110) ----
  * Teacher-forced scoring; the aux outputs (--score-nll/--score-topk/--score-rms)
  * and the deployment-split mode are not ported (the golden capture used the

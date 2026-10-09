@@ -53,6 +53,15 @@ int ds4_v41_engram_meta(void *engine, int k, uint32_t *il, char *path, int path_
                         uint64_t *rows, uint64_t *weight_off, uint64_t *scale_off,
                         uint32_t *head_dim, uint32_t *cols);
 
+/* Zchain gate support (unit D): the model shape the sidecar headers are
+ * validated against (the engine's DS4_N_EXPERT / DS4_N_EMBD) and the
+ * router-bias reference for layer il (the engine's model_find_tensor +
+ * m->map/m->size, core_v41_amp.c:104).  The C harness builds its loader from
+ * these; production loads the same files on the Rust host (sidecar.rs) and
+ * calls the two GPU stores. */
+int ds4_v41_shape(void *engine, uint32_t *n_layer, uint32_t *n_expert, uint32_t *n_embd);
+int ds4_v41_router_bias_ref(void *engine, uint32_t il, const void **map, uint64_t *size, uint64_t *offset);
+
 /* Diagnostic (P4-4 head investigation): the forward's head block dumps the
  * bytes a weight resolve returns (device range or mapped pointer) and the raw
  * mapping bytes for the same span when DS41_DUMP_HEAD=<prefix> is set, so a

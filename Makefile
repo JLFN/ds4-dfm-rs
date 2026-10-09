@@ -986,10 +986,10 @@ tests/test_ds41_forward: tests/test_ds41_forward.cu ds4_gpu.h ds41_forward.h $(D
 .PHONY: test-ds41-forward
 test-ds41-forward: tests/test_ds41_forward
 	@if [ -z "$(MODEL)" ] || [ -z "$(GOLDEN)" ]; then \
-	  echo "usage: make test-ds41-forward MODEL=<gguf> GOLDEN=<golden dir> [ENGRAM_DIR=<dir>] [NAMES=\"p1 p2 p3 p5\"] [OUT=/tmp/p44]"; \
+	  echo "usage: make test-ds41-forward MODEL=<gguf> GOLDEN=<golden dir> [ENGRAM_DIR=<dir>] [ZCHAIN=<dir>] [NAMES=\"p1 p2 p3 p5\"] [OUT=/tmp/p44]"; \
 	else \
 	  ./tests/test_ds41_forward "$(MODEL)" "$(GOLDEN)" "$${OUT:-/tmp/p44}" \
-	    $${ENGRAM_DIR:+--engram-dir "$(ENGRAM_DIR)"} $(NAMES); \
+	    $${ENGRAM_DIR:+--engram-dir "$(ENGRAM_DIR)"} $${ZCHAIN:+--zchain "$(ZCHAIN)"} $(NAMES); \
 	fi
 
 # The Rust host (./ds4) is the default binary, and the one the server shares.

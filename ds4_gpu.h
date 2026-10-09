@@ -5353,7 +5353,8 @@ void ds4_gpu_v41_set_indexer_mma(int on);
 
 /* DeepSeek V4.1 router + SwiGLU (P4-4, cuda/ds41_router.cuh,
  * src/cuda/cuda_v41_3.inc.cu:8-107).  The route-bias override store
- * (ds4_gpu_v41_set_rb_override) refuses by name until the sidecar lands. */
+ * (ds4_gpu_v41_set_rb_override) is the zchain rb half; the router entry
+ * consults its table by bias_offset when a layer is mounted. */
 int ds4_gpu_v41_router_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits,
         const void *model_map, uint64_t model_size, uint64_t bias_offset,
         uint32_t n_tok, uint32_t n_expert, uint32_t topk, float route_scale);
@@ -5361,6 +5362,12 @@ int ds4_gpu_v41_swiglu_tensor(ds4_gpu_tensor *h, const ds4_gpu_tensor *gate, con
         uint32_t n_tok, uint32_t mid, float limit);
 int ds4_gpu_v41_set_rb_override(const void *model_map, uint64_t model_size, uint64_t bias_offset,
         const float *host_delta, uint32_t n_expert);
+
+/* The zchain gr half (cuda/ds41_vq_prefill.cuh, src/cuda/cuda_vq_prefill.inc.cu:246-258):
+ * per-layer device table of [n_expert][out_dim] down-row gain overrides; host
+ * NULL unloads the layer.  Both the VQ prefill and decode arms read g_v41_gr
+ * (the engine's expression, cuda_v41_3.inc.cu:189-192). */
+int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_expert, uint32_t out_dim);
 
 #ifdef __cplusplus
 }

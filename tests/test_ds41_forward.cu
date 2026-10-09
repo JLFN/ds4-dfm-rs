@@ -5,7 +5,7 @@
  * logits against the golden directory:
  *
  *   test_ds41_forward <gguf> <golden_dir> <out_dir> [--engram-dir <dir>]
- *                     [--no-engram] <name>...
+ *                     [--no-engram] [--zchain <dir>] <name>...
  *
  * The golden set (tests/capture_ds41_golden.sh) holds per prompt:
  *   <name>.ids                  the exact token ids (the engine tokenized them)
@@ -15,11 +15,13 @@
  *   <name>.logits.bin.hce_Lnn.bin hc after the engram layer (n x HC x E f32)
  *   <name>.logits.bin.erows_Lnn.txt the engram row ids (n lines x cols)
  *
- * ★The golden must be the BARE variant★ (the capture script's NO_ZCHAIN=1):
- * the default capture ran the engine with --zchain (gr=39, rb=27 layers in
- * the real sidecar), and this port's forward does not apply the sidecar yet
- * (gr/rb land with the serving unit).  Comparing against a sidecar-applied
- * golden would measure the sidecar's effect, not the port's porting.
+ * Two golden variants exist (tests/capture_ds41_golden.sh): the default
+ * capture ran the engine WITH --zchain (the sidecar: gr=39, rb=27 layers in
+ * the real directory), NO_ZCHAIN=1 the bare variant.  --zchain <dir> makes
+ * this harness mount that directory through the two GPU stores
+ * (ds4_gpu_v41_set_gr_override / ds4_gpu_v41_set_rb_override) before
+ * scoring, so the with-sidecar golden gates the port's own sidecar
+ * application; without the flag the bare golden gates the bare path.
  *
  * Engram rows: the harness reads the golden erows txt (the engine's own row
  * ids) and preads the raw row bytes from the official shards, exactly the
@@ -42,6 +44,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <cuda_fp16.h>
 
 extern "C" {
 #include "../ds4.h"
@@ -76,6 +79,135 @@ static bool parse_ids(const char *path, std::vector<int> *ids) {
     while (fscanf(f, "%ld", &v) == 1) ids->push_back((int)v);
     fclose(f);
     return !ids->empty();
+}
+
+/* ---- the zchain sidecar (unit D) ----
+ * Gate-side mirror of the engine's loader, core_v41_amp.c:44-117, for the
+ * single (2) directory: the capture ran --zchain without --posttrain, so
+ * there is no (3) to merge.  Production reads the same files on the Rust host
+ * (crates/ds4-core/src/sidecar.rs) and calls the two GPU stores; this C copy
+ * exists because the harness is the gate driver.  A present-but-broken file
+ * is a hard stop, never a skip (half a plugin is a fake reading). */
+
+/* ds4_fp8.h:39-44 (E8M0: e=0 is the 0x00400000 bit pattern) and
+ * ds4_fp8.h:121-126 (the E2M1 nibble table); ds4_quantfmt.c:28-40 is the
+ * 17-byte block decode the fp4x32 gr files use (s-1 on disk). */
+static float e8m0_to_f32(uint8_t e) {
+    const uint32_t bits = e == 0 ? 0x00400000u : ((uint32_t)e << 23);
+    float f; memcpy(&f, &bits, 4); return f;
+}
+
+static const float kFp4Nibble[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+static void deq_fp4x32(const uint8_t *src, size_t nblk, float *out) {
+    for (size_t b = 0; b < nblk; b++) {
+        const uint8_t *blk = src + b * 17u;
+        const float s = e8m0_to_f32(blk[16]);
+        float *o = out + b * 32u;
+        for (int j = 0; j < 16; j++) {
+            o[2 * j] = kFp4Nibble[blk[j] & 0x0Fu] * s;
+            o[2 * j + 1] = kFp4Nibble[blk[j] >> 4] * s;
+        }
+    }
+}
+
+/* gr_Lnn.bin (core_v41_amp.c:44-84): header {n_expert, D, type}; type 1 = f32
+ * s, 2 = f16 s, 43 = fp4x32 storing s-1 (restored as 1+raw).  Mounts the
+ * layer's gain table; no file = the layer stays bare. */
+static bool zchain_gr_mount(const char *dir, uint32_t il, uint32_t n_expert, uint32_t n_embd) {
+    char path[4600];
+    snprintf(path, sizeof path, "%s/gr_L%02u.bin", dir, il);
+    FILE *f = fopen(path, "rb");
+    if (!f) return true;
+    int32_t hd[3];
+    if (fread(hd, 4, 3, f) != 3 || hd[0] != (int32_t)n_expert || hd[1] != (int32_t)n_embd ||
+        (hd[2] != 1 && hd[2] != 2 && hd[2] != 43)) {
+        fprintf(stderr, "harness: %s header bad (expert %d d %d type %d; want %u/%u/1|2|43)\n",
+                path, hd[0], hd[1], hd[2], n_expert, n_embd);
+        fclose(f);
+        return false;
+    }
+    const size_t nel = (size_t)n_expert * n_embd;
+    std::vector<float> acc(nel);
+    bool ok = true;
+    if (hd[2] == 43) {
+        if (nel % 32u) { ok = false; }
+        else {
+            std::vector<uint8_t> pk(nel / 32u * 17u);
+            ok = fread(pk.data(), 1, pk.size(), f) == pk.size();
+            if (ok) {
+                deq_fp4x32(pk.data(), pk.size() / 17u, acc.data());
+                for (size_t t = 0; t < nel; t++) acc[t] += 1.0f;
+            }
+        }
+    } else if (hd[2] == 2) {
+        std::vector<uint16_t> raw(nel);
+        ok = fread(raw.data(), 2, nel, f) == nel;
+        if (ok) for (size_t t = 0; t < nel; t++) acc[t] = __half2float(*(__half *)&raw[t]);
+    } else {
+        ok = fread(acc.data(), 4, nel, f) == nel;
+    }
+    fclose(f);
+    if (!ok) { fprintf(stderr, "harness: %s truncated\n", path); return false; }
+    if (!ds4_gpu_v41_set_gr_override(il, acc.data(), n_expert, n_embd)) {
+        fprintf(stderr, "harness: L%02u gain override upload failed\n", il);
+        return false;
+    }
+    return true;
+}
+
+/* rb_Lnn.bin (core_v41_amp.c:86-117): header {n_expert, 1=f32} + delta f32.
+ * The store adds it to the on-disk exp_probs_b (selection score only). */
+static bool zchain_rb_mount(void *engine, const char *dir, uint32_t il, uint32_t n_expert) {
+    char path[4600];
+    snprintf(path, sizeof path, "%s/rb_L%02u.bin", dir, il);
+    FILE *f = fopen(path, "rb");
+    if (!f) return true;
+    int32_t hd[2];
+    if (fread(hd, 4, 2, f) != 2 || hd[0] != (int32_t)n_expert || hd[1] != 1) {
+        fprintf(stderr, "harness: %s header bad (expert %d type %d; want %u/1=f32)\n", path, hd[0], hd[1], n_expert);
+        fclose(f);
+        return false;
+    }
+    std::vector<float> delta(n_expert);
+    const bool ok = fread(delta.data(), 4, n_expert, f) == n_expert;
+    fclose(f);
+    if (!ok) { fprintf(stderr, "harness: %s truncated\n", path); return false; }
+    const void *map = NULL;
+    uint64_t size = 0, off = 0;
+    if (!ds4_v41_router_bias_ref(engine, il, &map, &size, &off)) {
+        fprintf(stderr, "harness: L%02u has no exp_probs_b tensor for the rb sidecar\n", il);
+        return false;
+    }
+    if (!ds4_gpu_v41_set_rb_override(map, size, off, delta.data(), n_expert)) {
+        fprintf(stderr, "harness: L%02u route-bias override upload failed\n", il);
+        return false;
+    }
+    return true;
+}
+
+/* Mount the whole directory in the engine's order (v41_amp_load,
+ * core_v41_amp.c:227-229): rb unloads all first, then per-layer mounts. */
+static bool zchain_load(void *engine, const char *dir) {
+    uint32_t n_layer = 0, n_expert = 0, n_embd = 0;
+    if (!ds4_v41_shape(engine, &n_layer, &n_expert, &n_embd)) {
+        fprintf(stderr, "harness: shape query failed\n");
+        return false;
+    }
+    (void)ds4_gpu_v41_set_rb_override(NULL, 0, 0, NULL, 0);
+    uint32_t n_gr = 0, n_rb = 0;
+    for (uint32_t il = 0; il < n_layer; il++) {
+        char path[4600];
+        snprintf(path, sizeof path, "%s/gr_L%02u.bin", dir, il);
+        if (file_exists(path)) { if (!zchain_gr_mount(dir, il, n_expert, n_embd)) return false; n_gr++; }
+        snprintf(path, sizeof path, "%s/rb_L%02u.bin", dir, il);
+        if (file_exists(path)) { if (!zchain_rb_mount(engine, dir, il, n_expert)) return false; n_rb++; }
+    }
+    printf("zchain: gr=%u rb=%u layers mounted from %s\n", n_gr, n_rb, dir);
+    return true;
 }
 
 static bool parse_erows(const char *path, uint32_t n, uint32_t cols, std::vector<int64_t> *rows) {
@@ -136,16 +268,18 @@ static double ppl_of(const float *lg, uint32_t n, uint32_t V, const std::vector<
 
 int main(int argc, char **argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s <gguf> <golden_dir> <out_dir> [--engram-dir <dir>] [--no-engram] <name>...\n", argv[0]);
+        fprintf(stderr, "usage: %s <gguf> <golden_dir> <out_dir> [--engram-dir <dir>] [--no-engram] [--zchain <dir>] <name>...\n", argv[0]);
         return 2;
     }
     const char *gguf = argv[1], *golden = argv[2], *out_dir = argv[3];
     const char *engram_dir = NULL;
+    const char *zchain_dir = NULL;
     int no_engram = 0;
     std::vector<std::string> names;
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--engram-dir") == 0 && i + 1 < argc) { engram_dir = argv[++i]; continue; }
         if (strcmp(argv[i], "--no-engram") == 0) { no_engram = 1; continue; }
+        if (strcmp(argv[i], "--zchain") == 0 && i + 1 < argc) { zchain_dir = argv[++i]; continue; }
         names.push_back(argv[i]);
     }
     if (names.empty()) { fprintf(stderr, "harness: no prompt names\n"); return 2; }
@@ -162,6 +296,10 @@ int main(int argc, char **argv) {
     opt.defer_boot_prewarm = true;
     ds4_engine *e = NULL;
     if (ds4_engine_open(&e, &opt) != 0) { fprintf(stderr, "harness: engine open failed\n"); return 1; }
+    if (zchain_dir && !zchain_load(e, zchain_dir)) {
+        fprintf(stderr, "harness: zchain load failed -- hard stop (no silent bare run)\n");
+        return 1;
+    }
 
     int failures = 0;
     for (const std::string &name : names) {
