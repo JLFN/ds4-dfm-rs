@@ -328,6 +328,10 @@ pub struct ds4_bridge_model_open_options {
     pub power_percent: i32,
     pub warm_weights: i32,
     pub quality: i32,
+    pub ssd_streaming: i32,
+    pub ssd_streaming_cold: i32,
+    pub ssd_streaming_cache_experts: u32,
+    pub ssd_streaming_cache_bytes: u64,
     pub plan: *const ds4_bridge_bind_plan,
     pub tensors: *const ds4_host_tensor_dir,
     pub shape: *const ds4_host_shape,
@@ -574,6 +578,24 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_glm53_trial(
+        s: *mut ds4_bridge_session,
+        first: i32,
+        max_tokens: i32,
+        tokens: *mut i32,
+        target: *mut i32,
+        cap: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_glm53_commit(
+        s: *mut ds4_bridge_session,
+        keep: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_inkling_commit(
         s: *mut ds4_bridge_session,
         keep: i32,
@@ -611,6 +633,24 @@ extern "C" {
     ) -> c_int;
 
     pub fn ds4_bridge_naive_commit(
+        s: *mut ds4_bridge_session,
+        keep: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_iquest_trial(
+        s: *mut ds4_bridge_session,
+        first: i32,
+        max_tokens: i32,
+        tokens: *mut i32,
+        target: *mut i32,
+        cap: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_iquest_commit(
         s: *mut ds4_bridge_session,
         keep: i32,
         err: *mut c_char,

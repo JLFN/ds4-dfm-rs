@@ -10,6 +10,8 @@ use crate::render::{
     QWEN_TOOL_CALL_START, SOLAR_THINK_END, SOLAR_THINK_START, SOLAR_TOOL_ARG_END,
     SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE, SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END,
 };
+
+pub(crate) mod iquest;
 use crate::stream::{think_end, think_start, ChatFormat};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -1146,7 +1148,27 @@ fn parse_qwen_generated(
     })
 }
 
-fn parse_glm_generated(text: &[u8], require_thinking_closed: bool) -> Option<ParsedGenerated> {
+fn glm_arg_type(raw: &[u8], expected: Option<&str>) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return false;
+    };
+    match expected {
+        Some("number") => value.is_number(),
+        Some("integer") => value.as_number().is_some_and(|n| n.is_i64() || n.is_u64()),
+        Some("boolean") => value.is_boolean(),
+        Some("array") => value.is_array(),
+        Some("object") => value.is_object(),
+        Some("null") => value.is_null(),
+        _ => false,
+    }
+}
+
+fn parse_glm_generated(
+    syntax: ModelSyntax,
+    text: &[u8],
+    require_thinking_closed: bool,
+    orders: &[ToolSchemaOrder],
+) -> Option<ParsedGenerated> {
     const ARG_KEY_START: &[u8] = b"<arg_key>";
     const ARG_KEY_END: &[u8] = b"</arg_key>";
     const ARG_VALUE_START: &[u8] = b"<arg_value>";
@@ -1215,6 +1237,7 @@ fn parse_glm_generated(text: &[u8], require_thinking_closed: bool) -> Option<Par
             return None;
         }
         let name = String::from_utf8_lossy(name).into_owned();
+        let order = tool_schema_orders_find(orders, &name);
         p = name_end;
         let mut args = Vec::new();
 
@@ -1232,7 +1255,12 @@ fn parse_glm_generated(text: &[u8], require_thinking_closed: bool) -> Option<Par
             if key_end > close {
                 return None;
             }
-            let key = dsml_unescape_text(trim_ascii_span(&text[p..key_end]));
+            let raw_key = trim_ascii_span(&text[p..key_end]);
+            let key = if syntax == ModelSyntax::Glm53 {
+                raw_key.to_vec()
+            } else {
+                dsml_unescape_text(raw_key)
+            };
             if key.is_empty() {
                 return None;
             }
@@ -1245,8 +1273,21 @@ fn parse_glm_generated(text: &[u8], require_thinking_closed: bool) -> Option<Par
             if value_end > close {
                 return None;
             }
-            let value = dsml_unescape_text(&text[p..value_end]);
-            tool_call_json_args_add(&mut args, &key, &value, true);
+            let raw_value = &text[p..value_end];
+            if syntax == ModelSyntax::Glm53 {
+                // The embedded template writes strings verbatim and other
+                // values as JSON. Only an explicit schema resolves that ambiguity.
+                let expected = tool_schema_order_prop_type(order, &String::from_utf8_lossy(&key));
+                tool_call_json_args_add(
+                    &mut args,
+                    &key,
+                    raw_value,
+                    !glm_arg_type(raw_value, expected),
+                );
+            } else {
+                let value = dsml_unescape_text(raw_value);
+                tool_call_json_args_add(&mut args, &key, &value, true);
+            }
             p = value_end + ARG_VALUE_END.len();
         }
 
@@ -1308,10 +1349,11 @@ pub fn parse_generated_message(
         ModelSyntax::K2Horizon => parse_k2_generated(text, require_thinking_closed, orders),
         // Ling emits GLM's tool XML, not Qwen's JSON envelope.
         ModelSyntax::Glm53 | ModelSyntax::Ling3Vl => {
-            parse_glm_generated(text, require_thinking_closed)
+            parse_glm_generated(syntax, text, require_thinking_closed, orders)
         }
         // Malformed tool envelopes must not become user-visible raw text.
         ModelSyntax::Inkling => return crate::render::inkling::parse(text).unwrap_or_default(),
+        ModelSyntax::IQuestQ1 => Some(iquest::parse(text, require_thinking_closed, orders)),
         ModelSyntax::DeepSeek => {
             if format == ChatFormat::SolarOpen2 {
                 parse_solar_generated(text, require_thinking_closed, orders)
@@ -1347,6 +1389,7 @@ pub fn parse_generated_for_model_id(
         | ModelSyntax::NaiveN05 => ChatFormat::Qwen4Exp,
         ModelSyntax::K2Horizon => ChatFormat::K2Horizon,
         ModelSyntax::Inkling => ChatFormat::Inkling,
+        ModelSyntax::IQuestQ1 => ChatFormat::IQuestQ1,
         _ => ChatFormat::DeepSeek,
     };
     parse_generated_message(syntax, text, require_thinking_closed, format, orders)
@@ -1403,7 +1446,12 @@ pub fn parse_generated_for_response(
         return (parsed, intern_finish(finish));
     }
     if !has_tools {
-        let (content, reasoning) = split_reasoning_response(text, format, require_thinking_closed);
+        let (content, reasoning) = if syntax == ModelSyntax::IQuestQ1 {
+            let (body, reasoning) = iquest::split(text, require_thinking_closed);
+            (body.to_vec(), reasoning)
+        } else {
+            split_reasoning_response(text, format, require_thinking_closed)
+        };
         return (
             ParsedGenerated {
                 content,
@@ -1450,6 +1498,7 @@ fn intern_finish(finish: &str) -> &'static str {
 
 pub fn find_tool_start(s: &[u8], format: ChatFormat) -> Option<usize> {
     match format {
+        ChatFormat::IQuestQ1 => find_substr(s, crate::render::IQUEST_TOOL_CALL_START.as_bytes()),
         ChatFormat::SolarOpen2 => find_substr(s, SOLAR_TOOL_CALLS.as_bytes()),
         ChatFormat::Exaone => find_substr(s, b"<tool_call>"),
         ChatFormat::Qwen4Exp => find_substr(s, QWEN_TOOL_CALL_START.as_bytes()),
@@ -1470,6 +1519,7 @@ pub fn find_tool_start(s: &[u8], format: ChatFormat) -> Option<usize> {
 
 pub fn find_tool_end(s: &[u8], format: ChatFormat) -> Option<usize> {
     match format {
+        ChatFormat::IQuestQ1 => find_substr(s, crate::render::IQUEST_TOOL_CALL_END.as_bytes()),
         ChatFormat::SolarOpen2 => find_substr(s, SOLAR_TOOL_CALL_END.as_bytes()),
         ChatFormat::Exaone => find_substr(s, b"</tool_call>"),
         ChatFormat::Qwen4Exp => find_substr(s, QWEN_TOOL_CALL_END.as_bytes()),
@@ -1669,6 +1719,7 @@ fn stop_list_stream_safe_len(stops: &[String], text_len: usize) -> usize {
 
 fn tool_marker_stream_safe_len(text: &[u8], format: ChatFormat) -> usize {
     let marks: &[&[u8]] = match format {
+        ChatFormat::IQuestQ1 => &[crate::render::IQUEST_TOOL_CALL_START.as_bytes()],
         ChatFormat::SolarOpen2 => &[SOLAR_TOOL_CALLS.as_bytes()],
         ChatFormat::Exaone => &[b"<tool_call>"],
         ChatFormat::Qwen4Exp => &[QWEN_TOOL_CALL_START.as_bytes()],
@@ -1747,7 +1798,7 @@ impl SemAccum {
         let mut a = Self {
             text: Vec::new(),
             track_tools: kind_chat && has_tools,
-            cut_tool_syntax: kind_chat && !has_tools,
+            cut_tool_syntax: kind_chat && !has_tools && format != ChatFormat::IQuestQ1,
             think_gates: think_enabled || format == ChatFormat::Inkling,
             chat_format: format,
             thinking_inside: false,

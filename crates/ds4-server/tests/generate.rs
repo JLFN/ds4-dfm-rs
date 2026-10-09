@@ -62,6 +62,8 @@ struct PromptSyncDecode {
     remembered_tools: Vec<(Vec<String>, String)>,
     prefix_width: usize,
     prefix_budgets: Vec<i32>,
+    trimmed_positions: Vec<i32>,
+    sample_params: Vec<(f32, i32, f32, f32)>,
 }
 
 impl PromptSyncDecode {
@@ -90,6 +92,8 @@ impl PromptSyncDecode {
             remembered_tools: Vec::new(),
             prefix_width: 1,
             prefix_budgets: Vec::new(),
+            trimmed_positions: Vec::new(),
+            sample_params: Vec::new(),
         }
     }
 }
@@ -229,7 +233,25 @@ impl DecodeIo for PromptSyncDecode {
             self.inner.eval(token)?;
             tokens.push(token);
         }
+        if self.model_id() == ds4_server::ModelSyntax::Glm53 as i32 {
+            self.inner.live.extend_from_slice(&tokens);
+        }
         Ok(tokens)
+    }
+
+    fn trim_greedy(&mut self, pos: i32) -> Result<(), GenerateError> {
+        if self.model_id() != ds4_server::ModelSyntax::Glm53 as i32 {
+            self.invalidate();
+            return Ok(());
+        }
+        assert!(
+            (1..=self.inner.pos).contains(&pos),
+            "invalid journal target"
+        );
+        self.trimmed_positions.push(pos);
+        self.inner.live.truncate(pos as usize);
+        self.inner.pos = pos;
+        Ok(())
     }
 
     fn sample(
@@ -241,6 +263,7 @@ impl DecodeIo for PromptSyncDecode {
         rng: &mut u64,
     ) -> i32 {
         self.events.push("sample");
+        self.sample_params.push((temperature, top_k, top_p, min_p));
         self.inner.sample(temperature, top_k, top_p, min_p, rng)
     }
 
@@ -372,6 +395,125 @@ fn mtp_prefix_empty() {
     assert_eq!(engine.invalidations, 1);
 }
 
+fn glm_tool_prefix(surface: WireSurface, stream: bool, close: usize) {
+    const WIDTH: usize = 4;
+    const TAIL: &[u8] = b"UNEMITTED_SPECULATIVE_TAIL";
+    const BODY: &[u8] = b"<tool_call>bash<arg_key>command</arg_key><arg_value>echo hi</arg_value>";
+    let body = match surface {
+        WireSurface::Anthropic => {
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8,"tools":[{"name":"bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]}"#
+        }
+        WireSurface::Responses => {
+            r#"{"input":"hi","max_output_tokens":8,"tools":[{"type":"function","name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}]}"#
+        }
+        _ => unreachable!(),
+    };
+    let mut parsed = parse_request(surface, &env(), body).unwrap();
+    parsed.stream = stream;
+    parsed.think_mode = ThinkMode::None;
+    parsed.temperature = 0.0;
+
+    // The journal has already committed the whole prefix when output sees
+    // the close tag. Only its un-emitted tail may be discarded.
+    let mut pieces = vec![TAIL; WIDTH];
+    if close == 0 {
+        pieces[0] =
+            b"<tool_call>bash<arg_key>command</arg_key><arg_value>echo hi</arg_value></tool_call>";
+    } else {
+        pieces[0] = BODY;
+        pieces[1..close].fill(b"\n");
+        pieces[close] = b"</tool_call>";
+    }
+    let mut tape = ScriptedDecode::from_pieces(&pieces);
+    tape.model_id = ds4_server::ModelSyntax::Glm53 as i32;
+    let mut engine = PromptSyncDecode::new(tape, 0, 1);
+    engine.prefix_width = WIDTH;
+    let mut out = Vec::new();
+    let result = generate_and_write(
+        &mut engine,
+        &parsed,
+        "glm-tool-prefix",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+
+    let wire = String::from_utf8(out).unwrap();
+    assert_eq!(result.finish, "tool_calls", "{wire}");
+    assert_eq!(result.tool_ids.len(), 1, "{wire}");
+    assert!(wire.contains(&result.tool_ids[0]), "{wire}");
+    assert!(!wire.contains(std::str::from_utf8(TAIL).unwrap()), "{wire}");
+    assert_eq!(engine.prefix_budgets, [8]);
+    assert_eq!(engine.inner.idx, WIDTH, "all accepted rows were evaluated");
+    assert_eq!(result.timings.decode_tokens, (close + 1) as i32);
+    assert_eq!(result.frontier, (close + 2) as i32);
+    assert_eq!(engine.pos(), result.frontier);
+    assert_eq!(result.generation, 1);
+    assert_eq!(engine.invalidations, 0);
+    let expected_history = std::iter::once(1)
+        .chain(1..=(close + 1) as i32)
+        .collect::<Vec<_>>();
+    assert_eq!(engine.inner.live, expected_history);
+    let expected_trims = if close + 1 < WIDTH {
+        vec![result.frontier]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(engine.trimmed_positions, expected_trims);
+}
+
+macro_rules! glm_tool_prefix_case {
+    ($name:ident, $surface:ident, $stream:expr, $close:expr) => {
+        #[test]
+        fn $name() {
+            glm_tool_prefix(WireSurface::$surface, $stream, $close);
+        }
+    };
+}
+
+glm_tool_prefix_case!(glm_tool_prefix_an_b_first, Anthropic, false, 0);
+glm_tool_prefix_case!(glm_tool_prefix_an_b_middle, Anthropic, false, 1);
+glm_tool_prefix_case!(glm_tool_prefix_an_b_final, Anthropic, false, 3);
+glm_tool_prefix_case!(glm_tool_prefix_an_s_first, Anthropic, true, 0);
+glm_tool_prefix_case!(glm_tool_prefix_an_s_middle, Anthropic, true, 1);
+glm_tool_prefix_case!(glm_tool_prefix_an_s_final, Anthropic, true, 3);
+glm_tool_prefix_case!(glm_tool_prefix_re_b_first, Responses, false, 0);
+glm_tool_prefix_case!(glm_tool_prefix_re_b_middle, Responses, false, 1);
+glm_tool_prefix_case!(glm_tool_prefix_re_b_final, Responses, false, 3);
+glm_tool_prefix_case!(glm_tool_prefix_re_s_first, Responses, true, 0);
+glm_tool_prefix_case!(glm_tool_prefix_re_s_middle, Responses, true, 1);
+glm_tool_prefix_case!(glm_tool_prefix_re_s_final, Responses, true, 3);
+
+#[test]
+fn mtp_tool_tail_invalidates() {
+    let block = concat!(
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">",
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls",
+        "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
+    );
+    let tape = ScriptedDecode::from_pieces(&[block.as_bytes(), b"UNEMITTED_TAIL"]);
+    let mut engine = PromptSyncDecode::new(tape, 0, 1);
+    engine.prefix_width = 2;
+    let mut out = Vec::new();
+    let result = generate_and_write(
+        &mut engine,
+        &tools_req(),
+        "generic-tool-prefix",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(result.tool_ids.len(), 1);
+    assert_eq!(result.frontier, 0);
+    assert_eq!(engine.invalidations, 1);
+    assert!(engine.trimmed_positions.is_empty());
+    assert!(!String::from_utf8(out).unwrap().contains("UNEMITTED_TAIL"));
+}
+
 #[test]
 fn mtp_disconnect() {
     struct Disconnect;
@@ -439,12 +581,86 @@ fn mtp_sampling_policy() {
 }
 
 #[test]
+fn iquest_thinking_sampling() {
+    use ds4_core::chat_template::{RenderClock, Template};
+    use ds4_server::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
+    let iquest = ds4_core::Variant::IQuestQ1 as i32;
+    for model_id in [iquest, 0] {
+        for temperature in [0.0, 0.4] {
+            let parsed = parse_request(
+                WireSurface::OpenaiChat,
+                &env(),
+                &format!(r#"{{"messages":[{{"role":"user","content":"2 + 2"}}],"reasoning_effort":"high","temperature":{temperature},"top_k":9,"top_p":0.9,"min_p":0.03}}"#),
+            )
+            .unwrap();
+            let mut script = ScriptedDecode::from_pieces(&[b"Compute.", b"</think>", b"4"]);
+            script.model_id = model_id;
+            let mut engine = PromptSyncDecode::new(script, 0, 1);
+            if model_id == iquest {
+                engine.template = Some(Template::compile(
+                    include_str!("../../../tests/fixtures/chat-template/models/iquest/chat_template.jinja"),
+                    RenderClock::Fixed(0),
+                ).unwrap());
+            }
+            engine.prefix_width = 2;
+            let mut out = Vec::new();
+            generate_and_write(
+                &mut engine,
+                &parsed,
+                "thinking-sample",
+                CREATED_TEST,
+                false,
+                16,
+                &mut out,
+            )
+            .unwrap();
+            let expected = if model_id == iquest {
+                (temperature, 9, 0.9, 0.03)
+            } else {
+                (DEFAULT_TEMPERATURE, 0, DEFAULT_TOP_P, DEFAULT_MIN_P)
+            };
+            assert!(!engine.sample_params.is_empty());
+            assert!(
+                engine
+                    .sample_params
+                    .iter()
+                    .all(|&params| params == expected),
+                "model {model_id}, requested {temperature}: {:?}",
+                engine.sample_params
+            );
+            assert_eq!(
+                !engine.prefix_budgets.is_empty(),
+                model_id == iquest && temperature == 0.0
+            );
+        }
+    }
+}
+
+#[test]
 fn stop_list_find_matches_c_order() {
     let stops = vec!["STOP".into(), "END".into()];
     assert_eq!(
         stop_list_find_from(&stops, b"hello STOP tail END", 0),
         Some((6, 4))
     );
+}
+
+#[test]
+fn iquest_structured_tools_allow_dedicated_output_parser() {
+    let model_id = ds4_core::Variant::IQuestQ1 as i32;
+    let plain = user_req();
+    assert_eq!(generation_blocked(&plain, model_id), None);
+    let expected = None;
+    let mut tools = plain.clone();
+    tools.has_tools = true;
+    assert_eq!(generation_blocked(&tools, model_id), expected);
+    assert_eq!(generation_blocked(&tools, 0), None);
+    let mut results = plain.clone();
+    results.has_tool_results = true;
+    assert_eq!(generation_blocked(&results, model_id), expected);
+    let mut history = plain.clone();
+    history.messages[0].calls.push(ToolCall::default());
+    assert_eq!(generation_blocked(&history, model_id), expected);
 }
 
 #[test]

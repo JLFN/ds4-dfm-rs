@@ -69,6 +69,37 @@ order and every BF16 down/product/partial-sum/residual boundary. Dense layer
 zero and widths one through seven keep the original pair. The validated F32
 buffers must be disjoint; fallback scratch remains allocated.
 
+## Qwen vision attention
+
+On runtime `sm_121`, 72-value heads with at least 512 total patches use
+four queries per warp to reuse K/V registers. Other devices retain two
+queries; small inputs and other head widths retain their existing dispatch.
+Per-key FP32 dot, online softmax and value accumulation order stay exact.
+Blocks crossing image segments use the original per-row helper.
+Eligible four-query blocks pack shared K/V into vector loads without increasing
+shared storage. Packing is speed-qualified on Darwin GB10.
+The same eligible shapes fuse QKV bias with RoPE by default, rounding each
+bias sum before the unchanged rotation and storing biased V.
+
+| Variable | Diagnostic control |
+|---|---|
+| `DS4_QWEN_VISION_QUAD=0` | Restore two queries per warp. |
+| `DS4_QWEN_VISION_QUAD=1` | Force four queries on other CUDA devices for qualification. |
+| `DS4_QWEN_VISION_PACK=0` | Restore scalar shared K/V loads on the four-query path. |
+| `DS4_QWEN_VISION_PACK=1` | Enable packed shared K/V on eligible sm121 four-query blocks. |
+| `DS4_QWEN_VISION_FUSE_ROPE=0` | Restore separate QKV bias and RoPE kernels. |
+| `DS4_QWEN_VISION_FUSE_ROPE=1` | Enable eligible QKV bias/RoPE fusion; also the unset default. |
+| `DS4_QWEN_VISION_LEGACY=1` | Restore the original eight-query block. |
+| `DS4_CUDA_NO_QWEN_VISION_TILE=1` | Restore untiled per-row attention. |
+
+The controls are read per dispatch. The untiled override takes precedence,
+then legacy, then quad; packing applies within eligible quad dispatch.
+Bias/RoPE fusion is independent of attention controls; unrecognized fusion
+values retain the separate kernels.
+Fresh Darwin GB10 evidence is recorded in
+[`docs/qwen-vision-2026-10-02.md`](../docs/qwen-vision-2026-10-02.md) and
+[`the follow-up`](../docs/qwen-vision-followup-2026-10-02.md).
+
 ## Qwen embedded MTP
 
 The Q8 draft head scores low BPE IDs, non-normal token types and observed
@@ -199,6 +230,41 @@ The bandwidth figure is informational; we don't tier on it.
   prefill. Unset uses the GQA2 HMMA tiles already used on full-attention
   layers. EXAONE/K2 SWA stays on the warp path.
 
+- `DS4_IQUEST_ATTN_SHUFFLE=0` restores the shared-memory attention
+  reduction. The default keeps the same FP32 addition tree while replacing
+  six block barriers with warp shuffles. Both BF16 output boundaries and
+  the learned-key sink remain unchanged. Read once per process.
+- `DS4_IQUEST_ATTN_WARP=0` keeps the retained 128-thread reduction for
+  128-row full/SWA prefill. With tiled attention disabled, four independent
+  head warps share each block. Wider tails and the draft window retain the old
+  launch; single-row calls use the cached dispatch below.
+  `DS4_IQUEST_ATTN_SHUFFLE=0` also disables this path. Read once
+  per process.
+- `DS4_IQUEST_ROUTER_WARP=0` restores serial expert selection for
+  single-row calls. The default distributes the 256-expert/top8 scan over
+  one warp, preserving lower-ID ties, first-unused NaN behavior and the
+  serial selected-softmax normalization. Wider calls retain the old path.
+  No extra allocation or persistent state. Read once per process.
+- `DS4_IQUEST_ATTN_CACHED=0` restores retained shuffle attention for
+  single-row full/SWA4096 calls. The default stages 128 compressed Q8 keys
+  per CTA, then keeps the original key order, reduction tree, online FMA
+  recurrence, learned sink and BF16 boundaries. It uses 34816 B static
+  shared memory and no global scratch. Recursive window512 and wider
+  rows fall back; parent `DS4_IQUEST_ATTN_SHUFFLE=0` also disables it.
+- `DS4_IQUEST_ATTN_ASYNC=0` uses synchronous copies inside cached
+  single-row attention. On SM80+ compiled targets, the default issues
+  disjoint eight-byte asynchronous copies, waits for each producer, then
+  synchronizes the CTA before reading the compressed tile. Arithmetic,
+  tile size and allocation stay unchanged. The cached/shuffle parent
+  fallbacks also disable this path. Read once per process.
+- `DS4_IQUEST_ATTN_TILED=0` restores the four-head warp prefill path.
+  The default uses TF32-pair tiles for 128-row full/SWA prefill on CUDA
+  targets supporting TF32 MMA. Q8 KV stays canonical; bounded PV tiles
+  merge in FP32 before ordinary BF16 output, then the F32 learned-key sink
+  and second BF16 store. This changes arithmetic order and is not bit-exact.
+  LSE needs 24 KiB of common temporary storage. Parent shuffle/warp switches
+  also disable it; tails, decode and the 512-token draft window fall back.
+  Read once per process. See the [measured numerical and speed scope](../docs/benchmarks/2026-10-01-iquest-q1-optimization-gb10.md).
 - `DS4_MIMO2_SWA_DECODE=0` restores MiMo's one-row, window-128 attention
   walk. The default shares KV across eight query heads. `DS4_MIMO2_SWA_VEC=0`
   selects scalar copies inside the shared tile. Both accept `0` and `1` in
@@ -1061,3 +1127,56 @@ ceiling drops by ~50% on discrete GPUs in exchange for the parity.
   provides identical VMM ranges and running both would double-allocate
   the model. See `misc/proof-harness/README.md` for the sidecar
   lifecycle.
+
+- `DS4_GLM53_LOW_ATTN=0` restores reference GLM-5.3 compact attention.
+  Default enabled: pair latent outputs only for selected2051/128-row/
+  64-head/latent512 prefill. Preserve each output's FMA order; no added
+  workspace. Decode and other shapes keep the reference kernel. The
+  unrestricted pair path regressed whole-model decode and was rejected.
+- `DS4_GLM53_LOW_ATTN_WIDE=0` restores reference attention for 129–2048 rows.
+  Default enabled for selected 2051/64-head/latent512 prefill; preserve each
+  output's FMA order. Decode and other shapes retain the reference.
+- `DS4_GLM53_GATE_UP_PAIR=0` restores separate mixed gate/up preparation.
+  Default enabled above 8 rows for raw/padded IQ2_XXS, IQ2_XS and Q4_K pairs.
+  Share Q8_1 activations and routing maps without weight repacking. Same-width
+  outputs are exact; small-width Decode keeps its existing path.
+- `DS4_GLM53_DENSE_GEMM=1` enables diagnostic dense Tensor Core attention.
+  Default Off: FP16 Q/probability with FP32 accumulation passes its rounded
+  reference but loses two codes in the recorded 6K retrieval at 2048 rows.
+  Dense rows 128–2048/keys<=2051 only; sparse and Decode remain unchanged.
+- `DS4_GLM53_PREFILL_ROWS=N` requests 1–2048 physical rows (default 2048).
+  Rust fits workspace against weights, active KV/state, checkpoints, media
+  and reserve; it reports the effective width while preserving context/banks.
+- `DS4_GLM53_PREFILL_WINDOW=0` disables checkpoint-aligned layer-major
+  SSD Prefill. Default On when eligible; GEMMs remain <=2048 rows. One bank,
+  rows >=128 and at least two full expert layers are required. Short appends,
+  two banks and smaller caches use selected-expert supply. Rust publishes 0
+  when the admitted plan cannot use the window, including serial media graphs.
+- `DS4_GLM53_PREFETCH=0` disables whole-next-layer supply inside
+  the layer-major window. Default On; two staging groups share the expert
+  budget, with one bounded pageable reader and a separate CUDA upload stream.
+- `DS4_GLM53_HOT_CACHE=0` disables recent-route retention during
+  selected-expert Prefill. Default On; protect the last 8 rows of each layer
+  only when capacity also leaves one complete layer free. No added workspace.
+  Same-width logits/tokens are exact. The recorded 24 GiB 2K A/B reduces first
+  Decode-token waiting and improves sustained Decode without added storage.
+  See `docs/glm53-prefill-2026-10-08.md` for the adoption and workload boundary.
+- `DS4_GLM53_HOT_COPY=0` restores last-eight-row grouped cache retention.
+  Default On fills the funded hot area from recent unique routes across
+  physical chunks. It adds weight copies without enlarging the GPU pool.
+- `DS4_GLM53_HOT_LAST=0` copies grouped hot weights after every window.
+  Default On skips intermediate copies without a requested logits frontier.
+  The fixed 10000-slot 8K+64 A/B improves whole latency 1.35%, with 2.6% lower
+  Prefill throughput and 65.1% higher Decode. See the campaign for scope.
+- `DS4_GLM53_POOL_WARP=0` restores reference GLM-5.3 pooled index scores.
+  Default enabled for32 heads: compute independent heads in separate warps,
+  preserving the original dot-product tree and ordered head sum. No added
+  workspace; registers/key reads increase while synchronization decreases.
+  Other head counts retain the reference kernel.
+  See `docs/glm53-uncensored.md` for the matched resident A/B boundary.
+- `DS4_GLM53_SHARED_Q8=0` restores separate GLM shared gate/up and SwiGLU.
+  Default enabled only for eager Spark decode, raw Q8_0, K4096/M2048 and
+  clamp10. Quantize Q8_1 once; preserve each dot and the four-warp tree.
+  Aligned artifacts, capture and other shapes retain the reference path.
+  No global workspace growth; paired static shared memory is768B.
+  Three fresh2K pairs improve decode0.27–0.47%;8K remains within variation.

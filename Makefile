@@ -1,5 +1,6 @@
 CC ?= cc
 UNAME_S := $(shell uname -s)
+IQUEST_NATIVE_INCS := ds4_iquest_ref.h ds4_iquest_bind.inc ds4_iquest_graph.inc ds4_iquest_session.inc ds4_iquest_payload.inc ds4_iquest_batch.inc ds4_iquest_bank_payload.inc
 NAIVE_NATIVE_INCS := ds4_naive_plan.h ds4_naive_bind.inc ds4_naive_draft.inc ds4_naive_graph.inc ds4_naive_session.inc ds4_naive_mtp.inc ds4_naive_payload.inc ds4_naive_batch.inc ds4_naive_bank_payload.inc
 
 ifeq ($(UNAME_S),Darwin)
@@ -21,6 +22,8 @@ DS4_DOTS3_MODEL ?=
 DS4_QWEN4EXP_MODEL ?=
 DS4_QWEN4EXP_ROOT ?=
 DS4_QWEN4EXP_SOURCE ?=
+DS4_QWEN_VISION_TOKENS ?=
+DS4_QWEN_VISION_IMAGES ?= tests/fixtures/qwen-images/screen.png
 DS4_GLM53_MODEL ?=
 DS4_GLM53_VISION_MODEL ?=
 CUDA_EXTRA_BINS :=
@@ -97,7 +100,8 @@ endif
         test-qwen4exp-gdn-forward test-qwen4exp-qsa \
         test-qwen4exp-qsa-forward test-qwen4exp-batch \
         test-qwen4exp-verify \
-        test-qwen-vision-attention test-qwen-vision-model test-qwen-vision-norm \
+        test-qwen-vision-attention test-qwen-vision-model test-qwen-vision-host \
+        test-qwen-vision-norm test-qwen-vision-rope \
         test-mmid-fast \
         test-mmq-parity test-qwen35-cuda test-model-family-kernels test-inkling-kernels test-inkling-moe \
         test-inkling-attn-prep test-inkling-attention test-inkling-norm test-inkling-linear test-inkling-batch test-inkling-q8-batch test-inkling-media \
@@ -310,7 +314,7 @@ proof-rust-cuda-opp-c: ds4 ds4-c
 			--work-dir "$$root/rust" --check-expected "$$expected"
 endif
 
-ds4.o: ds4.c $(NAIVE_NATIVE_INCS) ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_mimo2_graph.inc ds4_mimo2_batch.inc ds4_mimo2_session.inc ds4_mimo2_mtp.inc ds4_mimo2_media.inc ds4_mimo2_payload.inc ds4_mimo2_dflash.inc cuda/mimo2_dflash_host.h ds4_dots3_batch.inc ds4_dots3_mtp.inc ds4_step37_graph.inc ds4_step37_vision.inc ds4_ling3vl_graph.inc ds4_ling3vl_vision.inc ds4_ling3vl_rope.h ds4_ling3vl_batch.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h vendor/stb_image.h
+ds4.o: ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS) ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_mimo2_graph.inc ds4_mimo2_batch.inc ds4_mimo2_session.inc ds4_mimo2_mtp.inc ds4_mimo2_media.inc ds4_mimo2_payload.inc ds4_mimo2_dflash.inc cuda/mimo2_dflash_host.h ds4_dots3_batch.inc ds4_dots3_mtp.inc ds4_step37_graph.inc ds4_step37_vision.inc ds4_ling3vl_graph.inc ds4_ling3vl_vision.inc ds4_ling3vl_rope.h ds4_ling3vl_batch.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h vendor/stb_image.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 # Rust FFI seam: wraps ds4.h so crates/ds4-sys never bindgens the engine header.
@@ -390,6 +394,66 @@ tests/naive_gate: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
 	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/naive_gate" $@
+
+# Common residency probes use at most one MiB of actual model-file mapping.
+tests/weight_mapping_probe: tests/test_weight_mapping.cu
+	$(NVCC) $(NVCCFLAGS) -o $@ $< -lcudart
+
+tests/weight_mapping_policy: tests/test_weight_mapping_policy.cu $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -DDS4_USE_CUDA -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_iquest_primitives: tests/test_iquest_primitives.cu cuda/iquest_primitives.cuh ds4_iquest_ref.h
+	$(NVCC) $(NVCCFLAGS) --fmad=false -o $@ $<
+
+tests/iquest_attention_profile: tests/iquest_attention_profile.cu cuda/iquest_primitives.cuh cuda/iquest_prefill.cuh cuda/iquest_decode.cuh ds4_iquest_ref.h
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+tests/iquest_attn_precision: tests/iquest_attn_precision.cu cuda/iquest_prefill.cuh cuda/iquest_primitives.cuh ds4_iquest_ref.h
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+tests/iquest_reduce_verify: tests/iquest_reduce_verify.cu cuda/iquest_primitives.cuh ds4_iquest_ref.h
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+tests/iquest_router_profile: tests/iquest_router_profile.cu cuda/iquest_primitives.cuh cuda/iquest_router.cuh ds4_iquest_ref.h
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+tests/iquest_router_verify: tests/iquest_router_verify.cu cuda/iquest_router.cuh cuda/iquest_primitives.cuh ds4_iquest_ref.h
+	$(NVCC) $(NVCCFLAGS) -o $@ $<
+
+tests/test_iquest_dispatch: tests/test_iquest_dispatch.c ds4.c $(IQUEST_NATIVE_INCS)
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+.PHONY: test-iquest-primitives test-iquest-dispatch
+test-iquest-primitives: tests/test_iquest_primitives
+	./tests/test_iquest_primitives
+
+test-iquest-dispatch: tests/test_iquest_dispatch
+	./tests/test_iquest_dispatch
+
+tests/iquest_verify: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --example iquest_verify --release --features native -- \
+		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/iquest_verify" $@
+
+tests/iquest_bank_verify: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --example iquest_bank_verify --release --features native -- \
+		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/iquest_bank_verify" $@
+
+tests/iquest_perf_verify: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --example iquest_perf_verify --release --features native -- \
+		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/iquest_perf_verify" $@
+
+tests/test_iquest_prefix: tests/test_iquest_prefix.c ds4.c $(IQUEST_NATIVE_INCS) $(DS4_CUDA_SUPPORT_OBJS)
+	$(CC) $(CFLAGS) -DDS4_USE_CUDA -ffunction-sections -fdata-sections -c -o tests/test_iquest_prefix.o tests/test_iquest_prefix.c
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/test_iquest_prefix.o $(DS4_CUDA_SUPPORT_OBJS) -Xlinker --gc-sections $(CUDA_LDLIBS)
 
 tests/naive_serve_gate: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --example naive_serve_gate --release --features native -- \
@@ -715,7 +779,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4_naive_bind.inc ds4_naive_plan.h ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c $(IQUEST_NATIVE_INCS) ds4_naive_bind.inc ds4_naive_plan.h ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h linenoise.h
@@ -733,10 +797,10 @@ ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_go
 ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
-ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_naive_stub.inc $(METAL_SRCS)
+ds4_metal.o: ds4_metal.m ds4_gpu.h ds4_naive_stub.inc ds4_iquest_stub.inc $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_qwen35_gpu.cuh cuda/qwen35_primitives.cuh cuda/qwen35_attn_gdn.cuh ds4_mimo2_gpu.cuh cuda/mimo2_primitives.cuh cuda/mimo2_prefill.cuh cuda/mimo2_media.cuh cuda/mimo2_dflash_attn.cuh cuda/mimo2_dflash_host.h ds4_glm53_vision_gpu.cuh ds4_inkling_gpu.cuh ds4_step37_gpu.cuh cuda/step37_primitives.cuh ds4_step37_vision_gpu.cuh cuda/step37_vision.cuh ds4_ling3vl_gpu.cuh cuda/ling3vl_primitives.cuh ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h cuda/mmq/ds4_mmq.h ds4_naive_gpu.cuh cuda/naive_primitives.cuh cuda/naive_sparse_tile.cuh cuda/naive_draft.cuh ds4_naive_plan.h
+ds4_cuda.o: ds4_cuda.cu ds4_iquest_gpu.cuh ds4_iquest_ref.h cuda/iquest_primitives.cuh cuda/iquest_prefill.cuh cuda/iquest_decode.cuh cuda/iquest_router.cuh ds4_gpu.h ds4_qwen35_gpu.cuh cuda/qwen35_primitives.cuh cuda/qwen35_attn_gdn.cuh ds4_mimo2_gpu.cuh cuda/mimo2_primitives.cuh cuda/mimo2_prefill.cuh cuda/mimo2_media.cuh cuda/mimo2_dflash_attn.cuh cuda/mimo2_dflash_host.h ds4_glm53_vision_gpu.cuh ds4_inkling_gpu.cuh ds4_step37_gpu.cuh cuda/step37_primitives.cuh ds4_step37_vision_gpu.cuh cuda/step37_vision.cuh ds4_ling3vl_gpu.cuh cuda/ling3vl_primitives.cuh ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h cuda/mmq/ds4_mmq.h ds4_naive_gpu.cuh cuda/naive_primitives.cuh cuda/naive_sparse_tile.cuh cuda/naive_draft.cuh ds4_naive_plan.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces. ds4_mmq.cu transitively pulls in mmq.cuh which has
@@ -744,7 +808,7 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_qwen35_gpu.cuh cuda/qwen35_primitives.cuh 
 cuda/mmq/ds4_ggml_stubs.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
 
-cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/ds4_mmq_pipe.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/mmvq.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/ds4_mimo2_swiglu.cuh
+cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/ds4_mmq_pipe.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/mmvq.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh cuda/mmq/ds4_mimo2_swiglu.cuh cuda/mmq/ds4_glm_q2.h cuda/mmq/ds4_glm_shared.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_mmq_d2r.o: cuda/mmq/ds4_mmq_d2r.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
@@ -907,14 +971,14 @@ tests/test_step37_vision_ops: tests/test_step37_vision_ops.cu cuda/step37_vision
 test-step37-vision-ops: tests/test_step37_vision_ops
 	./tests/test_step37_vision_ops
 
-tests/naive_state: tests/naive_state.c ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_state: tests/naive_state.c ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
 
 .PHONY: test-naive-state
 test-naive-state: tests/naive_state
 	./tests/naive_state
 
-tests/naive_dense.o: tests/naive_dense.c ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_dense.o: tests/naive_dense.c ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
 tests/naive_dense: tests/naive_dense.o $(DS4_CUDA_SUPPORT_OBJS)
@@ -924,25 +988,25 @@ tests/naive_dense: tests/naive_dense.o $(DS4_CUDA_SUPPORT_OBJS)
 test-naive-dense: tests/naive_dense
 	./tests/naive_dense
 
-tests/naive_graph.o: tests/naive_graph.c tests/naive_state_fixture.h ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_graph.o: tests/naive_graph.c tests/naive_state_fixture.h ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
 tests/naive_graph: tests/naive_graph.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -Xlinker --gc-sections -o $@ $^ $(CUDA_LDLIBS)
 
-tests/naive_banks.o: tests/naive_banks.c tests/naive_state_fixture.h ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_banks.o: tests/naive_banks.c tests/naive_state_fixture.h ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
 tests/naive_banks: tests/naive_banks.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -Xlinker --gc-sections -o $@ $^ $(CUDA_LDLIBS)
 
-tests/naive_trial.o: tests/naive_trial.c tests/naive_state_fixture.h ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_trial.o: tests/naive_trial.c tests/naive_state_fixture.h ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
 tests/naive_trial: tests/naive_trial.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -Xlinker --gc-sections -o $@ $^ $(CUDA_LDLIBS)
 
-tests/naive_trial_live.o: tests/naive_trial_live.c ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_trial_live.o: tests/naive_trial_live.c ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
 tests/naive_trial_live: tests/naive_trial_live.o $(DS4_CUDA_SUPPORT_OBJS)
@@ -985,7 +1049,7 @@ tests/naive_draft_ops: tests/naive_draft_ops.cu cuda/naive_primitives.cuh cuda/n
 test-naive-draft-ops: tests/naive_draft_ops
 	./tests/naive_draft_ops
 
-tests/naive_draft_graph.o: tests/naive_draft_graph.c ds4.c $(NAIVE_NATIVE_INCS)
+tests/naive_draft_graph.o: tests/naive_draft_graph.c ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS)
 	$(CC) $(CFLAGS) -O0 -Wno-unused-function -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
 tests/naive_draft_graph: tests/naive_draft_graph.o $(DS4_CUDA_SUPPORT_OBJS)
@@ -1215,6 +1279,15 @@ tests/test_qwen_vision_attention.o: tests/test_qwen_vision_attention.c ds4_gpu.h
 tests/test_qwen_vision_norm.o: tests/test_qwen_vision_norm.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
+tests/test_qwen_vision_rope.o: tests/test_qwen_vision_rope.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_qwen_vision_rope: tests/test_qwen_vision_rope.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen-vision-rope: tests/test_qwen_vision_rope
+	./tests/test_qwen_vision_rope
+
 tests/test_qwen_vision_norm: tests/test_qwen_vision_norm.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
@@ -1237,6 +1310,18 @@ tests/test_qwen_vision_model: tests/test_qwen_vision_model.o $(DS4_CUDA_SUPPORT_
 test-qwen-vision-model: tests/test_qwen_vision_model
 	@test -n "$(DS4_QWEN4EXP_MODEL)" || (echo "Set DS4_QWEN4EXP_MODEL to the Qwen GGUF"; exit 1)
 	./tests/test_qwen_vision_model "$(DS4_QWEN4EXP_MODEL)" tests/fixtures/qwen-images/screen.png
+
+# Rust-tokenized full-model gate; no retained C tokenizer is invoked.
+tests/test_qwen_vision_host.o: tests/test_qwen_vision_host.c ds4.c ds4.h ds4_gpu.h native/bridge/ds4_host_load.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen_vision_host: tests/test_qwen_vision_host.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen-vision-host: tests/test_qwen_vision_host
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || (echo "Set DS4_QWEN4EXP_MODEL to the Qwen/Darwin GGUF"; exit 1)
+	@test -n "$(DS4_QWEN_VISION_TOKENS)" || (echo "Set DS4_QWEN_VISION_TOKENS to Rust --dump-tokens output"; exit 1)
+	./tests/test_qwen_vision_host "$(DS4_QWEN4EXP_MODEL)" "$(DS4_QWEN_VISION_TOKENS)" $(DS4_QWEN_VISION_IMAGES)
 
 test-qwen4exp-primitives: tests/test_qwen4exp_primitives
 	./tests/test_qwen4exp_primitives
@@ -1588,6 +1673,188 @@ test-glm53-loader: tests/test_glm53_loader
 		{ echo "set DS4_GLM53_MODEL to GLM-5.3-Flash-Q2.gguf" >&2; exit 2; }
 	./tests/test_glm53_loader "$(DS4_GLM53_MODEL)"
 
+tests/test_glm53_quant: tests/test_glm53_quant.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-glm53-quant: tests/test_glm53_quant
+	./tests/test_glm53_quant
+
+tests/test_glm53_mixed.o: tests/test_glm53_mixed.c ds4_gpu.h cuda/mmq/ggml-common.h
+	$(CC) $(CFLAGS) -std=c11 -I. -c -o $@ $<
+
+tests/test_glm53_mixed: tests/test_glm53_mixed.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-glm53-mixed: tests/test_glm53_mixed
+	./tests/test_glm53_mixed
+
+tests/test_glm53_pair: tests/test_glm53_pair.cu $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $^ $(CUDA_LDLIBS)
+
+test-glm53-pair: tests/test_glm53_pair
+	./tests/test_glm53_pair
+
+tests/test_glm53_dense_gemm: tests/test_glm53_dense_gemm.cu cuda/glm53_dense_attn.cuh ds4_glm53_attn.h
+	$(NVCC) $(NVCCFLAGS) -DTEST_DENSE_GEMM -I. -o $@ $< $(CUDA_LDLIBS)
+
+test-glm53-dense-gemm: tests/test_glm53_dense_gemm
+	./tests/test_glm53_dense_gemm
+
+tests/test_glm53_upload_async: tests/test_glm53_upload_async.cu $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $^ $(CUDA_LDLIBS)
+
+test-glm53-upload-async: tests/test_glm53_upload_async
+	./tests/test_glm53_upload_async
+
+tests/glm53_state_gate: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --example glm53_state_gate --release --features native -- \
+		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/glm53_state_gate" $@
+
+tests/glm53_mtp_gate: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --example glm53_mtp_gate --release --features native -- \
+		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/glm53_mtp_gate" $@
+
+GLM53_NATIVE_DEPS = ds4_glm53_cache.h ds4_glm53_stream.inc ds4_glm53_compact.h \
+	ds4_glm53_graph.inc ds4_glm53_payload.inc ds4_glm53_mtp.inc ds4_glm53_batch.inc \
+	ds4_glm53_image.inc
+ds4.o: $(GLM53_NATIVE_DEPS)
+tests/test_glm53_loader tests/test_glm53_vision_loader tests/test_glm53_image \
+	tests/test_glm53_vision.o tests/test_glm53_bounds.o tests/test_glm53_stream \
+	tests/test_glm53_payload: $(GLM53_NATIVE_DEPS)
+ds4_cuda.o: ds4_glm53_compact.h ds4_glm53_compact_gpu.cuh ds4_glm53_map.inc cuda/glm53_dense_attn.cuh \
+	cuda/glm53_vision_norm.cuh ds4_glm53_attn.h cuda/glm53_low_attn.cuh cuda/glm53_pool_score.cuh
+
+tests/test_glm53_cache: tests/test_glm53_cache.c ds4_glm53_cache.h
+	$(CC) $(CFLAGS) -Werror -o $@ $<
+
+tests/test_glm53_compact.o: tests/test_glm53_compact.c ds4_glm53_compact.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm53_compact: tests/test_glm53_compact.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-glm53-cache test-glm53-compact
+test-glm53-cache: tests/test_glm53_cache
+	./tests/test_glm53_cache
+
+tests/test_glm53_stream: tests/test_glm53_stream.c ds4.c ds4.h ds4_gpu.h ds4_glm53_cache.h ds4_glm53_stream.inc
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ $< -Wl,--gc-sections -lm -pthread
+
+.PHONY: test-glm53-stream
+test-glm53-stream: tests/test_glm53_stream
+	./tests/test_glm53_stream
+
+.PHONY: test-glm53-lifetime
+test-glm53-lifetime:
+	@glm_fixture_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$glm_fixture_dir"' EXIT; \
+	python3 tests/test_glm53_close_fixture.py "$$glm_fixture_dir/close" \
+		ctor close finish finish_retry finish_cancel && \
+	python3 tests/test_glm53_prefill_fixture.py "$$glm_fixture_dir/prefill"
+
+.PHONY: test-glm53-fit
+test-glm53-fit:
+	@glm_fixture_dir=$$(mktemp -d); \
+	trap 'rm -rf "$$glm_fixture_dir"' EXIT; \
+	DS4_GLM_FIT_POLICY_RECEIPT="$$glm_fixture_dir/window" \
+		cargo test -p ds4-core --lib glm_fit_keeps_retry_window --locked -- --test-threads=1 && \
+	python3 tests/test_glm53_fit_fixture.py "$$glm_fixture_dir/fit" --sanitize \
+		--window-policy "$$glm_fixture_dir/window" && \
+	python3 tests/test_glm53_lazy_fixture.py "$$glm_fixture_dir/lazy" --sanitize
+
+tests/test_glm53_width: tests/test_glm53_width.cu $(DS4_CUDA_CORE_OBJS)
+	@test -f "$(DS4_GLM53_WIDTH_FIXTURE)/weights.h" || \
+		{ echo "set DS4_GLM53_WIDTH_FIXTURE to the extracted fixture directory" >&2; exit 2; }
+	$(NVCC) $(NVCCFLAGS) -I. -I"$(DS4_GLM53_WIDTH_FIXTURE)" -o $@ $^ $(CUDA_LDLIBS)
+
+test-glm53-compact: tests/test_glm53_compact
+	./tests/test_glm53_compact
+
+tests/test_glm53_weight.o: tests/test_glm53_weight.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm53_weight: tests/test_glm53_weight.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-glm53-weight: tests/test_glm53_weight
+	./tests/test_glm53_weight
+	./tests/test_glm53_weight freeze
+
+tests/test_glm53_payload: tests/test_glm53_payload.c ds4.c ds4.h ds4_glm53_payload.inc ds4_glm53_compact.h
+	$(CC) $(CFLAGS) -O0 -fno-fast-math -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-glm53-payload: tests/test_glm53_payload
+	./tests/test_glm53_payload
+
+tests/test_glm53_stop: tests/test_glm53_stop.c ds4.c ds4.h $(GLM53_NATIVE_DEPS)
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+.PHONY: test-glm53-stop
+test-glm53-stop: tests/test_glm53_stop
+	./tests/test_glm53_stop
+
+tests/test_glm53_tokens: tests/test_glm53_tokens.c ds4.c ds4.h $(GLM53_NATIVE_DEPS)
+	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+tests/test_glm53_mtp: tests/test_glm53_mtp.c ds4_glm53_mtp.inc ds4_gpu.h
+	$(CC) $(CFLAGS) -Werror -Wno-unused-function -I. -o $@ $< -lm
+
+test-glm53-mtp: tests/test_glm53_mtp
+	./tests/test_glm53_mtp
+
+tests/test_glm53_banks: tests/test_glm53_banks.c ds4_glm53_batch.inc ds4_glm53_compact.h
+	$(CC) $(CFLAGS) -Werror -I. -o $@ $< -lm
+
+test-glm53-banks: tests/test_glm53_banks
+	./tests/test_glm53_banks
+
+tests/test_glm53_map: tests/test_glm53_map.c ds4_glm53_map.inc
+	$(CC) $(CFLAGS) -Werror -Wno-unused-function -I. -o $@ $<
+
+test-glm53-map: tests/test_glm53_map
+	./tests/test_glm53_map
+
+tests/test_glm53_vision_norm: tests/test_glm53_vision_norm.cu cuda/glm53_vision_norm.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< -lcudart
+
+test-glm53-vision-norm: tests/test_glm53_vision_norm
+	./tests/test_glm53_vision_norm
+
+tests/test_glm53_attention: tests/test_glm53_attention.c ds4_glm53_attn.h
+	$(CC) $(CFLAGS) -Werror -I. -o $@ $<
+
+tests/test_glm53_attention_cuda: tests/test_glm53_attention.cu ds4_glm53_attn.h cuda/glm53_low_attn.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< -lcudart
+
+tests/bench_glm53_attention: tests/bench_glm53_attention.cu ds4_glm53_attn.h ds4_glm53_compact.h cuda/glm53_low_attn.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< -lcudart
+
+tests/bench_glm53_pool: tests/bench_glm53_pool.cu ds4_glm53_compact.h cuda/glm53_pool_score.cuh
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< -lcudart
+
+tests/bench_glm53_shared: tests/bench_glm53_shared.cu $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: test-glm53-attention test-glm53-attention-cuda
+test-glm53-attention: tests/test_glm53_attention
+	./tests/test_glm53_attention
+
+test-glm53-attention-cuda: tests/test_glm53_attention_cuda
+	./tests/test_glm53_attention_cuda
+
+.PHONY: test-glm53-quant test-glm53-mixed test-glm53-weight \
+	test-glm53-payload test-glm53-mtp test-glm53-banks test-glm53-map test-glm53-vision-norm
+
 tests/test_glm53_vision_loader: tests/test_glm53_vision_loader.c ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -O0 -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
@@ -1650,6 +1917,43 @@ tests/test_glm53_session.o: tests/test_glm53_session.c ds4.h
 
 tests/test_glm53_session: tests/test_glm53_session.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_glm53_long.o: tests/test_glm53_long.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_glm53_long: tests/test_glm53_long.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_glm53_mtp_actual.o: tests/test_glm53_mtp_actual.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_glm53_mtp_actual: tests/test_glm53_mtp_actual.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/test_glm53_compare: tests/test_glm53_mtp_long.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -DGLM53_COMPARE_ONLY -I. -o $@ $<
+
+tests/test_glm53_mtp_long.o: tests/test_glm53_mtp_long.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_glm53_mtp_long: tests/test_glm53_mtp_long.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+tests/bench_glm53_stream.o: tests/bench_glm53_stream.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -I. -c -o $@ $<
+
+tests/bench_glm53_stream: tests/bench_glm53_stream.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+# Build only; the operator runs each arm in a separate process.
+.PHONY: bench-glm53-stream glm53-stream-plan
+bench-glm53-stream: tests/bench_glm53_stream
+
+glm53-stream-plan:
+	@test -n "$(DS4_GLM53_MODEL)" -a -n "$(DS4_GLM53_HASH_RECEIPT)" -a -n "$(DS4_GLM53_IO_PLAN_DIR)" || \
+		{ echo "set DS4_GLM53_MODEL, DS4_GLM53_HASH_RECEIPT and DS4_GLM53_IO_PLAN_DIR" >&2; exit 2; }
+	python3 tests/glm53_stream_fixture.py --model "$(DS4_GLM53_MODEL)" \
+		--receipt "$(DS4_GLM53_HASH_RECEIPT)" --output "$(DS4_GLM53_IO_PLAN_DIR)"
 
 test-glm53-session: tests/test_glm53_session
 	@test -n "$(DS4_GLM53_MODEL)" || \
@@ -1900,6 +2204,11 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
+	rm -f tests/bench_glm53_attention tests/bench_glm53_pool tests/bench_glm53_shared
+	rm -f tests/bench_glm53_stream tests/bench_glm53_stream.o
+	rm -f tests/test_glm53_tokens tests/test_glm53_long tests/test_glm53_long.o tests/test_glm53_mtp_actual tests/test_glm53_mtp_actual.o
+	rm -f tests/test_glm53_compare tests/test_glm53_mtp_long tests/test_glm53_mtp_long.o
+	rm -f tests/test_glm53_quant tests/test_glm53_mixed tests/test_glm53_mixed.o tests/test_glm53_compact tests/test_glm53_compact.o tests/test_glm53_cache tests/test_glm53_stream tests/test_glm53_weight tests/test_glm53_weight.o tests/test_glm53_payload tests/test_glm53_stop tests/test_glm53_mtp tests/test_glm53_banks tests/test_glm53_map tests/test_glm53_vision_norm tests/test_glm53_attention tests/test_glm53_attention_cuda
 	rm -f tests/test_qwen35_ref
 	rm -f tests/test_solar_fattn tests/test_solar_fattn.o
 	rm -f tests/test_step37_media tests/test_step37_media.o
@@ -1940,7 +2249,9 @@ clean:
 	rm -f tests/test_inkling_mtp_shared tests/test_inkling_mtp_shared.o
 	rm -f tests/test_inkling_encoders tests/test_inkling_encoders.o
 	rm -f tests/test_qwen_vision_norm tests/test_qwen_vision_norm.o
+	rm -f tests/test_qwen_vision_rope tests/test_qwen_vision_rope.o
 	rm -f tests/test_qwen_vision_attention tests/test_qwen_vision_attention.o tests/test_qwen_vision_model tests/test_qwen_vision_model.o
+	rm -f tests/test_qwen_vision_host tests/test_qwen_vision_host.o
 	rm -f ds4-agent-rs tests/parity/agent_c_oracle tests/parity/agent_c_oracle.o
 	rm -f tests/test_glm53_loader tests/test_glm53_vision_loader tests/test_glm53_image tests/test_glm53_vision tests/test_glm53_vision.o tests/test_glm53_dsa tests/test_glm53_dsa.o tests/test_glm53_session tests/test_glm53_session.o tests/test_glm53_bounds tests/test_glm53_bounds.o tests/test_k2_lifecycle tests/test_k2_lifecycle.o
 	rm -f tests/test_k2_rewind tests/test_deepseek_budget

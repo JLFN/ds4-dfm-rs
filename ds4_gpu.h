@@ -41,6 +41,10 @@ int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
+/* CUDA-owned cache weights: requires a bound model source and records
+ * WEIGHT_SPAN against it. Ordinary tensor_free releases the same charge.
+ * Returns NULL for zero bytes, an unbound source, or unsupported backends. */
+ds4_gpu_tensor *ds4_gpu_weight_alloc(const void *model_map, uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 /* R5 Inc1b: demand-mapped reserved tensors.  reserve() takes the full VIRTUAL
@@ -74,6 +78,13 @@ const void *ds4_gpu_tensor_ptr(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+/* Bounded SSD uploads use an independent stream. A completed write releases
+ * its host buffer without waiting for unrelated inference commands. */
+typedef struct ds4_gpu_upload ds4_gpu_upload;
+ds4_gpu_upload *ds4_gpu_upload_new(void);
+int ds4_gpu_upload_write(ds4_gpu_upload *upload, ds4_gpu_tensor *dst,
+                        uint64_t offset, const void *src, uint64_t bytes);
+void ds4_gpu_upload_free(ds4_gpu_upload *upload);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
@@ -573,6 +584,10 @@ void ds4_gpu_derived_artifact_stats(int *source, uint64_t *count, uint64_t *byte
 /* Print the canonical one-line boot banner for the artifact tier. */
 void ds4_gpu_report_derived_artifacts(void);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+/* Bounded SSD source: coherent CUDA host page tables are required. It never
+ * registers/copies the full mmap; the unit plan keeps routed experts cold. */
+int ds4_gpu_set_stream_map(const void *model_map, uint64_t model_size,
+        const uint64_t *offsets, const uint64_t *sizes, uint32_t count);
 /* Retire the host registration for one mapping BEFORE its owner frees it.
    Required for map-swapping callers (kernel unit tests); a registration that
    outlives its allocation poisons later cudaMemcpy calls whose host buffers
@@ -1134,6 +1149,11 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* Raw Q8 GLM shared decode only. 1=success, 0=refusal, -1=launch failure. */
+int ds4_gpu_glm53_shared_q8(ds4_gpu_tensor *mid, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, float clamp);
 
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
@@ -3827,6 +3847,19 @@ int ds4_gpu_routed_moe_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x);
 
+/* Raw GLM expert weights owned by the bounded SSD cache. Slot strides include
+ * padding; selected IDs index slots, preserving router order and weights. */
+int ds4_gpu_glm53_moe_owned(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const ds4_gpu_tensor *gate_w, const ds4_gpu_tensor *up_w,
+        const ds4_gpu_tensor *down_w, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_stride, uint64_t down_stride,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t experts, uint32_t used, uint32_t tokens, float clamp,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -5115,6 +5148,34 @@ int ds4_gpu_mimo2_to_ctime(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 int ds4_gpu_mimo2_code_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *ids,
         const void *map, uint64_t size, uint64_t offset,
         uint32_t n, uint32_t dim, uint32_t vocab, uint32_t channels);
+
+/* IQuest-Q1 primitives. These do not imply a qualified session graph.
+ * Q/K RMS is per head; call it before partial NeoX RoPE. KV is Q8_0.
+ * Caller admits monotonically contiguous live positions and ring retention. */
+int ds4_gpu_iquest_rms(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset, uint32_t width, uint32_t rows);
+int ds4_gpu_iquest_policy(void);
+int ds4_gpu_iquest_rope(ds4_gpu_tensor *x, const ds4_gpu_tensor *positions,
+        uint32_t heads, uint32_t rows, float theta);
+int ds4_gpu_iquest_router(ds4_gpu_tensor *ids, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, uint32_t rows);
+int ds4_gpu_iquest_kv(ds4_gpu_tensor *cache, const ds4_gpu_tensor *key,
+        const ds4_gpu_tensor *value, const ds4_gpu_tensor *positions,
+        uint32_t rows, uint32_t capacity);
+int ds4_gpu_iquest_attn(ds4_gpu_tensor *out, const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *cache, const ds4_gpu_tensor *positions,
+        const void *map, uint64_t size, uint64_t offset,
+        uint32_t rows, uint32_t capacity, uint32_t window);
+int ds4_gpu_iquest_add(ds4_gpu_tensor *out, const ds4_gpu_tensor *residual,
+        const ds4_gpu_tensor *branch, uint32_t rows, float scale);
+int ds4_gpu_iquest_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *experts,
+        const ds4_gpu_tensor *weights, uint32_t rows);
+int ds4_gpu_iquest_swiglu(ds4_gpu_tensor *out, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up, uint64_t count);
+int ds4_gpu_iquest_expert(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *ids, const void *map, uint64_t size, uint64_t offset,
+        uint32_t type, uint32_t in, uint32_t width, uint32_t rows,
+        uint32_t used, uint32_t input_used);
 
 int ds4_gpu_step37_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t offset,

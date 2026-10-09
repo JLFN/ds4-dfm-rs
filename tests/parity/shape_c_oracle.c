@@ -37,9 +37,9 @@ typedef enum {
     DS4_VARIANT_QWEN38_FLASH_NEXT = 6,
     DS4_VARIANT_GLM53_FLASH = 7,
     DS4_VARIANT_K2_HORIZON_375B = 8,
-    /* value 15 mirrors the Rust enum; the C engine spells the same table
-     * DS4_SHAPE_V41_FLASH (core_shape_select.c:81) */
-    DS4_VARIANT_V41 = 15,
+    /* value 16 mirrors the Rust enum (15 is IQuestQ1 upstream); the C engine
+     * spells the same table DS4_SHAPE_V41_FLASH (core_shape_select.c:81) */
+    DS4_VARIANT_V41 = 16,
 } ds4_variant;
 
 typedef struct {

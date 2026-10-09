@@ -232,7 +232,9 @@ unsafe extern "C" fn tramp_admit(ud: *mut c_void, req: *mut ds4_bridge_cont_requ
     r.seed = a.seed;
     r.sample_override = Some(tramp_sample_override);
     r.sample_exclude = a.exclude_eos.then_some(tramp_sample_exclude);
-    r.step_accept = Some(if t.family == crate::ModelFamily::NaiveN05 {
+    r.step_accept = Some(if t.family == crate::ModelFamily::IQuestQ1 {
+        crate::iquest::accept_banked
+    } else if t.family == crate::ModelFamily::NaiveN05 {
         crate::naive_mtp::accept_banked
     } else {
         crate::step37_mtp::accept_banked
@@ -387,6 +389,7 @@ impl Model {
         max_seq: i32,
         max_total_tokens: i32,
     ) -> Result<BatchCtx<'_>> {
+        self.fit_glm_rows(ctx_size, crate::MaxSeqs::Fixed(max_seq.max(1) as u32))?;
         let mut raw = ptr::null_mut();
         let mut err = [0u8; 512];
         let rc = unsafe {

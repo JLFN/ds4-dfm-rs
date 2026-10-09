@@ -31,6 +31,7 @@ pub struct BenchArgs {
     mtp_margin: f32,
     output_head_bench_iters: i32,
     dump_frontier_logits_dir: Option<String>,
+    ssd_options: Vec<ds4_core::ModelOpenOption>,
     dist: ds4_dist::Options,
     help: bool,
 }
@@ -59,6 +60,7 @@ impl Default for BenchArgs {
             mtp_margin: 3.0,
             output_head_bench_iters: 0,
             dump_frontier_logits_dir: None,
+            ssd_options: Vec::new(),
             dist: ds4_dist::Options::default(),
             help: false,
         }
@@ -136,6 +138,18 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
                     parse_nonnegative_i32(&arg, &require_value(&arg, iter.next())?)?;
             }
             "--csv" => parsed.csv = Some(require_value(&arg, iter.next())?),
+            "--ssd-streaming" => parsed
+                .ssd_options
+                .push(ds4_core::ModelOpenOption::SsdStreaming),
+            "--ssd-streaming-cold" => parsed
+                .ssd_options
+                .push(ds4_core::ModelOpenOption::SsdStreamingCold),
+            "--ssd-streaming-cache-experts" => {
+                let value = require_value(&arg, iter.next())?;
+                parsed.ssd_options.push(
+                    ds4_core::ModelOpenOption::ssd_cache(&value).map_err(|error| error.message)?,
+                );
+            }
             "--quality" => parsed.quality = true,
             "--warm-weights" => parsed.warm_weights = true,
             "--power" => {
@@ -217,6 +231,18 @@ fn uses_prefix_replay(args: &BenchArgs, family: ModelFamily) -> bool {
 }
 
 fn use_mtp_spec(family: ModelFamily, mtp: Option<&str>, draft: i32) -> bool {
+    if family == ModelFamily::Glm53 {
+        return mtp.is_none()
+            && draft > 1
+            && ds4_core::check_mtp_draft(family, draft).is_ok()
+            && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none();
+    }
+    if family == ModelFamily::IQuestQ1 {
+        return mtp.is_none()
+            && (2..=ds4_core::IQuestPlan::MAX_MTP_DRAFT as i32).contains(&draft)
+            && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none();
+    }
+
     // Qwen4Exp and MiMo carry embedded MTP heads, so bench can speculate
     // without an external draft file. Other families still need that file.
     // Naive's fixed seven-row DSpark block can verify one proposal too.
@@ -228,6 +254,30 @@ fn use_mtp_spec(family: ModelFamily, mtp: Option<&str>, draft: i32) -> bool {
     draft >= min_draft
         && (mtp.is_some() || matches!(family, ModelFamily::Qwen4Exp | ModelFamily::Mimo2))
         && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
+}
+
+fn check_mtp_args(args: &BenchArgs) -> Result<(), String> {
+    let dspark = std::env::var_os("DS4_DSPARK_MODEL").filter(|path| !path.is_empty());
+    let max_draft = ds4_core::IQuestPlan::MAX_MTP_DRAFT as i32;
+    if args.mtp_draft <= max_draft && args.mtp.is_none() && dspark.is_none() {
+        return Ok(());
+    }
+
+    // Probe metadata only for potentially invalid controls. Ordinary benches
+    // retain one model-open scan; reject IQuest sidecars before loading weights.
+    let Ok(identified) = ds4_core::identify_gguf(std::path::Path::new(&args.model)) else {
+        return Ok(()); // Model::open retains the original malformed-model error.
+    };
+    if identified.shape.family != ModelFamily::IQuestQ1 {
+        return Ok(());
+    }
+    if args.mtp.is_some() || dspark.is_some() {
+        return Err("IQuest-Q1 uses embedded MTP; external drafters are unsupported".into());
+    }
+    if args.mtp_draft > max_draft {
+        return Err("IQuest-Q1 accepts at most seven recursive draft tokens".into());
+    }
+    Ok(())
 }
 
 fn backend_name(backend: Backend) -> &'static str {
@@ -391,8 +441,10 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
 
     let (prompt_path, chat_prompt) = prompt_source(&args)?;
     let text = read_prompt(prompt_path)?;
+    check_mtp_args(&args)?;
     let native_dist = crate::distributed_config(&args.dist);
     let mut open_options = Vec::with_capacity(5);
+    open_options.extend(args.ssd_options.iter().cloned());
     if args.quality {
         open_options.push(ModelOpenOption::Quality);
     }
@@ -402,6 +454,18 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
     open_options.push(ModelOpenOption::PowerPercent(args.power_percent as u8));
     open_options.push(ModelOpenOption::MtpDraftTokens(args.mtp_draft));
     open_options.push(ModelOpenOption::MtpMargin(args.mtp_margin));
+    if open_options.contains(&ModelOpenOption::SsdStreaming) {
+        open_options.push(ModelOpenOption::ServingBudget(ds4_core::ServingRequest {
+            ctx: args.ctx_alloc,
+            max_seqs: ds4_core::MaxSeqs::Off,
+            mtp_mode: if args.mtp_draft > 1 {
+                ds4_core::MtpMode::On
+            } else {
+                ds4_core::MtpMode::Off
+            },
+            ..ds4_core::ServingRequest::default()
+        }));
+    }
     let model = if let Some(config) = native_dist.as_ref() {
         Model::open_distributed_options(
             &args.model,
@@ -749,6 +813,9 @@ fn help_text() -> &'static str {
      --cuda|--metal|--cpu   Select backend\n\
      --backend NAME         metal, cuda, or cpu\n\
      -t, --threads N        CPU helper threads\n\
+     --ssd-streaming         Stream GLM CUDA routed experts from SSD\n\
+     --ssd-streaming-cache-experts N|GB  Global slots or GiB budget\n\
+     --ssd-streaming-cold    Advise eviction of read expert pages\n\
      --quality              Prefer exact kernels where applicable\n\
      --warm-weights         Touch mapped tensor pages before benchmarking\n\
      --power N              GPU duty cycle, 1..100 (default: 100)\n\
@@ -772,6 +839,119 @@ fn help_text() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SavedEnv(&'static str, Option<std::ffi::OsString>);
+
+    impl SavedEnv {
+        fn unset(key: &'static str) -> Self {
+            let saved = Self(key, std::env::var_os(key));
+            std::env::remove_var(key);
+            saved
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    #[test]
+    fn iquest_embedded_mtp_gate() {
+        let _disabled = SavedEnv::unset("DS4_MTP_SPEC_DISABLE");
+        for draft in 2..=7 {
+            assert!(use_mtp_spec(ModelFamily::IQuestQ1, None, draft));
+        }
+        for draft in [0, 1, 8] {
+            assert!(!use_mtp_spec(ModelFamily::IQuestQ1, None, draft));
+        }
+        assert!(!use_mtp_spec(ModelFamily::IQuestQ1, Some("draft.gguf"), 3));
+        for value in ["", "0", "1"] {
+            std::env::set_var("DS4_MTP_SPEC_DISABLE", value);
+            assert!(!use_mtp_spec(ModelFamily::IQuestQ1, None, 3));
+        }
+    }
+
+    fn write_arch(path: &std::path::Path, architecture: &str) {
+        // Identification needs only architecture. Any full model open fails
+        // required metadata, proving bad controls are rejected before loading.
+        let mut bytes = Vec::from(*b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        for (index, value) in ["general.architecture", architecture].iter().enumerate() {
+            if index == 1 {
+                bytes.extend_from_slice(&8u32.to_le_bytes());
+            }
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn iquest_rejects_bad_mtp_early() {
+        let _drafter = SavedEnv::unset("DS4_DSPARK_MODEL");
+        let dir = std::env::temp_dir().join(format!("ds4-bench-iquest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("metadata.gguf");
+        for architecture in ["iquest_q1", "qwen4exp", "mimo2", "naive_n05_flash"] {
+            write_arch(&model, architecture);
+            for (draft, mtp, dspark, expected) in [
+                (
+                    8,
+                    None,
+                    None,
+                    "IQuest-Q1 accepts at most seven recursive draft tokens",
+                ),
+                (
+                    3,
+                    Some("draft.gguf"),
+                    None,
+                    "IQuest-Q1 uses embedded MTP; external drafters are unsupported",
+                ),
+                (
+                    3,
+                    None,
+                    Some("draft.gguf"),
+                    "IQuest-Q1 uses embedded MTP; external drafters are unsupported",
+                ),
+            ] {
+                match dspark {
+                    Some(path) => std::env::set_var("DS4_DSPARK_MODEL", path),
+                    None => std::env::remove_var("DS4_DSPARK_MODEL"),
+                }
+                let args = BenchArgs {
+                    model: model.to_string_lossy().into_owned(),
+                    mtp_draft: draft,
+                    mtp: mtp.map(str::to_owned),
+                    ..BenchArgs::default()
+                };
+                if architecture == "iquest_q1" {
+                    assert_eq!(check_mtp_args(&args).unwrap_err(), expected);
+                } else {
+                    check_mtp_args(&args).unwrap();
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn iquest_accepts_embedded_mtp() {
+        let _drafter = SavedEnv::unset("DS4_DSPARK_MODEL");
+        std::env::set_var("DS4_DSPARK_MODEL", "");
+        for draft in [1, 2, 7] {
+            let args = BenchArgs {
+                mtp_draft: draft,
+                ..BenchArgs::default()
+            };
+            check_mtp_args(&args).unwrap();
+        }
+    }
 
     #[test]
     fn inkling_sweep_replays_prefix() {
@@ -866,6 +1046,27 @@ mod tests {
         assert_eq!(
             parse_args(argv(&["--prompt-file", "prompt.txt", "--power"])).unwrap_err(),
             "--power requires a value"
+        );
+    }
+
+    #[test]
+    fn parses_ssd_streaming() {
+        let parsed = parse_args(argv(&[
+            "--prompt-file",
+            "prompt.txt",
+            "--ssd-streaming",
+            "--ssd-streaming-cache-experts",
+            "8",
+            "--ssd-streaming-cold",
+        ]));
+        let parsed = parsed.unwrap();
+        assert_eq!(
+            parsed.ssd_options,
+            vec![
+                ds4_core::ModelOpenOption::SsdStreaming,
+                ds4_core::ModelOpenOption::SsdCacheExperts(8),
+                ds4_core::ModelOpenOption::SsdStreamingCold,
+            ]
         );
     }
 
@@ -1139,6 +1340,16 @@ mod tests {
             Some(value) => std::env::set_var("DS4_MTP_SPEC_DISABLE", value),
             None => std::env::remove_var("DS4_MTP_SPEC_DISABLE"),
         }
+    }
+
+    #[test]
+    fn glm_embedded_mtp_gate() {
+        let _disabled = SavedEnv::unset("DS4_MTP_SPEC_DISABLE");
+        assert!(use_mtp_spec(ModelFamily::Glm53, None, 2));
+        assert!(use_mtp_spec(ModelFamily::Glm53, None, 3));
+        assert!(!use_mtp_spec(ModelFamily::Glm53, None, 1));
+        assert!(!use_mtp_spec(ModelFamily::Glm53, None, 4));
+        assert!(!use_mtp_spec(ModelFamily::Glm53, Some("mtp.gguf"), 3));
     }
 
     #[test]

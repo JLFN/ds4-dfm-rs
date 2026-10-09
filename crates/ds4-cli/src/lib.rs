@@ -82,6 +82,7 @@ pub struct ShadowArgs {
     pub validate: bool,
     pub layout: bool,
     pub layout_variant: Option<String>,
+    ssd_options: Vec<ds4_core::ModelOpenOption>,
     pub dist: ds4_dist::Options,
     pub help: bool,
 }
@@ -132,6 +133,7 @@ impl Default for ShadowArgs {
             validate: false,
             layout: false,
             layout_variant: None,
+            ssd_options: Vec::new(),
             dist: ds4_dist::Options::default(),
             help: false,
         }
@@ -158,6 +160,18 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             "--mtp-margin" => {
                 parsed.mtp_margin =
                     parse_f32_range(&arg, &require_value(&arg, iter.next())?, 0.0, 1000.0)?;
+            }
+            "--ssd-streaming" => parsed
+                .ssd_options
+                .push(ds4_core::ModelOpenOption::SsdStreaming),
+            "--ssd-streaming-cold" => parsed
+                .ssd_options
+                .push(ds4_core::ModelOpenOption::SsdStreamingCold),
+            "--ssd-streaming-cache-experts" => {
+                let value = require_value(&arg, iter.next())?;
+                parsed.ssd_options.push(
+                    ds4_core::ModelOpenOption::ssd_cache(&value).map_err(|error| error.message)?,
+                );
             }
             "--dspark" => {
                 parsed.dspark = Some(require_value(&arg, iter.next())?);
@@ -322,6 +336,21 @@ fn use_mtp_spec(temp: f32, mtp: Option<&str>, draft: i32) -> bool {
     temp <= 0.0 && mtp.is_some() && draft > 1 && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
 }
 
+fn use_iquest_spec(temp: f32, family: ds4_core::ModelFamily, draft: i32) -> bool {
+    family == ds4_core::ModelFamily::IQuestQ1
+        && temp <= 0.0
+        && (2..=ds4_core::IQuestPlan::MAX_MTP_DRAFT as i32).contains(&draft)
+        && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
+}
+
+fn use_glm_spec(temp: f32, family: ds4_core::ModelFamily, draft: i32) -> bool {
+    family == ds4_core::ModelFamily::Glm53
+        && temp <= 0.0
+        && draft > 1
+        && ds4_core::check_mtp_draft(family, draft).is_ok()
+        && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
+}
+
 fn use_naive_spec(temp: f32, dspark: Option<&str>, draft: i32) -> bool {
     temp <= 0.0
         && dspark.is_some()
@@ -329,14 +358,35 @@ fn use_naive_spec(temp: f32, dspark: Option<&str>, draft: i32) -> bool {
         && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
 }
 
-fn mtp_open_options(args: &ShadowArgs) -> Vec<ModelOpenOption> {
+fn mtp_open_options(
+    args: &ShadowArgs,
+    family: Option<ds4_core::ModelFamily>,
+) -> Result<Vec<ModelOpenOption>, String> {
+    if let Some(family) = family {
+        ds4_core::check_mtp_draft(family, args.mtp_draft).map_err(|error| error.message)?;
+    }
     let mut options = Vec::new();
-    if args.mtp.is_some() || args.dspark.is_some() || std::env::var_os("DS4_DSPARK_MODEL").is_some()
+    options.extend(args.ssd_options.iter().cloned());
+    if args.ssd_options.contains(&ModelOpenOption::SsdStreaming) {
+        options.push(ModelOpenOption::ServingBudget(ds4_core::ServingRequest {
+            ctx: args.ctx,
+            backend: args.backend,
+            max_seqs: ds4_core::MaxSeqs::Off,
+            ..ds4_core::ServingRequest::default()
+        }));
+    }
+    if args.mtp.is_some()
+        || args.dspark.is_some()
+        || std::env::var_os("DS4_DSPARK_MODEL").is_some()
+        || (matches!(
+            family,
+            Some(ds4_core::ModelFamily::IQuestQ1 | ds4_core::ModelFamily::Glm53)
+        ) && args.mtp_draft > 1)
     {
         options.push(ModelOpenOption::MtpDraftTokens(args.mtp_draft));
         options.push(ModelOpenOption::MtpMargin(args.mtp_margin));
     }
-    options
+    Ok(options)
 }
 
 fn generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
@@ -458,6 +508,8 @@ fn run_chat_turn(
     let mut out = stdout.lock();
     let mut printer = TokenPrinter::new(model.family(), chat.thinking_enabled());
     let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft)
+        || use_iquest_spec(args.temp, model.family(), args.mtp_draft)
+        || use_glm_spec(args.temp, model.family(), args.mtp_draft)
         || (model.family() == ds4_core::ModelFamily::NaiveN05
             && use_naive_spec(args.temp, model.dspark().map(|d| d.path()), args.mtp_draft));
     let eos = model.token_eos();
@@ -583,6 +635,8 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
     let mut printer = TokenPrinter::new(model.family(), !args.nothink);
     let mut decode_error = None;
     let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft)
+        || use_iquest_spec(args.temp, model.family(), args.mtp_draft)
+        || use_glm_spec(args.temp, model.family(), args.mtp_draft)
         || (model.family() == ds4_core::ModelFamily::NaiveN05
             && use_naive_spec(args.temp, model.dspark().map(|d| d.path()), args.mtp_draft));
     let eos = model.token_eos();
@@ -1005,6 +1059,9 @@ Usage:
 
 C-compatible flags (same names as `ds4 --help`):
   -m, --model FILE        GGUF model path. Default: ds4flash.gguf
+  --ssd-streaming         Stream GLM CUDA routed experts from SSD
+  --ssd-streaming-cache-experts auto|N|GB  Auto budget, slots or GiB
+  --ssd-streaming-cold    Advise eviction of read expert pages
   --mtp FILE              Optional MTP support GGUF
   --mtp-draft N           Maximum MTP draft tokens. Default: 1
   --mtp-margin F          MTP verifier margin. Default: 3
@@ -1022,6 +1079,8 @@ C-compatible flags (same names as `ds4 --help`):
   -h, --help              Show this help
 
 --mtp attaches DeepSeek, Inkling or Step predictors; --dspark takes DeepSeek or Naive.
+IQuest-Q1 uses embedded MTP: --cuda --mtp-draft 2..7 --temp 0, with no --mtp file.
+GLM-5.3 uses embedded MTP: --cuda --mtp-draft 2..3 --temp 0, with no --mtp file.
 --dump-logprobs mirrors the C CLI proof loop (chat-template encode via
 the engine, argmax decode, host stop set); ctx grows to fit prompt+n
 unless -c is explicit.
@@ -1051,7 +1110,7 @@ or DeepSeek sibling mtp-flash|mtp-pro|dspark-flash|dspark-pro.
 --tokenize loads the host-owned GPT-2/BPE vocab (no engine open).
 --session-plan dumps the host session ledger (no engine open).
 --session-payload dumps the host DSV4 prefix codec (no engine open).
-FAMILY is deepseek4|motif3|solar-open2|exaone-moe|dots3-note|qwen4exp|glm5-next|k2-horizon.
+FAMILY is deepseek4|motif3|solar-open2|exaone-moe|dots3-note|qwen4exp|glm5-next|k2-horizon|iquest_q1.
 CMD is specials | encode HEX | render HEX | decode ID | stop ID.
 ",
         dist_usage = ds4_dist::USAGE,
@@ -1202,7 +1261,19 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
     }
 
     let native_dist = distributed_config(&args.dist);
-    let mtp_opts = mtp_open_options(&args);
+    // Embedded IQuest uses the existing --mtp-draft control without a sidecar.
+    // Other families retain their current support-artifact activation rules.
+    let embedded_family = if args.mtp.is_none() && args.dspark.is_none() && args.mtp_draft > 1 {
+        Some(
+            ds4_core::identify_gguf(std::path::Path::new(model_path))
+                .map_err(|e| e.to_string())?
+                .shape
+                .family,
+        )
+    } else {
+        None
+    };
+    let mtp_opts = mtp_open_options(&args, embedded_family)?;
     let model = match native_dist.as_ref() {
         Some(config) => ds4_core::Model::open_distributed_options(
             model_path,
@@ -1482,6 +1553,47 @@ mod tests {
         assert_eq!(parsed.ctx, 4096);
         assert!(parsed.lifecycle_only);
         assert_eq!(parsed.backend, default_backend());
+    }
+
+    #[test]
+    fn ssd_budget_uses_context() {
+        let parsed = parse_args(args(&["--ssd-streaming", "-c", "1048576"])).unwrap();
+        let options = mtp_open_options(&parsed, None).unwrap();
+        assert!(options.iter().any(|option| matches!(option,
+            ModelOpenOption::ServingBudget(req) if req.ctx == 1048576
+                && req.max_seqs == ds4_core::MaxSeqs::Off)));
+        assert!(ds4_core::check_ssd_options(
+            &options,
+            Some(ds4_core::ModelFamily::Glm53),
+            ds4_core::Backend::Cuda,
+            None,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn parses_ssd_streaming() {
+        let parsed = parse_args(args(&[
+            "--ssd-streaming",
+            "--ssd-streaming-cache-experts",
+            "1.5GB",
+            "--ssd-streaming-cold",
+        ]));
+        let parsed = parsed.unwrap();
+        assert_eq!(
+            parsed.ssd_options,
+            vec![
+                ds4_core::ModelOpenOption::SsdStreaming,
+                ds4_core::ModelOpenOption::SsdCacheBytes(3 * (1 << 29)),
+                ds4_core::ModelOpenOption::SsdStreamingCold,
+            ]
+        );
+        let options = mtp_open_options(&parsed, None).unwrap();
+        assert_eq!(options[..parsed.ssd_options.len()], parsed.ssd_options);
+        assert!(
+            matches!(options.last(), Some(ModelOpenOption::ServingBudget(req))
+            if req.ctx == parsed.ctx && req.max_seqs == ds4_core::MaxSeqs::Off)
+        );
     }
 
     #[test]
@@ -1788,6 +1900,63 @@ mod tests {
     }
 
     #[test]
+    fn iquest_embedded_mtp_passes_explicit_draft_controls() {
+        let parsed = parse_args(args(&["--temp", "0", "--mtp-draft", "3", "-p", "hello"])).unwrap();
+        assert!(parsed.mtp.is_none());
+        assert!(
+            mtp_open_options(&parsed, Some(ds4_core::ModelFamily::IQuestQ1))
+                .unwrap()
+                .iter()
+                .any(|option| matches!(option, ModelOpenOption::MtpDraftTokens(3)))
+        );
+        assert!(
+            mtp_open_options(&parsed, Some(ds4_core::ModelFamily::DeepSeek4))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(mtp_open_options(&parsed, None).unwrap().is_empty());
+        let too_many = parse_args(args(&["--mtp-draft", "8", "-p", "hello"])).unwrap();
+        assert!(mtp_open_options(&too_many, Some(ds4_core::ModelFamily::IQuestQ1)).is_err());
+        assert!(use_iquest_spec(0.0, ds4_core::ModelFamily::IQuestQ1, 3));
+        assert!(use_iquest_spec(0.0, ds4_core::ModelFamily::IQuestQ1, 7));
+        assert!(!use_iquest_spec(0.5, ds4_core::ModelFamily::IQuestQ1, 3));
+        assert!(!use_iquest_spec(0.0, ds4_core::ModelFamily::IQuestQ1, 1));
+        assert!(!use_iquest_spec(0.0, ds4_core::ModelFamily::IQuestQ1, 8));
+        assert!(!use_iquest_spec(0.0, ds4_core::ModelFamily::DeepSeek4, 3));
+    }
+
+    #[test]
+    fn glm_embedded_mtp_controls() {
+        let parsed = parse_args(args(&["--mtp-draft", "3", "--mtp-margin", "2.5"])).unwrap();
+        let options = mtp_open_options(&parsed, Some(ds4_core::ModelFamily::Glm53)).unwrap();
+        assert!(options.contains(&ModelOpenOption::MtpDraftTokens(3)));
+        assert!(options.contains(&ModelOpenOption::MtpMargin(2.5)));
+        assert!(use_glm_spec(0.0, ds4_core::ModelFamily::Glm53, 3));
+        assert!(!use_glm_spec(0.5, ds4_core::ModelFamily::Glm53, 3));
+        assert!(!use_glm_spec(0.0, ds4_core::ModelFamily::Glm53, 1));
+        let mut too_many = parsed;
+        too_many.mtp_draft = 4;
+        assert!(mtp_open_options(&too_many, Some(ds4_core::ModelFamily::Glm53)).is_err());
+    }
+
+    #[test]
+    fn iquest_embedded_mtp_passes_confidence_margin() {
+        let parsed = parse_args(args(&[
+            "--mtp-draft",
+            "3",
+            "--mtp-margin",
+            "1.75",
+            "-p",
+            "hello",
+        ]))
+        .unwrap();
+        let controls = mtp_open_options(&parsed, Some(ds4_core::ModelFamily::IQuestQ1)).unwrap();
+        assert!(controls
+            .iter()
+            .any(|o| matches!(o, ModelOpenOption::MtpMargin(m) if *m == 1.75)));
+    }
+
+    #[test]
     fn dspark_uses_spec_controls() {
         let parsed = parse_args(args(&[
             "--dspark",
@@ -1798,7 +1967,7 @@ mod tests {
             "0",
         ]))
         .unwrap();
-        let controls = mtp_open_options(&parsed);
+        let controls = mtp_open_options(&parsed, None).unwrap();
         assert!(controls
             .iter()
             .any(|o| matches!(o, ModelOpenOption::MtpDraftTokens(6))));

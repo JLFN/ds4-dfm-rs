@@ -14,11 +14,13 @@ pub mod chat_template;
 mod dots3_mtp;
 mod engram;
 mod gguf;
+mod glm_mtp;
 mod identify;
 mod inkling;
 mod inkling_audio;
 mod inkling_media;
 mod inkling_mtp;
+mod iquest;
 mod layout;
 mod ling3vl;
 mod mapped;
@@ -38,6 +40,8 @@ mod shape;
 mod sibling;
 mod sidecar;
 mod spec;
+mod ssd;
+mod ssd_quote;
 mod step37;
 mod step37_mtp;
 mod tensors;
@@ -64,6 +68,7 @@ pub use bind::{
 pub use engram::{EngramError, EngramHash, EngramRow, EngramShard, EDIO_ALIGN};
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};
+pub use iquest::{IQuestCache, IQuestPlan};
 pub use layout::{
     dump_expected_dspark_shape, dump_expected_layouts, dump_expected_layouts_shape,
     dump_expected_layouts_variant, dump_expected_mtp_shape, dump_expected_support,
@@ -126,6 +131,8 @@ pub use sidecar::{
     TYPE_F16, TYPE_F32, TYPE_FP4X32,
 };
 pub use spec::{snapshot_spec, SpecMetrics};
+pub use ssd::check_ssd_options;
+pub use ssd_quote::probe_ssd_quote;
 pub use step37::{Step37Error, Step37Layer, Step37Plan, Step37Sidecar, Step37SidecarPlan};
 pub use tensors::{
     apply_host_dir, consume_host_dir, dump_apply_tapes, dump_consume_tapes, dump_nbytes_table,
@@ -193,6 +200,14 @@ pub enum Backend {
 pub enum ModelOpenOption {
     Quality,
     WarmWeights,
+    SsdStreaming,
+    SsdStreamingCold,
+    SsdCacheAuto,
+    SsdCacheExperts(u32),
+    SsdCacheBytes(u64),
+    /// Memory admission uses the intended context, banks and optional state.
+    /// Required for automatic SSD cache sizing; fixed count/bytes may omit it.
+    ServingBudget(ServingRequest),
     PowerPercent(u8),
     MtpDraftTokens(i32),
     MtpMargin(f32),
@@ -231,6 +246,12 @@ pub struct AudioInput<'a> {
 struct OpenTuning {
     quality: bool,
     warm_weights: bool,
+    ssd_streaming: bool,
+    ssd_streaming_cold: bool,
+    ssd_cache_auto: bool,
+    ssd_streaming_cache_experts: u32,
+    ssd_streaming_cache_bytes: u64,
+    serving_budget: Option<ServingRequest>,
     power_percent: i32,
     mtp_draft_tokens: i32,
     mtp_margin: f32,
@@ -245,6 +266,12 @@ impl Default for OpenTuning {
         Self {
             quality: false,
             warm_weights: false,
+            ssd_streaming: false,
+            ssd_streaming_cold: false,
+            ssd_cache_auto: false,
+            ssd_streaming_cache_experts: 0,
+            ssd_streaming_cache_bytes: 0,
+            serving_budget: None,
             power_percent: 100,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
@@ -254,6 +281,23 @@ impl Default for OpenTuning {
             vision_path: None,
         }
     }
+}
+
+/// Validate common draft controls before metadata validation or GPU allocation.
+pub fn check_mtp_draft(family: ModelFamily, draft: i32) -> Result<()> {
+    let message = if draft <= 0 {
+        "MTP draft tokens must be positive"
+    } else if family == ModelFamily::IQuestQ1 && draft > iquest::DRAFT_SLOTS as i32 {
+        "IQuest-Q1 accepts at most seven recursive draft tokens"
+    } else if family == ModelFamily::Glm53 && draft > glm_mtp::DRAFT_MAX {
+        "GLM-5.3 accepts at most three recursive draft tokens"
+    } else {
+        return Ok(());
+    };
+    Err(Error {
+        code: 1,
+        message: message.into(),
+    })
 }
 
 fn inkling_open_check(
@@ -343,6 +387,22 @@ fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
         match option {
             ModelOpenOption::Quality => tuning.quality = true,
             ModelOpenOption::WarmWeights => tuning.warm_weights = true,
+            ModelOpenOption::SsdStreaming => tuning.ssd_streaming = true,
+            ModelOpenOption::SsdStreamingCold => tuning.ssd_streaming_cold = true,
+            ModelOpenOption::SsdCacheAuto => tuning.ssd_cache_auto = true,
+            ModelOpenOption::ServingBudget(req) => tuning.serving_budget = Some(req.clone()),
+            ModelOpenOption::SsdCacheExperts(count) if *count > 0 => {
+                tuning.ssd_streaming_cache_experts = *count;
+            }
+            ModelOpenOption::SsdCacheBytes(bytes) if *bytes > 0 => {
+                tuning.ssd_streaming_cache_bytes = *bytes;
+            }
+            ModelOpenOption::SsdCacheExperts(_) | ModelOpenOption::SsdCacheBytes(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "SSD expert cache must be positive".into(),
+                });
+            }
             ModelOpenOption::PowerPercent(percent) if (1..=100).contains(percent) => {
                 tuning.power_percent = i32::from(*percent);
             }
@@ -415,6 +475,31 @@ fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
         });
     }
 
+    if !tuning.ssd_streaming
+        && (tuning.ssd_streaming_cold
+            || tuning.ssd_cache_auto
+            || tuning.ssd_streaming_cache_experts != 0
+            || tuning.ssd_streaming_cache_bytes != 0)
+    {
+        return Err(Error {
+            code: 1,
+            message: "SSD cache and cold options require --ssd-streaming".into(),
+        });
+    }
+    if tuning.ssd_streaming_cache_experts != 0 && tuning.ssd_streaming_cache_bytes != 0 {
+        return Err(Error {
+            code: 1,
+            message: "SSD expert count and byte budgets are mutually exclusive".into(),
+        });
+    }
+    if tuning.ssd_cache_auto
+        && (tuning.ssd_streaming_cache_experts != 0 || tuning.ssd_streaming_cache_bytes != 0)
+    {
+        return Err(Error {
+            code: 1,
+            message: "SSD auto and fixed budgets are mutually exclusive".into(),
+        });
+    }
     Ok(tuning)
 }
 
@@ -588,6 +673,7 @@ pub struct Model {
     chat_template: Option<chat_template::Template>,
     vision_ready: bool,
     mtp_draft_tokens: i32,
+    runtime_budget: Option<ServingRequest>,
     _distributed: Option<FfiDistributed>,
     _not_send: PhantomData<*const ()>,
 }
@@ -1163,6 +1249,32 @@ pub fn probe_model_artifact(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn glm_runtime_req(req: &ServingRequest, ctx: i32, banks: MaxSeqs) -> ServingRequest {
+    let mut req = req.clone();
+    req.ctx = ctx;
+    req.max_seqs = banks;
+    // Serial media uses snapshots; partial reuse remains the text banks'
+    // policy. Validate this allocation without changing the serving request.
+    if banks == MaxSeqs::Off && req.prefix_reuse == PrefixReuse::Partial {
+        req.prefix_reuse = PrefixReuse::Exact;
+    }
+    req
+}
+
+fn apply_glm_fit(req: &ServingRequest, shape: Shape, plan: &ResolvedPlan) {
+    let serial = glm_runtime_req(req, req.ctx, MaxSeqs::Off);
+    let rows = plan.effective.native_chunk.unwrap_or(0);
+    // Native prices this eligible window before bank allocation, then disables
+    // it for multiple banks. Keep the policy available for a one-bank retry.
+    let window = ssd_quote::prefill_window(
+        &serial,
+        plan.effective.ssd_streaming_cache_experts,
+        rows,
+        shape.n_expert,
+    );
+    ssd_quote::apply_window(window);
+}
+
 impl Model {
     pub fn open(
         path: &str,
@@ -1289,11 +1401,26 @@ impl Model {
         distributed: Option<&DistributedConfig>,
         options: &[ModelOpenOption],
     ) -> Result<Self> {
-        let tuning = open_tuning(options)?;
+        let mut tuning = open_tuning(options)?;
         let identified = identify_gguf(std::path::Path::new(path)).map_err(|e| Error {
             code: 1,
             message: format!("identify failed: {}", e.token()),
         })?;
+        ssd::check_tuning(&tuning, Some(identified.shape.family), backend, distributed)?;
+        // Refuse impossible IQuest widths before tensor validation or native
+        // open, which would otherwise hide the requested width behind a clamp.
+        check_mtp_draft(identified.shape.family, tuning.mtp_draft_tokens)?;
+        if identified.shape.family == ModelFamily::Glm53
+            && (backend != Backend::Cuda
+                || distributed.is_some()
+                || mtp_path.is_some()
+                || dspark_path.is_some())
+        {
+            return Err(Error {
+                code: 1,
+                message: "GLM-5.3 requires one full CUDA model with embedded MTP".into(),
+            });
+        }
         // Resolve Naive's common sidecar environment here as well as native:
         // the Rust catalog must validate and retain the actual loaded file.
         let env_dspark = (identified.shape.family == ModelFamily::NaiveN05)
@@ -1394,6 +1521,28 @@ impl Model {
                 })?;
             }
         }
+        let mut runtime_budget = (identified.shape.family == ModelFamily::Glm53)
+            .then(|| tuning.serving_budget.clone().unwrap_or_default());
+        if let Some(req) = &mut runtime_budget {
+            req.mtp_mode = glm_mtp::mode(
+                tuning.mtp_draft_tokens,
+                std::env::var("DS4_GLM53_MTP").ok().as_deref(),
+                std::env::var("DS4_MTP_SPEC_DISABLE").ok().as_deref(),
+            );
+            req.native_chunk = Some(ssd_quote::prefill_rows(
+                req,
+                None,
+                identified.shape.n_expert_used,
+            )?);
+        }
+        ssd::resolve_budget(&mut tuning, &identified, &inventory, backend)?;
+        if let Some(req) = &mut runtime_budget {
+            req.ssd_streaming = tuning.ssd_streaming;
+            req.ssd_streaming_cache_experts = (tuning.ssd_streaming_cache_experts != 0)
+                .then_some(tuning.ssd_streaming_cache_experts);
+            req.ssd_streaming_cache_bytes =
+                (tuning.ssd_streaming_cache_bytes != 0).then_some(tuning.ssd_streaming_cache_bytes);
+        }
         let bind_plan = open_bind_plan(&g, identified.shape, &inventory)?;
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;
         let mut ffi_bind = pack_host_bind_map(&bind_plan)?;
@@ -1451,6 +1600,10 @@ impl Model {
             power_percent: tuning.power_percent,
             warm_weights: i32::from(tuning.warm_weights),
             quality: i32::from(tuning.quality),
+            ssd_streaming: i32::from(tuning.ssd_streaming),
+            ssd_streaming_cold: i32::from(tuning.ssd_streaming_cold),
+            ssd_streaming_cache_experts: tuning.ssd_streaming_cache_experts,
+            ssd_streaming_cache_bytes: tuning.ssd_streaming_cache_bytes,
             plan: ffi_plan.as_c(),
             tensors: ffi_dir.as_c(),
             shape: &ffi_shape,
@@ -1510,6 +1663,7 @@ impl Model {
             chat_template,
             vision_ready: tuning.vision_path.is_some(),
             mtp_draft_tokens: tuning.mtp_draft_tokens,
+            runtime_budget,
             _distributed: ffi_distributed,
             _not_send: PhantomData,
         })
@@ -1644,7 +1798,66 @@ impl Model {
         inkling_audio::probe_audio(data, u32::MAX)
     }
 
+    /// Report the cache admitted at open; Auto may change since preflight.
+    pub fn ssd_quote(&self, facts: &mut EngineFacts) -> Result<()> {
+        let Some(req) = &self.runtime_budget else {
+            return Ok(());
+        };
+        if req.ssd_streaming {
+            probe_ssd_quote(facts, req, self.bind_plan.shape, &self.inventory)?;
+        }
+        Ok(())
+    }
+
+    fn fit_glm_rows(&self, ctx_size: i32, banks: MaxSeqs) -> Result<()> {
+        let Some(req) = &self.runtime_budget else {
+            return Ok(());
+        };
+        if self.backend != Backend::Cuda {
+            return Ok(());
+        }
+        let mut req = glm_runtime_req(req, ctx_size, banks);
+        req.backend = self.backend;
+        let shape = self.bind_plan.shape;
+        let caps = caps_from_shape(shape);
+        let mut facts = EngineFacts::default();
+        if req.ssd_streaming {
+            probe_ssd_quote(&mut facts, &req, shape, &self.inventory)?;
+        }
+        // Ownership is now known, but no bank graph has been allocated.
+        // Fit rows against live memory before native can reduce bank count.
+        attach_host_quote(
+            &mut facts,
+            &req,
+            caps,
+            Some(shape),
+            self.inventory.shards.first().map(|s| s.path.as_path()),
+            None,
+            None,
+            None,
+            1,
+            None,
+            self.vision_ready,
+            true,
+        );
+        let plan = resolve_plan(&req, Some(caps), &facts);
+        if plan.has_errors() {
+            return Err(Error {
+                code: 1,
+                message: format!("GLM runtime budget rejected: {}", plan.report()),
+            });
+        }
+        apply_glm_fit(&req, shape, &plan);
+        if let Some(rows) = plan.effective.native_chunk {
+            std::env::set_var("DS4_GLM53_PREFILL_ROWS", rows.to_string());
+            eprintln!("GLM Prefill rows: requested={} effective={rows} ctx={ctx_size} banks={} qualified=unverified",
+                req.native_chunk.unwrap_or(0), plan.effective.max_seqs);
+        }
+        Ok(())
+    }
+
     pub fn session(&self, ctx_size: i32) -> Result<Session<'_>> {
+        self.fit_glm_rows(ctx_size, MaxSeqs::Off)?;
         let mut raw = ptr::null_mut();
         let mut err = [0u8; 512];
         let rc = unsafe {
@@ -1893,6 +2106,8 @@ impl Session<'_> {
                 | ModelFamily::Ling3Vl
                 | ModelFamily::Dots3Note
                 | ModelFamily::Mimo2
+                | ModelFamily::IQuestQ1
+                | ModelFamily::Glm53
         ) {
             return;
         }
@@ -2469,6 +2684,9 @@ impl Session<'_> {
         max_tokens: i32,
         eos: i32,
     ) -> Result<Vec<i32>> {
+        if self.host.family == ModelFamily::Glm53 {
+            return self.eval_glm_argmax(first, max_tokens, eos);
+        }
         if self.host.family == ModelFamily::Inkling {
             return self.eval_inkling_argmax(first, max_tokens, eos);
         }
@@ -2480,6 +2698,9 @@ impl Session<'_> {
         }
         if self.host.family == ModelFamily::Mimo2 {
             return self.eval_mimo2_argmax(first, max_tokens, eos);
+        }
+        if self.host.family == ModelFamily::IQuestQ1 {
+            return self.eval_iquest_argmax(first, max_tokens, eos);
         }
         if self.host.family == ModelFamily::NaiveN05 {
             return self.eval_naive_argmax(first, max_tokens, eos);
@@ -2962,6 +3183,33 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     #[test]
+    fn glm_serial_budget_keeps_banks() {
+        let req = ServingRequest {
+            ctx: 8192,
+            max_seqs: MaxSeqs::Fixed(2),
+            prefix_reuse: PrefixReuse::Partial,
+            ssd_streaming: true,
+            ssd_streaming_cache_experts: Some(8230),
+            native_chunk: Some(2048),
+            ..ServingRequest::default()
+        };
+        let serial = glm_runtime_req(&req, 4096, MaxSeqs::Off);
+        assert_eq!(serial.ctx, 4096);
+        assert_eq!(serial.max_seqs, MaxSeqs::Off);
+        assert_eq!(serial.prefix_reuse, PrefixReuse::Exact);
+        assert_eq!(
+            serial.ssd_streaming_cache_experts,
+            req.ssd_streaming_cache_experts
+        );
+        assert_eq!(serial.native_chunk, req.native_chunk);
+
+        let banked = glm_runtime_req(&req, 8192, MaxSeqs::Fixed(2));
+        assert_eq!(banked.prefix_reuse, PrefixReuse::Partial);
+        assert_eq!(req.prefix_reuse, PrefixReuse::Partial);
+        assert_eq!(req.max_seqs, MaxSeqs::Fixed(2));
+    }
+
+    #[test]
     fn graph_fit_quote_copies_c_fields() {
         let raw = ds4_bridge_graph_fit_quote {
             fits: 1,
@@ -3178,6 +3426,17 @@ mod tests {
 
     thread_local! {
         static STEP_GENERATION: Cell<u64> = const { Cell::new(1) };
+        static IQUEST_FAILURE: Cell<IQuestFailure> = const { Cell::new(IQuestFailure::Reject) };
+        static GLM_TRIAL_CALLS: Cell<u32> = const { Cell::new(0) };
+        static GLM_FIRST: Cell<i32> = const { Cell::new(0) };
+        static GLM_KEEP: Cell<i32> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum IQuestFailure {
+        Reject,
+        Trial,
+        Commit,
     }
 
     #[no_mangle]
@@ -3234,6 +3493,139 @@ mod tests {
     ) -> i32 {
         STEP_GENERATION.with(|g| g.set(g.get() + 1));
         1
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_iquest_trial(
+        _s: *mut ds4_bridge_session,
+        first: i32,
+        _max: i32,
+        tokens: *mut i32,
+        target: *mut i32,
+        cap: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        match IQUEST_FAILURE.with(Cell::get) {
+            IQuestFailure::Reject => -1,
+            IQuestFailure::Trial => {
+                // Native readback failure invalidates the checkpoint generation.
+                STEP_GENERATION.with(|g| g.set(g.get() + 1));
+                -1
+            }
+            IQuestFailure::Commit => {
+                assert!(cap >= 1);
+                // SAFETY: eval_iquest_argmax supplies live output arrays.
+                unsafe {
+                    *tokens = first;
+                    *target = first + 1;
+                }
+                1
+            }
+        }
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_iquest_commit(
+        s: *mut ds4_bridge_session,
+        keep: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32 {
+        ds4_bridge_step37_commit(s, keep, err, errlen)
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_glm53_trial(
+        _s: *mut ds4_bridge_session,
+        first: i32,
+        _max: i32,
+        tokens: *mut i32,
+        target: *mut i32,
+        cap: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        assert_eq!(cap, 4);
+        GLM_TRIAL_CALLS.with(|calls| calls.set(calls.get() + 1));
+        GLM_FIRST.with(|value| value.set(first));
+        if first < 0 {
+            if first == -2 {
+                STEP_GENERATION.with(|g| g.set(g.get() + 1));
+            }
+            return -1;
+        }
+        // SAFETY: The four-row host wrapper lends these arrays synchronously.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [first, first + 1, first + 2, first + 3].as_ptr(),
+                tokens,
+                4,
+            );
+            std::ptr::copy_nonoverlapping(
+                [first + 1, 99, first + 3, first + 4].as_ptr(),
+                target,
+                4,
+            );
+        }
+        match first {
+            3 => 1,
+            30 => 5,
+            _ => 4,
+        }
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_glm53_commit(
+        _s: *mut ds4_bridge_session,
+        keep: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        GLM_KEEP.with(|value| value.set(keep));
+        if GLM_FIRST.with(Cell::get) == 3 {
+            STEP_GENERATION.with(|g| g.set(g.get() + 1));
+            return 1;
+        }
+        0
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_eval_speculative_argmax(
+        _s: *mut ds4_bridge_session,
+        _first: i32,
+        _max: i32,
+        _eos: i32,
+        _accepted: *mut i32,
+        _cap: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        -1
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_inkling_trial(
+        s: *mut ds4_bridge_session,
+        first: i32,
+        max: i32,
+        tokens: *mut i32,
+        target: *mut i32,
+        cap: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32 {
+        ds4_bridge_step37_trial(s, first, max, tokens, target, cap, err, errlen)
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_inkling_commit(
+        s: *mut ds4_bridge_session,
+        keep: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> i32 {
+        ds4_bridge_step37_commit(s, keep, err, errlen)
     }
 
     #[no_mangle]
@@ -3471,6 +3863,105 @@ mod tests {
             assert_eq!(session.generation(), if first == -1 { 1 } else { 2 });
             if first == -1 {
                 assert_eq!(session.host.tokens(), &[1, 2, 3]);
+            } else {
+                assert!(session.host.tokens().is_empty());
+            }
+        }
+    }
+
+    fn iquest_error_ledger(failure: IQuestFailure) {
+        STEP_GENERATION.with(|g| g.set(1));
+        IQUEST_FAILURE.with(|mode| mode.set(failure));
+        let mut session = std::mem::ManuallyDrop::new(Session {
+            raw: NonNull::<ds4_bridge_session>::dangling(),
+            host: SessionLedger::new(ModelFamily::IQuestQ1, SessionBackend::Cuda, 1024, 64),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        });
+        let prefix = [1, 2, 3];
+        session.host.replace_checkpoint(&prefix);
+        session.host.mtp_draft_valid = true;
+        assert!(session.eval_iquest_argmax(4, 4, 0).is_err());
+        assert_eq!(session.generation(), session.native_generation());
+
+        if failure == IQuestFailure::Reject {
+            // Rejected input before native mutation retains the reusable prefix.
+            assert_eq!(session.generation(), 1);
+            assert!(session.host().valid);
+            assert!(session.host().mtp_draft_valid);
+            assert_eq!(session.host().tokens(), &prefix);
+            assert_eq!(session.last_plan(&[1, 2, 3, 4]).start, 3);
+            return;
+        }
+
+        assert_eq!(session.generation(), 2);
+        assert!(!session.host().valid);
+        assert!(!session.host().mtp_draft_valid);
+        assert!(session.host().tokens().is_empty());
+        assert_eq!(session.pos(), 0);
+        assert_eq!(session.host().common_prefix_with(&prefix), 0);
+        let plan = session.last_plan(&[1, 2, 3, 4]);
+        assert_eq!(plan.start, 0);
+        assert!(plan.rebuild);
+
+        // Invalid state cannot reach the native disk writer or survive a repeat
+        // reconciliation as a reusable checkpoint from the old generation.
+        let path = std::env::temp_dir().join(format!(
+            "ds4-iquest-failed-save-{}-{failure:?}.kv",
+            std::process::id()
+        ));
+        assert!(!path.exists());
+        assert_eq!(
+            session.save_payload(&path).unwrap_err().message,
+            "session has no valid checkpoint to save"
+        );
+        assert!(!path.exists());
+        session.step_failed();
+        assert_eq!(session.generation(), 2);
+        assert!(!session.host().valid);
+    }
+
+    #[test]
+    fn iquest_trial_failure_ledger() {
+        iquest_error_ledger(IQuestFailure::Trial);
+    }
+
+    #[test]
+    fn iquest_commit_failure_ledger() {
+        iquest_error_ledger(IQuestFailure::Commit);
+    }
+
+    #[test]
+    fn iquest_rejected_trial_keeps() {
+        iquest_error_ledger(IQuestFailure::Reject);
+    }
+
+    #[test]
+    fn glm_mtp_dispatch_ledger() {
+        for first in [10, -1, -2, 3, 30] {
+            STEP_GENERATION.with(|value| value.set(1));
+            GLM_TRIAL_CALLS.with(|value| value.set(0));
+            GLM_KEEP.with(|value| value.set(0));
+            let mut session = std::mem::ManuallyDrop::new(Session {
+                raw: NonNull::<ds4_bridge_session>::dangling(),
+                host: SessionLedger::new(ModelFamily::Glm53, SessionBackend::Cuda, 1024, 64),
+                _model: PhantomData,
+                _not_send: PhantomData,
+            });
+            session.host.replace_checkpoint(&[1, 2, 3]);
+            let result = session.eval_speculative_argmax(first, 4, 99);
+            assert_eq!(GLM_TRIAL_CALLS.with(Cell::get), 1);
+            assert_eq!(session.generation(), session.native_generation());
+            if first == 10 {
+                assert_eq!(result.unwrap(), [10, 11]);
+                assert_eq!(GLM_KEEP.with(Cell::get), 2);
+                assert_eq!(session.host.tokens(), [1, 2, 3, 10, 11]);
+                continue;
+            }
+            assert!(result.is_err());
+            assert_eq!(session.host.valid, first == -1);
+            if first == -1 {
+                assert_eq!(session.host.tokens(), [1, 2, 3]);
             } else {
                 assert!(session.host.tokens().is_empty());
             }

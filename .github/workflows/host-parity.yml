@@ -38,8 +38,12 @@ jobs:
           make test-agent-parity
       - name: Serialized workspace tests
         run: cargo test --workspace --locked -- --test-threads=1
+      - name: IQuest evidence comparator
+        run: cargo test -p ds4-cli --example iquest_perf_verify --features native --locked
       - name: PLE storage formats
         run: make test-ple-formats
+      - name: GLM bank fallback
+        run: make test-glm53-fit
       - name: Bonsai CPU reference
         run: make pq2-0-test test-qwen35-ref
       - name: All host targets

@@ -23,6 +23,8 @@ artifact and workload. They do not describe live processes or qualify a new buil
 | [Chat templates](chat-templates.md) | Official input assets, normalization and continuation |
 | [API matrix](ds4-api-surface-matrix.md) | HTTP objects, routing, media forms and unsupported requests |
 | [Memory guard](host-memory-guard.md) | Large-model admission, job limits and cleanup |
+| [SSD expert streaming](ssd-streaming.md) | Bounded GLM expert cache, options and memory policy |
+| [GLM Prefill on Spark, 2026-10-08](glm53-prefill-2026-10-08.md) | Large batches, partial offload, numerical contracts and measured adoption |
 
 ## Models
 
@@ -34,9 +36,10 @@ Other recipes and dated gates retain their hardware and workload limits.
 |---|---|
 | [Model families](ds4-dfm-model-families.md) | Architecture selectors, native state, context, snapshots and reuse |
 | [Qwen](ds4-dfm-model-families.md#qwen-release-scope) | Q5, images, owner/cache setup and YaRN |
-| [Qwen derivatives](ds4-dfm-model-families.md#qwen-derivatives) | Uncensored and Swift artifact-specific evidence |
+| [Qwen derivatives](ds4-dfm-model-families.md#qwen-derivatives) | Uncensored, Swift and Darwin artifact-specific evidence |
 | [Qwen FP8 PLE](qwen38-ple-fp8.md) | Sidecar selection, KV compatibility and paired card sweeps |
-| [GLM](ds4-dfm-model-families.md#glm-53-flash-release-scope) | Exact Q2 + vision, serial graph and 2K cap |
+| [GLM](ds4-dfm-model-families.md#glm-53-flash-release-scope) | Q2 + vision; recorded serial 2K qualification |
+| [GLM Uncensored](glm53-uncensored.md) | Mixed recipe, SSD/bank contracts and current verification boundaries |
 | [K2](ds4-dfm-model-families.md#k2-horizon-375b-release-scope) | MQ87, IFM tools, one-bank serving and disk limits |
 | [dots3](ds4-dfm-model-families.md#dots3-serving) | Separate opt-in text banks and serial MTP |
 | [Bonsai](BONSAI.md) | Pinned ternary PQ2_0, CPU reference and serial CUDA |
@@ -46,6 +49,7 @@ Other recipes and dated gates retain their hardware and workload limits.
 | [MiMo RL](mimo2-serving-2026-09-25.md) | Recorded mixed serving, bank reuse and memory limits |
 | [MiMo MOPD](ds4-dfm-model-families.md#mimo-mopd) | Separate artifact, text performance and DFlash boundaries |
 | [Naive](naive-n05-flash.md) | MQ87, banks, disk KV, long-context gates and drafter limits |
+| [IQuest-Q1](iquest-q1.md) | Canonical mixed weights, hybrid Q8 KV, embedded MTP and pending Spark gates |
 | [DeepSeek V4.1 Flash (plan)](deepseek41-port-plan.md) | Proposal: the vq8sh14 artifact, the C engine as source of truth, the gap inventory and the golden-set gate |
 
 ## Development
@@ -82,7 +86,9 @@ These reports preserve successful gates, rejected experiments and unresolved lim
   [September 6](qwen38-prefill-2026-09-06.md),
   [September 7 prefill](qwen38-prefill-2026-09-07.md),
   [September 7 image/text/agent](qwen38-image-2026-09-07.md),
-  [September 14 draft/prefix](qwen38-perf-2026-09-14.md).
+  [September 14 draft/prefix](qwen38-perf-2026-09-14.md),
+  [October 2 Darwin images](qwen-vision-2026-10-02.md) and
+  [follow-up rounds](qwen-vision-followup-2026-10-02.md).
 - **Solar:** [September 7](solar-open2-optimization-2026-09-07.md),
   [September 12 rounds 1–4](solar-open2-optimization-2026-09-12.md),
   [September 12 round 5](solar-open2-optimization-2026-09-12-r5.md),

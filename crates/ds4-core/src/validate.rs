@@ -24,9 +24,12 @@ use crate::tensors::TensorInventory;
 
 const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";
 const DOTS3_SHA: &[u8] = b"99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833";
-const QWEN_REVISIONS: [&[u8]; 2] = [
+const DARWIN_REVISION: &[u8] = b"bc3c7b0410b40c085b78084e13f01c12df31087b";
+const QWEN_REVISIONS: [&[u8]; 3] = [
     b"f5d08274bafd880402bd16f5e3e6c514136ec06c",
     b"8336e613ea508b13c2159bd0f68965d97a606b95",
+    // Darwin retains the pinned Qwen graph and Community License.
+    DARWIN_REVISION,
 ];
 
 /// V4.1 gives the compression ratio per layer from the official config and
@@ -1699,6 +1702,13 @@ fn validate_qwen4exp(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         expect_string(g, key, want)?;
     }
 
+    // Darwin declares its source NFC/Unicode splitter independently of
+    // the shared inference graph and official Jinja input grammar.
+    if g.get_string("general.source.revision") == Some(DARWIN_REVISION) {
+        expect_string(g, "tokenizer.ggml.pre", b"qwen4exp")?;
+        expect_string(g, "tokenizer.ggml.normalizer", b"nfc")?;
+    }
+
     let types = g
         .get_array("qwen4exp.attention.layer_types")
         .ok_or(ValidateError::TokenKey(
@@ -1943,6 +1953,7 @@ pub fn validate_file(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         ModelFamily::Ling3Vl => crate::Ling3VlPlan::validate(g),
         ModelFamily::Mimo2 => crate::Mimo2Plan::validate(g),
         ModelFamily::NaiveN05 => crate::naive::validate_metadata(g),
+        ModelFamily::IQuestQ1 => crate::iquest::validate(g),
         ModelFamily::Glm53 => validate_glm53(g, shape),
         ModelFamily::Qwen4Exp => validate_qwen4exp(g, shape),
         ModelFamily::Qwen35 => validate_qwen35(g, shape),
@@ -2006,6 +2017,7 @@ pub fn dump_validate(path: &std::path::Path) -> String {
                         Variant::Ling30FlashVl => crate::shape::SHAPE_LING30_FLASH_VL,
                         Variant::Mimo26Flash => crate::shape::SHAPE_MIMO26_FLASH,
                         Variant::NaiveN05Flash => crate::shape::SHAPE_NAIVE_N05_FLASH,
+                        Variant::IQuestQ1 => crate::shape::SHAPE_IQUEST_Q1,
                         Variant::DeepSeek41Flash => crate::shape::SHAPE_V41_FLASH,
                         Variant::Flash => SHAPE_FLASH,
                         Variant::Pro => SHAPE_PRO,
@@ -2026,12 +2038,18 @@ mod tests {
     use super::qwen_source_revision_supported;
 
     #[test]
-    fn qwen_source_revision_allowlist_is_exact() {
+    fn qwen_source_pins_are_exact() {
         assert!(qwen_source_revision_supported(Some(
             b"f5d08274bafd880402bd16f5e3e6c514136ec06c"
         )));
         assert!(qwen_source_revision_supported(Some(
             b"8336e613ea508b13c2159bd0f68965d97a606b95"
+        )));
+        assert!(qwen_source_revision_supported(Some(
+            b"bc3c7b0410b40c085b78084e13f01c12df31087b"
+        )));
+        assert!(!qwen_source_revision_supported(Some(
+            b"bc3c7b0410b40c085b78084e13f01c12df31087a"
         )));
         assert!(!qwen_source_revision_supported(Some(b"unknown")));
         assert!(!qwen_source_revision_supported(None));

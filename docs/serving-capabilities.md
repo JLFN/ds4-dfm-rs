@@ -25,13 +25,14 @@ The request's effective and qualified plan remains authoritative.
 | K-EXAONE 236B A23B | persistent / qualified | partial / unverified | qualified | qualified | None / none / none |
 | dots3-note-prev | opt_in / unverified | partial / unverified | unverified | qualified | Embedded / serial / unverified |
 | Qwen3.8-Flash-Next | persistent / qualified | partial / qualified | qualified | qualified | Embedded / bank / qualified |
-| GLM 5.3 Flash | serial / none | none / none | none | none | None / none / none |
+| GLM 5.3 Flash | persistent / unverified | partial / unverified | unverified | unverified | Embedded / serial + bank / unverified |
 | K2-Horizon 375B A23B | persistent / qualified | exact / qualified | unverified | unverified | None / none / none |
 | Inkling Small | serial / none | exact / qualified | unverified | unverified | Sidecar / serial / qualified |
 | Step-3.7-Flash | opt_in / qualified | partial / qualified | qualified | qualified | Sidecar / serial + bank / qualified |
 | Ling-3.0-flash-VL | persistent / qualified | partial / qualified | qualified | qualified | None / none / none |
 | MiMo-V2.6-Flash-RL | opt_in / unverified | partial / unverified | unverified | unverified | Embedded / serial / qualified |
 | Naive-N0.5-Flash | opt_in / qualified | partial / qualified | qualified | qualified | External / serial + bank / unverified |
+| IQuest-Q1 | persistent / unverified | partial / unverified | unverified | unverified | Embedded / serial + bank / unverified |
 
 ## Bounds and allocator controls
 
@@ -48,13 +49,14 @@ not mean unlimited capacity. Qualified columns retain their workload scope.
 | K-EXAONE 236B A23B | — | — | — | — | `DS4_EXAONE_PREFILL_CHUNK` |
 | dots3-note-prev | 524288 | — | 1 | — | `DS4_DOTS3_PREFILL_CHUNK` |
 | Qwen3.8-Flash-Next | 1048576 | 262144 | 2 | — | `DS4_QWEN_PREFILL_CHUNK` |
-| GLM 5.3 Flash | 2048 | 2048 | 1 | — | — |
+| GLM 5.3 Flash | 1048576 | 2048 | 1 | — | `DS4_GLM53_PREFILL_ROWS` |
 | K2-Horizon 375B A23B | — | 32768 | 1 | — | `DS4_EXAONE_PREFILL_CHUNK` |
 | Inkling Small | 1048576 | 1024 | 1 | — | `DS4_INKLING_PREFILL_CHUNK` |
 | Step-3.7-Flash | 262144 | 65536 | 2 | 6300 | `DS4_STEP37_PREFILL_CHUNK` |
 | Ling-3.0-flash-VL | 262144 | 65536 | 2 | — | `DS4_LING3VL_PREFILL_CHUNK` |
 | MiMo-V2.6-Flash-RL | 1048576 | 524288 | 1 | — | `DS4_MIMO2_PREFILL_CHUNK` |
 | Naive-N0.5-Flash | 1048576 | 8192 | 2 | 702 | `DS4_NAIVE_PREFILL_CHUNK` |
+| IQuest-Q1 | 524288 | — | — | — | `DS4_IQUEST_PREFILL_CHUNK` |
 
 Scheduler chunk candidates: 256, 512, 1024, 2048, 4096, 8192. The resolved plan only offers
 values at or below its known native capacity. Unknown capacity offers no
@@ -65,12 +67,13 @@ candidate. These are scheduler controls, not measurements or speed claims.
 - **K-EXAONE 236B A23B:** exact reuse qualified; LLLG partial checkpoints await live qualification.
 - **dots3-note-prev:** text banks, local-window partial reuse and serial MTP are present but unqualified.
 - **Qwen3.8-Flash-Next:** common UX baseline; configured values and verified combinations differ.
-- **GLM 5.3 Flash:** serial graph is capped at 2,048 tokens; snapshots unsupported.
+- **GLM 5.3 Flash:** compact banks, partial reuse, snapshots and embedded MTP are present; 1M structural capacity and historical 2K qualification are separate.
 - **K2-Horizon 375B A23B:** 32K one-bank serving is qualified; disk KV and external owner import are not.
 - **Inkling Small:** serial text snapshots present; media snapshots unsupported.
 - **Step-3.7-Flash:** text banks are opt-in; Chat restart hits need history-stable identity; images serial.
 - **MiMo-V2.6-Flash-RL:** 512K serial text and 256K serial media/DFlash are prior gates. With MTP off, 256K two-bank text plus serial media passed bounded checks at chunk 2048 with Q8 repack off, including live partial reuse and restart disk continuation. 1M one-bank text passed a bounded 1,040,506-token prompt; two banks did not fit. 512K two-bank media exceeds Spark memory.
 - **Naive-N0.5-Flash:** main-only chunk-2048 buffered retrieval and disk continuation: 256K/two banks, 512K/one bank; draft-loaded and other shapes retain the bounded 8K gate; DSpark acceleration unqualified.
+- **IQuest-Q1:** 8K/two-bank thinking HTTP passed at chunk 128 with short prompts and MTP off/on (draft 3, margin 0); plan bounds stay unqualified because reasoning and margin are not represented; no-thinking output, other shapes and 512K remain unqualified.
 
 Regenerate without loading a model:
 
