@@ -16,9 +16,10 @@
  * first — byte-identical to the retired per-warp reader (benchmarked on the
  * real shapes) — and selects between them by the group's row bytes.
  *
- * Scope (P4-4): the n <= 8 GEMV arm, the embedding row fetch and the grouped
- * (wo_a) arm.  The n > 8 prefill arm (v41_q4k_gemm: decode to bf16 + cuBLAS)
- * and the head colnorm are not ported yet and refuse by name. */
+ * Scope: the n <= 8 GEMV arm, the embedding row fetch and the grouped (wo_a)
+ * arm (P4-4), plus the n > 8 prefill GEMM (P4-5: decode to bf16 in row tiles,
+ * then cuBLAS — cuda_v41_q4k.inc.cu:183-205 the to-bf16 kernel, :330-390 the
+ * GEMM).  The head colnorm is not ported yet and refuses by name. */
 #pragma once
 #include <cuda_pipeline.h>   /* the pipe variant's cp.async intrinsics */
 
@@ -251,19 +252,101 @@ __global__ static void v41_q4k_embed_kernel(float *out, const int32_t *tok, cons
     }
 }
 
-/* The q4_K entries (cuda_v41_q4k.inc.cu:392-433).  n > 8 (the prefill GEMM)
- * is not ported and refuses by name. */
+/* q4_K -> bf16 prefill decode (cuda_v41_q4k.inc.cu:183-205): one warp per
+ * block, the lane layout identical to the GEMV's, so both paths decode the
+ * same value bits. */
+__global__ static void v41_q4k_to_bf16_kernel(__nv_bfloat16 *o, const uint8_t *w, uint64_t nblk) {
+    const uint64_t b = (uint64_t)blockIdx.x * blockDim.y + threadIdx.y;
+    if (b >= nblk) return;
+    const uint8_t *blk = w + b * V41_Q4K_BYTES;
+    const uint32_t lane = threadIdx.x & 31u, gidx = lane >> 3, q0 = (lane & 7u) * 4u;
+    uint16_t hd = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+    uint16_t hm = (uint16_t)blk[2] | ((uint16_t)blk[3] << 8);
+    const float d = __half2float(__ushort_as_half(hd)), dmin = __half2float(__ushort_as_half(hm));
+    float s_lo, m_lo, s_hi, m_hi;
+    v41_q4k_sm(blk + 4, (int)(gidx * 2u), &s_lo, &m_lo);
+    v41_q4k_sm(blk + 4, (int)(gidx * 2u + 1u), &s_hi, &m_hi);
+    const uint32_t qw = *(const uint32_t *)(blk + 16u + 4u * lane);
+    __nv_bfloat16 *ob = o + b * V41_Q4K_BLK;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const uint32_t byte = (qw >> (8 * i)) & 0xFFu;
+        ob[gidx * 64u + q0 + i]       = __float2bfloat16(d * s_lo * (float)(byte & 0xFu) - dmin * m_lo);
+        ob[gidx * 64u + 32u + q0 + i] = __float2bfloat16(d * s_hi * (float)(byte >> 4)  - dmin * m_hi);
+    }
+}
+
+/* Prefill GEMM (cuda_v41_q4k.inc.cu:330-390): decode the tensor to bf16 in
+ * row tiles bounded by V41_BF16_STAGE_ELEMS, then one cuBLAS bf16 GEMM per
+ * tile.  Only the head (129280 rows) exceeds the cap; grouped wo_a (67 MB)
+ * decodes whole once and issues one GEMM per block-diagonal group.
+ * Deviation, named: the engine's v41_wc_* weight cache (a backward-pass
+ * buffer, cuda_v41_q4k.inc.cu:350-353) has no port — `hit` is NULL on every
+ * call here, so the cache branches are omitted.  The cache stores exactly the
+ * bytes v41_q4k_to_bf16_kernel writes, so the arithmetic is identical. */
+#define V41_BF16_STAGE_ELEMS (200ull * 1000000ull)   /* cuda_v41_1.inc.cu:27 */
+static v41_scratch g_v41_q4k_wbf, g_v41_q4k_xbf;
+static int v41_q4k_gemm(const void *model_map, uint64_t model_size, uint64_t off, uint64_t in_dim,
+                        uint64_t out_dim, const float *x, float *out, uint32_t n_tok, uint32_t n_groups,
+                        uint32_t x_stride, uint32_t out_stride, int round_out, const char *what) {
+    (void)round_out;   /* rounding is the caller's (one whole-tensor pass when round_out) */
+    const uint64_t bpr = in_dim / V41_Q4K_BLK, nblk_g = out_dim * bpr, nblk = nblk_g * n_groups;
+    if (off > model_size || nblk * V41_Q4K_BYTES > model_size - off) return 0;
+    const uint8_t *w = (const uint8_t *)cuda_model_range_ptr(model_map, off, nblk * V41_Q4K_BYTES, what);
+    if (!w) return 0;
+    if (((uintptr_t)w & 3u) != 0u) { fprintf(stderr, "ds4: %s q4_K tensor start is not 4-byte aligned\n", what); return 0; }
+    const uint64_t rows_cap = V41_BF16_STAGE_ELEMS / in_dim;
+    const uint64_t tile = n_groups > 1u ? out_dim : (rows_cap < 256u ? 256u : (rows_cap >= out_dim ? out_dim : (rows_cap & ~255ull)));
+    const uint64_t stage = n_groups > 1u ? nblk * V41_Q4K_BLK : tile * in_dim;
+    __nv_bfloat16 *wb = (__nv_bfloat16 *)v41_grow(&g_v41_q4k_wbf, stage * sizeof(__nv_bfloat16), "v41 q4k w bf16");
+    if (!wb) return 0;
+    const uint64_t xn = (uint64_t)n_tok * x_stride;
+    __nv_bfloat16 *xb = (__nv_bfloat16 *)v41_grow(&g_v41_q4k_xbf, xn * sizeof(__nv_bfloat16), "v41 q4k x bf16");
+    if (!xb) return 0;
+    v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, ds4_current_stream()>>>(xb, x, xn);
+    if (!cuda_ok(cudaGetLastError(), "v41 q4k x->bf16")) return 0;
+    const float alpha = 1.0f, beta = 0.0f;
+    const dim3 dblk(32, 8);
+    cuda_cublas_ws_prep(ds4_current_stream());
+    if (n_groups > 1u) {
+        v41_q4k_to_bf16_kernel<<<(unsigned)((nblk + 7) / 8), dblk, 0, ds4_current_stream()>>>(wb, w, nblk);
+        if (!cuda_ok(cudaGetLastError(), "v41 q4k->bf16")) return 0;
+        for (uint32_t g = 0; g < n_groups; g++) {
+            cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+                                             wb + (uint64_t)g * nblk_g * V41_Q4K_BLK, CUDA_R_16BF, (int)in_dim,
+                                             xb + (uint64_t)g * in_dim, CUDA_R_16BF, (int)x_stride, &beta,
+                                             out + (uint64_t)g * out_dim, CUDA_R_32F, (int)out_stride,
+                                             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, what)) return 0;
+        }
+        return 1;
+    }
+    for (uint64_t r0 = 0; r0 < out_dim; r0 += tile) {
+        const uint64_t rows = out_dim - r0 < tile ? out_dim - r0 : tile, tb = rows * bpr;
+        v41_q4k_to_bf16_kernel<<<(unsigned)((tb + 7) / 8), dblk, 0, ds4_current_stream()>>>(wb, w + r0 * bpr * V41_Q4K_BYTES, tb);
+        if (!cuda_ok(cudaGetLastError(), "v41 q4k->bf16")) return 0;
+        cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)rows, (int)n_tok, (int)in_dim, &alpha,
+                                         wb, CUDA_R_16BF, (int)in_dim, xb, CUDA_R_16BF, (int)x_stride, &beta,
+                                         out + r0, CUDA_R_32F, (int)out_stride, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, what)) return 0;
+    }
+    return 1;
+}
+
+/* The q4_K entries (cuda_v41_q4k.inc.cu:392-433).  n <= 8 takes the GEMV,
+ * n > 8 the prefill GEMM above. */
 extern "C" int ds4_gpu_v41_matmul_q4k_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                              const ds4_gpu_tensor *x, uint32_t n_tok, int round_out) {
     if (!out || !x || !g_cublas_ready || n_tok == 0) return 0;
     if (x->bytes < (uint64_t)n_tok * in_dim * 4 || out->bytes < (uint64_t)n_tok * out_dim * 4) return 0;
-    if (n_tok > V41_GEMV_MAX_TOK) {
-        fprintf(stderr, "ds4: [ds41] q4_K prefill (n_tok %u > %u) is not ported yet\n", n_tok, V41_GEMV_MAX_TOK);
+    if (n_tok <= V41_GEMV_MAX_TOK) {
+        if (!v41_q4k_gemv(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr, (uint32_t)in_dim,
+                          (float *)out->ptr, (uint32_t)out_dim, n_tok, 1u, 0u, 0u, round_out, "v41 q4k gemv")) return 0;
+    } else if (!v41_q4k_gemm(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr,
+                             (float *)out->ptr, n_tok, 1u, (uint32_t)in_dim, (uint32_t)out_dim, round_out, "v41 q4k gemm")) {
         return 0;
     }
-    if (!v41_q4k_gemv(model_map, model_size, weight_offset, in_dim, out_dim, (const float *)x->ptr, (uint32_t)in_dim,
-                      (float *)out->ptr, (uint32_t)out_dim, n_tok, 1u, 0u, 0u, round_out, "v41 q4k gemv")) return 0;
     return round_out ? ds4_gpu_v41_round_bf16_tensor(out, (uint64_t)n_tok * out_dim) : 1;
 }
 extern "C" int ds4_gpu_v41_grouped_matmul_q4k_tensor(ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
@@ -272,13 +355,14 @@ extern "C" int ds4_gpu_v41_grouped_matmul_q4k_tensor(ds4_gpu_tensor *low, const 
     if (!low || !heads || !g_cublas_ready || n_tok == 0) return 0;
     const uint64_t in_all = (uint64_t)n_groups * group_dim, out_all = (uint64_t)n_groups * rank;
     if (heads->bytes < (uint64_t)n_tok * in_all * 4 || low->bytes < (uint64_t)n_tok * out_all * 4) return 0;
-    if (n_tok > V41_GEMV_MAX_TOK) {
-        fprintf(stderr, "ds4: [ds41] q4_K grouped prefill (n_tok %u > %u) is not ported yet\n", n_tok, V41_GEMV_MAX_TOK);
+    if (n_tok <= V41_GEMV_MAX_TOK) {
+        if (group_dim % V41_Q4K_BLK) return 0;
+        if (!v41_q4k_gemv(model_map, model_size, weight_offset, group_dim, rank, (const float *)heads->ptr, (uint32_t)in_all,
+                          (float *)low->ptr, (uint32_t)out_all, n_tok, n_groups, (uint32_t)group_dim, (uint32_t)rank, round_out, "v41 wo_a q4k gemv")) return 0;
+    } else if (!v41_q4k_gemm(model_map, model_size, weight_offset, group_dim, rank, (const float *)heads->ptr,
+                             (float *)low->ptr, n_tok, n_groups, (uint32_t)in_all, (uint32_t)out_all, round_out, "v41 wo_a q4k gemm")) {
         return 0;
     }
-    if (group_dim % V41_Q4K_BLK) return 0;
-    if (!v41_q4k_gemv(model_map, model_size, weight_offset, group_dim, rank, (const float *)heads->ptr, (uint32_t)in_all,
-                      (float *)low->ptr, (uint32_t)out_all, n_tok, n_groups, (uint32_t)group_dim, (uint32_t)rank, round_out, "v41 wo_a q4k gemv")) return 0;
     return round_out ? ds4_gpu_v41_round_bf16_tensor(low, (uint64_t)n_tok * out_all) : 1;
 }
 extern "C" int ds4_gpu_v41_embed_q4k_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens, const void *model_map,

@@ -33,6 +33,9 @@ int g_ds4_v41_vq_group = 1;
 #include "cuda/ds41_vq_group.cuh"
 #include "cuda/ds41_vq_persist.cuh"
 #include "cuda/ds41_vq_launch.cuh"
+#include "cuda/ds41_vq_prefill.cuh"        /* P4-5: the prefill scheduler (hdr cache, counting sort, reduce) */
+#include "cuda/ds41_vq_prefill_fused.cuh"  /* P4-5: the v2 fused prefill arm (decode-is-the-multiply) */
+#include "cuda/ds41_vq_prefill_mma.cuh"    /* P4-5: the v3 tensor-core prefill arms (vqm tile + vqs register-direct) */
 #include "cuda/ds41_fp8blk.cuh"   /* P4-3: fp8_32x32 decode (towers + engram wkv) */
 #include "cuda/ds41_engram.cuh"   /* P4-3: the engram gate + read-path device pieces */
 #include "cuda/ds41_q4k.cuh"      /* P4-4: the q4_K skeleton GEMV + embedding */
@@ -200,28 +203,27 @@ extern "C" int ds4_gpu_v41_debug_dump_raw(const void *model_map, uint64_t model_
 
 /* Tensor-level decode entry for the forward (mirror of the engine's
  * ds4_gpu_v41_routed_moe_tensor, src/cuda/cuda_v41_3.inc.cu:156-230; the
- * prefill GEMM arm and the per-layer streaming registration are not ported:
- * n_tok > V41_GEMV_MAX_TOK refuses by name, and the device pointer comes from
- * the native range resolver, which owns this tree's memory policy).
+ * per-layer streaming registration is not ported: the device pointer comes
+ * from the native range resolver, which owns this tree's memory policy — the
+ * engine reaches for it only when the resolver has no registered range).
+ * n_tok <= 8 takes the fused decode kernels, n_tok > 8 the prefill family
+ * (the engine's split, cuda_v41_3.inc.cu:189-192).
  *
  * ver and nc are read from the HOST-side blob header — a wrong version is a
  * load-time error, never a guess (cuda_v41_3.inc.cu:164-175).  A bad header
  * is fatal: a wrong layout decodes silently and only shows as garbage.
- * gr (the zchain per-expert gain override, the engine's g_v41_gr) is NULL
- * until the sidecar gain store lands; named deviation. */
+ *
+ * gr (the zchain per-expert gain override, the engine's g_v41_gr) is NULL on
+ * the decode arm until the sidecar gain store lands (unit D); named
+ * deviation.  The prefill arm reads g_v41_gr directly, the engine's
+ * expression (all-NULL today, which is the BARE golden's state). */
 extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t blob_offset, uint64_t blob_bytes,
                                              uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
                                              const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
                                              uint32_t n_total_expert, uint32_t n_expert_used, float clamp,
                                              const ds4_gpu_tensor *x, uint32_t layer, uint32_t n_tok) {
-    (void)n_total_expert;
-    (void)layer;   /* the gr slot indexes by layer; the sidecar store lands with serving */
-    if (!selected || !weights || !x || n_tok == 0) return 0;
-    if (n_tok > V41_GEMV_MAX_TOK) {
-        fprintf(stderr, "ds4: [ds41] MoE prefill (n_tok %u > %u) is not ported yet\n", n_tok, V41_GEMV_MAX_TOK);
-        return 0;
-    }
+    if ((!out && n_tok > V41_GEMV_MAX_TOK) || !selected || !weights || !x || n_tok == 0) return 0;
     if (blob_offset > model_size || blob_bytes > model_size - blob_offset) return 0;
     const uint8_t *bh = (const uint8_t *)model_map + blob_offset;
     if (!ds4vq_blob_ok(bh, (size_t)blob_bytes)) {
@@ -236,6 +238,9 @@ extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *mo
     if (off0 && off0 + 8 <= blob_bytes) { uint16_t n16; memcpy(&n16, bh + off0 + 6, 2); nc = n16; }
     const uint8_t *blob = (const uint8_t *)cuda_model_range_ptr(model_map, blob_offset, blob_bytes, "v41 vq blob");
     if (!blob) return 0;
+    if (n_tok > V41_GEMV_MAX_TOK)
+        return cuda_vq_moe_prefill_gemm(out, blob, model_map, 0, 0, in_dim, mid_dim, out_dim, selected, weights,
+                                        n_total_expert, n_expert_used, clamp, x, layer, n_tok, ver);
     const int rc = ds4_gpu_v41_vq_decode_raw(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim,
                                      (const int32_t *)selected->ptr, (const float *)weights->ptr,
                                      n_expert_used, clamp, (const float *)x->ptr, n_tok, nc, NULL, ver);

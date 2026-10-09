@@ -15,9 +15,9 @@
  * only in the accumulation order — the engine's gate for those is the main
  * NLL/PPL scale, not cmp (cuda_v41_gemv_highprec.inc.cu:11-14).
  *
- * Scope (P4-4): n <= 8 (the GEMV arms).  The n > 8 cuBLAS arms of the two
- * matmul entries refuse by name (P4-5).  The fp4x32 skeleton arm of the
- * embedding is ported for completeness; the artifact carries none. */
+ * Scope: the n <= 8 GEMV arms (P4-4) and the n > 8 cuBLAS prefill arms
+ * (cuda_v41_1.inc.cu:291-296 f32, :308-330 bf16).  The fp4x32 skeleton arm of
+ * the embedding is ported for completeness; the artifact carries none. */
 #pragma once
 
 /* ---- f32 weights GEMV (clear.md C2 (3): the decode path's cublasSgemm) ----
@@ -190,16 +190,25 @@ static int v41_bf16_gemv(const __nv_bfloat16 *w, uint64_t in_dim, uint64_t out_d
 extern "C" int ds4_gpu_v41_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                              const ds4_gpu_tensor *x, uint32_t n_tok) {
-    if (!out || !x || n_tok == 0) return 0;
+    if (!out || !x || !g_cublas_ready || n_tok == 0) return 0;
     const uint64_t wbytes = in_dim * out_dim * 4;
     if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
     const float *W = (const float *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 f32 w");
     if (!W) return 0;
     if (n_tok <= V41_GEMV_MAX_TOK && (in_dim % 128u) == 0u)
         return v41_f32_gemv(W, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 f32 gemv");
-    fprintf(stderr, "ds4: [ds41] f32 prefill (n_tok %u > %u) is not ported yet\n", n_tok, V41_GEMV_MAX_TOK);
-    return 0;
+    /* Prefill (cuda_v41_1.inc.cu:291-296): one Sgemm straight off the mmap'd
+     * f32 table.  The GEMV above is the decode/small-batch arm because cuBLAS
+     * splits an n=1 Sgemm into 200+ small kernels (the GEMV header's account). */
+    cuda_cublas_ws_prep(ds4_current_stream());
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st = cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+                                    W, (int)in_dim, (const float *)x->ptr, (int)in_dim, &beta, (float *)out->ptr, (int)out_dim);
+    return cublas_ok(st, "v41 f32 gemm");
 }
+/* Prefill activation scratch (the engine's shared g_v41_xbf; each port family
+ * owns its own slot, ds41_fp8blk.cuh precedent). */
+static v41_scratch g_v41_dense_xbf;
 extern "C" int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                               uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                               const ds4_gpu_tensor *x, uint32_t n_tok) {
@@ -210,8 +219,20 @@ extern "C" int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *m
     if (!W) return 0;
     if (n_tok <= V41_GEMV_MAX_TOK && (in_dim % 256u) == 0u)
         return v41_bf16_gemv(W, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 bf16 gemv", NULL);
-    fprintf(stderr, "ds4: [ds41] bf16 prefill (n_tok %u > %u) is not ported yet\n", n_tok, V41_GEMV_MAX_TOK);
-    return 0;
+    /* Prefill (cuda_v41_1.inc.cu:308-330): activations to bf16 (they already
+     * sit on the bf16 grid — the conversion changes no value), then one
+     * bf16 x bf16 -> f32 GEMM straight off the mmap'd table. */
+    const uint64_t xn = (uint64_t)n_tok * in_dim;
+    __nv_bfloat16 *xb = (__nv_bfloat16 *)v41_grow(&g_v41_dense_xbf, xn * sizeof(__nv_bfloat16), "v41 bf16 x");
+    if (!xb) return 0;
+    v41_x_to_bf16_kernel<<<(unsigned)((xn + 255) / 256), 256, 0, ds4_current_stream()>>>(xb, (const float *)x->ptr, xn);
+    if (!cuda_ok(cudaGetLastError(), "v41 x->bf16")) return 0;
+    cuda_cublas_ws_prep(ds4_current_stream());
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N, (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+                                     W, CUDA_R_16BF, (int)in_dim, xb, CUDA_R_16BF, (int)in_dim, &beta,
+                                     (float *)out->ptr, CUDA_R_32F, (int)out_dim, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "v41 bf16 gemm");
 }
 
 /* ---- embedding row fetch, fp4x32 arm (cuda_v41_1.inc.cu:365-391) ----
