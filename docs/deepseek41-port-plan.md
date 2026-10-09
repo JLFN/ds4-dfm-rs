@@ -261,6 +261,27 @@ layer-by-layer gate instrument, not just an end-of-model one, and the port
 should use it from P3 onward: a wrong layer shows up at its own layer index
 instead of being smeared into the final logits.
 
+## 6.6 P2/P3 first check: the Rust host reads the artifact (2026-10-09)
+
+`cargo run -p ds4-core --example ds41_inspect -- <gguf>` on the Spark, against
+the real 113.6 GB file:
+
+| item | value |
+| --- | --- |
+| header | 73 kv entries, 1000 tensors, data_pos 4,787,744, alignment 32 |
+| types | f32 531 / 171.6 MB, q4_k 330 / 4.41 GB, i32 1 / 517 KB, i64 3 / 832 B, bf16 65 / 333 MB, **vqblob 43 / 107.75 GB**, **fp8_32x32 27 / 880 MB** |
+| identity | `general.architecture` = `deepseek4`, `general.name` = `DeepSeek V4.1 Flash` |
+| V4.1 keys | all 18 present: context_length 1048576, kv sources 4, index sources 8, candidate source L20 (2048 blocks x 8), engram 2 layers (max n-gram 4), MTP 3 towers / 128 experts / block 5 / top 3 / noise 128799 / markov rank 256 / 3 target layers |
+
+So the container is readable by this host today (the type table addition was
+the only blocker), and the blob count confirms the tower contract: 40 layers
+plus 3 towers, one blob each. Types 40, 41 and 43 do not occur in this
+artifact; the towers use blobs too.
+
+What is still missing to load it is the V4.1 arm itself: metadata
+interpretation, the variant/shape, and the bind and layout for the blob-form
+experts (G3b), which is the next unit.
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
