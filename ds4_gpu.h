@@ -5196,6 +5196,16 @@ int ds4_gpu_step37_qk(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
 int ds4_gpu_step37_gate(ds4_gpu_tensor *values, const ds4_gpu_tensor *gate,
         uint32_t heads, uint32_t rows);
 
+/* DeepSeek V4.1 (ds41) VQ expert decode. All pointers are device pointers.
+ * `ver`/`nc` come from the blob header and its payload (ds4vq_blob_ver, the
+ * payload's u16 nc). The row probe is a diagnostic entry for the P4-1 gate:
+ * it writes n raw row_dot results (gain included) for n consecutive rows
+ * against one activation x of `cols` floats, so a one-hot x extracts the
+ * decoded value at (row, c) exactly. Returns 1 on success. */
+int ds4_gpu_v41_vq_row_probe(float *out, const uint8_t *blob, uint32_t ver, uint32_t nc,
+        int32_t e, int which, uint32_t row, uint32_t rows, uint32_t cols,
+        const float *x, uint32_t n);
+
 #ifdef __cplusplus
 }
 #endif

@@ -113,7 +113,7 @@ endif
         test-solar-gates test-solar-kv test-solar-tokenizer \
         test-solar-forward test-solar-session \
         test-exaone-ref test-exaone-kernels test-exaone-batch \
-        pq2-0-test test-qwen35-rows \
+        pq2-0-test test-qwen35-rows test-ds41-vq \
         rust-bridge ds4-rs ds4-bench-rs ds4-agent-rs ds4-server-rs test-kv-parity test-web-parity test-dist-parity test-route-parity test-server-parity test-catalog-parity test-tokenizer-parity test-agent-parity test-session-parity
 
 ifeq ($(UNAME_S),Darwin)
@@ -910,6 +910,20 @@ tests/test_qwen35_cuda: tests/test_qwen35_cuda.cu ds4_cuda_test_hooks.o $(filter
 .PHONY: test-qwen35-cuda
 test-qwen35-cuda: tests/test_qwen35_cuda
 	./tests/test_qwen35_cuda
+
+# DeepSeek V4.1 (ds41) VQ expert decode gate: the device row probe against an
+# independent host oracle, bit-exact (v3 fixtures carry their own ref.f32; v2
+# is checked against ds4vq_dequant_f32 inside the test). Fixtures and the
+# generator live in tests/fixtures/ds41/vq.
+tests/test_ds41_vq: tests/test_ds41_vq.cu ds4_gpu.h ds41_vq_fmt.h $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ tests/test_ds41_vq.cu $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
+
+.PHONY: test-ds41-vq
+test-ds41-vq: tests/test_ds41_vq
+	./tests/test_ds41_vq tests/fixtures/ds41/vq/v3_13b.blob tests/fixtures/ds41/vq/v3_13b.probes.txt tests/fixtures/ds41/vq/v3_13b.ref.f32
+	./tests/test_ds41_vq tests/fixtures/ds41/vq/v3_12b.blob tests/fixtures/ds41/vq/v3_12b.probes.txt tests/fixtures/ds41/vq/v3_12b.ref.f32
+	./tests/test_ds41_vq tests/fixtures/ds41/vq/v2_12b.blob tests/fixtures/ds41/vq/v2_12b.probes.txt
+	./tests/test_ds41_vq tests/fixtures/ds41/vq/v2_11b.blob tests/fixtures/ds41/vq/v2_11b.probes.txt
 
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its
