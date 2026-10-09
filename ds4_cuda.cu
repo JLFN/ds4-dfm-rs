@@ -3729,6 +3729,7 @@ static char *cuda_vq_blob_build_aligned(const void *model_map, uint64_t model_si
                                         uint64_t offset, uint64_t bytes,
                                         uint64_t *total_out, const char *what, int *flat) {
     *flat = 1;
+    if (getenv("DS4_CUDA_NO_VQ_ALIGN") != NULL) return NULL;   /* kill switch: flat copy */
     if (!model_map || bytes == 0 || offset > model_size || bytes > model_size - offset) return NULL;
     const uint8_t *hb = (const uint8_t *)model_map + offset;
     if (!ds4vq_blob_ok(hb, (size_t)bytes)) return NULL;
@@ -3778,26 +3779,41 @@ static char *cuda_vq_blob_build_aligned(const void *model_map, uint64_t model_si
     const uint64_t total = cur;
     *flat = 0;
 
-    char *d = cuda_vmm_arena_alloc(model_map, total, what);
-    if (!d) d = cuda_model_arena_alloc(model_map, total, what);
-    if (!d) {
-        fprintf(stderr, "ds4: [vq-align] %s alloc %.2f MiB failed\n", what, (double)total / 1048576.0);
+    /* Build the relocated image in a PAGEABLE host buffer and upload it in one
+     * cudaMemcpy.  The engine copies payload-by-payload straight from the map
+     * (cuda_vq_align.inc.cu:66-73); that path wedged the GB10 copy engine when
+     * the source pages were not resident (measured 2026-10-09: 100% user-space
+     * spin in the CUDA sync, idle GPU, boot frozen at 32.5 GiB) because the
+     * DMA reads a cold registered mapping directly.  The pageable upload is
+     * the standard driver-staged path and is immune to that.  Named deviation. */
+    uint8_t *img = (uint8_t *)malloc((size_t)total);
+    if (!img) {
+        fprintf(stderr, "ds4: [vq-align] %s host image alloc %.2f MiB failed\n", what, (double)total / 1048576.0);
         return NULL;
     }
-
-    cudaError_t err = cudaMemset(d, 0, (size_t)total);   /* padding is never read; zeroed for determinism */
-    if (err == cudaSuccess) err = cudaMemcpy(d, hb, (size_t)first, cudaMemcpyHostToDevice);
-    for (size_t i = 0; err == cudaSuccess && i < pl.size(); i++) {
+    memset(img, 0, (size_t)total);   /* padding is never read; zeroed for determinism */
+    memcpy(img, hb, (size_t)first);
+    for (size_t i = 0; i < pl.size(); i++) {
         const uint64_t n = (i + 1 < pl.size() ? pl[i + 1].first : bytes) - pl[i].first;
-        err = cudaMemcpy(d + noff[i], hb + pl[i].first, (size_t)n, cudaMemcpyHostToDevice);
+        memcpy(img + noff[i], hb + pl[i].first, (size_t)n);
     }
     /* Slot table written LAST: the prefix copy above carried the old table. */
     std::vector<uint64_t> tab((size_t)ns);
     memcpy(tab.data(), hb + 16, (size_t)ns * 8u);
     for (size_t i = 0; i < pl.size(); i++) tab[pl[i].second] = noff[i];
-    if (err == cudaSuccess) err = cudaMemcpy(d + 16, tab.data(), (size_t)ns * 8u, cudaMemcpyHostToDevice);
+    memcpy(img + 16, tab.data(), (size_t)ns * 8u);
+
+    char *d = cuda_vmm_arena_alloc(model_map, total, what);
+    if (!d) d = cuda_model_arena_alloc(model_map, total, what);
+    if (!d) {
+        fprintf(stderr, "ds4: [vq-align] %s alloc %.2f MiB failed\n", what, (double)total / 1048576.0);
+        free(img);
+        return NULL;
+    }
+    const cudaError_t err = cudaMemcpy(d, img, (size_t)total, cudaMemcpyHostToDevice);
+    free(img);
     if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: [vq-align] %s copy failed: %s\n", what, cudaGetErrorString(err));
+        fprintf(stderr, "ds4: [vq-align] %s upload failed: %s\n", what, cudaGetErrorString(err));
         (void)cudaGetLastError();
         return NULL;
     }
