@@ -392,9 +392,11 @@ pub fn dump_oracle() -> String {
     let _ = writeln!(out, "{}", SHAPE_QWEN38_FLASH_NEXT.dump_line("QWEN38"));
     let _ = writeln!(out, "{}", SHAPE_GLM53_FLASH.dump_line("GLM53"));
     let _ = writeln!(out, "{}", SHAPE_K2_HORIZON_375B.dump_line("K2HORIZON"));
+    let _ = writeln!(out, "{}", SHAPE_V41_FLASH.dump_line("V41"));
 
     let flash = DeepSeekDims::from_shape(&SHAPE_FLASH);
     let pro = DeepSeekDims::from_shape(&SHAPE_PRO);
+    let v41 = DeepSeekDims::from_shape(&SHAPE_V41_FLASH);
     let mut miss = flash;
     miss.n_layer = 1;
     let _ = writeln!(
@@ -408,6 +410,13 @@ pub fn dump_oracle() -> String {
         out,
         "SELECT\tpro\t{}",
         select_shape_from_metadata(&pro)
+            .map(|s| s.name)
+            .unwrap_or("unsupported")
+    );
+    let _ = writeln!(
+        out,
+        "SELECT\tv41\t{}",
+        select_shape_from_metadata(&v41)
             .map(|s| s.name)
             .unwrap_or("unsupported")
     );
