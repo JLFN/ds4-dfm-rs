@@ -490,6 +490,56 @@ P4 unit order, each with its own gate:
 | P4-3 | fp8_32x32 decode and the engram read path | erows and the wkv matmul against the golden `hce_L01/L14` traces |
 | P4-4 | forward bring-up on the golden prompts | G2: per-layer `x_Lnn`/`y_Lnn` traces first, then logits |
 
+## 6.8 P4-1 evidence: the VQ decode family vs the host oracle (2026-10-09)
+
+Unit commits c9b5313 (the gate) and 84301f8 (the stream-ordering fix).
+
+Built: `ds4_gpu_v41_vq_row_probe` (ds4_ds41_gpu.cuh) — one warp, n consecutive
+rows against one activation. A one-hot x at column c makes row_dot exactly one
+nonzero term, so out[i] IS the decoded value at (row+i, c): the compare is
+bit-exact without replicating the kernel's accumulation order. Instance
+dispatch mirrors v41_vq_fused_moe; a slot that fails to open writes NaN.
+Fixtures (tests/fixtures/ds41/vq/gen_v3_13b.py, written from the spec, never
+from a decoder): v3 13-bit with plane at the real column geometry, v3 12-bit,
+v2 12-bit, v2 11-bit; v3 refs from the generator's own arrays (locally) or
+vq.rs (the ds41_vq_ref example, which extracts one expert into a mini-blob);
+v2 refs from the vendored ds4vq_dequant_f32 inside tests/test_ds41_vq.cu.
+
+Local (RTX 4070 SUPER, sm_89), `make test-ds41-vq`:
+
+    DS41 VQ row probe: PASS (blob v3, 35 probes, 1432 values bit-exact)
+    DS41 VQ row probe: PASS (blob v3, 13 probes, 265 values bit-exact)
+    DS41 VQ row probe: PASS (blob v2, 9 probes, 198 values bit-exact)
+    DS41 VQ row probe: PASS (blob v2, 9 probes, 198 values bit-exact)
+
+and `cargo run --example ds41_vq_ref -- tests/fixtures/ds41/vq/v3_13b.blob 0 0
+<dir>` reproduces the generator's v3 ref byte for byte (vq.rs == generator).
+
+Spark (GB10, sm_121): the four fixtures PASS with the same refs, then the
+real layer-0 payload (blk.0.ffn_exps_vq.blob at abs 456249888):
+
+    which 0: rows=2304 cols=5120 nc=8192 probes=13 values=9225
+    which 1: rows=2304 cols=5120 nc=8192 probes=13 values=9225
+    which 2: rows=5120 cols=2304 nc=8192 probes=9 values=15366
+    blob ver 3 nexp 384 expert 0: 35 probes, 33816 values
+    DS41 VQ row probe: PASS (blob v3, 35 probes, 33816 values bit-exact)
+
+The three real payloads measure 2400808/2400808/2406440 B — exactly the
+extraction lengths computed from the payload headers (no padding).
+
+Two findings the gate produced:
+
+- The first generator interleaved the 13th-bit plane per row; the device and
+  vq.rs agreed against it and exposed the layout error: the plane region
+  follows ALL rows' main streams (m.ex = m.ix + rows*mrow,
+  cuda_vq_row.inc.cu:41).
+- A rare Spark flake (once: 2/35 probes returning the PREVIOUS probe's value
+  bit-for-bit; 20 further pre-fix runs clean): the probe launches on the
+  non-blocking moe stream, which does not inherit the legacy default stream's
+  ordering, and a pageable H2D cudaMemcpy returns once staged, its DMA
+  possibly still in flight. Fixed in 84301f8 (event on the legacy stream, the
+  moe stream waits on it); post-fix 50/50 runs clean.
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
