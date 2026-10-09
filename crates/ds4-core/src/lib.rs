@@ -1160,8 +1160,15 @@ fn pack_sibling_ffi(attach: &SiblingAttach) -> Result<FfiSupport> {
 /// The bind plan for an artifact, resolved and validated: every family goes
 /// from the shape alone except V4.1, whose source-layer conditionals, engram
 /// layers and tower expert form come from the `deepseek4.*` metadata wire
-/// (`V41Wire::load`, `bind_names_v41`, `expected_layouts_v41`).
-fn open_bind_plan(g: &GgufFile, shape: Shape, inventory: &TensorInventory) -> Result<BindPlan> {
+/// (`V41Wire::load`, `bind_names_v41`, `expected_layouts_v41`). The wire is
+/// returned so `Model::open` can fill the native host-shape ABI from the
+/// same load (the compress table is metadata truth for V4.1, not the V4
+/// formula `host_compress_ratios` derives).
+fn open_bind_plan(
+    g: &GgufFile,
+    shape: Shape,
+    inventory: &TensorInventory,
+) -> Result<(BindPlan, Option<V41Wire>)> {
     let wire = if shape.variant == Variant::DeepSeek41Flash {
         Some(V41Wire::load(g, &shape).map_err(|e| Error {
             code: 1,
@@ -1188,7 +1195,7 @@ fn open_bind_plan(g: &GgufFile, shape: Shape, inventory: &TensorInventory) -> Re
         code: 1,
         message: format!("layout failed: {}", e.token()),
     })?;
-    Ok(plan)
+    Ok((plan, wire))
 }
 
 /// Everything `Model::open` checks before it touches the device: identify,
@@ -1245,7 +1252,7 @@ pub fn probe_model_artifact(path: &str) -> Result<()> {
             message: e.to_string(),
         })?;
     }
-    open_bind_plan(&g, identified.shape, &inventory)?;
+    open_bind_plan(&g, identified.shape, &inventory).map(|_| ())?;
     Ok(())
 }
 
@@ -1471,16 +1478,6 @@ impl Model {
         })?;
         let chat_template = chat_template::Template::load(std::path::Path::new(path), &g)?;
         let mut ffi_vocab = pack_host_vocab(&vocab);
-        let compress = host_compress_ratios(&identified.shape);
-        let ffi_shape = ds4_host_shape {
-            variant: identified.shape.variant as u32,
-            n_compress: compress.len() as u32,
-            compress: if compress.is_empty() {
-                ptr::null()
-            } else {
-                compress.as_ptr()
-            },
-        };
         let inventory = TensorInventory::open(std::path::Path::new(path)).map_err(|e| Error {
             code: 1,
             message: format!("tensor inventory failed: {}", e.token()),
@@ -1543,7 +1540,85 @@ impl Model {
             req.ssd_streaming_cache_bytes =
                 (tuning.ssd_streaming_cache_bytes != 0).then_some(tuning.ssd_streaming_cache_bytes);
         }
-        let bind_plan = open_bind_plan(&g, identified.shape, &inventory)?;
+        let (bind_plan, v41_wire) = open_bind_plan(&g, identified.shape, &inventory)?;
+        // Host-shape ABI.  V4.1 carries its wiring over the ABI (the native
+        // stores it in g_ds4_v41 and never re-reads the metadata); the
+        // compress table is metadata truth for V4.1, the V4 formula
+        // otherwise.  All pointers borrow locals that outlive the open call.
+        let compress: Vec<u32> = match &v41_wire {
+            Some(w) => w.compress_ratios.clone(),
+            None => host_compress_ratios(&identified.shape),
+        };
+        let v41_kv_source: Vec<u8> = v41_wire
+            .as_ref()
+            .map(|w| w.is_kv_source.iter().map(|&b| u8::from(b)).collect())
+            .unwrap_or_default();
+        let v41_index_source: Vec<u8> = v41_wire
+            .as_ref()
+            .map(|w| w.is_index_source.iter().map(|&b| u8::from(b)).collect())
+            .unwrap_or_default();
+        let v41_engram_layers: Vec<i32> = v41_wire
+            .as_ref()
+            .map(|w| w.engram_layers.iter().map(|&v| v as i32).collect())
+            .unwrap_or_default();
+        let ffi_shape = ds4_host_shape {
+            variant: identified.shape.variant as u32,
+            n_compress: compress.len() as u32,
+            compress: if compress.is_empty() {
+                ptr::null()
+            } else {
+                compress.as_ptr()
+            },
+            v41_kv_source: if v41_kv_source.is_empty() {
+                ptr::null()
+            } else {
+                v41_kv_source.as_ptr()
+            },
+            v41_index_source: if v41_index_source.is_empty() {
+                ptr::null()
+            } else {
+                v41_index_source.as_ptr()
+            },
+            v41_kv_source_of: v41_wire
+                .as_ref()
+                .map(|w| w.kv_source_of.as_ptr())
+                .unwrap_or(ptr::null()),
+            v41_index_source_of: v41_wire
+                .as_ref()
+                .map(|w| w.index_source_of.as_ptr())
+                .unwrap_or(ptr::null()),
+            v41_engram_index_of: v41_wire
+                .as_ref()
+                .map(|w| w.engram_index_of.as_ptr())
+                .unwrap_or(ptr::null()),
+            v41_n_engram: v41_wire
+                .as_ref()
+                .map(|w| w.engram_layers.len() as u32)
+                .unwrap_or(0),
+            v41_engram_layers: if v41_engram_layers.is_empty() {
+                ptr::null()
+            } else {
+                v41_engram_layers.as_ptr()
+            },
+            v41_engram_max_ngram: v41_wire.as_ref().map(|w| w.engram_max_ngram).unwrap_or(0),
+            v41_engram_heads: v41_wire.as_ref().map(|w| w.engram_heads).unwrap_or(0),
+            v41_engram_head_dim: v41_wire.as_ref().map(|w| w.engram_head_dim).unwrap_or(0),
+            v41_engram_pad: v41_wire.as_ref().map(|w| w.engram_pad).unwrap_or(0),
+            v41_candidate_source_layer: v41_wire
+                .as_ref()
+                .map(|w| w.candidate_source_layer)
+                .unwrap_or(0),
+            v41_candidate_topk_blocks: v41_wire
+                .as_ref()
+                .map(|w| w.candidate_topk_blocks)
+                .unwrap_or(0),
+            v41_candidate_block_size: v41_wire
+                .as_ref()
+                .map(|w| w.candidate_block_size)
+                .unwrap_or(0),
+            v41_mtp_towers: v41_wire.as_ref().map(|w| w.mtp_towers).unwrap_or(0),
+            v41_mtp_experts: v41_wire.as_ref().map(|w| w.mtp_experts).unwrap_or(0),
+        };
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;
         let mut ffi_bind = pack_host_bind_map(&bind_plan)?;
         let mut ffi_dir = pack_tensor_dir(&inventory)?;

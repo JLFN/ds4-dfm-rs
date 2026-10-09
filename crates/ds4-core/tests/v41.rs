@@ -132,6 +132,11 @@ fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFil
             ("deepseek4.engram.head_count", Val::U32(8)),
             ("deepseek4.engram.head_dim", Val::U32(256)),
             ("deepseek4.engram.pad_id_compressed", Val::U32(2)),
+            // The artifact's candidate two-level topk (L20 screens, 2048
+            // blocks of 8); required since the ABI carries the triple.
+            ("deepseek4.attention.candidate.source_layer", Val::U32(20)),
+            ("deepseek4.attention.candidate.topk_blocks", Val::U32(2048)),
+            ("deepseek4.attention.candidate.block_size", Val::U32(8)),
             (
                 "deepseek4.engram.0.table_path",
                 Val::Str("/home/fodelf/ds4-main/hf/model-00047-of-00048.safetensors"),

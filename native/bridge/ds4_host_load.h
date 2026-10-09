@@ -26,11 +26,34 @@ static inline void ds4_host_set_err(char *err, size_t errlen, const char *msg)
 
 /* Host-selected shape.  When installed, ds4_engine_open applies the pinned
  * C literal + compress table and skips config_validate_model.  The C
- * CLI/server leave this NULL.  variant matches ds4_variant / Rust Variant. */
+ * CLI/server leave this NULL.  variant matches ds4_variant / Rust Variant.
+ * The v41_* block is the DeepSeek V4.1 wiring (variant 16): borrowed arrays,
+ * n_layer long except v41_engram_layers (v41_n_engram entries), valid for
+ * the open call.  The Rust host fills them from V41Wire::load, which mirrors
+ * the engine's v41_load_metadata (core_validate_v41.c:46-154); the native
+ * stores them in g_ds4_v41 and never re-reads the metadata on this path.
+ * Other variants leave every v41_* field NULL/0. */
 typedef struct {
     uint32_t variant;
     uint32_t n_compress;
     const uint32_t *compress; /* borrowed; DeepSeek only */
+    /* V4.1 wiring */
+    const uint8_t *v41_kv_source;            /* per layer: compresses, holds compressed KV */
+    const uint8_t *v41_index_source;         /* per layer: runs the indexer */
+    const int16_t *v41_kv_source_of;         /* per layer: nearest source, -1 = none */
+    const int16_t *v41_index_source_of;
+    const int16_t *v41_engram_index_of;      /* per layer: engram index, -1 = none */
+    uint32_t v41_n_engram;
+    const int32_t *v41_engram_layers;        /* metadata order */
+    uint32_t v41_engram_max_ngram;
+    uint32_t v41_engram_heads;
+    uint32_t v41_engram_head_dim;
+    uint32_t v41_engram_pad;
+    int32_t v41_candidate_source_layer;
+    int32_t v41_candidate_topk_blocks;
+    int32_t v41_candidate_block_size;
+    uint32_t v41_mtp_towers;
+    uint32_t v41_mtp_experts;
 } ds4_host_shape;
 
 void ds4_host_shape_install(const ds4_host_shape *s);

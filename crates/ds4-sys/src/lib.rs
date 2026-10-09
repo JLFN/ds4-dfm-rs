@@ -354,6 +354,24 @@ pub struct ds4_host_shape {
     pub variant: u32,
     pub n_compress: u32,
     pub compress: *const u32,
+    /* DeepSeek V4.1 wiring; mirrors native/bridge/ds4_host_load.h.  Borrowed,
+     * valid for the open call; NULL/0 for every other variant. */
+    pub v41_kv_source: *const u8,
+    pub v41_index_source: *const u8,
+    pub v41_kv_source_of: *const i16,
+    pub v41_index_source_of: *const i16,
+    pub v41_engram_index_of: *const i16,
+    pub v41_n_engram: u32,
+    pub v41_engram_layers: *const i32,
+    pub v41_engram_max_ngram: u32,
+    pub v41_engram_heads: u32,
+    pub v41_engram_head_dim: u32,
+    pub v41_engram_pad: u32,
+    pub v41_candidate_source_layer: i32,
+    pub v41_candidate_topk_blocks: i32,
+    pub v41_candidate_block_size: i32,
+    pub v41_mtp_towers: u32,
+    pub v41_mtp_experts: u32,
 }
 
 #[repr(C)]

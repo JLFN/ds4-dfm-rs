@@ -41,6 +41,9 @@ const KEY_ENGRAM_MAX_NGRAM: &str = "deepseek4.engram.max_ngram_size";
 const KEY_ENGRAM_HEADS: &str = "deepseek4.engram.head_count";
 const KEY_ENGRAM_HEAD_DIM: &str = "deepseek4.engram.head_dim";
 const KEY_ENGRAM_PAD: &str = "deepseek4.engram.pad_id_compressed";
+const KEY_CANDIDATE_SOURCE_LAYER: &str = "deepseek4.attention.candidate.source_layer";
+const KEY_CANDIDATE_TOPK_BLOCKS: &str = "deepseek4.attention.candidate.topk_blocks";
+const KEY_CANDIDATE_BLOCK_SIZE: &str = "deepseek4.attention.candidate.block_size";
 const KEY_MTP_TOWER_COUNT: &str = "deepseek4.mtp.tower_count";
 const KEY_MTP_EXPERT_COUNT: &str = "deepseek4.mtp.expert_count";
 const KEY_MTP_TARGET_LAYERS: &str = "deepseek4.mtp.target_layers";
@@ -130,6 +133,13 @@ pub struct V41Wire {
     /// before the start of the sequence and for out-of-vocab tokens
     /// (`core_v41_engram.c:104-107`).
     pub engram_pad: u32,
+    /// `deepseek4.attention.candidate.source_layer` / `.topk_blocks` /
+    /// `.block_size`: the layer that screens candidate blocks and the two
+    /// two-level-topk widths (`core_validate_v41.c:113-115`). Stored signed
+    /// like the engine's `g_ds4_v41` fields.
+    pub candidate_source_layer: i32,
+    pub candidate_topk_blocks: i32,
+    pub candidate_block_size: i32,
     /// `deepseek4.mtp.tower_count`; 0 = the GGUF carries no towers and the
     /// engine decodes one token at a time (`core_validate_v41.c:85-90`).
     pub mtp_towers: u32,
@@ -251,6 +261,17 @@ impl V41Wire {
             .get_u32(KEY_ENGRAM_PAD)
             .ok_or(V41WireError::MissingKey(KEY_ENGRAM_PAD))?;
 
+        // The candidate two-level-topk triple is required (core_validate_v41.c:113-115).
+        let candidate_source_layer = g
+            .get_u32(KEY_CANDIDATE_SOURCE_LAYER)
+            .ok_or(V41WireError::MissingKey(KEY_CANDIDATE_SOURCE_LAYER))?;
+        let candidate_topk_blocks = g
+            .get_u32(KEY_CANDIDATE_TOPK_BLOCKS)
+            .ok_or(V41WireError::MissingKey(KEY_CANDIDATE_TOPK_BLOCKS))?;
+        let candidate_block_size = g
+            .get_u32(KEY_CANDIDATE_BLOCK_SIZE)
+            .ok_or(V41WireError::MissingKey(KEY_CANDIDATE_BLOCK_SIZE))?;
+
         // One u64 row count per engram layer, and per-layer offsets into the
         // shard (core_validate_v41.c:119-148).
         let rows_arr = g
@@ -327,6 +348,9 @@ impl V41Wire {
             engram_scale_off,
             engram_table_path,
             engram_pad,
+            candidate_source_layer: candidate_source_layer as i32,
+            candidate_topk_blocks: candidate_topk_blocks as i32,
+            candidate_block_size: candidate_block_size as i32,
             mtp_towers,
             mtp_experts,
             mtp_targets,
