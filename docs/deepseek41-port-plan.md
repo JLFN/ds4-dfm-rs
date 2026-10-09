@@ -139,7 +139,7 @@ before any state-changing command.
 | P0 | Freeze inputs: verify the assembled artifact hash (the 40 part files are deleted after assembly, so `SHA256SUMS`' part lines cannot resolve); capture the C engine's golden set with `tests/capture_ds41_golden.sh`, with the engram tables as the primary instrument and `NO_ENGRAM=1` as the fixture variant; record the artifact's accepted tensor inventory | hashes re-verify; the golden set exists as files with its own MANIFEST |
 | P0 | DONE 2026-10-08 | see 6.5 |
 | P1 | DONE 2026-10-08 (`c1fdc04`, `7c21279`): tensor types 40-44 in `tensors.rs`, the VQ decode oracle, the type table | v2 decode bit-exact against `ds4vq_dequant_f32` (fixtures in `tests/fixtures/vq`); v3 at unit level (12-bit, 13-bit plane); types match `core_gguf.c:89-104` |
-| P2 | Loaders: engram metadata and table open, sidecar `gr`/`rb` reader, `base.fnv` check (parse-only, not applied) | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
+| P2 | IN PROGRESS: the engram half is DONE (2026-10-09, `79756c0` + `0af1d10`, §6.6.2: hash and table reader with engine parity and the golden-row gate); the sidecar `gr`/`rb` reader and the `base.fnv` check remain | the tensor/key inventory matches the engine's; a mismatched posttrain pair is refused |
 | P3 | DONE for the loader half (2026-10-09): the `Variant::V41` shape (`d53079b`), the metadata wire, the bind arm (`0d3378d`) and the layout table (`356a100`); the engram/sidecar session state remains (P2) | the loader accepts the artifact: `identify` + `validate: ok` + `layout: ok` + `bind: slots=1000 bound=1000 required-missing=0` on the real file (§6.6.1) |
 | P4 | CUDA: VQ MoE decode (mirror `v41_vq_open` geometry), the fp8_32x32 skeleton path, and the engram read path | G2 on device: logits match the golden set |
 | P5 | MTP towers and DSpark verify/rollback | byte-identical greedy output with drafting on and off at N=1; cache-frontier gate at N>1. The engine's own cautions: the main-hidden ring trim in rollback, and the compressor pending-row snapshot taken before the shift |
@@ -349,6 +349,27 @@ The loader half of P3 is therefore closed: the host accepts the artifact's
 metadata, names, types and dims. Next: P2's remaining loaders (engram metadata
 and table open, the sidecar `gr`/`rb` reader, the `base.fnv` check) and the
 engram/sidecar state.
+
+### 6.6.2 P2: the engram loader (2026-10-09, `79756c0`, `0af1d10`)
+
+`EngramHash` mirrors `v41_engram_hash` and `EngramShard` mirrors
+`v41_engram_open_shard`/`v41_edio_pread`; the wire gained the table metadata
+(num_embeddings, both plane offsets, the per-layer paths, the pad id) and
+`apply_engram_dir` for `--engram-dir`. Gates:
+
+| gate | result |
+| --- | --- |
+| the engine's own hash function as a C harness (`fixtures/engram/gen_engram_ref.c`, compiled and run) | every row of both engram indices over every position reproduced |
+| the artifact's real constants against the engine's captured golden rows (fixtures from `golden/p1*`) | all 8 positions x 2 layers identical |
+| the Spark, real shards: `--engram-dir`, `--ids p1.ids`, `--erows-out` then `diff` against `golden/p1.logits.bin.erows_L01/L14.txt` | `EROWS-IDENTICAL`; both shards open with O_DIRECT (`direct=true`), sizes 101,535,150,936 and 101,537,926,640 exactly as §2 measured |
+
+One real bug came out of the Spark run: aarch64 defines `O_DIRECT` as
+0o200000 and `O_DIRECTORY` as 0o40000, the reverse of the asm-generic value
+x86_64 uses, so the first Rust build opened the shard as a directory, failed
+with ENOTDIR and silently took the FADV_RANDOM fallback (`direct=false` in the
+run). `0af1d10` fixes the constant per arch and the comment records the
+symptom; the fallback is a reproducibility risk (page-cache churn), not a
+performance note.
 
 ## 7. Numerics contract
 
