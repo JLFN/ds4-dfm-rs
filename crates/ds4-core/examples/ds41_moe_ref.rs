@@ -136,6 +136,9 @@ fn main() {
     let blob = std::fs::read(&args[0]).expect("blob");
     let cases = parse_cases(&args[1], in_dim as usize);
     let mut out_bytes: Vec<u8> = Vec::new();
+    // DS41_MOE_REF_DUMP=1 writes the per-pair mid (bf16) and down partials
+    // (f32) to /tmp/ref_{mid,part}.bin, the emulation side of the P4-2
+    // acceptance comparison against the device's DS41_MOE_DUMP_MID dumps.
     let dump = std::env::var("DS41_MOE_REF_DUMP").is_ok();
     let mut mid_dump: Vec<u8> = Vec::new();
     let mut part_dump: Vec<u8> = Vec::new();

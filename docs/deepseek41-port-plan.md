@@ -616,6 +616,87 @@ passed) are green; the one ds4-core failure seen once is the pre-existing
 
 Next: P4-2 (the MoE launcher wiring in the native forward for variant 16).
 
+## 6.10 P4-2 evidence: the MoE entry, and what actually failed the gate (2026-10-09)
+
+Unit commits: 5b19e39 (entry + wiring WIP), 263f843 (the harness fix and the
+criterion), 2fa9b89 (geometry parameters), plus the closing commit. What
+landed: the tensor-level entry `ds4_gpu_v41_routed_moe_tensor` (host blob
+header read, range-resolved device pointer, ver/nc dispatch), the decode-path
+arms for variant 16 in ds4.c (the routed VQ call, the shared expert through
+`plain_graph_matmul_tensor`, fused shared gate/up and down_hc forced off for
+v41), the whole ds41 family on `ds4_current_stream()` (the engine's
+g_cur_stream convention; the P4-1 event band-aid removed), the MoE fixture
+(gen_moe.py: 2 experts, shared gate/up slots, one probe down with a single
+nonzero column, 13-bit plane states covered), the Rust emulation
+(ds41_moe_ref.rs), the device gate (tests/test_ds41_moe.cu), and the geometry
+parameters so the same gate can drive the real payload.
+
+The gate failed for three days of wall time on a HARNESS bug, not a kernel
+bug, and the distinction is the unit's main lesson:
+
+- `parse_cases` read with fgets into an 8 KB buffer; an x line is IN_DIM hex
+  words (~18 KB at IN_DIM 2048). Every x was silently truncated after ~910
+  values: one-hot cases 4-5 (c=1024, 2047) read as all-zero x and returned
+  exact zeros, and the random cases lost most of their activation. The
+  earlier "mid wrong 1419/2048" bisect was this truncation, reproduced
+  against the emulation. getline fixed it (263f843).
+- The persist kernels were never at fault: with the activation intact, six
+  onehot cases and one dense random case are bit-exact, and the one
+  remaining divergence is fully measured (below).
+
+Acceptance criterion (random cases) and why: the emulation is an
+order-divergent oracle (sequential f32 sums; the device is lane-split dot8
+chains with FMA contraction and --use_fast_math expf). Both round the same
+mathematical value; where an intermediate sits within ~1e-5 relative of a
+bf16 quantization boundary the two round to different sides. Measured on the
+synthetic case 6: ONE gate dot 5e-5 from a boundary flips 2 bf16 ulps, the
+mid inherits it, 15/3072 down partials flip by <=5 bf16 ulps, and the folded
+output moves by sum_k |w| * that quantum. Per-element relative error blows
+up wherever the weighted partials cancel (worst 0.107 on a value ~20 among
+outputs ~1e5), so the gate compares against the reference vector's own
+scale: max |delta| <= 1e-3 * max |ref| (measured 2.74e-4 synthetic,
+7.7e-4/2.6e-4 real). The mid/partial dumps are what made this measurable
+(DS41_MOE_DUMP_MID, DS41_MOE_REF_DUMP; both kept, diagnostic-only).
+
+Gates:
+
+1. Local (RTX 4070 SUPER, sm_89): `make test-ds41-moe` 8/8 PASS — cases 0-5
+   onehot bit-exact, case 7 random bit-exact, case 6 scale 2.743e-04.
+2. Spark (sm_121): `make test-ds41-moe` 8/8 PASS, numbers identical to
+   sm_89 (case 6: max abs 4.608e+02, 5 diffs, scale 2.743e-04) — the
+   divergence is deterministic across architectures.
+3. Spark: `make test-ds41-vq` 70/70 PASS (4 fixtures, 2093 values
+   bit-exact) — the P4-1 regression.
+4. Spark, the real layer-0 payload (blk.0 at abs 456249888, expert 0
+   extracted by ds41_vq_ref; gate/up [2304][5120] R=20, down [5120][2304]
+   R=9 — the persist path's real regime, both cases random K=6):
+   `./tests/test_ds41_moe <blob> <cases> <ref> 5120 2304 5120` 2/2 PASS
+   (scale 7.716e-04 and 2.648e-04).
+5. Spark, same payload at the dump level: mid 0/13824 bit-diffs
+   (bit-exact), down partials 12/30720 at exactly 1 bf16 ulp.
+6. Spark, the engine's own equivalence doctrine ("gate = cmp against the
+   v2-shaped kernels"): DS41_VQ_NO_PERSIST=1 on the synthetic fixture gives
+   the same 8/8 with identical numbers, and on the real payload the persist
+   and plain paths' mid and partial dumps are byte-identical (cmp). The
+   switch stays as a diagnostic; it cannot run on sm_89 (the plain gateup
+   kernel needs 92 registers at 1024 threads there).
+
+Contracts and notes:
+
+- The n=1 persist kernels pipeline 8-round blocks: every row needs
+  R = cols/256 >= 8 rounds and every span (n rows) >= 8 rounds. The real
+  artifact is R=20/9; the synthetic fixture sits at the R=8 floor. A smaller
+  artifact would decode garbage in rows 2+ of a span — this is a payload
+  format precondition, not a runtime check.
+- The shared-expert arm (plain_graph_matmul_tensor, q4_K) is wired but not
+  exercised by this gate: it runs with the forward (P4-4).
+- The scale tolerance's margin on the real payload is 1.3x (7.7e-4 vs
+  1e-3) — thin, and honest to record. It absorbs boundary-rounding noise
+  only; a structural error moves whole outputs far past it (verified during
+  the bisect: the truncated-activation failure sat at scale ~1).
+
+Next: P4-3 (fp8_32x32 decode and the engram read path).
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the

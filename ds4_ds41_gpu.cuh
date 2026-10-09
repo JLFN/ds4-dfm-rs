@@ -167,9 +167,12 @@ extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *mo
     const int rc = ds4_gpu_v41_vq_decode_raw(out ? (float *)out->ptr : NULL, blob, in_dim, mid_dim, out_dim,
                                      (const int32_t *)selected->ptr, (const float *)weights->ptr,
                                      n_expert_used, clamp, (const float *)x->ptr, n_tok, nc, NULL, ver);
-    /* P4-2 debugging aid (remove when the unit closes): DS41_MOE_DUMP_MID=1
-     * writes the worker's mid scratch (bf16, np x mid_dim) to a file so the
-     * persist path's h can be compared against the emulation. */
+    /* Diagnostic switch, kept (P4-2): DS41_MOE_DUMP_MID=1 writes the worker's
+     * mid scratch (bf16, np x mid_dim) and the down partials (f32, np x
+     * out_dim) to /tmp so the persist path's values can be compared against
+     * the emulation's dumps (DS41_MOE_REF_DUMP=1 in ds41_moe_ref.rs). This is
+     * what measured the P4-2 acceptance: mid 0/13824 bit-diffs, partials
+     * 12/30720 at <=1 bf16 ulp on the real layer-0 payload. */
     if (getenv("DS41_MOE_DUMP_MID") && g_v41_vq_h.p) {
         (void)cudaDeviceSynchronize();
         const uint64_t bytes = (uint64_t)n_tok * n_expert_used * mid_dim * 2u;

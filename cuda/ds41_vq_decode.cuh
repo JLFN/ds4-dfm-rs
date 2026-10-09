@@ -320,11 +320,14 @@ static int v41_vq_fused_moe_n(float *out, const uint8_t *blob, uint32_t IN, uint
         grp = v41_vq_grp_launch<NBIT, V3, EXT>(0, n_tok, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, K, clamp, cbb, gr, ord, (uint32_t)np);
         if (grp < 0) return 0;
     }
-    /* P4-2 debugging aid (remove when the unit closes): DS41_VQ_NO_PERSIST=1
-     * forces the plain kernels so the two paths can be compared on the same
-     * case.  Note: on sm_89 the plain gateup kernel currently compiles to 92
-     * registers and cannot launch at 1024 threads ("too many resources"); the
-     * persist kernels are pinned by __launch_bounds__(1024, 1) and launch. */
+    /* Diagnostic switch, kept (P4-2): DS41_VQ_NO_PERSIST=1 forces the
+     * v2-shaped plain kernels so the persist path can be cmp'd against them —
+     * the engine's own equivalence gate ("gate = cmp against the v2-shaped
+     * kernels"). Verified byte-identical (mid + partial dumps) on the real
+     * layer-0 payload (sm_121, P4-2 evidence). Not usable on sm_89: the plain
+     * gateup kernel compiles to 92 registers there and cannot launch at 1024
+     * threads ("too many resources"); the persist kernels are pinned by
+     * __launch_bounds__(1024, 1). */
     const bool per = n_tok == 1u && V3 && shg && shd && getenv("DS41_VQ_NO_PERSIST") == NULL;
     if (pern) { /* already launched */ }
     else if (per) { if (!v41_vq_persist_launch<NBIT, EXT>(0, h, part, blob, sel, (const uint32_t *)xb, IN, MID, OUT, (uint32_t)np, clamp, cbb, gr)) return 0; }
