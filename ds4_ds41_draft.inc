@@ -705,6 +705,10 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     int produced = 0;
     do {
         if (!am) break;
+        /* --emit-trace prints the prompt too (`[ptok] <pos> <id>`): the prompt
+         * is the chat template's render, whose re-tokenization cannot be
+         * reconstructed from text afterwards (core_v41_api.c:171-173). */
+        if (g_ds4_v41_emit_trace) for (uint32_t i = 0; i < np; i++) fprintf(stderr, "[ptok] %u %d\n", i, prompt[i]);
         const double t0 = now_sec();
         bool ok = true, aborted = false;
         for (uint32_t c0 = 0; ok && c0 < np;) {

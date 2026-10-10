@@ -24,10 +24,61 @@ pub const THINK_MAX_PREFIX: &str = concat!(
     "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n",
 );
 
+/// The engine's official V4.1 encoding.py effort lines (`core_globals.c:14-17`,
+/// `DS4_REASONING_EFFORT_HIGH_PREFIX` / `DS4_REASONING_EFFORT_MAX_PREFIX`).
+/// The `THINK_*_PREFIX` pair above is the port's pre-2026-09-21 V4-era text
+/// and stays for the V4 head only.
+pub const V41_THINK_HIGH_PREFIX: &str = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+pub const V41_THINK_MAX_PREFIX: &str = "Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+
+/// The DSML prompt head a model writes. `V4` is the port's own C lineage
+/// (`THINK_*_PREFIX`, no system token). `V41` is the engine's official
+/// encoding.py head: the 75/100 effort lines (core_globals.c:14-17) and the
+/// <｜System｜> token written before the effort prefix when the effort or the
+/// system body is non-empty (server_dsml_render.c:375-383), gated on the
+/// loaded tokenizer owning it (core_bpe.c:332-333, core_engine_api.c:94-96).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DsmlHead {
+    V4,
+    V41 { system_token: bool },
+}
+
+/// C `ds4_chat_system_token()` (core_engine_api.c:94-96).
+pub const DSML_SYSTEM_TOKEN: &str = "<｜System｜>";
+
+/// The head for a model id: only `Variant::DeepSeek41Flash` takes the engine's
+/// V4.1 encoding.py head; every other DSML model keeps the port's own.
+pub fn dsml_head(model_id: i32, system_token: &str) -> DsmlHead {
+    if model_id == ds4_core::Variant::DeepSeek41Flash as i32 {
+        DsmlHead::V41 {
+            system_token: !system_token.is_empty(),
+        }
+    } else {
+        DsmlHead::V4
+    }
+}
+
+fn head_effort_prefix(head: DsmlHead, mode: ThinkMode) -> &'static str {
+    match head {
+        DsmlHead::V4 => think_effort_prefix(mode),
+        DsmlHead::V41 { .. } => match mode {
+            ThinkMode::High => V41_THINK_HIGH_PREFIX,
+            ThinkMode::Max => V41_THINK_MAX_PREFIX,
+            ThinkMode::None | ThinkMode::Low => "",
+        },
+    }
+}
+
 pub const DSML_BOS: &str = "<｜begin▁of▁sentence｜>";
 pub const DSML_USER: &str = "<｜User｜>";
 pub const DSML_ASSISTANT: &str = "<｜Assistant｜>";
 pub const DSML_EOS: &str = "<｜end▁of▁sentence｜>";
+
+/// The DSML think tags (the engine's literal in server_dsml_render.c: an ASCII
+/// `<think>` / `</think>` pair).  Written with \u escapes so the string
+/// survives any pipeline that parses bare angle brackets as markup.
+pub const DSML_THINK_START: &str = "\u{3c}think\u{3e}";
+pub const DSML_THINK_END: &str = "\u{3c}/think\u{3e}";
 pub const DSML_TOOL_CALLS: &str = "<｜DSML｜tool_calls>";
 pub const MOTIF_TOOL_CALLS: &str = "<tool_call>";
 pub const EXAONE_TOOL_CALLS: &str = "<tool_call>";
@@ -1059,7 +1110,7 @@ pub fn render_dsml_chat(
     tool_schemas: &str,
     think_mode: ThinkMode,
 ) -> Result<Vec<u8>, RenderError> {
-    render_dsml_chat_choice(msgs, tool_schemas, think_mode, ToolChoice::Auto)
+    render_dsml_chat_choice_ex(msgs, tool_schemas, think_mode, ToolChoice::Auto, DsmlHead::V4)
 }
 
 pub fn render_dsml_chat_choice(
@@ -1067,6 +1118,16 @@ pub fn render_dsml_chat_choice(
     tool_schemas: &str,
     think_mode: ThinkMode,
     tool_choice: ToolChoice,
+) -> Result<Vec<u8>, RenderError> {
+    render_dsml_chat_choice_ex(msgs, tool_schemas, think_mode, tool_choice, DsmlHead::V4)
+}
+
+pub fn render_dsml_chat_choice_ex(
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    think_mode: ThinkMode,
+    tool_choice: ToolChoice,
+    head: DsmlHead,
 ) -> Result<Vec<u8>, RenderError> {
     let think = think_mode_enabled(think_mode);
     let tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -1096,7 +1157,16 @@ pub fn render_dsml_chat_choice(
 
     let mut out = Vec::new();
     put(&mut out, DSML_BOS);
-    put(&mut out, think_effort_prefix(think_mode));
+    // The engine's one V4.1 branch (server_dsml_render.c:375-383): a non-empty
+    // system body or effort prefix writes <｜System｜> once, before the effort
+    // prefix.  The token is "" for the V4 head (the V4 tokenizer has none).
+    let effort = head_effort_prefix(head, think_mode);
+    if !effort.is_empty() || !system.is_empty() {
+        if let DsmlHead::V41 { system_token: true } = head {
+            put(&mut out, DSML_SYSTEM_TOKEN);
+        }
+    }
+    put(&mut out, effort);
     out.extend_from_slice(&system);
 
     let mut pending_assistant = false;
@@ -1836,13 +1906,14 @@ pub fn render_chat(
     tool_schemas: &str,
     think_mode: ThinkMode,
 ) -> Result<Vec<u8>, RenderError> {
-    render_chat_choice(
+    render_chat_choice_ex(
         syntax,
         msgs,
         tool_schemas,
         &[],
         think_mode,
         ToolChoice::Auto,
+        DsmlHead::V4,
     )
 }
 
@@ -1853,6 +1924,18 @@ pub fn render_chat_choice(
     tool_orders: &[ToolSchemaOrder],
     think_mode: ThinkMode,
     tool_choice: ToolChoice,
+) -> Result<Vec<u8>, RenderError> {
+    render_chat_choice_ex(syntax, msgs, tool_schemas, tool_orders, think_mode, tool_choice, DsmlHead::V4)
+}
+
+pub fn render_chat_choice_ex(
+    syntax: ModelSyntax,
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    tool_orders: &[ToolSchemaOrder],
+    think_mode: ThinkMode,
+    tool_choice: ToolChoice,
+    head: DsmlHead,
 ) -> Result<Vec<u8>, RenderError> {
     if syntax != ModelSyntax::Inkling
         && syntax != ModelSyntax::Mimo2
@@ -1892,7 +1975,7 @@ pub fn render_chat_choice(
         ModelSyntax::K2Horizon => render_k2_chat(msgs, tool_schemas, think_mode),
         ModelSyntax::Inkling => inkling::render(msgs, tool_schemas, think_mode),
         ModelSyntax::DeepSeek => {
-            render_dsml_chat_choice(msgs, tool_schemas, think_mode, tool_choice)
+            render_dsml_chat_choice_ex(msgs, tool_schemas, think_mode, tool_choice, head)
         }
     }
 }
@@ -1998,18 +2081,52 @@ pub fn render_live_tool_tail(
             }
         }
         ModelSyntax::DeepSeek => {
+            // The engine tail is standalone (server_live_prep.c:21-69; the
+            // port own C: ds4_server.c:4700-4748): EOS + messages only - no
+            // effort prefix and no system token, whose head is already in KV.
+            let think = think_mode_enabled(think_mode);
+            let mut pending_assistant = false;
+            let mut pending_tool_result = false;
             put(&mut out, DSML_EOS);
-            let tail: Vec<_> = tail
-                .iter()
-                .filter(|msg| !role_is_system(&msg.role))
-                .cloned()
-                .collect();
-            let rendered = render_dsml_chat_choice(&tail, "", think_mode, ToolChoice::Auto)?;
-            out.extend_from_slice(
-                rendered
-                    .strip_prefix(DSML_BOS.as_bytes())
-                    .unwrap_or(&rendered),
-            );
+            for m in tail {
+                if role_is_system(&m.role) {
+                    continue;
+                } else if m.role == "user" {
+                    put(&mut out, DSML_USER);
+                    put(&mut out, &m.content);
+                    pending_assistant = true;
+                    pending_tool_result = false;
+                } else if m.role == "tool" || m.role == "function" {
+                    if !pending_tool_result {
+                        put(&mut out, DSML_USER);
+                    }
+                    put(&mut out, "<tool_result>");
+                    append_tool_result_text(&mut out, m.content.as_bytes());
+                    put(&mut out, "</tool_result>");
+                    pending_assistant = true;
+                    pending_tool_result = true;
+                } else if m.role == "assistant" {
+                    if pending_assistant {
+                        put(&mut out, DSML_ASSISTANT);
+                        if think {
+                            put(&mut out, DSML_THINK_START);
+                            put(&mut out, &m.reasoning);
+                            put(&mut out, DSML_THINK_END);
+                        } else {
+                            put(&mut out, DSML_THINK_END);
+                        }
+                    }
+                    put(&mut out, &m.content);
+                    append_dsml_tool_calls_text(&mut out, m);
+                    put(&mut out, DSML_EOS);
+                    pending_assistant = false;
+                    pending_tool_result = false;
+                }
+            }
+            if pending_assistant {
+                put(&mut out, DSML_ASSISTANT);
+                put(&mut out, if think { DSML_THINK_START } else { DSML_THINK_END });
+            }
         }
         ModelSyntax::SolarOpen2 => {
             put(&mut out, SOLAR_IM_END);

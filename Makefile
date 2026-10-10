@@ -1060,6 +1060,20 @@ test-ds41-serving-http: ds4 ds4-server
 	  sh tests/ds41_serving_http_gate.sh ./ds4-server ./ds4 "$(MODEL)" "$(ENGRAM_DIR)" "$${PORT:-8477}" "$${PROMPT:-The capital of France is}" "$${NPRED:-16}"; \
 	fi
 
+# DeepSeek V4.1 (ds41) chat gate (unit G): the served chat prompt and its ids
+# must equal the ENGINE's on the same chat+tools request.  The engine server
+# --trace dumps the rendered prompt text and both id lists (server_trace.c:222);
+# the port server --emit-trace prints the same ids ([ptok] + [emit]).
+#   make test-ds41-chat ENG_SERVER=<engine ds4-server> MODEL=<gguf> \
+#        ENGRAM_DIR=<shard dir> [PORT=8478]
+.PHONY: test-ds41-chat
+test-ds41-chat: ds4-server
+	@if [ -z "$(ENG_SERVER)" ] || [ -z "$(MODEL)" ] || [ -z "$(ENGRAM_DIR)" ]; then \
+	  echo "usage: make test-ds41-chat ENG_SERVER=<engine server> MODEL=<gguf> ENGRAM_DIR=<shard dir> [PORT=8478]"; \
+	else \
+	  sh tests/ds41_chat_gate.sh "$(ENG_SERVER)" ./ds4-server "$(MODEL)" "$(ENGRAM_DIR)" "$${PORT:-8478}"; \
+	fi
+
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its
 # load-time configuration is not the C validator's: this gate pins the two

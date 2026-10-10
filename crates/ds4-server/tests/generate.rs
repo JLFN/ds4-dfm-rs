@@ -5,7 +5,8 @@ use ds4_server::route::WireSurface;
 use ds4_server::{
     generate_and_write, generation_blocked, handle_client_inner, render_prompt,
     stop_list_find_from, ContStepper, DecodeIo, GenerateError, ParseEnv, ParsedRequest, ReqTimings,
-    ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode, CREATED_TEST, TAPE_PLAIN,
+    ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode, CREATED_TEST,
+    DSML_ASSISTANT, DSML_BOS, DSML_SYSTEM_TOKEN, DSML_THINK_END, DSML_USER, TAPE_PLAIN,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -35,6 +36,37 @@ fn user_req() -> ParsedRequest {
     r.think_mode = ThinkMode::None;
     r.temperature = 0.0;
     r
+}
+
+#[test]
+fn ds41_chat_takes_the_c_renderer_with_the_v41_head() {
+    // The C-rendered DSML families ship no chat template: model 16 is admitted
+    // beside model 0 (chat_input.rs) and renders through render_prompt with the
+    // engine's official encoding.py head (server_dsml_render.c:375-383), the
+    // scripted model standing in for a V4.1 tokenizer that owns the token.
+    let parsed = parse_request(
+        WireSurface::OpenaiChat,
+        &env(),
+        r#"{"messages":[{"role":"system","content":"S"},{"role":"user","content":"U"}]}"#,
+    )
+    .unwrap();
+    let mut engine = ScriptedDecode::from_pieces(&[b"x"]);
+    engine.model_id = ds4_core::Variant::DeepSeek41Flash as i32;
+    let rendered = engine.render_request(&parsed).unwrap();
+    assert_eq!(
+        rendered,
+        format!(
+            "{DSML_BOS}{DSML_SYSTEM_TOKEN}S{DSML_USER}U{DSML_ASSISTANT}{DSML_THINK_END}"
+        )
+        .as_bytes()
+    );
+    // The base V4 family keeps its own head: no system token.
+    engine.model_id = ds4_core::Variant::Flash as i32;
+    let rendered = engine.render_request(&parsed).unwrap();
+    assert_eq!(
+        rendered,
+        format!("{DSML_BOS}S{DSML_USER}U{DSML_ASSISTANT}{DSML_THINK_END}").as_bytes()
+    );
 }
 
 struct PromptSyncDecode {

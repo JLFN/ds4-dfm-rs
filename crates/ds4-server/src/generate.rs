@@ -30,8 +30,8 @@ use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ChatMsg, ChatPart, EosPolicy, ParsedRequest, ToolCall, ToolChoice};
 use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
 use crate::render::{
-    render_chat_choice, syntax_for_model_id, tool_start_marker, ModelSyntax, RenderError, DSML_EOS,
-    QWEN_IM_END, SOLAR_IM_END,
+    render_chat_choice_ex, syntax_for_model_id, tool_start_marker, ModelSyntax, RenderError,
+    DSML_EOS, QWEN_IM_END, SOLAR_IM_END,
 };
 use crate::retry::{
     build_recovery_suffix, parse_failure_should_retry, terminal_finish, truncation_outcome,
@@ -162,11 +162,20 @@ pub trait DecodeIo {
     fn template(&self) -> Option<&ds4_core::chat_template::Template> {
         None
     }
+    /// C `ds4_chat_system_token()` (core_engine_api.c:94-96): the DSML prompt
+    /// head token the loaded vocab owns, "" when it has none (the V4 fallback).
+    fn chat_system_token(&self) -> &'static str {
+        ""
+    }
     fn render_request(&self, parsed: &ParsedRequest) -> Result<Vec<u8>, GenerateError> {
         if let Some(template) = self.template() {
             return crate::chat_input::render(template, self.model_id(), parsed);
         }
-        render_prompt(parsed, self.model_id())
+        render_prompt_ex(
+            parsed,
+            self.model_id(),
+            crate::render::dsml_head(self.model_id(), self.chat_system_token()),
+        )
     }
     fn restore_chat(&self, _parsed: &mut ParsedRequest) -> Result<(), GenerateError> {
         Ok(())
@@ -1250,15 +1259,24 @@ pub fn stream_req_from_parsed(parsed: &ParsedRequest, model_id: i32) -> StreamRe
 }
 
 pub fn render_prompt(parsed: &ParsedRequest, model_id: i32) -> Result<Vec<u8>, GenerateError> {
+    render_prompt_ex(parsed, model_id, crate::render::DsmlHead::V4)
+}
+
+pub fn render_prompt_ex(
+    parsed: &ParsedRequest,
+    model_id: i32,
+    head: crate::render::DsmlHead,
+) -> Result<Vec<u8>, GenerateError> {
     match parsed.kind {
         ReqKind::Completion => Ok(parsed.prompt_text.clone().unwrap_or_default().into_bytes()),
-        ReqKind::Chat => Ok(render_chat_choice(
+        ReqKind::Chat => Ok(render_chat_choice_ex(
             syntax_for_model_id(model_id),
             &parsed.messages,
             &parsed.tool_schemas,
             &parsed.tool_orders,
             parsed.think_mode,
             parsed.tool_choice,
+            head,
         )?),
     }
 }
@@ -3313,6 +3331,16 @@ impl DecodeIo for ScriptedDecode {
         false
     }
 
+    fn chat_system_token(&self) -> &'static str {
+        // A scripted V4.1 model implies a V4.1 tokenizer, which owns
+        // <｜System｜> (core_bpe.c:332); every other scripted model has none.
+        if self.model_id == ds4_core::Variant::DeepSeek41Flash as i32 {
+            crate::render::DSML_SYSTEM_TOKEN
+        } else {
+            ""
+        }
+    }
+
     fn token_text(&self, token: i32) -> Result<Vec<u8>, GenerateError> {
         Ok(self
             .steps
@@ -3890,8 +3918,17 @@ impl DecodeIo for NativeDecode<'_> {
         self.model.chat_template()
     }
 
+    fn chat_system_token(&self) -> &'static str {
+        self.model.vocab().chat_system_token()
+    }
+
     fn render_request(&self, parsed: &ParsedRequest) -> Result<Vec<u8>, GenerateError> {
-        crate::chat_input::render_model(self.model.chat_template(), self.model_id(), parsed)
+        crate::chat_input::render_model(
+            self.model.chat_template(),
+            self.model_id(),
+            parsed,
+            self.model.vocab().chat_system_token(),
+        )
     }
 
     fn restore_chat(&self, parsed: &mut ParsedRequest) -> Result<(), GenerateError> {
