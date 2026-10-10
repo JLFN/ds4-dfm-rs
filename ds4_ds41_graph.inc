@@ -79,10 +79,11 @@ typedef struct {
 /* The engine's ds4_engine_v41_set_graph + the port's diagnostics.  A run with
  * a readback diagnostic set (FWD_TRACE / DUMP_HEAD / FEED_DIGEST) stays
  * direct: those sync inside the forward and would void every capture. */
+static int g_ds4_v41_graph = -1;
+void ds4_engine_v41_set_graph(int on) { g_ds4_v41_graph = on; }
 static int v41_graph_enabled(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("DS41_NO_GRAPH") ? 0 : 1;
-    return on;
+    if (g_ds4_v41_graph < 0) g_ds4_v41_graph = getenv("DS41_NO_GRAPH") ? 0 : 1;
+    return g_ds4_v41_graph;
 }
 static int v41_graph_diag(void) {
     static int on = -1;

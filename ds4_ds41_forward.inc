@@ -45,6 +45,75 @@ extern int g_ds4_v41_prof;
  * only matters to the generate-path prefill slicing kept below. */
 static int g_ds4_v41_decoder_full = 0;
 
+/* ---- P5: the serving switches (ds41_forward.h) -----------------------------
+ * The engine's process globals, one setter each; the env fallbacks are read
+ * once at first use so the E-gates' DS41_NO_DSPARK / DS41_NO_GRAPH keep
+ * working until a setter overrides them. */
+static int g_ds4_v41_dspark = -1;   /* core_v41_api.c:37: 0 off / 1 default on / 2 explicit --dspark */
+void ds4_engine_v41_set_dspark(int mode) { g_ds4_v41_dspark = mode; }
+static int v41_dspark_mode(void) {
+    if (g_ds4_v41_dspark < 0) g_ds4_v41_dspark = getenv("DS41_NO_DSPARK") ? 0 : 1;
+    return g_ds4_v41_dspark;
+}
+void ds4_engine_v41_set_emit_trace(int on) { g_ds4_v41_emit_trace = on; }
+void ds4_engine_v41_set_prof(int on) { g_ds4_v41_prof = on; }
+
+/* The engine's prefill progress hook (core_v41_api.c:187-194). */
+static int (*g_v41_progress)(void *ud, const char *event, int current, int total);
+static void *g_v41_progress_ud;
+void ds4_engine_v41_set_progress(int (*cb)(void *ud, const char *event, int current, int total), void *ud) {
+    g_v41_progress = cb;
+    g_v41_progress_ud = ud;
+}
+
+/* The Rust host's rows provider (ds41_forward.h): pinned raw buffers owned
+ * here, the caller fills them through the trampoline.  The cap matches the
+ * generate entry's prefill cap; a larger block is refused (a cap drift must
+ * fail loud, not read past the buffer). */
+struct ds4_v41_feed {
+    ds41_engram_feed feed;
+    ds4_v41_rows_fn fn;
+    void *ud;
+    void *raw[DS4_V41_MAX_ENGRAM];
+    uint32_t n_layers, rows_cap;
+};
+static int v41_feed_tramp(uint32_t pos0, const int *tokens, int n, void *ud) {
+    ds4_v41_feed *f = (ds4_v41_feed *)ud;
+    if (n < 0 || (uint32_t)n > f->rows_cap) {
+        fprintf(stderr, "ds4: [v41] engram feed block %d over its capacity %u\n", n, f->rows_cap);
+        return 1;
+    }
+    const int rc = f->fn ? f->fn(pos0, tokens, n, (uint8_t *const *)f->raw, f->ud) : 0;
+    f->feed.pos0 = pos0;   /* declare the exact block; the forward asserts it at the point of use */
+    return rc;
+}
+void ds4_v41_feed_close(ds4_v41_feed *f) {
+    if (!f) return;
+    for (uint32_t k = 0; k < DS4_V41_MAX_ENGRAM; k++) if (f->raw[k]) ds4_gpu_host_free(f->raw[k]);
+    free(f);
+}
+ds4_v41_feed *ds4_v41_feed_open(void *engine, int n_prompt, ds4_v41_rows_fn fn, void *ud) {
+    if (!engine || DS4_MODEL_VARIANT != DS4_VARIANT_V41 || g_ds4_v41.n_engram == 0) return NULL;
+    const uint32_t cols = (g_ds4_v41.engram_max_ngram - 1u) * g_ds4_v41.engram_heads;
+    const uint32_t stride = g_ds4_v41.engram_head_dim + g_ds4_v41.engram_head_dim / 32u;
+    const uint32_t np = n_prompt > 0 ? (uint32_t)n_prompt : 1u;
+    const uint32_t cap = DS4_V41_CHUNK < np ? DS4_V41_CHUNK : np;   /* the generate entry's own cap */
+    ds4_v41_feed *f = calloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->fn = fn; f->ud = ud; f->rows_cap = cap; f->n_layers = g_ds4_v41.n_engram;
+    for (uint32_t k = 0; k < f->n_layers; k++) {
+        f->raw[k] = ds4_gpu_host_alloc((uint64_t)cap * cols * stride);
+        if (!f->raw[k]) { ds4_v41_feed_close(f); return NULL; }
+        f->feed.raw[k] = f->raw[k];
+    }
+    f->feed.prepare = v41_feed_tramp;
+    f->feed.ud = f;
+    return f;
+}
+const ds41_engram_feed *ds4_v41_feed_handle(const ds4_v41_feed *f) {
+    return f ? &f->feed : NULL;
+}
+
 /* The engram row feed (ds41_forward.h): pinned raw bytes + host row ids per
  * engram layer.  In production the Rust host hashes and preads; the C harness
  * may pread the golden row ids directly. */

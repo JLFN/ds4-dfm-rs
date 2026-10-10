@@ -47,6 +47,7 @@ mod step37_mtp;
 mod tensors;
 mod tok;
 mod v41;
+mod v41_run;
 mod validate;
 mod vq;
 mod zchain;
@@ -143,6 +144,7 @@ pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use v41::{
     V41Wire, V41WireError, MTP_MAX_EXPERTS, MTP_MAX_TOWERS, V41_MAX_COMPRESS_RATIO, V41_MAX_ENGRAM,
 };
+pub use v41_run::{V41Feed, V41RunOptions};
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, validate_qwen_inventory,
     ValidateError,

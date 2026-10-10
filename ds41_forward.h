@@ -87,6 +87,48 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
 extern int g_ds4_v41_prof;
 extern int g_ds4_v41_emit_trace;   /* the engine's --emit-trace (the [dspark] lines without the draft/main sections) */
 
+/* ---- P5: the serving switches and the host rows provider -------------------
+ * The engine sets its process-global switches before the run (cli_diag.c:58,
+ * cli_main.c:144); these are the same knobs for the port's CLI and the
+ * bridge.  DS41_NO_DSPARK / DS41_NO_GRAPH stay the env fallbacks and are
+ * read once, at first use; an explicit setter wins over them. */
+
+/* core_v41_api.c:37: 0 = off (--no-dspark), 1 = default on, 2 = explicit
+ * --dspark.  The port is greedy-only, so 1 and 2 behave alike today (the
+ * engine's mode-1 penalty fallback and mode-2 hard refusal are sampling-path
+ * behavior, a recorded gap); the three CLI flags land on this one knob. */
+void ds4_engine_v41_set_dspark(int mode);
+
+/* --no-graph (the engine's ds4_engine_v41_set_graph(0)); until this is
+ * called the graph enable also consults DS41_NO_GRAPH. */
+void ds4_engine_v41_set_graph(int on);
+
+/* --emit-trace / --v41-prof (the two globals above; setters for the CLI). */
+void ds4_engine_v41_set_emit_trace(int on);
+void ds4_engine_v41_set_prof(int on);
+
+/* The engine's prefill progress hook (core_v41_api.c:187-194): called once
+ * per prefill chunk with the running count; a nonzero return aborts the
+ * prefill (the server's client-gone check). */
+void ds4_engine_v41_set_progress(int (*cb)(void *ud, const char *event, int current, int total), void *ud);
+
+/* The Rust host's engram rows provider.  The forward hands over the exact
+ * block it is about to run (pos0, its token ids, n rows); the provider fills
+ * dst[k] -- engram layer k's PINNED buffer, [n][cols][stride] bytes: per row,
+ * head_dim e4m3 bytes then the head_dim/32 ue8m0 tail (the on-disk row form)
+ * -- and returns 0, or nonzero to refuse the block.  The pinned buffers and
+ * the ds41_engram_feed plumbing stay native (pinned memory is a
+ * device-adjacent concern; the host never sees a device pointer).  The buffer
+ * holds the same cap the generate entry uses for this prompt
+ * (min(DS4_V41_CHUNK, n_prompt)); a block over it is refused by the
+ * trampoline, so a cap drift fails loud.  NULL when the model carries no
+ * engram layers. */
+typedef int (*ds4_v41_rows_fn)(uint32_t pos0, const int *tokens, int n, uint8_t *const *dst, void *ud);
+typedef struct ds4_v41_feed ds4_v41_feed;
+ds4_v41_feed *ds4_v41_feed_open(void *engine, int n_prompt, ds4_v41_rows_fn fn, void *ud);
+void ds4_v41_feed_close(ds4_v41_feed *f);
+const ds41_engram_feed *ds4_v41_feed_handle(const ds4_v41_feed *f);
+
 /* Engram table metadata for the feed builder: the engine's C loader filled it
  * from the GGUF, so a caller that hashes + preads rows itself (the Rust host,
  * or this port's C harness) does not re-parse the metadata.  count = how many

@@ -269,6 +269,34 @@ int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
                                        int32_t *accepted,
                                        int32_t accepted_cap,
                                        char *err, size_t errlen);
+
+/* ---- V4.1 (ds41) run surface (P5) -----------------------------------------
+ * The engine's single-request server path IS the one-shot generate with two
+ * callbacks (server_generate_v41.c:412-414 sets the prefill progress hook and
+ * calls ds4_engine_v41_generate_argmax with v41_emit); this is that same
+ * surface across the bridge, so it is the family's decode entry, not a new
+ * category.  The Rust host hashes and preads the engram rows
+ * (crates/ds4-core/src/engram.rs); the native owns the pinned buffers and
+ * hands the rows provider the exact block the forward is about to run.  All
+ * callbacks run on the calling thread; emit returning nonzero stops the
+ * generate (the CLI's EOS convention) and progress returning nonzero aborts
+ * the prefill.  The switches mirror the engine's CLI globals (cli_diag.c:58):
+ * dspark mode 0 off / 1 default on / 2 explicit --dspark. */
+typedef int (*ds4_bridge_v41_rows_fn)(uint32_t pos0, const int32_t *tokens, int n,
+                                      uint8_t *const *dst, void *ud);
+typedef int (*ds4_bridge_v41_emit_fn)(int32_t token, void *ud);
+typedef int (*ds4_bridge_v41_progress_fn)(void *ud, const char *event, int32_t current, int32_t total);
+void ds4_bridge_v41_set_dspark(int mode);
+void ds4_bridge_v41_set_graph(int on);
+void ds4_bridge_v41_set_emit_trace(int on);
+void ds4_bridge_v41_set_prof(int on);
+int ds4_bridge_v41_generate(ds4_bridge_model *m,
+                            const int32_t *prompt, int n_prompt, int n_predict,
+                            int no_engram, int verify_k,
+                            ds4_bridge_v41_rows_fn rows, void *rows_ud,
+                            ds4_bridge_v41_emit_fn emit, void *emit_ud,
+                            ds4_bridge_v41_progress_fn progress, void *progress_ud,
+                            char *err, size_t errlen);
 int ds4_bridge_session_eval_layer_slice(ds4_bridge_session *s,
                                         const int32_t *tokens,
                                         uint32_t n_tokens,

@@ -668,10 +668,11 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);   /* per-row 16 B slots (sampling layout; argmax uses the first int) */
     /* Spec decode arms when the GGUF carries the towers + draft parameters
      * (core_v41_api.c:219-221); ready=0 keeps the single-token loop.  The
-     * engine's --no-dspark equivalent is the env switch (the CLI flag lands
-     * with the serving unit). */
+     * three-way switch (--no-dspark / default / --dspark) is
+     * ds4_engine_v41_set_dspark (ds41_forward.h); DS41_NO_DSPARK remains the
+     * env fallback until a setter is called. */
     ds4_v41_draft dr;
-    const bool spec = !getenv("DS41_NO_DSPARK") && v41_draft_alloc(e, &dr);
+    const bool spec = v41_dspark_mode() != 0 && v41_draft_alloc(e, &dr);
     v41_sched cal; memset(&cal, 0, sizeof cal);
     uint32_t spec_rounds = 0, spec_acc = 0, spec_skipped = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
     for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
@@ -692,9 +693,20 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     do {
         if (!am) break;
         const double t0 = now_sec();
-        bool ok = true;
-        for (uint32_t c0 = 0; ok && c0 < np;) ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);
-        if (!ok) break;
+        bool ok = true, aborted = false;
+        for (uint32_t c0 = 0; ok && c0 < np;) {
+            ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);
+            /* The engine's per-chunk progress hook (core_v41_api.c:187-194):
+             * nonzero = the caller wants out (the server's client-gone check),
+             * stop before the remaining chunks. */
+            if (ok && g_v41_progress &&
+                g_v41_progress(g_v41_progress_ud, "prefill_chunk", (int)c0, (int)np) != 0) {
+                fprintf(stderr, "[v41] prefill aborted by the caller at %u/%u\n", c0, np);
+                aborted = true;
+                break;
+            }
+        }
+        if (!ok || aborted) break;
         fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, now_sec() - t0, (double)np / (now_sec() - t0 + 1e-9));
         if (getenv("DS41_ADDR_DUMP")) {   /* the A/B layout discriminator (see the harness) */
             fprintf(stderr, "addr am %p logits %p x %p xn %p tok %p pos %p\n", ds4_gpu_tensor_ptr(am), ds4_gpu_tensor_ptr(st.logits),

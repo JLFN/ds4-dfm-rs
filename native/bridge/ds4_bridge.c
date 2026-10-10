@@ -2,6 +2,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds41_forward.h"   /* the V4.1 run surface (P5): generate + feed + switches */
 
 #include <pthread.h>
 #include <stdio.h>
@@ -848,13 +849,66 @@ int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
                                                errlen);
 }
 
+/* ---- V4.1 (ds41) run surface (P5; ds4_bridge.h) --------------------------
+ * One-shot generate with the engine's two callbacks + the three switches.
+ * The rows provider is optional: NULL keeps the caller-pre-filled feed
+ * protocol unused, and the native forward then refuses by name when the
+ * model carries engram layers and no rows exist. */
+
+void ds4_bridge_v41_set_dspark(int mode) { ds4_engine_v41_set_dspark(mode); }
+void ds4_bridge_v41_set_graph(int on) { ds4_engine_v41_set_graph(on); }
+void ds4_bridge_v41_set_emit_trace(int on) { ds4_engine_v41_set_emit_trace(on); }
+void ds4_bridge_v41_set_prof(int on) { ds4_engine_v41_set_prof(on); }
+
+int ds4_bridge_v41_generate(ds4_bridge_model *m,
+                            const int32_t *prompt, int n_prompt, int n_predict,
+                            int no_engram, int verify_k,
+                            ds4_bridge_v41_rows_fn rows, void *rows_ud,
+                            ds4_bridge_v41_emit_fn emit, void *emit_ud,
+                            ds4_bridge_v41_progress_fn progress, void *progress_ud,
+                            char *err, size_t errlen)
+{
+    ds4_v41_feed *feed = NULL;
+
+    if (!m || !m->engine) {
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    if (!prompt || n_prompt < 1) {
+        set_err(err, errlen, "prompt is NULL or empty");
+        return 1;
+    }
+    if (n_predict < 0) {
+        set_err(err, errlen, "n_predict is negative");
+        return 1;
+    }
+    /* The pinned buffers exist only when the model has engram layers; a model
+     * without them takes the NULL feed and never consults the provider. */
+    if (!no_engram && ds4_v41_engram_count(m->engine) > 0) {
+        feed = ds4_v41_feed_open(m->engine, n_prompt, rows, rows_ud);
+        if (!feed) {
+            set_err(err, errlen, "V4.1 engram feed allocation failed");
+            return 1;
+        }
+    }
+    ds4_engine_v41_set_progress(progress, progress_ud);
+    const int rc = ds4_v41_generate_argmax(m->engine, prompt, n_prompt, n_predict,
+                                           no_engram, verify_k,
+                                           ds4_v41_feed_handle(feed), emit, emit_ud);
+    ds4_engine_v41_set_progress(NULL, NULL);
+    ds4_v41_feed_close(feed);
+    if (rc != 0) {
+        set_err(err, errlen, "V4.1 generate failed");
+        return rc;
+    }
+    return 0;
+}
+
 int ds4_bridge_session_argmax(ds4_bridge_session *s)
 {
     if (!s || !s->session) return -1;
     return ds4_session_argmax(s->session);
-}
-
-int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
+}int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
                                         int32_t excluded_id)
 {
     if (!s || !s->session) return -1;

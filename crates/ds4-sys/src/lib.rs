@@ -119,6 +119,17 @@ pub struct ds4_bridge_batch_ctx {
 
 pub type ds4_bridge_prefill_fn = Option<unsafe extern "C" fn(*mut c_void, i32, i32)>;
 
+/* V4.1 (ds41) callbacks (native/bridge/ds4_bridge.h): the rows provider fills
+ * the pinned raw rows for the exact block the forward runs (dst[k] is engram
+ * layer k's buffer); emit returns nonzero to stop; progress returns nonzero
+ * to abort the prefill. */
+pub type ds4_bridge_v41_rows_fn = Option<
+    unsafe extern "C" fn(u32, *const i32, c_int, *const *mut u8, *mut c_void) -> c_int,
+>;
+pub type ds4_bridge_v41_emit_fn = Option<unsafe extern "C" fn(i32, *mut c_void) -> c_int>;
+pub type ds4_bridge_v41_progress_fn =
+    Option<unsafe extern "C" fn(*mut c_void, *const c_char, i32, i32) -> c_int>;
+
 pub type ds4_bridge_backend = c_int;
 
 pub const DS4_BRIDGE_BACKEND_CUDA: ds4_bridge_backend = 0;
@@ -770,6 +781,30 @@ extern "C" {
         eos_token: i32,
         accepted: *mut i32,
         accepted_cap: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    /* V4.1 (ds41) run surface (P5): the engine's one-shot generate with the
+     * prefill-progress and emit callbacks, plus the three process switches.
+     * All callbacks run on the calling thread. */
+    pub fn ds4_bridge_v41_set_dspark(mode: c_int);
+    pub fn ds4_bridge_v41_set_graph(on: c_int);
+    pub fn ds4_bridge_v41_set_emit_trace(on: c_int);
+    pub fn ds4_bridge_v41_set_prof(on: c_int);
+    pub fn ds4_bridge_v41_generate(
+        m: *mut ds4_bridge_model,
+        prompt: *const i32,
+        n_prompt: c_int,
+        n_predict: c_int,
+        no_engram: c_int,
+        verify_k: c_int,
+        rows: ds4_bridge_v41_rows_fn,
+        rows_ud: *mut c_void,
+        emit: ds4_bridge_v41_emit_fn,
+        emit_ud: *mut c_void,
+        progress: ds4_bridge_v41_progress_fn,
+        progress_ud: *mut c_void,
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
