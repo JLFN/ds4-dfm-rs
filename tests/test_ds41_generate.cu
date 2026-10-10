@@ -6,6 +6,7 @@
  *
  *   test_ds41_generate <gguf> <ids_file> <engine_log> <n_predict>
  *                      [--engram-dir <shard dir>] [--no-engram]
+ *                      [--rows-ref <score dump prefix>]
  *
  * The engine log is the stderr of
  *   ds4 --cuda -m <gguf> --engram-dir <dir> --gen-ids <ids_file> -n N
@@ -14,6 +15,31 @@
  * (core_v41_api.c:246/387; the ids are the exact instrument — the printed text
  * loses the token boundaries).  The port must reproduce the sequence token for
  * token, positions included (a position mismatch = the state advanced wrong).
+ *
+ * --rows-ref <prefix>: an INDEPENDENT reference for the engram rows the feed
+ * delivers at every position — the score dump's `<prefix>.erows_Lnn.txt` over
+ * the full prompt+emitted sequence (n <= 64, one block: core_v41_score.c:36).
+ * The gate pin is N=56 with the 8-token prompt, so positions 8..63 cover all
+ * 56 emitted steps; a longer run's tail would be silently ungated, and the
+ * harness refuses that (the coverage print + the verdict).  The comparison is
+ * only meaningful while the port still matches the golden (the reference rows
+ * are for the golden history), so the check stops at the first id divergence
+ * and says so.
+ *
+ * The feed protocol: the harness derives each step's position from its own
+ * token index, declares it in feed->pos0 and the PORT asserts it against the
+ * state at the point of use (ds4_ds41_forward.inc) — the E0 class (a drifted
+ * counter feeding shifted rows, invisible to every device instrument) now
+ * refuses loudly.  Two deliberate corruptions keep the gate falsifiable:
+ *   DS41_EMIT_OFFSET=n  shifts the declared position itself (the E0 shape):
+ *                       the row reference must MISMATCH and the port must
+ *                       refuse the step;
+ *   DS41_ROW_SHIFT=n    keeps the declaration right but hashes rows for the
+ *                       wrong position: the row reference must MISMATCH while
+ *                       the port's assertion stays quiet (the two defenses are
+ *                       independent).
+ * The runner (tests/ds41_generate_gate.sh, make test-ds41-generate) requires
+ * the positive run to PASS with full coverage and both controls to FAIL.
  *
  * The engine's generate path has NO no-engram switch (only the score path
  * takes --v41-no-engram), so the gate runs with the engram layers live: the
@@ -91,16 +117,30 @@ struct engram_layer {
     uint64_t nrows, woff, soff;
     int fd;
     void *raw;      /* pinned [np][cols][stride]; row 0 is refreshed per step */
+    /* --rows-ref: the engine's own rows for every position of the reference
+     * sequence (the score dump's erows file), compared against every row set
+     * this harness hashes; ref_first_bad = -1 until the first mismatch. */
+    std::vector<int64_t> ref;
+    uint64_t ref_lines;
+    uint64_t ref_prompt, ref_emit;      /* positions checked */
+    uint64_t ref_bad;
+    int64_t ref_first_bad;
+    uint32_t ref_first_col;
 };
 
 struct gen_feed {
     ds41_engram_hash_ref ref;
+    ds41_engram_feed *feed;         /* pos0 is updated per emit (the port asserts it) */
+    std::vector<int> *gids;         /* the golden ids: the live divergence stop */
     std::vector<int32_t> token_map;
     std::vector<int64_t> mult, prim, offs;
     std::vector<int32_t> hist;      /* absolute position -> token id */
     std::vector<engram_layer> layers;
     uint32_t np;
     uint32_t emitted;
+    uint32_t emit_offset;           /* DS41_EMIT_OFFSET: shifts the declared position (the E0 shape) */
+    int row_shift;                  /* DS41_ROW_SHIFT: hashes the wrong position, declares the right one */
+    int ref_valid;                  /* 0 once the port's token left the golden history */
     int32_t eos;
     std::vector<int> *ids;          /* emitted ids for the comparison */
 };
@@ -154,12 +194,31 @@ static void ehash_rows(const gen_feed *g, int64_t p, uint32_t ei, std::vector<in
     }
 }
 
-static bool feed_fill(gen_feed *g, uint32_t slot, int64_t pos) {
+/* Hash the rows for `hash_pos` into `slot`; with `check` on, compare them
+ * against the reference line for `declared` — the position the feed claims.
+ * DS41_ROW_SHIFT makes the two differ: this check is what proves it (the
+ * port's own assertion cannot see a wrong hash target under a right
+ * declaration). */
+static bool feed_fill(gen_feed *g, uint32_t slot, int64_t declared, int64_t hash_pos, int check) {
     std::vector<int64_t> rows;
     for (uint32_t k = 0; k < g->layers.size(); k++) {
         engram_layer &L = g->layers[k];
-        ehash_rows(g, pos, k, &rows);
+        ehash_rows(g, hash_pos, k, &rows);
         if (rows.size() != L.cols) { fprintf(stderr, "harness: hash cols %zu != meta %u\n", rows.size(), L.cols); return false; }
+        if (check && !L.ref.empty() && declared >= 0 && (uint64_t)declared < L.ref_lines) {
+            const int64_t *want = &L.ref[(size_t)declared * L.cols];
+            if (declared < (int64_t)g->np) { L.ref_prompt++; } else { L.ref_emit++; }
+            for (uint32_t c = 0; c < L.cols; c++) {
+                if (rows[c] == want[c]) { continue; }
+                L.ref_bad++;
+                if (L.ref_first_bad < 0) {
+                    L.ref_first_bad = declared; L.ref_first_col = c;
+                    fprintf(stderr, "harness: row reference L%02u: MISMATCH at declared pos %lld col %u (harness row %lld != engine row %lld)\n",
+                            L.il, (long long)declared, c, (long long)rows[c], (long long)want[c]);
+                }
+                break;
+            }
+        }
         uint8_t *dst = (uint8_t *)L.raw + (size_t)slot * L.cols * L.stride;
         for (uint32_t c = 0; c < L.cols; c++) {
             const int64_t r = rows[c];
@@ -190,17 +249,40 @@ static FILE *feed_digest_file(void) {
 
 /* The emit hook: record the token, then refresh every engram layer's row 0
  * with the rows for this token's position — the forward's next step (n=1)
- * reads exactly that slot. */
+ * reads exactly that slot, and the port asserts the declared pos0 against its
+ * own state position (ds4_ds41_forward.inc).  The position is derived from
+ * this harness's token index (np + emitted); DS41_EMIT_OFFSET shifts the
+ * declaration itself (the E0 shape), DS41_ROW_SHIFT hashes the wrong position
+ * under a right declaration. */
 static int emit_feed(int token, void *ud) {
     gen_feed *g = (gen_feed *)ud;
-    const int64_t pos = (int64_t)g->np + g->emitted;
-    g->hist[(size_t)pos] = token;
-    if (!g->layers.empty() && !feed_fill(g, 0, pos)) { fprintf(stderr, "harness: feed refresh failed at pos %lld\n", (long long)pos); return 1; }
+    const uint32_t i = g->emitted;
+    const int64_t declared = (int64_t)g->np + (int64_t)i + (int64_t)g->emit_offset;
+    const int64_t hash_pos = declared + g->row_shift;
+    if (declared < 0 || (size_t)declared >= g->hist.size() ||
+        hash_pos < 0 || (size_t)hash_pos >= g->hist.size()) {
+        fprintf(stderr, "harness: emit position %lld (hash %lld) outside the history window (%zu)\n",
+                (long long)declared, (long long)hash_pos, g->hist.size());
+        return 1;
+    }
+    /* Once the port's token leaves the golden sequence the reference rows are
+     * for a different history: stop comparing (and say so). */
+    if (g->ref_valid && g->gids && i < g->gids->size() && token != (*g->gids)[i]) {
+        g->ref_valid = 0;
+        fprintf(stderr, "harness: row reference check stopped at the first id divergence (emitted index %u: port %d != golden %d)\n",
+                i, token, (*g->gids)[i]);
+    }
+    g->hist[(size_t)declared] = token;
+    if (!g->layers.empty() && !feed_fill(g, 0, declared, hash_pos, g->ref_valid)) {
+        fprintf(stderr, "harness: feed refresh failed at pos %lld\n", (long long)declared);
+        return 1;
+    }
+    if (g->feed) { g->feed->pos0 = (uint32_t)declared; }   /* the port asserts this at the point of use */
     FILE *df = feed_digest_file();
     if (df) {
         for (uint32_t k = 0; k < g->layers.size(); k++) {
             const engram_layer &L = g->layers[k];
-            fprintf(df, "host pos %lld k %u fnv %016llx\n", (long long)pos, k, (unsigned long long)fnv1a(L.raw, (size_t)L.cols * L.stride));
+            fprintf(df, "host pos %lld k %u fnv %016llx\n", (long long)declared, k, (unsigned long long)fnv1a(L.raw, (size_t)L.cols * L.stride));
         }
         fflush(df);
     }
@@ -209,18 +291,34 @@ static int emit_feed(int token, void *ud) {
     return 0;
 }
 
+/* The row-reference accounting, printed on every path: a check that does not
+ * print its coverage is how a dead check passes for a live one. */
+static void print_ref_summary(const gen_feed *g) {
+    int any = 0;
+    for (uint32_t k = 0; k < g->layers.size(); k++) {
+        const engram_layer &L = g->layers[k];
+        if (L.ref.empty()) { continue; }
+        any = 1;
+        printf("row reference L%02u: prompt %llu/%u, emitted %llu/%zu checked, %llu mismatches\n",
+               L.il, (unsigned long long)L.ref_prompt, g->np, (unsigned long long)L.ref_emit,
+               g->gids ? g->gids->size() : 0, (unsigned long long)L.ref_bad);
+    }
+    if (!any) { printf("row reference: none (the emitted positions' rows are ungated)\n"); }
+}
+
 int main(int argc, char **argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s <gguf> <ids_file> <engine_log> <n_predict> [--engram-dir <dir>] [--no-engram]\n", argv[0]);
+        fprintf(stderr, "usage: %s <gguf> <ids_file> <engine_log> <n_predict> [--engram-dir <dir>] [--no-engram] [--rows-ref <score dump prefix>]\n", argv[0]);
         return 2;
     }
     const char *gguf = argv[1], *ids_path = argv[2], *englog = argv[3];
     const int n_predict = atoi(argv[4]);
-    const char *engram_dir = NULL;
+    const char *engram_dir = NULL, *rows_ref = NULL;
     int no_engram = 0;
     for (int i = 5; i < argc; i++) {
         if (strcmp(argv[i], "--engram-dir") == 0 && i + 1 < argc) { engram_dir = argv[++i]; continue; }
         if (strcmp(argv[i], "--no-engram") == 0) { no_engram = 1; continue; }
+        if (strcmp(argv[i], "--rows-ref") == 0 && i + 1 < argc) { rows_ref = argv[++i]; continue; }
         fprintf(stderr, "harness: unknown argument %s\n", argv[i]);
         return 2;
     }
@@ -253,21 +351,32 @@ int main(int argc, char **argv) {
      * emitted was never initialized — uninitialized stack garbage that is
      * deterministic per binary (the 485e9c9 harness diverged at the first
      * step, the b36a865 one passed; identical addresses, identical payload
-     * digests, so the garbage was invisible to every instrument).  Zero it,
-     * and keep DS41_EMIT_OFFSET as the deliberate reproduction: any nonzero
-     * offset shifts every live-hashed engram row the same way the garbage did. */
+     * digests, so the garbage was invisible to every instrument).  Zero it;
+     * the port also asserts the declared position against its own state at
+     * the point of use now, and DS41_EMIT_OFFSET is the deliberate
+     * reproduction: it shifts the declared position the same way the garbage
+     * did (the row reference must MISMATCH and the port must refuse). */
     g.emitted = 0;
     g.eos = 0;
     g.ids = NULL;
+    g.feed = NULL;
+    g.gids = NULL;
+    g.emit_offset = 0;
+    g.row_shift = 0;
+    g.ref_valid = 1;
     if (const char *eo = getenv("DS41_EMIT_OFFSET")) {
-        g.emitted = (uint32_t)atoi(eo);
-        printf("emit offset: %u (deliberate)\n", g.emitted);
+        g.emit_offset = (uint32_t)atoi(eo);
+        printf("emit offset: %u (deliberate)\n", g.emit_offset);
+    }
+    if (const char *rs = getenv("DS41_ROW_SHIFT")) {
+        g.row_shift = atoi(rs);
+        printf("row shift: %d (deliberate)\n", g.row_shift);
     }
     const int n_eng = ds4_v41_engram_count(e);
     if (!no_engram && n_eng > 0) {
         if (!engram_dir) { fprintf(stderr, "harness: the model has engram layers; pass --engram-dir <dir> (or --no-engram for the port-only debug mode)\n"); return 2; }
         if (!ds4_v41_engram_hash_ref(e, &g.ref) || !hash_tables(&g)) { fprintf(stderr, "harness: engram hash tables unavailable\n"); return 1; }
-        g.hist.assign((size_t)g.np + (size_t)n_predict + 8u, 0);
+        g.hist.assign((size_t)g.np + (size_t)n_predict + 8u + g.emit_offset + (g.row_shift > 0 ? (size_t)g.row_shift : 0u), 0);
         for (uint32_t i = 0; i < g.np; i++) g.hist[i] = prompt[i];
         for (int k = 0; k < n_eng; k++) {
             engram_layer L;
@@ -290,7 +399,32 @@ int main(int argc, char **argv) {
             }
             g.layers.push_back(L);
         }
-        for (uint32_t i = 0; i < g.np; i++) if (!feed_fill(&g, i, (int64_t)i)) { fprintf(stderr, "harness: prompt feed fill failed at %u\n", i); return 1; }
+        /* The independent row reference (--rows-ref): the engine's own rows
+         * for every position of the full prompt+emitted sequence, from a score
+         * dump over those exact ids (single block, n <= 64: core_v41_score.c:36).
+         * Loaded per layer; a missing file is a hard stop (the caller asked
+         * for the check) and a short file is named SHORT — the tail would
+         * otherwise be silently ungated. */
+        if (rows_ref) {
+            const uint64_t need = (uint64_t)g.np + (uint64_t)gids.size();
+            for (uint32_t k = 0; k < g.layers.size(); k++) {
+                engram_layer &L = g.layers[k];
+                char rp[4600];
+                snprintf(rp, sizeof rp, "%s.erows_L%02u.txt", rows_ref, L.il);
+                FILE *rf = fopen(rp, "r");
+                if (!rf) { fprintf(stderr, "harness: --rows-ref file missing: %s\n", rp); return 2; }
+                long long v;
+                while (fscanf(rf, "%lld", &v) == 1) { L.ref.push_back((int64_t)v); }
+                fclose(rf);
+                if (L.ref.empty() || L.ref.size() % L.cols != 0) { fprintf(stderr, "harness: %s: %zu values are not a multiple of cols %u\n", rp, L.ref.size(), L.cols); return 2; }
+                L.ref_lines = L.ref.size() / L.cols;
+                L.ref_first_bad = -1;
+                printf("row reference L%02u: %s (%llu lines; the run needs %llu = %u prompt + %zu emitted)%s\n",
+                       L.il, rp, (unsigned long long)L.ref_lines, (unsigned long long)need, g.np, gids.size(),
+                       L.ref_lines < need ? "  -- SHORT: the tail is NOT covered" : "");
+            }
+        }
+        for (uint32_t i = 0; i < g.np; i++) if (!feed_fill(&g, i, (int64_t)i, (int64_t)i, g.ref_valid)) { fprintf(stderr, "harness: prompt feed fill failed at %u\n", i); return 1; }
         printf("engram feed: %zu layers, cols %u, head_dim %u, %u prompt rows hashed\n",
                g.layers.size(), g.layers.empty() ? 0 : g.layers[0].cols, g.layers.empty() ? 0 : g.layers[0].hd, g.np);
         {   /* host-side digest of the prompt region the prefill will upload (dev pos0 0 n np) */
@@ -339,6 +473,9 @@ int main(int argc, char **argv) {
     g.ids = &oids;
     ds41_engram_feed feed;
     memset(&feed, 0, sizeof feed);
+    feed.pos0 = 0;   /* the prompt block starts at 0 (the prefill asserts this) */
+    g.feed = &feed;  /* the hook declares the decode steps' positions; the port asserts them */
+    g.gids = &gids;  /* the golden sequence: the live divergence stop for the row reference */
     for (uint32_t k = 0; k < g.layers.size(); k++) feed.raw[k] = g.layers[k].raw;   /* k == the engram index (ds41_forward.h) */
     /* DS41_GEN_DELAY_MS=<n>: a bare delay before the generate call (the
      * timing-vs-content discriminator; no reads, no allocations). */
@@ -353,7 +490,11 @@ int main(int argc, char **argv) {
     const int rc = ds4_v41_generate_argmax(e, prompt.data(), (int)prompt.size(), n_predict,
                                            no_engram || n_eng == 0 ? 1 : 0,
                                            g.layers.empty() ? NULL : &feed, emit_feed, &g);
-    if (rc != 0) { fprintf(stderr, "harness: generate entry failed\n"); return 1; }
+    if (rc != 0) {
+        print_ref_summary(&g);
+        fprintf(stderr, "harness: generate entry failed\n");
+        return 1;
+    }
 
     size_t diffs = 0, first = SIZE_MAX;
     const size_t n = gids.size() < oids.size() ? gids.size() : oids.size();
@@ -375,7 +516,19 @@ int main(int argc, char **argv) {
     printf("\nport   ids:");
     for (size_t i = 0; i < oids.size(); i++) printf(" %d", oids[i]);
     printf("\n");
-    const bool pass = (diffs == 0) && (gids.size() == oids.size()) && !pos_bad;
+    print_ref_summary(&g);
+    /* The reference verdict: with --rows-ref, every layer must have checked
+     * the full prompt + every emitted position with zero mismatches — a check
+     * narrower than the claim is how the next wrong-index bug survives it. */
+    uint64_t ref_bad = 0;
+    int ref_short = 0;
+    for (uint32_t k = 0; k < g.layers.size(); k++) {
+        const engram_layer &L = g.layers[k];
+        if (L.ref.empty()) { continue; }
+        ref_bad += L.ref_bad;
+        if (L.ref_prompt != g.np || L.ref_emit != oids.size()) { ref_short = 1; }
+    }
+    const bool pass = (diffs == 0) && (gids.size() == oids.size()) && !pos_bad && !ref_bad && !ref_short;
     printf("DS41 generate gate: %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
