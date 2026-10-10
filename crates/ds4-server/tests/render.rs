@@ -2,8 +2,10 @@
 
 use ds4_server::{
     render_chat, render_chat_choice, render_dsml_chat, render_dsml_chat_choice,
-    render_live_tool_tail, render_motif3_chat_ex, Api, ChatMsg, ChatPart, ModelSyntax, ThinkMode,
-    ToolCall, ToolChoice, ToolSchemaOrder, THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
+    render_dsml_chat_choice_ex, render_live_tool_tail, render_motif3_chat_ex, Api, ChatMsg,
+    ChatPart, DsmlHead, ModelSyntax, ThinkMode, ToolCall, ToolChoice, ToolSchemaOrder,
+    DSML_ASSISTANT, DSML_BOS, DSML_EOS, DSML_SYSTEM_TOKEN, DSML_THINK_END, DSML_THINK_START,
+    DSML_USER, THINK_HIGH_PREFIX, THINK_MAX_PREFIX, V41_THINK_HIGH_PREFIX,
 };
 
 use std::path::PathBuf;
@@ -95,6 +97,68 @@ fn dsml_anthropic_live_tool_tail_does_not_replay_the_assistant_call() {
     );
 }
 
+#[test]
+fn dsml_v41_head_matches_official_encoding() {
+    // The engine's golden byte test `test_render_matches_official_v41_encoding`
+    // (tests/server_tests_render_v41.c): the official encoding.py render of
+    // four conversations, plus the V4-tokenizer fallback.  A V4.1 tokenizer
+    // owns the system token; the head writes it once before the effort prefix.
+    let v41 = DsmlHead::V41 { system_token: true };
+    let with_sys = [msg("system", "S"), msg("user", "U")];
+    let only_user = [msg("user", "U")];
+    let render = |msgs: &[ChatMsg], mode| {
+        render_dsml_chat_choice_ex(msgs, "", mode, ToolChoice::Auto, v41).unwrap()
+    };
+    // The message list ends in a user turn, so the render closes with the
+    // pending assistant head (the think-end tag when plain, the think-start tag
+    // when thinking).
+    let sys_tail = format!("S{DSML_USER}U{DSML_ASSISTANT}");
+    let user_tail = format!("{DSML_USER}U{DSML_ASSISTANT}");
+    assert_eq!(
+        render(&with_sys, ThinkMode::None),
+        format!("{DSML_BOS}{DSML_SYSTEM_TOKEN}{sys_tail}{DSML_THINK_END}").as_bytes()
+    );
+    // A user-only chat with no effort prefix writes no head token at all.
+    assert_eq!(
+        render(&only_user, ThinkMode::None),
+        format!("{DSML_BOS}{user_tail}{DSML_THINK_END}").as_bytes()
+    );
+    assert_eq!(
+        render(&with_sys, ThinkMode::High),
+        format!("{DSML_BOS}{DSML_SYSTEM_TOKEN}{V41_THINK_HIGH_PREFIX}{sys_tail}{DSML_THINK_START}").as_bytes()
+    );
+    assert_eq!(
+        render(&only_user, ThinkMode::High),
+        format!("{DSML_BOS}{DSML_SYSTEM_TOKEN}{V41_THINK_HIGH_PREFIX}{user_tail}{DSML_THINK_START}").as_bytes()
+    );
+    // The V4 tokenizer has no system token: BOS then the system body (V4 head).
+    assert_eq!(
+        render_dsml_chat_choice_ex(&with_sys, "", ThinkMode::None, ToolChoice::Auto, DsmlHead::V4)
+            .unwrap(),
+        format!("{DSML_BOS}{sys_tail}{DSML_THINK_END}").as_bytes()
+    );
+}
+
+#[test]
+fn dsml_live_tool_tail_has_no_head() {
+    // The engine's tail writes EOS + messages only (server_live_prep.c:21-69;
+    // the port's own C: ds4_server.c:4700-4748): no effort prefix and no
+    // system token; the head is already in the live KV.
+    let mut result = msg("tool", "ok");
+    result.tool_call_id = "call_1".into();
+    let tail = render_live_tool_tail(
+        ModelSyntax::DeepSeek,
+        Api::Responses,
+        &[result],
+        ThinkMode::High,
+    )
+    .unwrap();
+    assert!(!tail.starts_with(V41_THINK_HIGH_PREFIX.as_bytes()));
+    let expected = format!(
+        "{DSML_EOS}{DSML_USER}<tool_result>ok</tool_result>{DSML_ASSISTANT}{DSML_THINK_START}"
+    );
+    assert_eq!(tail, expected.as_bytes());
+}
 #[test]
 fn user_none_and_low_match_c() {
     for (name, mode) in [("none", ThinkMode::None), ("low", ThinkMode::Low)] {

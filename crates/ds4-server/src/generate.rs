@@ -7,6 +7,7 @@
 //! tool error) are host-owned. Continuation publish/hold/resolve is
 //! host-owned (`cont`).
 
+use std::cell::RefCell;
 use std::io::Write;
 #[cfg(any(feature = "native", test))]
 use std::path::Path;
@@ -29,8 +30,8 @@ use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ChatMsg, ChatPart, EosPolicy, ParsedRequest, ToolCall, ToolChoice};
 use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
 use crate::render::{
-    render_chat_choice, syntax_for_model_id, tool_start_marker, ModelSyntax, RenderError, DSML_EOS,
-    QWEN_IM_END, SOLAR_IM_END,
+    render_chat_choice_ex, syntax_for_model_id, tool_start_marker, ModelSyntax, RenderError,
+    DSML_EOS, QWEN_IM_END, SOLAR_IM_END,
 };
 use crate::retry::{
     build_recovery_suffix, parse_failure_should_retry, terminal_finish, truncation_outcome,
@@ -130,14 +131,55 @@ pub struct SerialSessionProbe {
 
 pub trait DecodeIo {
     fn model_id(&self) -> i32;
+    /// True when this engine serves the V4.1 (ds41) family: no ds4_session
+    /// exists for it, so the serial path takes the push-based route instead
+    /// of the pull loop (server_generate_v41.c; the dispatch mirrors the
+    /// engine's one-line check, server_generate.c:19).
+    fn is_v41(&self) -> bool {
+        false
+    }
+    /// The V4.1 push entry: the engine's one-shot generate with callbacks
+    /// (`ds4_engine_v41_generate_argmax`).  `sampling` is the per-request
+    /// decode face (the engine's ds4_engine_set_decode_sampling,
+    /// server_generate_v41.c:409); None resets to bare argmax.  `emit`
+    /// returns false to stop, `progress` returns false to abort the prefill.
+    /// Only an engine with a loaded v41 route answers; the default refuses
+    /// by name.
+    fn v41_generate(
+        &self,
+        _prompt: &[i32],
+        _n_predict: i32,
+        _sampling: Option<ds4_core::V41Sampling>,
+        _emit: &mut dyn FnMut(i32) -> bool,
+        _progress: &mut dyn FnMut(&str, i32, i32) -> bool,
+    ) -> Result<(), GenerateError> {
+        Err(GenerateError::Unsupported(
+            "V4.1 generation is not loaded on this engine",
+        ))
+    }
+    /// The last V4.1 run's speculation account (rounds, offered, accepted;
+    /// the engine's `ds4_engine_v41_last_spec_stats`, core_v41_api.c:41-46).
+    /// Zero for engines that do not speculate.
+    fn v41_last_spec_stats(&self) -> (i32, i32, i32) {
+        (0, 0, 0)
+    }
     fn template(&self) -> Option<&ds4_core::chat_template::Template> {
         None
+    }
+    /// C `ds4_chat_system_token()` (core_engine_api.c:94-96): the DSML prompt
+    /// head token the loaded vocab owns, "" when it has none (the V4 fallback).
+    fn chat_system_token(&self) -> &'static str {
+        ""
     }
     fn render_request(&self, parsed: &ParsedRequest) -> Result<Vec<u8>, GenerateError> {
         if let Some(template) = self.template() {
             return crate::chat_input::render(template, self.model_id(), parsed);
         }
-        render_prompt(parsed, self.model_id())
+        render_prompt_ex(
+            parsed,
+            self.model_id(),
+            crate::render::dsml_head(self.model_id(), self.chat_system_token()),
+        )
     }
     fn restore_chat(&self, _parsed: &mut ParsedRequest) -> Result<(), GenerateError> {
         Ok(())
@@ -1221,15 +1263,24 @@ pub fn stream_req_from_parsed(parsed: &ParsedRequest, model_id: i32) -> StreamRe
 }
 
 pub fn render_prompt(parsed: &ParsedRequest, model_id: i32) -> Result<Vec<u8>, GenerateError> {
+    render_prompt_ex(parsed, model_id, crate::render::DsmlHead::V4)
+}
+
+pub fn render_prompt_ex(
+    parsed: &ParsedRequest,
+    model_id: i32,
+    head: crate::render::DsmlHead,
+) -> Result<Vec<u8>, GenerateError> {
     match parsed.kind {
         ReqKind::Completion => Ok(parsed.prompt_text.clone().unwrap_or_default().into_bytes()),
-        ReqKind::Chat => Ok(render_chat_choice(
+        ReqKind::Chat => Ok(render_chat_choice_ex(
             syntax_for_model_id(model_id),
             &parsed.messages,
             &parsed.tool_schemas,
             &parsed.tool_orders,
             parsed.think_mode,
             parsed.tool_choice,
+            head,
         )?),
     }
 }
@@ -2281,6 +2332,24 @@ pub(crate) fn generate_terminal_prepared(
         audios,
         videos,
     } = prep;
+    // The engine's one-line dispatch (server_generate.c:19): a V4.1 engine
+    // has no ds4_session, so the pull loop below cannot run for it — the
+    // push route takes over with the same prepared prompt.
+    if engine.is_v41() {
+        return generate_terminal_v41(
+            engine,
+            &parsed,
+            &prompt,
+            &tokens,
+            job_id,
+            created,
+            cors,
+            default_tokens,
+            t_arrive,
+            stop_requested,
+            out,
+        );
+    }
     let syntax = syntax_for_model_id(engine.model_id());
     let mut req = stream_req_from_parsed(&parsed, engine.model_id());
     let mut w = Writer::new(created);
@@ -2685,6 +2754,526 @@ pub(crate) fn generate_terminal_prepared(
     Ok((outcome, terminal))
 }
 
+/// The V4.1 callbacks' shared state (the engine's `v41_gen`,
+/// server_generate_v41.c:15-...): the emit and progress closures both need
+/// the writer and the client probe, so one struct carries the per-request
+/// streaming state and the two closures reach it through a RefCell — the
+/// native calls them sequentially, never reentrantly.
+struct V41EmitState<'a, W: Write> {
+    engine: &'a dyn DecodeIo,
+    parsed: &'a ParsedRequest,
+    req: StreamReq,
+    job_id: &'a str,
+    stop_requested: Option<fn() -> bool>,
+    max_tokens: i32,
+    acc: SemAccum,
+    w: &'a mut Writer,
+    out: &'a mut W,
+    oa: Option<OpenaiStream>,
+    anth: Option<AnthropicStream>,
+    resp: Option<ResponsesStream>,
+    first_tok: Option<Instant>,
+    decode_steps: i32,
+    token_ids: Vec<i32>,
+    finish: &'static str,
+    last_heartbeat: Instant,
+    err: Option<GenerateError>,
+}
+
+impl<W: Write> V41EmitState<'_, W> {
+    /// Flush the accumulated bytes; the job sink's flush is also the
+    /// disconnect probe (`serve.rs` JobSink::flush), so a dead peer aborts
+    /// generation the same way it does on the pull path.
+    fn flush_out(&mut self) -> bool {
+        if flush(self.w, self.out).is_ok() {
+            return true;
+        }
+        self.err = Some(GenerateError::Io);
+        false
+    }
+
+    /// `v41_emit` (server_generate_v41.c:84-206): one pushed token, the same
+    /// per-token work as the pull loop's body (`decode_pass`), in the
+    /// engine's order — EOS and the budget check run before the token
+    /// counts, so neither produces text (:114-118).
+    fn emit_token(&mut self, token: i32) -> bool {
+        if self.err.is_some() {
+            return false;
+        }
+        if self.first_tok.is_none() {
+            self.first_tok = Some(Instant::now());
+        }
+        if self.stop_requested.is_some_and(|stop| stop()) {
+            self.finish = "error";
+            self.err = Some(GenerateError::Engine("shutdown requested".into()));
+            return false;
+        }
+        if self.parsed.return_token_ids {
+            self.token_ids.push(token);
+        }
+        if token < 0 || self.engine.token_is_stop(token) {
+            self.finish = "stop";
+            return false;
+        }
+        if self.acc.completion >= self.max_tokens {
+            return false;
+        }
+        self.decode_steps += 1;
+        let piece = match self.engine.token_text(token) {
+            Ok(piece) => piece,
+            Err(error) => {
+                self.err = Some(error);
+                return false;
+            }
+        };
+        let feed = self.acc.feed(&piece, &self.parsed.stops);
+        if self.req.stream {
+            let view = &self.acc.text[..feed.emit_limit.min(self.acc.text.len())];
+            match self.req.api {
+                Api::Openai if self.req.kind == ReqKind::Completion => {
+                    if let Some(delta) = last_delta(&self.acc.text, feed.emit_limit, piece.len()) {
+                        sse_chunk(self.w, &self.req, self.job_id, Some(delta), None);
+                    }
+                }
+                Api::Openai => {
+                    if let Some(st) = self.oa.as_mut() {
+                        openai_sse_stream_update(self.w, &self.req, self.job_id, st, view, false);
+                    }
+                }
+                Api::Anthropic => {
+                    if let Some(st) = self.anth.as_mut() {
+                        if !anthropic_sse_stream_update(
+                            self.w,
+                            &self.req,
+                            self.job_id,
+                            st,
+                            view,
+                            false,
+                        ) {
+                            self.err = Some(GenerateError::Io);
+                            return false;
+                        }
+                    }
+                }
+                Api::Responses => {
+                    if let Some(st) = self.resp.as_mut() {
+                        if !responses_sse_stream_update(self.w, &self.req, st, view, false) {
+                            self.err = Some(GenerateError::Io);
+                            return false;
+                        }
+                    }
+                }
+            }
+            stream_heartbeat_if_due(
+                self.w,
+                &self.req,
+                self.resp.as_mut(),
+                &mut self.last_heartbeat,
+                Instant::now(),
+                ": decode\n\n",
+            );
+            if !self.flush_out() {
+                return false;
+            }
+        }
+        if feed.hit_stop {
+            self.finish = "stop";
+            return false;
+        }
+        if self.acc.track_tools && self.acc.saw_tool_end && self.req.chat_format == ChatFormat::DeepSeek
+        {
+            self.finish = "tool_calls";
+            return false;
+        }
+        true
+    }
+
+    /// `v41_progress_cb` (server_generate_v41.c:22-32): the prefill
+    /// keepalive (`: prefill`, the engine's 5 s interval) and the client
+    /// probe; returning false aborts the prefill (the engine's nonzero
+    /// return, `ds41_forward.h`).
+    fn prefill_progress(&mut self, _event: &str, _current: i32, _total: i32) -> bool {
+        if self.req.stream {
+            stream_heartbeat_if_due(
+                self.w,
+                &self.req,
+                self.resp.as_mut(),
+                &mut self.last_heartbeat,
+                Instant::now(),
+                ": prefill\n\n",
+            );
+        }
+        self.flush_out()
+    }
+}
+
+/// V4.1 (ds41) serial generation — the engine's push-based route
+/// (`server_generate_v41.c`).  Render and tokenize already happened
+/// (`prepare_serial_prompt`); the engine's one-shot generate pushes tokens
+/// through the emit callback, the per-token work mirrors `v41_emit`
+/// (:84-206) on the shared machinery (`SemAccum::feed` carries text,
+/// thinking, DSML and stops), and the finish mirrors `v41_finish` (:211-316)
+/// minus the pieces the engine itself drops on this route: no
+/// invalid-DSML retry (needs a session), no tool replay / live bindings /
+/// thinking checkpoints (all session-addressed), and no tool-memory write
+/// (the port's tool memory is wired to the session store this route never
+/// creates; the engine's v41 path keeps its own).
+#[allow(clippy::too_many_arguments)]
+fn generate_terminal_v41(
+    engine: &mut dyn DecodeIo,
+    parsed: &ParsedRequest,
+    prompt: &[u8],
+    tokens: &[i32],
+    job_id: &str,
+    created: i64,
+    cors: bool,
+    default_tokens: i32,
+    t_arrive: Instant,
+    stop_requested: Option<fn() -> bool>,
+    out: &mut impl Write,
+) -> Result<(GenerateOutcome, Vec<u8>), GenerateError> {
+    let prompt_n = tokens.len() as i32;
+    if prompt_n < 1 {
+        // v41_gen_begin (:325): an empty prompt never reaches the engine.
+        return Err(GenerateError::Engine("empty prompt".into()));
+    }
+    let syntax = syntax_for_model_id(engine.model_id());
+    let mut req = stream_req_from_parsed(parsed, engine.model_id());
+    // v41_gen_begin (:342-345): the budget clamps to the metadata context
+    // (the only context source; --ctx is refused at boot), and there is no
+    // prefix cache on this route — every token is a write.
+    let mut max_tokens = decode_budget(parsed.max_tokens_set, parsed.max_tokens, default_tokens);
+    let room = engine.ctx() - prompt_n;
+    if max_tokens > room {
+        max_tokens = room;
+    }
+    if max_tokens < 0 {
+        max_tokens = 0;
+    }
+    req.cache_read_tokens = 0;
+    req.cache_write_tokens = prompt_n;
+    let mut w = Writer::new(created);
+    if req.stream {
+        w.out.extend_from_slice(&sse_headers(cors));
+    }
+    let oa = if req.stream && req.api == Api::Openai && req.kind == ReqKind::Chat {
+        let mut stream = openai_stream_start(&req);
+        stream.tool.use_random_ids();
+        Some(stream)
+    } else {
+        None
+    };
+    let anth = if req.stream && req.api == Api::Anthropic {
+        let mut stream = anthropic_sse_start_live(&mut w, &req, job_id, prompt_n);
+        stream.tool.use_random_ids();
+        Some(stream)
+    } else {
+        None
+    };
+    let resp = if req.stream && req.api == Api::Responses {
+        let (rid, rsid, mid) = responses_ids(job_id);
+        let mut st = responses_stream_init(&req, &rid, &rsid, &mid);
+        responses_sse_created(&mut w, &req, &mut st, created);
+        Some(st)
+    } else {
+        None
+    };
+    if req.stream {
+        if req.api == Api::Openai && req.kind == ReqKind::Chat {
+            sse_chunk(&mut w, &req, job_id, None, None);
+        }
+        flush(&mut w, out)?;
+    }
+
+    let t0 = Instant::now();
+    let chat_format = req.chat_format;
+    let state = RefCell::new(V41EmitState {
+        engine,
+        parsed,
+        req,
+        job_id,
+        stop_requested,
+        max_tokens,
+        acc: SemAccum::init(
+            parsed.kind == ReqKind::Chat,
+            parsed.has_tools,
+            think_mode_enabled(parsed.think_mode),
+            chat_format,
+            prompt,
+        ),
+        w: &mut w,
+        out,
+        oa,
+        anth,
+        resp,
+        first_tok: None,
+        decode_steps: 0,
+        token_ids: Vec::new(),
+        finish: "length",
+        last_heartbeat: Instant::now(),
+        err: None,
+    });
+    // The per-request sampling face (server_generate_v41.c:355-366): request
+    // values win, omitted fields keep the parse's defaults (temp 1.0 / top_p
+    // 1.0 / min_p 0.0 for this model set); DRY follows dry_set with the
+    // engine's base / allowed fallbacks (1.75 / 2; the service dry defaults
+    // have no port flags yet, and their values are the same defaults).
+    let sampling = ds4_core::V41Sampling {
+        temperature: parsed.temperature,
+        top_p: parsed.top_p,
+        min_p: parsed.min_p,
+        top_k: parsed.top_k,
+        seed: parsed.seed,
+        freq_penalty: parsed.frequency_penalty,
+        presence_penalty: parsed.presence_penalty,
+        dry_multiplier: if parsed.dry_set { parsed.dry_multiplier } else { 0.0 },
+        dry_base: if parsed.dry_set && parsed.dry_base > 1.0 {
+            parsed.dry_base
+        } else {
+            1.75
+        },
+        dry_allowed_length: if parsed.dry_set && parsed.dry_allowed_length > 0 {
+            parsed.dry_allowed_length
+        } else {
+            2
+        },
+    };
+    let result = {
+        let mut emit = |token: i32| state.borrow_mut().emit_token(token);
+        let mut progress = |event: &str, current: i32, total: i32| {
+            state.borrow_mut().prefill_progress(event, current, total)
+        };
+        engine.v41_generate(tokens, max_tokens, Some(sampling), &mut emit, &mut progress)
+    };
+    let mut st = state.into_inner();
+
+    if let Some(error) = st.err.take() {
+        if !st.req.stream || matches!(error, GenerateError::Io) {
+            return Err(error);
+        }
+        let message = error.to_string();
+        stream_error(st.w, &st.req, st.resp.as_mut(), &message);
+        flush(st.w, st.out)?;
+        return Err(GenerateError::Streamed(message));
+    }
+    if let Err(error) = result {
+        // The native's own refusal (context over-run, a failed feed block).
+        if !st.req.stream || matches!(error, GenerateError::Io) {
+            return Err(error);
+        }
+        let message = error.to_string();
+        stream_error(st.w, &st.req, st.resp.as_mut(), &message);
+        flush(st.w, st.out)?;
+        return Err(GenerateError::Streamed(message));
+    }
+
+    let completion = st.acc.completion;
+    let mut finish = terminal_finish(st.finish);
+    // v41_finish (:230-235): an unterminated tool call is an error on this
+    // route -- the V4 repair needs a session.
+    if parsed.kind == ReqKind::Chat
+        && parsed.has_tools
+        && st.acc.saw_tool_start
+        && !st.acc.saw_tool_end
+        && finish != "error"
+    {
+        finish = "error";
+    }
+    let mut parsed_gen = if parsed.kind == ReqKind::Chat {
+        let (pg, recovered_finish) = parse_generated_for_response(
+            syntax,
+            &st.acc.text,
+            parsed.has_tools,
+            st.acc.saw_tool_start,
+            think_mode_enabled(parsed.think_mode),
+            chat_format,
+            &parsed.tool_orders,
+            finish,
+        );
+        finish = recovered_finish;
+        pg
+    } else {
+        crate::tools::ParsedGenerated {
+            content: st.acc.text.clone(),
+            ok: true,
+            ..Default::default()
+        }
+    };
+    if !parsed_gen.calls.is_empty() {
+        if let Some(stream) = st.oa.as_ref() {
+            stream.tool.apply_ids(&mut parsed_gen.calls);
+        }
+        if let Some(stream) = st.anth.as_ref() {
+            stream.tool.apply_ids(&mut parsed_gen.calls);
+        }
+        assign_tool_ids(
+            &mut parsed_gen.calls,
+            if parsed.api == Api::Anthropic {
+                "toolu_"
+            } else {
+                "call_"
+            },
+        );
+        finish = "tool_calls";
+    }
+    st.req.timings.prefill_tokens = prompt_n;
+    st.req.timings.prefill_cached = 0;
+    st.req.timings.decode_tokens = completion;
+    st.req.timings.decode_steps = st.decode_steps;
+    if completion > 0 {
+        if let Some(t_first) = st.first_tok {
+            st.req.timings = ReqTimings {
+                valid: true,
+                ttft_ms: t_first.duration_since(t_arrive).as_secs_f64() * 1e3,
+                prefill_ms: t_first.duration_since(t0).as_secs_f64() * 1e3,
+                decode_ms: Instant::now().duration_since(t_first).as_secs_f64() * 1e3,
+                prefill_tokens: prompt_n,
+                prefill_cached: 0,
+                decode_tokens: completion,
+                decode_steps: st.decode_steps,
+            };
+        }
+    }
+    let matched_stop = st.acc.matched_stop.clone();
+    let terminal = if st.req.stream {
+        match st.req.api {
+            Api::Openai if st.req.kind == ReqKind::Completion => {
+                sse_chunk(st.w, &st.req, job_id, None, Some(finish));
+                sse_done(st.w, &st.req, job_id, prompt_n, completion);
+                std::mem::take(&mut st.w.out)
+            }
+            Api::Openai => {
+                if let Some(stream) = st.oa.as_mut() {
+                    openai_sse_finish_live(
+                        st.w,
+                        &st.req,
+                        job_id,
+                        stream,
+                        &st.acc.text,
+                        finish,
+                        prompt_n,
+                        completion,
+                        &parsed_gen.calls,
+                    );
+                }
+                std::mem::take(&mut st.w.out)
+            }
+            Api::Anthropic => {
+                if let Some(stream) = st.anth.as_mut() {
+                    if !anthropic_sse_finish_live(
+                        st.w,
+                        &st.req,
+                        job_id,
+                        stream,
+                        &st.acc.text,
+                        finish,
+                        matched_stop.as_deref(),
+                        completion,
+                        &parsed_gen.calls,
+                    ) {
+                        return Err(GenerateError::Io);
+                    }
+                }
+                std::mem::take(&mut st.w.out)
+            }
+            Api::Responses => {
+                if let Some(stream) = st.resp.as_mut() {
+                    if !responses_sse_finish_live(
+                        st.w,
+                        &st.req,
+                        stream,
+                        &st.acc.text,
+                        finish,
+                        prompt_n,
+                        completion,
+                        st.acc.reasoning_tokens,
+                        created,
+                        &parsed_gen.calls,
+                    ) {
+                        return Err(GenerateError::Io);
+                    }
+                }
+                std::mem::take(&mut st.w.out)
+            }
+        }
+    } else {
+        match st.req.api {
+            Api::Anthropic => anthropic_final_response(
+                &st.req,
+                job_id,
+                &parsed_gen.content,
+                Some(&parsed_gen.reasoning),
+                finish,
+                matched_stop.as_deref(),
+                prompt_n,
+                completion,
+                cors,
+                &parsed_gen.calls,
+            ),
+            Api::Responses => {
+                let (rid, rsid, mid) = responses_ids(job_id);
+                let think = if st.acc.thinking_inside() {
+                    ThinkBlock::Open
+                } else {
+                    ThinkBlock::Closed
+                };
+                responses_final_response(
+                    &st.req,
+                    &parsed_gen.content,
+                    Some(&parsed_gen.reasoning),
+                    finish,
+                    think,
+                    prompt_n,
+                    completion,
+                    st.acc.reasoning_tokens,
+                    created,
+                    cors,
+                    &rid,
+                    &rsid,
+                    &mid,
+                    &parsed_gen.calls,
+                )
+            }
+            Api::Openai => final_response(
+                &st.req,
+                job_id,
+                &parsed_gen.content,
+                Some(&parsed_gen.reasoning),
+                finish,
+                prompt_n,
+                completion,
+                created,
+                cors,
+                &parsed_gen.calls,
+                if parsed.return_token_ids {
+                    &st.token_ids
+                } else {
+                    &[]
+                },
+            ),
+        }
+    };
+    let outcome = GenerateOutcome {
+        tool_ids: parsed_gen
+            .calls
+            .iter()
+            .map(|c| c.id.clone())
+            .filter(|id| !id.is_empty())
+            .collect(),
+        bank: None,
+        generation: engine.generation(),
+        frontier: prompt_n + completion,
+        finish: finish.to_string(),
+        timings: st.req.timings,
+        speculation_active: engine.v41_last_spec_stats().0 > 0,
+        reuse: ReuseTaken::Cold,
+        reuse_miss: ReuseMiss::None,
+        lane: None,
+        fallback_reason: None,
+    };
+    Ok((outcome, terminal))
+}
+
 fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> {
     if emit_limit == 0 {
         return None;
@@ -2769,6 +3358,16 @@ impl DecodeIo for ScriptedDecode {
 
     fn tokenizes_control_literals(&self) -> bool {
         false
+    }
+
+    fn chat_system_token(&self) -> &'static str {
+        // A scripted V4.1 model implies a V4.1 tokenizer, which owns
+        // <｜System｜> (core_bpe.c:332); every other scripted model has none.
+        if self.model_id == ds4_core::Variant::DeepSeek41Flash as i32 {
+            crate::render::DSML_SYSTEM_TOKEN
+        } else {
+            ""
+        }
     }
 
     fn token_text(&self, token: i32) -> Result<Vec<u8>, GenerateError> {
@@ -3118,6 +3717,24 @@ pub struct NativeDecode<'a> {
     speculated: bool,
     reuse: ReuseTaken,
     miss: ReuseMiss,
+    v41: Option<V41ServeRoute>,
+}
+
+/// The V4.1 serial route's boot state: the artifact path the feed opens and
+/// the run switches the server accepted (the engine's server flags,
+/// cli_opts.c:258-395).  Present only for a V4.1 model — the route has no
+/// ds4_session, so it is the engine's own push entry or nothing.
+#[cfg(feature = "native")]
+#[derive(Clone, Debug)]
+pub struct V41ServeRoute {
+    pub model_path: std::path::PathBuf,
+    pub engram_dir: Option<String>,
+    pub no_engram: bool,
+    pub dspark: Option<i32>,
+    pub graph: Option<bool>,
+    pub verify_k: i32,
+    pub emit_trace: bool,
+    pub prof: bool,
 }
 
 #[cfg(feature = "native")]
@@ -3138,7 +3755,16 @@ impl<'a> NativeDecode<'a> {
             speculated: false,
             reuse: ReuseTaken::Cold,
             miss: ReuseMiss::None,
+            v41: None,
         }
+    }
+
+    /// Load the V4.1 push route (the server boot calls this when the model
+    /// identified as ds41; the engine decides the same way from the open
+    /// engine, server_main.c:29).
+    pub fn with_v41_route(mut self, route: V41ServeRoute) -> Self {
+        self.v41 = Some(route);
+        self
     }
 
     pub fn with_prefix_reuse(mut self, reuse: ds4_core::ReuseKind) -> Self {
@@ -3285,12 +3911,55 @@ impl DecodeIo for NativeDecode<'_> {
         self.model.model_id()
     }
 
+    fn is_v41(&self) -> bool {
+        self.v41.is_some()
+    }
+
+    fn v41_generate(
+        &self,
+        prompt: &[i32],
+        n_predict: i32,
+        sampling: Option<ds4_core::V41Sampling>,
+        emit: &mut dyn FnMut(i32) -> bool,
+        progress: &mut dyn FnMut(&str, i32, i32) -> bool,
+    ) -> Result<(), GenerateError> {
+        let route = self.v41.as_ref().ok_or(GenerateError::Unsupported(
+            "V4.1 generation is not loaded on this engine",
+        ))?;
+        let opts = ds4_core::V41RunOptions {
+            engram_dir: route.engram_dir.as_deref(),
+            no_engram: route.no_engram,
+            dspark: route.dspark,
+            graph: route.graph,
+            verify_k: route.verify_k,
+            emit_trace: route.emit_trace,
+            prof: route.prof,
+            sampling,
+        };
+        self.model
+            .v41_generate(&route.model_path, prompt, n_predict, &opts, emit, progress)
+            .map_err(|e| GenerateError::Engine(e.to_string()))
+    }
+
+    fn v41_last_spec_stats(&self) -> (i32, i32, i32) {
+        ds4_core::v41_last_spec_stats()
+    }
+
     fn template(&self) -> Option<&ds4_core::chat_template::Template> {
         self.model.chat_template()
     }
 
+    fn chat_system_token(&self) -> &'static str {
+        self.model.vocab().chat_system_token()
+    }
+
     fn render_request(&self, parsed: &ParsedRequest) -> Result<Vec<u8>, GenerateError> {
-        crate::chat_input::render_model(self.model.chat_template(), self.model_id(), parsed)
+        crate::chat_input::render_model(
+            self.model.chat_template(),
+            self.model_id(),
+            parsed,
+            self.model.vocab().chat_system_token(),
+        )
     }
 
     fn restore_chat(&self, parsed: &mut ParsedRequest) -> Result<(), GenerateError> {
@@ -3458,6 +4127,12 @@ impl DecodeIo for NativeDecode<'_> {
     }
 
     fn native_graph_fit(&self, ctx: i32) -> Option<NativeGraphFit> {
+        // The quote sizes a session graph; v41 has no session at all
+        // (server_main.c:65 creates one only for non-v41), so there is no
+        // graph to quote and the unquoted margin applies.
+        if self.is_v41() {
+            return None;
+        }
         let quote = self.model.session_graph_fit_quote(ctx)?;
         Some(NativeGraphFit {
             fits: quote.fits,
@@ -3470,6 +4145,12 @@ impl DecodeIo for NativeDecode<'_> {
     }
 
     fn serial_session_probe(&self) -> Option<SerialSessionProbe> {
+        // v41 has no serial session to probe or right-size
+        // (server_main.c:65); answer like an engine without a native
+        // session so ensure_serial_session_fit passes native.
+        if self.is_v41() {
+            return None;
+        }
         Some(match &self.session {
             Some(s) => SerialSessionProbe {
                 cur_ctx: s.ctx(),
@@ -5778,6 +6459,7 @@ mod disk_sync_tests {
             default_effort: ThinkMode::None,
             default_temp: 0.0,
             live_ids: Vec::new(),
+            engine_defaults: false,
         };
         let ordinary = parse_request(
             WireSurface::OpenaiChat,
