@@ -1034,6 +1034,93 @@ loader).
 
 Unit: D complete
 
+## 6.15 Unit E evidence: the greedy loop, the DSpark spec round and the decode graph (2026-10-10)
+
+Unit commits: 8284be8 + a6b424b (E0), cd59876 (E1), 9771b1d + 1284acd +
+a3b3f8c (E2), ed0e408 + 783f9ff + 74d012a (E3).
+
+1. What was ported (engine-cited in the file headers). The greedy generate
+   entry (core_v41_api.c:426-470 + the round drive :175-425; head_last_only
+   and the xlast GEMV head, core_v41_forward.c:334-342). The DSpark draft
+   towers (core_v41_draft.c: main_x, the markov cache, the block forward;
+   core_v41_attn.c:239-280: the tower attention and the window push). The
+   spec round (core_v41_forward.c:241/267 snapshot/rollback + the win-ring
+   snap kernel cuda_kv_ring.inc.cu:34-68 + the cpre snapshot BEFORE the
+   destructive shift, core_v41_attn.c:76-85 + the confidence scheduler
+   core_draft_sched.c:31-97 + the [dspark] trace core_v41_api.c:246-406).
+   The feed's prepare protocol (the engine's full-block hist memcpy,
+   core_v41_forward.c:377). The decode-step CUDA graph (core_decode_graph.c:
+   one graph per batch size n, position buckets of 1024, the "device
+   position" convention ds4_gpu_v41.h:116-124, the rollback snapshot inside
+   the graph, closed-form host accounting, the capture-failure policy:
+   request-local n1_off, ONE batch_off for every batch shape) with its
+   primitives (cuda_decode_graph.inc.cu: ThreadLocal capture, the PDL edge
+   rewrite, the zero-copy upload/readback), the three posd host entries
+   (cuda_v41_2.inc.cu:248-260 sparse attn, cuda_kv_ring.inc.cu:46-56 win
+   commit, :59-68 win ring snap), the compress-step-n kernel
+   (cuda_v41_2.inc.cu:74-128, bit-identical to the pool it replaces), the
+   draft graph (core_v41_draft.c:326-370) and the host-gap accounting
+   (core_v41_api.c:401-411).
+
+2. Named port adaptations, each at its site in the code. (a) The capture
+   stream: the engine captures on cudaStreamPerThread (-default-stream
+   per-thread); the port captures on ONE dedicated stream created with
+   BLOCKING flags and routes ds4_current_stream() onto it via the existing
+   ds4_capture_set_stream — the legacy-default-stream implicit sync then
+   orders it with the eager stream 0 in BOTH directions, which is what makes
+   the rollback (eager, stream 0) safe before the next graph launch; a
+   nonblocking stream would not have that ordering.  (b) The engram provider
+   is synchronous (the P4-4 design): dg_launch calls the feed's prepare
+   before the capture/launch and the graph records only the zero-copy upload
+   — no flag-wait/arm/serve; provider success, the declared pos0 and the
+   captured pinned pointers are validated on EVERY launch (the captured
+   upload bakes the addresses; a moved buffer invalidates and re-captures).
+   (c) No hist (the provider owns history) and no dev_sample/spec_q (sampling
+   is its own unit; the graph's tail is one argmax per row and the wait picks
+   next[i] = slot[4i], core_v41_sample.c:24-37's argmax arm).  (d) The PDL
+   edge rewrite is skipped below compute capability 9 (the engine only ever
+   runs sm_121); on the Spark it rewrote 1600/1543 edges, 0 unsupported.
+   (e) DS41_NO_GRAPH=1 is the harness's graph switch (the engine's
+   ds4_engine_v41_set_graph(0)); the CLI flags come with the serving unit.
+
+3. Gate E-1 — the 56-token generate gate (tests/ds41_generate_gate.sh;
+   Spark /tmp/e3_gate.log, GATE_RC=0). Non-spec PASS: 56/56 ids, the row
+   reference L01/L14 clean (prompt 8/8, emitted 56 checked, 0 mismatches),
+   history equal to the golden, and the n=1 graph walked 55 steps on 1
+   capture (1703 nodes, 1600 PDL edges; 23.68 t/s steady). Spec (VK=5) PASS:
+   the [dspark] trace line-identical to the engine's (19 rounds), the 6-row
+   verify-batch graph walked 18 rounds on 1 capture (1790 nodes, 1543
+   edges). DS41_NO_GRAPH=1 control PASS with no graph. The required negative
+   controls FAIL as designed: DS41_EMIT_OFFSET=3 refused by name ("engram
+   feed pos0"), DS41_ROW_SHIFT=1 mismatched with the port quiet.
+
+4. Gate E-2 — the long-run gate (tests/ds41_graph_gate.sh; engine goldens
+   /tmp/long_{nospec,spec}.log, 1100 tokens from the 8-token prompt; the
+   engine's own spec == non-spec byte-identity verified on them). Non-spec
+   PASS: the n=1 graph captured [9,1023] then re-captured [1024,1117], 1099
+   steps on 2 captures. Spec PASS: the batch graph captured [1022,1023] then
+   [1028,1112] — the re-capture fires at the first row whose LAST row leaves
+   the cap, the engine's pos0+n-1 > cap condition mirrored exactly — 232
+   rounds, 9 draft-graph captures with 203 graph rounds, the
+   scratch-generation invalidation path exercised ("backend scratch moved,
+   all re-capturing"), [dspark] diff empty. Scheduler run (k unpinned) PASS:
+   258 rounds, 11 verify captures across widths 4/5/6 rows, 10 draft captures
+   with 221 graph rounds, 2 k=0 rounds walked on the n=1 graph, and the ids
+   still equal the pure-decode golden — k only affects speed, never the
+   output.
+
+5. Recorded limits. The port's synchronous engram provider shows up in the
+   host-gap line (~9-37 ms/round of preparation the engine overlaps with the
+   graph): that is the P4-4 host-IO decision's measured cost, not a
+   correctness gap. Sampling and the penalties, the sampling draft arm
+   (dev_sample), the amp/distillation sidecars, and the Rust-host ABI for
+   the draft parameters (P5: block_size / expert_used_count / noise_token_id
+   / markov_rank / target_layers) remain their units. The engine's extra
+   re-captures when a batch's last row straddles a bucket cap are mirrored
+   (the [1022,1023] capture above is that case).
+
+Unit: E complete
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
