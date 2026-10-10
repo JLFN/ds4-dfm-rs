@@ -290,6 +290,10 @@ void ds4_bridge_v41_set_dspark(int mode);
 void ds4_bridge_v41_set_graph(int on);
 void ds4_bridge_v41_set_emit_trace(int on);
 void ds4_bridge_v41_set_prof(int on);
+/* The last v41 run's speculation account (the engine's
+ * ds4_engine_v41_last_spec_stats, core_v41_api.c:41-46): rounds/offered/
+ * accepted, cleared by the next generate entry.  Any pointer may be NULL. */
+void ds4_bridge_v41_last_spec_stats(int *rounds, int *offered, int *accepted);
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,

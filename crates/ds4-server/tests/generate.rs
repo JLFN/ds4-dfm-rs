@@ -2311,3 +2311,258 @@ fn inkling_bad_tool_terminal() {
         }
     }
 }
+
+// ---- the V4.1 push route (P5.5) -------------------------------------------
+
+/// A scripted V4.1 engine: `is_v41` + the push entry, nothing session-shaped
+/// behind it.  The script is (token, text) pairs; `stop_id` ends generation
+/// the way the native checks it, and every run records what the route handed
+/// the engine (prompt tokens, budget).
+struct ScriptedV41 {
+    script: Vec<(i32, Vec<u8>)>,
+    stop_id: i32,
+    ctx: i32,
+    runs: std::cell::RefCell<Vec<(Vec<i32>, i32)>>,
+}
+
+impl ScriptedV41 {
+    fn new(script: &[(i32, &str)], ctx: i32) -> Self {
+        Self {
+            script: script
+                .iter()
+                .map(|(id, s)| (*id, s.as_bytes().to_vec()))
+                .collect(),
+            stop_id: 99,
+            ctx,
+            runs: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl DecodeIo for ScriptedV41 {
+    fn model_id(&self) -> i32 {
+        16 // Variant::DeepSeek41Flash
+    }
+
+    fn is_v41(&self) -> bool {
+        true
+    }
+
+    fn tokenize_text(&self, text: &str) -> Result<Vec<i32>, GenerateError> {
+        Ok(text.bytes().map(i32::from).collect())
+    }
+
+    fn tokenize_rendered_chat(&self, text: &[u8]) -> Result<Vec<i32>, GenerateError> {
+        Ok(text.iter().map(|b| i32::from(*b)).collect())
+    }
+
+    fn token_text(&self, token: i32) -> Result<Vec<u8>, GenerateError> {
+        Ok(self
+            .script
+            .iter()
+            .find(|(id, _)| *id == token)
+            .map(|(_, piece)| piece.clone())
+            .unwrap_or_default())
+    }
+
+    fn token_is_stop(&self, token: i32) -> bool {
+        token == self.stop_id
+    }
+
+    fn eos_id(&self) -> i32 {
+        self.stop_id
+    }
+
+    fn v41_generate(
+        &self,
+        prompt: &[i32],
+        n_predict: i32,
+        emit: &mut dyn FnMut(i32) -> bool,
+        progress: &mut dyn FnMut(&str, i32, i32) -> bool,
+    ) -> Result<(), GenerateError> {
+        self.runs.borrow_mut().push((prompt.to_vec(), n_predict));
+        // One prefill chunk: the route's keepalive path runs (a no-op
+        // off-stream, the disconnect probe on it).
+        if !progress("prefill_chunk", prompt.len() as i32, prompt.len() as i32) {
+            return Ok(());
+        }
+        // The native loop's shape: `while (!stop && produced < n_predict)`.
+        let mut produced = 0i32;
+        for (id, _) in &self.script {
+            if produced >= n_predict {
+                break;
+            }
+            produced += 1;
+            if !emit(*id) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync(&mut self, _tokens: &[i32]) -> Result<(), GenerateError> {
+        Ok(())
+    }
+
+    fn eval(&mut self, _token: i32) -> Result<(), GenerateError> {
+        Ok(())
+    }
+
+    fn sample(&mut self, _t: f32, _k: i32, _p: f32, _m: f32, _rng: &mut u64) -> i32 {
+        -1
+    }
+
+    fn pos(&self) -> i32 {
+        0
+    }
+
+    fn ctx(&self) -> i32 {
+        self.ctx
+    }
+
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    fn invalidate(&mut self) {}
+}
+
+fn v41_completion_req(body: &str) -> ParsedRequest {
+    let mut r = parse_request(WireSurface::OpenaiCompletion, &env(), body).unwrap();
+    r.temperature = 0.0;
+    r
+}
+
+#[test]
+fn v41_completion_pushes_the_script() {
+    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":8}"#);
+    let mut engine = ScriptedV41::new(&[(1, "Hello"), (2, " world"), (99, "")], 1 << 20);
+    let mut out = Vec::new();
+    let result = generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-cmpl",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+    let response = String::from_utf8(out).unwrap();
+    assert!(response.contains("Hello world"), "{response}");
+    assert!(response.contains("\"finish_reason\":\"stop\""), "{response}");
+    let runs = engine.runs.borrow();
+    assert_eq!(runs.len(), 1);
+    // The prompt reached the engine as the tokenized bytes, not the text.
+    assert_eq!(runs[0].0, vec![i32::from(b'h'), i32::from(b'i')]);
+    assert_eq!(runs[0].1, 8);
+    assert_eq!(result.timings.decode_tokens, 2);
+    assert_eq!(result.frontier, 4);
+    assert!(!result.speculation_active);
+}
+
+#[test]
+fn v41_stream_carries_deltas_and_done() {
+    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":8,"stream":true}"#);
+    assert!(parsed.stream);
+    let mut engine = ScriptedV41::new(&[(1, "Hello"), (2, " world"), (99, "")], 1 << 20);
+    let mut out = Vec::new();
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-stream",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+    let sse = String::from_utf8(out).unwrap();
+    assert!(sse.contains("data: "), "{sse}");
+    assert!(sse.contains("Hello"), "{sse}");
+    assert!(sse.contains(" world"), "{sse}");
+    assert!(sse.contains("\"finish_reason\":\"stop\""), "{sse}");
+    assert!(sse.contains("[DONE]"), "{sse}");
+}
+
+#[test]
+fn v41_budget_stops_at_max_tokens() {
+    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":2}"#);
+    let mut engine = ScriptedV41::new(&[(1, "a"), (2, "b"), (3, "c")], 1 << 20);
+    let mut out = Vec::new();
+    let result = generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-budget",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+    let response = String::from_utf8(out).unwrap();
+    assert!(response.contains("\"finish_reason\":\"length\""), "{response}");
+    assert!(response.contains("\"ab\""), "{response}");
+    assert!(!response.contains("abc"), "{response}");
+    assert_eq!(result.timings.decode_tokens, 2);
+}
+
+#[test]
+fn v41_budget_clamps_to_the_metadata_context() {
+    // ctx 5, prompt 2 -> room 3; the request asks for 8.
+    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":8}"#);
+    let mut engine = ScriptedV41::new(&[(1, "a")], 5);
+    let mut out = Vec::new();
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-ctx",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+    let runs = engine.runs.borrow();
+    assert_eq!(runs[0].1, 3);
+}
+
+#[test]
+fn v41_stop_string_truncates_and_stops() {
+    let parsed = v41_completion_req(r#"{"prompt":"hi","max_tokens":8,"stop":" world"}"#);
+    let mut engine = ScriptedV41::new(&[(1, "Hello"), (2, " world"), (3, "!")], 1 << 20);
+    let mut out = Vec::new();
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-stop",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+    let response = String::from_utf8(out).unwrap();
+    assert!(response.contains("Hello"), "{response}");
+    assert!(!response.contains(" world"), "{response}");
+    assert!(response.contains("\"finish_reason\":\"stop\""), "{response}");
+}
+
+#[test]
+fn v41_empty_prompt_is_refused_before_the_engine() {
+    let parsed = v41_completion_req(r#"{"prompt":""}"#);
+    let mut engine = ScriptedV41::new(&[(1, "a")], 1 << 20);
+    let mut out = Vec::new();
+    let error = generate_and_write(
+        &mut engine,
+        &parsed,
+        "v41-empty",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("empty prompt"), "{error}");
+    assert!(engine.runs.borrow().is_empty());
+}

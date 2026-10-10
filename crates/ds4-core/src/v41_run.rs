@@ -18,12 +18,26 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 use ds4_sys::{
-    ds4_bridge_v41_generate, ds4_bridge_v41_set_dspark, ds4_bridge_v41_set_emit_trace,
-    ds4_bridge_v41_set_graph, ds4_bridge_v41_set_prof,
+    ds4_bridge_v41_generate, ds4_bridge_v41_last_spec_stats, ds4_bridge_v41_set_dspark,
+    ds4_bridge_v41_set_emit_trace, ds4_bridge_v41_set_graph, ds4_bridge_v41_set_prof,
 };
 
 use crate::engram::{EngramHash, EngramShard};
 use crate::{identify_file, Error, GgufFile, Model, Result, TensorInventory, V41Wire};
+
+/// The last V4.1 run's speculation account: (rounds, offered, accepted), the
+/// engine's `ds4_engine_v41_last_spec_stats` (`core_v41_api.c:41-46`; the
+/// counters are cleared by the next generate entry).  The server reports the
+/// rates after the call returns.
+pub fn v41_last_spec_stats() -> (i32, i32, i32) {
+    let mut rounds = 0i32;
+    let mut offered = 0i32;
+    let mut accepted = 0i32;
+    unsafe {
+        ds4_bridge_v41_last_spec_stats(&mut rounds, &mut offered, &mut accepted);
+    }
+    (rounds, offered, accepted)
+}
 
 /// The per-run switches (the engine's CLI globals, `cli_diag.c:58`).
 #[derive(Clone, Debug)]

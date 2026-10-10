@@ -144,7 +144,7 @@ pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use v41::{
     V41Wire, V41WireError, MTP_MAX_EXPERTS, MTP_MAX_TOWERS, V41_MAX_COMPRESS_RATIO, V41_MAX_ENGRAM,
 };
-pub use v41_run::{V41Feed, V41RunOptions};
+pub use v41_run::{v41_last_spec_stats, V41Feed, V41RunOptions};
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, validate_qwen_inventory,
     ValidateError,
@@ -676,6 +676,10 @@ pub struct Model {
     vision_ready: bool,
     mtp_draft_tokens: i32,
     runtime_budget: Option<ServingRequest>,
+    /// `deepseek4.context_length` for a V4.1 artifact (the engine's only
+    /// context source, `core_validate_v41.c:51-53`); None for every other
+    /// family.  The server boots its ctx from here.
+    v41_ctx: Option<u32>,
     _distributed: Option<FfiDistributed>,
     _not_send: PhantomData<*const ()>,
 }
@@ -1808,6 +1812,7 @@ impl Model {
             vision_ready: tuning.vision_path.is_some(),
             mtp_draft_tokens: tuning.mtp_draft_tokens,
             runtime_budget,
+            v41_ctx: v41_wire.as_ref().map(|w| w.ctx),
             _distributed: ffi_distributed,
             _not_send: PhantomData,
         })
@@ -1815,6 +1820,13 @@ impl Model {
 
     pub fn family(&self) -> ModelFamily {
         self.family
+    }
+
+    /// `deepseek4.context_length` of a V4.1 artifact (None for other
+    /// families): the server's ctx comes only from here (`--ctx` is refused
+    /// for V4.1, core_validate_v41.c:51-53).
+    pub fn v41_ctx(&self) -> Option<u32> {
+        self.v41_ctx
     }
 
     pub fn inventory(&self) -> &TensorInventory {

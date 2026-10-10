@@ -798,6 +798,7 @@ extern "C" {
     pub fn ds4_bridge_v41_set_graph(on: c_int);
     pub fn ds4_bridge_v41_set_emit_trace(on: c_int);
     pub fn ds4_bridge_v41_set_prof(on: c_int);
+    pub fn ds4_bridge_v41_last_spec_stats(rounds: *mut c_int, offered: *mut c_int, accepted: *mut c_int);
     pub fn ds4_bridge_v41_generate(
         m: *mut ds4_bridge_model,
         prompt: *const i32,

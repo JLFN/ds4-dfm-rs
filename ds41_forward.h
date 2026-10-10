@@ -107,6 +107,11 @@ void ds4_engine_v41_set_graph(int on);
 void ds4_engine_v41_set_emit_trace(int on);
 void ds4_engine_v41_set_prof(int on);
 
+/* The last run's speculation account (core_v41_api.c:41-46): the generate
+ * entry clears the three counters and the spec summary writes them, so the
+ * server can report the round/accept rates after the call returns. */
+void ds4_engine_v41_last_spec_stats(int *rounds, int *offered, int *accepted);
+
 /* The engine's prefill progress hook (core_v41_api.c:187-194): called once
  * per prefill chunk with the running count; a nonzero return aborts the
  * prefill (the server's client-gone check). */

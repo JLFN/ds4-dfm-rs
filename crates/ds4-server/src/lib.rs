@@ -70,6 +70,8 @@ pub use format::{
 };
 #[cfg(feature = "native")]
 pub use generate::NativeDecode;
+#[cfg(feature = "native")]
+pub use generate::V41ServeRoute;
 pub use generate::{
     generate_and_write, generation_blocked, render_prompt, stop_list_find_from, DecodeIo,
     GenerateError, GenerateOutcome, ScriptedDecode, ScriptedStep,

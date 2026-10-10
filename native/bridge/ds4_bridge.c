@@ -859,6 +859,9 @@ void ds4_bridge_v41_set_dspark(int mode) { ds4_engine_v41_set_dspark(mode); }
 void ds4_bridge_v41_set_graph(int on) { ds4_engine_v41_set_graph(on); }
 void ds4_bridge_v41_set_emit_trace(int on) { ds4_engine_v41_set_emit_trace(on); }
 void ds4_bridge_v41_set_prof(int on) { ds4_engine_v41_set_prof(on); }
+void ds4_bridge_v41_last_spec_stats(int *rounds, int *offered, int *accepted) {
+    ds4_engine_v41_last_spec_stats(rounds, offered, accepted);
+}
 
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,

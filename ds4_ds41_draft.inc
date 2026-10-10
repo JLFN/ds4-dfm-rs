@@ -627,6 +627,18 @@ static void v41_gen_dump_row(ds4_v41_state *st, FILE *fd) {
     free(row);
 }
 
+/* The engine's per-run spec account for the server monitor
+ * (core_v41_api.c:41-46): the generate entry clears them and the spec
+ * summary writes them; ds4_engine_v41_last_spec_stats reads them.  The
+ * server reports the round/accept rates, so the counts must outlive the
+ * call. */
+static int g_v41_last_spec_rounds, g_v41_last_spec_off, g_v41_last_spec_acc;
+void ds4_engine_v41_last_spec_stats(int *rounds, int *offered, int *accepted) {
+    if (rounds) *rounds = g_v41_last_spec_rounds;
+    if (offered) *offered = g_v41_last_spec_off;
+    if (accepted) *accepted = g_v41_last_spec_acc;
+}
+
 /* ---- the greedy generate entry (core_v41_api.c:426-470 + the round drive
  * :175-425, the eager subset) ----
  * Prompt prefill in chunks (the shared v41_prefill_chunk), then decode steps:
@@ -674,7 +686,8 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     ds4_v41_draft dr;
     const bool spec = v41_dspark_mode() != 0 && v41_draft_alloc(e, &dr);
     v41_sched cal; memset(&cal, 0, sizeof cal);
-    uint32_t spec_rounds = 0, spec_acc = 0, spec_skipped = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
+    uint32_t spec_rounds = 0, spec_acc = 0, spec_off = 0, spec_skipped = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
+    g_v41_last_spec_rounds = g_v41_last_spec_off = g_v41_last_spec_acc = 0;   /* the monitor account clears per run (core_v41_api.c:42) */
     for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
     double ms_draft = 0, ms_snap = 0, ms_verify = 0, ms_argmax = 0;
     /* Host-gap account (core_v41_api.c:233-237, the engine's 2026-10-07 split):
@@ -857,7 +870,7 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
                 fprintf(stderr, "\n");
             }
             if (k) {
-                spec_rounds++; spec_acc += a; spec_hist[a]++;
+                spec_rounds++; spec_acc += a; spec_off += k; spec_hist[a]++;
                 const double tb0 = now_sec();
                 if (!v41_spec_rollback(&st, 1u + a)) { rc = 1; break; }
                 ms_snap += (now_sec() - tb0) * 1e3;   /* the rollback belongs to the snapshot/rollback term (core_v41_api.c:363-366) */
@@ -894,6 +907,9 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
         if (draft_inflight && draft_r == 1) (void)v41_draft_wait(&dr);   /* the loop stopped with a draft in flight (emit stop / cap): drain before free */
         /* The engine's summary (core_v41_api.c:393-411). */
         if (spec_rounds) {
+            g_v41_last_spec_rounds = (int)spec_rounds;
+            g_v41_last_spec_off = (int)spec_off;
+            g_v41_last_spec_acc = (int)spec_acc;
             fprintf(stderr, "\n[v41] DSpark: %u rounds (scheduler skipped %u), average accept %.2f/%u; histogram",
                     spec_rounds, spec_skipped, (double)spec_acc / (double)spec_rounds, dr.block);
             for (uint32_t i = 0; i <= dr.block; i++) fprintf(stderr, " %u:%u", i, spec_hist[i]);
