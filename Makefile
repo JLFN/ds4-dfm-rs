@@ -1014,6 +1014,21 @@ test-ds41-generate: tests/test_ds41_generate
 	  sh tests/ds41_generate_gate.sh ./tests/test_ds41_generate "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$${NPRED:-56}" "$(ENGRAM_DIR)" "$(ROWS_REF)" "$(ENGLOG_SPEC)" "$${VK:-5}"; \
 	fi
 
+# Long-run decode-graph gate (E3 phase 2): a run long enough to cross the
+# 1024-position bucket (the n=1 and verify-batch graphs must re-capture and
+# replay on both sides) and to open the draft graphs (pos0 >= the 128 window).
+# Needs the two engine goldens; the capture commands are in the script header:
+#   make test-ds41-graph MODEL=<gguf> IDS=<ids file> \
+#        ENGLOG=<engine --no-dspark log> ENGLOG_SPEC=<engine --dspark-verify log> \
+#        ENGRAM_DIR=<shard dir> [VK=5] [NPRED=1100]
+.PHONY: test-ds41-graph
+test-ds41-graph: tests/test_ds41_generate
+	@if [ -z "$(MODEL)" ] || [ -z "$(IDS)" ] || [ -z "$(ENGLOG)" ] || [ -z "$(ENGLOG_SPEC)" ] || [ -z "$(ENGRAM_DIR)" ]; then \
+	  echo "usage: make test-ds41-graph MODEL=<gguf> IDS=<ids file> ENGLOG=<engine --no-dspark log> ENGLOG_SPEC=<engine --dspark-verify log> ENGRAM_DIR=<shard dir> [VK=5] [NPRED=1100]"; \
+	else \
+	  sh tests/ds41_graph_gate.sh ./tests/test_ds41_generate "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$(ENGLOG_SPEC)" "$${NPRED:-1100}" "$(ENGRAM_DIR)" "$${VK:-5}"; \
+	fi
+
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its
 # load-time configuration is not the C validator's: this gate pins the two
