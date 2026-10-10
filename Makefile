@@ -314,7 +314,7 @@ proof-rust-cuda-opp-c: ds4 ds4-c
 			--work-dir "$$root/rust" --check-expected "$$expected"
 endif
 
-ds4.o: ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS) ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_mimo2_graph.inc ds4_mimo2_batch.inc ds4_mimo2_session.inc ds4_mimo2_mtp.inc ds4_mimo2_media.inc ds4_mimo2_payload.inc ds4_mimo2_dflash.inc cuda/mimo2_dflash_host.h ds4_dots3_batch.inc ds4_dots3_mtp.inc ds4_step37_graph.inc ds4_step37_vision.inc ds4_ling3vl_graph.inc ds4_ling3vl_vision.inc ds4_ling3vl_rope.h ds4_ling3vl_batch.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h ds41_forward.h ds41_kvfmt.h ds4_ds41_forward.inc vendor/stb_image.h ds4_ds41_graph.inc
+ds4.o: ds4.c $(NAIVE_NATIVE_INCS) $(IQUEST_NATIVE_INCS) ds4_mimo2_bind.inc ds4_mimo2_plan.h ds4_mimo2_graph.inc ds4_mimo2_batch.inc ds4_mimo2_session.inc ds4_mimo2_mtp.inc ds4_mimo2_media.inc ds4_mimo2_payload.inc ds4_mimo2_dflash.inc cuda/mimo2_dflash_host.h ds4_dots3_batch.inc ds4_dots3_mtp.inc ds4_step37_graph.inc ds4_step37_vision.inc ds4_ling3vl_graph.inc ds4_ling3vl_vision.inc ds4_ling3vl_rope.h ds4_ling3vl_batch.inc ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h ds41_forward.h ds41_kvfmt.h ds4_ds41_forward.inc vendor/stb_image.h ds4_ds41_graph.inc ds4_ds41_draft.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 # Rust FFI seam: wraps ds4.h so crates/ds4-sys never bindgens the engine header.
@@ -1027,6 +1027,23 @@ test-ds41-graph: tests/test_ds41_generate
 	  echo "usage: make test-ds41-graph MODEL=<gguf> IDS=<ids file> ENGLOG=<engine --no-dspark log> ENGLOG_SPEC=<engine --dspark-verify log> ENGRAM_DIR=<shard dir> [VK=5] [NPRED=1100]"; \
 	else \
 	  sh tests/ds41_graph_gate.sh ./tests/test_ds41_generate "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$(ENGLOG_SPEC)" "$${NPRED:-1100}" "$(ENGRAM_DIR)" "$${VK:-5}"; \
+	fi
+
+# DeepSeek V4.1 (ds41) Rust serving gate (unit F, P5.4): the Rust host
+# (./ds4, the --gen-ids route) against the engine's own --emit-trace captures,
+# in four modes (default, --no-graph, --no-dspark, --dspark-verify <k>) with
+# the [emit] position+id instrument as the comparison, plus the two required
+# failing negative controls (see tests/ds41_serving_gate.sh).
+# Artifact- and Spark-only, so the runner takes the paths from the environment:
+#   make test-ds41-serving MODEL=<gguf> IDS=<ids file> ENGLOG=<engine log> \
+#        ENGRAM_DIR=<shard dir> [ENGLOG_SPEC=<engine --dspark-verify log>] \
+#        [VK=5] [NPRED=56]
+.PHONY: test-ds41-serving
+test-ds41-serving: ds4
+	@if [ -z "$(MODEL)" ] || [ -z "$(IDS)" ] || [ -z "$(ENGLOG)" ] || [ -z "$(ENGRAM_DIR)" ]; then \
+	  echo "usage: make test-ds41-serving MODEL=<gguf> IDS=<ids file> ENGLOG=<engine --emit-trace log> ENGRAM_DIR=<shard dir> [ENGLOG_SPEC=<engine --dspark-verify log>] [VK=5] [NPRED=56]"; \
+	else \
+	  sh tests/ds41_serving_gate.sh ./ds4 "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$${NPRED:-56}" "$(ENGRAM_DIR)" "$(ENGLOG_SPEC)" "$${VK:-5}"; \
 	fi
 
 # The Rust host (./ds4) is the default binary, and the one the server shares.

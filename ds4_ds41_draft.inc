@@ -736,6 +736,13 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
         bool stop = false;
         while (!stop && produced < n_predict) {
             produced++;
+            /* The engine's id-level instrument (core_v41_api.c:246): one line
+             * per emitted token, absolute position + id, in emission order.
+             * The position is the live state's n_past, never a counter -- a
+             * rollback that pushed the state wrong shows as a position
+             * mismatch here, which is why the engine prints it at all
+             * (core_v41_api.c:244-245). */
+            if (g_ds4_v41_emit_trace) fprintf(stderr, "[emit] %u %d\n", st.n_past, tok);
             const bool draft_now = spec;   /* speculation on: every step drafts (the scheduler picks k, may be 0) */
             /* Pure decode step on the graph (core_v41_api.c:257-267): no
              * speculation, or a round the scheduler sat out.  The first step
@@ -876,6 +883,10 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
                 if (produced >= n_predict) break;
                 produced++;
                 const int t = (int)batch[i + 1u];
+                /* Position = the post-rollback n_past minus the not-yet-emitted
+                 * accepted tokens (core_v41_api.c:387, the same absolute-
+                 * position convention as the loop-top site). */
+                if (g_ds4_v41_emit_trace) fprintf(stderr, "[emit] %u %d\n", st.n_past - a + i, t);
                 if ((emit && emit(t, ud) != 0) || t == ds4_token_eos(e)) { stop = true; break; }
             }
             tok = tok_next;
