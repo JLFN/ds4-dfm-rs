@@ -31,6 +31,13 @@ typedef struct {
      * the erows dump). */
     const void *raw[DS41_MAX_ENGRAM];
     const int64_t *rows[DS41_MAX_ENGRAM];
+    /* The absolute position of slot 0's rows.  The forward consumes rows for
+     * the block that starts at its own state position and REFUSES when this
+     * disagrees (the E0 lesson: a caller counter that drifts must fail loud,
+     * never silently shift the rows).  Derive the value from the loop's token
+     * index, not from a counter incremented on a different event; the decode
+     * caller refills slot 0 per step and updates pos0 with it. */
+    uint32_t pos0;
 } ds41_engram_feed;
 
 /* Teacher-forced scoring of `ids` through an opened V4.1 engine.  Writes the
@@ -49,7 +56,9 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
  * penalties, the DSpark spec round and the decode graph are their own units.
  * no_engram mirrors the engine's --v41-no-engram; the engine's generate path
  * has no such switch, so the gate runs with the engram live and the caller
- * refreshes `feed` per step (its emit hook owns the hash + pread). */
+ * refreshes `feed` per step (its emit hook owns the hash + pread) and sets
+ * feed->pos0 to the step's position — the entry asserts it against the state
+ * at the point of use and refuses a drifted feed. */
 int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
                             const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud);
 

@@ -294,6 +294,16 @@ static bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     for (uint32_t k = 0; k < v->n_engram; k++) if (!st->eraw[k]) return false;
     const v41_engram_feed *fd = st->efeed;
     if (!fd || !fd->raw[ei]) { fprintf(stderr, "ds4: [v41] engram layer L%u has no row feed (host hash + pread missing)\n", il); return false; }
+    /* The feed declares which block its slot 0 holds; the state is the
+     * authority (the engine hashes rows from st->hist at st->pos0, never from
+     * a caller counter).  A drifted declaration must refuse here — the E0
+     * class fed rows for shifted positions and no device instrument could see
+     * it.  The caller refills slot 0 per decode step and updates pos0 with it;
+     * a multi-chunk score refills per chunk. */
+    if (fd->pos0 != st->pos0) {
+        fprintf(stderr, "ds4: [v41] engram feed pos0 %u != block pos0 %u (rows must be for the block the forward is about to run)\n", fd->pos0, st->pos0);
+        return false;
+    }
     if (!ds4_gpu_tensor_write_zerocopy(st->eraw[ei], 0, fd->raw[ei], (uint64_t)n * cols * stride)) return false;
     /* Diagnostic (kept): DS41_FEED_DIGEST=<path> appends the FNV-1a of the
      * exact bytes this upload put on the device.  The row-id self-check

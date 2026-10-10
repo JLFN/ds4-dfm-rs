@@ -312,6 +312,7 @@ int main(int argc, char **argv) {
         /* Build the engram feed: golden row ids + raw rows pread from the shards. */
         ds41_engram_feed feed;
         memset(&feed, 0, sizeof feed);
+        feed.pos0 = 0;   /* one block from position 0 (every golden name here is <= DS4_V41_CHUNK, so the whole sequence fits the feed and no per-chunk refill is needed) */
         std::vector<std::vector<uint8_t>> raw_keep;   /* pins the pinned pointers' lifetime */
         std::vector<std::vector<int64_t>> rows_keep;
         const int n_eng = no_engram ? 0 : ds4_v41_engram_count(e);
