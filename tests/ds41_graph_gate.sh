@@ -39,8 +39,12 @@ NS_STEPS=$(sed -n 's/.*walked \([0-9][0-9]*\) pure-decode steps.*/\1/p' "$LOG.no
 NS_CAPS=$(sed -n 's/.*pure-decode steps, \([0-9][0-9]*\) captures.*/\1/p' "$LOG.nospec.log" | head -1)
 [ -n "$NS_STEPS" ] && [ -n "$NS_CAPS" ] || fail "non-spec run: no [graph] walked line"
 [ "$NS_CAPS" -ge 2 ] || fail "non-spec run: the 1024 bucket was never crossed (captures=$NS_CAPS)"
-grep -q "1-row graph captured: position bucket \[1024" "$LOG.nospec.log" \
-  || fail "non-spec run: no re-capture on the far side of 1024"
+# The far-side capture's lower bound is the first position the graph was
+# re-captured at (n=1 crosses exactly at 1024; a batch re-captures at the
+# first row whose LAST row leaves the old cap -- the engine's condition
+# pos0+n-1 > cap, mirrored).
+NS_LO_MAX=$(grep -o "1-row graph captured: position bucket \[[0-9]*" "$LOG.nospec.log" | sed 's/.*\[//' | sort -n | tail -1)
+[ -n "$NS_LO_MAX" ] && [ "$NS_LO_MAX" -ge 1024 ] || fail "non-spec run: no re-capture on the far side of 1024 (max bucket lo=$NS_LO_MAX)"
 [ "$NS_STEPS" -gt "$NS_CAPS" ] || fail "non-spec run: no graph reuse (steps=$NS_STEPS captures=$NS_CAPS)"
 
 # ---- spec pinned k: batch graph crossing + the draft graph ----
@@ -56,8 +60,8 @@ SP_ROUNDS=$(sed -n 's/.*verify batches walked \([0-9][0-9]*\) rounds.*/\1/p' "$L
 [ -n "$SP_ROUNDS" ] || fail "spec run: no verify-batch graph walked line"
 SP_CAPS=$(grep -c "row graph captured: position bucket" "$LOG.spec.log")
 [ "$SP_CAPS" -ge 2 ] || fail "spec run: the batch graph never crossed 1024 (captures=$SP_CAPS)"
-grep -q "graph captured: position bucket \[1024" "$LOG.spec.log" \
-  || fail "spec run: no batch re-capture on the far side of 1024"
+SP_LO_MAX=$(grep -o "row graph captured: position bucket \[[0-9]*" "$LOG.spec.log" | sed 's/.*\[//' | sort -n | tail -1)
+[ -n "$SP_LO_MAX" ] && [ "$SP_LO_MAX" -ge 1024 ] || fail "spec run: no batch re-capture on the far side of 1024 (max bucket lo=$SP_LO_MAX)"
 [ "$SP_ROUNDS" -gt "$SP_CAPS" ] || fail "spec run: no batch graph reuse (rounds=$SP_ROUNDS captures=$SP_CAPS)"
 grep -q "draft graph (top-up .* rows) captured" "$LOG.spec.log" || fail "spec run: no draft graph was captured (pos0 >= 128 never reached?)"
 D_GRAND=$(sed -n 's/.*cudaGraphLaunch(draft, \([0-9][0-9]*\) graph rounds).*/\1/p' "$LOG.spec.log" | head -1)
