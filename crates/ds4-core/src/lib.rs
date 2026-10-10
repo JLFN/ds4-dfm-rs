@@ -1587,6 +1587,14 @@ impl Model {
         };
         let v41_engram_path_ptrs: Vec<*const c_char> =
             v41_engram_paths.iter().map(|p| p.as_ptr()).collect();
+        // P5: the draft parameters arm the drafter on the native side
+        // (core_validate_v41.c:91-110).  Unarmed (no towers, or an incomplete
+        // parameter set) carries zeros/NULL, and the native then prints the
+        // engine's warning when the towers are there.
+        let v41_mtp = v41_wire.as_ref().filter(|w| w.mtp_armed());
+        let v41_mtp_target: Vec<i16> = v41_mtp
+            .map(|w| w.mtp_targets.iter().map(|&t| t as i16).collect())
+            .unwrap_or_default();
         let ffi_shape = ds4_host_shape {
             variant: identified.shape.variant as u32,
             n_compress: compress.len() as u32,
@@ -1663,6 +1671,16 @@ impl Model {
                 ptr::null()
             } else {
                 v41_engram_path_ptrs.as_ptr()
+            },
+            v41_mtp_block: v41_mtp.and_then(|w| w.mtp_block).unwrap_or(0),
+            v41_mtp_used: v41_mtp.and_then(|w| w.mtp_used).unwrap_or(0),
+            v41_mtp_noise_id: v41_mtp.and_then(|w| w.mtp_noise_id).unwrap_or(0),
+            v41_mtp_markov_rank: v41_mtp.and_then(|w| w.mtp_markov_rank).unwrap_or(0),
+            v41_n_mtp_target: v41_mtp_target.len() as u32,
+            v41_mtp_target: if v41_mtp_target.is_empty() {
+                ptr::null()
+            } else {
+                v41_mtp_target.as_ptr()
             },
         };
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;

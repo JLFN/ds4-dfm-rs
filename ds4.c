@@ -2663,6 +2663,34 @@ static void model_apply_host_v41_wiring(const ds4_host_shape *s) {
     v->candidate_block_size   = s->v41_candidate_block_size;
     v->mtp_towers  = s->v41_mtp_towers;
     v->mtp_experts = s->v41_mtp_experts;
+    /* P5: the draft parameters arm the drafter (core_validate_v41.c:91-110;
+     * the GGUF path parses the same keys at v41_load_wiring).  block == 0 =
+     * unarmed: either no towers, or a GGUF that predates the parameters --
+     * the engine's own warning, one token at a time.  The slot table must be
+     * -1 everywhere before the targets land (the memset above left zeros,
+     * and mtp_target_slot >= 0 gates the mainh capture in v41_layer). */
+    for (uint32_t i = 0; i < DS4_MAX_LAYER; i++) v->mtp_target_slot[i] = -1;
+    if (s->v41_mtp_block != 0) {
+        if (s->v41_n_mtp_target == 0 || s->v41_n_mtp_target > DS4_MTP_MAX_TOWERS * 2u ||
+            !s->v41_mtp_target) {
+            ds4_die("V4.1 host shape carries a draft block without its target layers");
+        }
+        v->mtp_block = s->v41_mtp_block;
+        v->mtp_used = s->v41_mtp_used;
+        v->mtp_noise_id = s->v41_mtp_noise_id;
+        v->mtp_markov_rank = s->v41_mtp_markov_rank;
+        v->n_mtp_target = s->v41_n_mtp_target;
+        for (uint32_t i = 0; i < v->n_mtp_target; i++) {
+            const int16_t t = s->v41_mtp_target[i];
+            if (t < 0 || t >= (int16_t)DS4_N_LAYER) {
+                ds4_die("V4.1 host shape has an mtp target layer out of range");
+            }
+            v->mtp_target[i] = t;
+            v->mtp_target_slot[t] = (int16_t)i;
+        }
+    } else if (s->v41_mtp_towers) {
+        fprintf(stderr, "ds4: [v41] this GGUF carries the towers but not the draft parameters (block_size/target_layers), so speculative decode stays unarmed\n");
+    }
     /* P4-3: the engram table wiring (rows, plane offsets, shard path).  A
      * count without its arrays is a bridge bug, not an artifact property
      * (same rule as the wiring arrays above). */
@@ -2682,8 +2710,6 @@ static void model_apply_host_v41_wiring(const ds4_host_shape *s) {
         v->engram_scale_off[i] = s->v41_engram_scale_off[i];
         memcpy(v->engram_table_path[i], p, plen + 1);
     }
-    /* The draft parameters (mtp block/targets) are still not on this ABI
-     * (P5); nothing reads them on this path. */
     v41_report_wiring(1);
 }
 

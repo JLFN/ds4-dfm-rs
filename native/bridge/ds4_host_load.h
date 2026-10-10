@@ -65,6 +65,19 @@ typedef struct {
     const uint64_t *v41_engram_weight_off;
     const uint64_t *v41_engram_scale_off;
     const char *const *v41_engram_table_path;
+    /* P5: the draft parameters (core_validate_v41.c:91-110; the C GGUF path
+     * parses the same five keys in v41_load_wiring).  They arm the drafter:
+     * without them the towers bind but speculation stays off.  block == 0
+     * means "not armed" (no towers, or the GGUF predates the parameters) and
+     * every other draft field is then ignored; the native prints the engine's
+     * warning when towers > 0.  When block != 0, n_mtp_target >= 1 and
+     * mtp_target (borrowed, DS4_MTP_MAX_TOWERS*2 entries max) is required. */
+    uint32_t v41_mtp_block;
+    uint32_t v41_mtp_used;
+    uint32_t v41_mtp_noise_id;
+    uint32_t v41_mtp_markov_rank;
+    uint32_t v41_n_mtp_target;
+    const int16_t *v41_mtp_target;
 } ds4_host_shape;
 
 void ds4_host_shape_install(const ds4_host_shape *s);

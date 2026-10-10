@@ -48,6 +48,9 @@ const KEY_MTP_TOWER_COUNT: &str = "deepseek4.mtp.tower_count";
 const KEY_MTP_EXPERT_COUNT: &str = "deepseek4.mtp.expert_count";
 const KEY_MTP_TARGET_LAYERS: &str = "deepseek4.mtp.target_layers";
 const KEY_MTP_MARKOV_RANK: &str = "deepseek4.mtp.markov_rank";
+const KEY_MTP_BLOCK_SIZE: &str = "deepseek4.mtp.block_size";
+const KEY_MTP_EXPERT_USED: &str = "deepseek4.mtp.expert_used_count";
+const KEY_MTP_NOISE_TOKEN_ID: &str = "deepseek4.mtp.noise_token_id";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum V41WireError {
@@ -145,6 +148,13 @@ pub struct V41Wire {
     pub mtp_towers: u32,
     /// `deepseek4.mtp.expert_count`; per-expert form only.
     pub mtp_experts: u32,
+    /// `deepseek4.mtp.block_size` / `.expert_used_count` / `.noise_token_id`:
+    /// the draft scalars (`core_validate_v41.c:97-99`).  None when absent
+    /// (or when the GGUF carries no towers); the drafter arms only when all
+    /// four scalars and the target list are present (`mtp_armed`).
+    pub mtp_block: Option<u32>,
+    pub mtp_used: Option<u32>,
+    pub mtp_noise_id: Option<u32>,
     /// `deepseek4.mtp.target_layers` (the layers whose attention input feeds
     /// `main_proj`); empty when the key is absent. The engine reads the same
     /// array when the draft parameters are complete
@@ -153,6 +163,20 @@ pub struct V41Wire {
     /// `deepseek4.mtp.markov_rank`; None when absent. The markov head and the
     /// confidence head are shaped by it.
     pub mtp_markov_rank: Option<u32>,
+}
+
+impl V41Wire {
+    /// The engine's arming rule (`core_validate_v41.c:97-110`): the towers,
+    /// all four draft scalars and a nonempty target list, or the drafter
+    /// stays off and the engine warns instead of guessing a default.
+    pub fn mtp_armed(&self) -> bool {
+        self.mtp_towers > 0
+            && self.mtp_block.is_some()
+            && self.mtp_used.is_some()
+            && self.mtp_noise_id.is_some()
+            && self.mtp_markov_rank.is_some()
+            && !self.mtp_targets.is_empty()
+    }
 }
 
 /// C `v41_arr_i32`: an INT32 or UINT32 array, read signed. Returns the values.
@@ -325,12 +349,37 @@ impl V41Wire {
         if mtp_towers > MTP_MAX_TOWERS || mtp_experts > MTP_MAX_EXPERTS {
             return Err(V41WireError::TowerLimit);
         }
-        let mtp_targets = if g.get_array(KEY_MTP_TARGET_LAYERS).is_some() {
-            layer_ids(g, KEY_MTP_TARGET_LAYERS, shape.n_layer)?
+        // The four draft scalars, read only when the towers are there
+        // (core_validate_v41.c:97-99).  A missing scalar leaves the drafter
+        // unarmed -- never a guessed default, because a wrong guess is
+        // silent: the draft is simply wrong and acceptance collapses to 0.
+        let (mtp_block, mtp_used, mtp_noise_id, mtp_markov_rank) = if mtp_towers > 0 {
+            (
+                g.get_u32(KEY_MTP_BLOCK_SIZE),
+                g.get_u32(KEY_MTP_EXPERT_USED),
+                g.get_u32(KEY_MTP_NOISE_TOKEN_ID),
+                g.get_u32(KEY_MTP_MARKOV_RANK),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        let mtp_have = mtp_block.is_some()
+            && mtp_used.is_some()
+            && mtp_noise_id.is_some()
+            && mtp_markov_rank.is_some();
+        let mtp_targets = if mtp_have || g.get_array(KEY_MTP_TARGET_LAYERS).is_some() {
+            // With the scalars complete the engine requires this list and
+            // exits when it is missing (v41_arr_i32), so a missing key here
+            // is a hard stop, not an empty list.
+            let targets = layer_ids(g, KEY_MTP_TARGET_LAYERS, shape.n_layer)?;
+            if targets.len() > MTP_MAX_TOWERS as usize * 2 {
+                // The engine dies on an over-cap array (v41_arr_i32).
+                return Err(V41WireError::ArrayLen(KEY_MTP_TARGET_LAYERS));
+            }
+            targets
         } else {
             Vec::new()
         };
-        let mtp_markov_rank = g.get_u32(KEY_MTP_MARKOV_RANK);
 
         Ok(Self {
             compress_ratios,
@@ -353,6 +402,9 @@ impl V41Wire {
             candidate_block_size: candidate_block_size as i32,
             mtp_towers,
             mtp_experts,
+            mtp_block,
+            mtp_used,
+            mtp_noise_id,
             mtp_targets,
             mtp_markov_rank,
         })

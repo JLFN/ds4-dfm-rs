@@ -113,48 +113,78 @@ fn tmp(name: &str) -> PathBuf {
 
 /// The artifact's metadata, with the arrays overridable for the refusal cases.
 fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFile {
+    artifact_gguf_mtp(name, kv, idx, ratios, Some(5), Some(3), Some(128_799), Some(256), Some(&[37, 38, 39]))
+}
+
+/// `artifact_gguf` with the draft keys overridable: the engine arms the
+/// drafter only when all four scalars and a nonempty target list are present,
+/// and requires the list once the scalars are complete
+/// (`core_validate_v41.c:97-110`; a `None` drops that key).
+#[allow(clippy::too_many_arguments)]
+fn artifact_gguf_mtp(
+    name: &str,
+    kv: &[i32],
+    idx: &[i32],
+    ratios: &[i32],
+    block: Option<u32>,
+    used: Option<u32>,
+    noise: Option<u32>,
+    rank: Option<u32>,
+    targets: Option<&[i32]>,
+) -> GgufFile {
     let path = tmp(name);
-    write_gguf(
-        &path,
-        &[
-            ("deepseek4.attention.compress_ratios", Val::ArrayI32(ratios)),
-            ("deepseek4.attention.kv_source_layers", Val::ArrayI32(kv)),
-            (
-                "deepseek4.attention.index_source_layers",
-                Val::ArrayI32(idx),
-            ),
-            ("deepseek4.engram.layer_ids", Val::ArrayI32(ENGRAM_LAYERS)),
-            (
-                "deepseek4.engram.num_embeddings",
-                Val::ArrayU64(&[384_006_168, 384_016_682]),
-            ),
-            ("deepseek4.engram.max_ngram_size", Val::U32(4)),
-            ("deepseek4.engram.head_count", Val::U32(8)),
-            ("deepseek4.engram.head_dim", Val::U32(256)),
-            ("deepseek4.engram.pad_id_compressed", Val::U32(2)),
-            // The artifact's candidate two-level topk (L20 screens, 2048
-            // blocks of 8); required since the ABI carries the triple.
-            ("deepseek4.attention.candidate.source_layer", Val::U32(20)),
-            ("deepseek4.attention.candidate.topk_blocks", Val::U32(2048)),
-            ("deepseek4.attention.candidate.block_size", Val::U32(8)),
-            (
-                "deepseek4.engram.0.table_path",
-                Val::Str("/home/fodelf/ds4-main/hf/model-00047-of-00048.safetensors"),
-            ),
-            ("deepseek4.engram.0.weight_offset", Val::U64(664)),
-            ("deepseek4.engram.0.scale_offset", Val::U64(98_305_579_672)),
-            (
-                "deepseek4.engram.1.table_path",
-                Val::Str("/home/fodelf/ds4-main/hf/model-00048-of-00048.safetensors"),
-            ),
-            ("deepseek4.engram.1.weight_offset", Val::U64(664)),
-            ("deepseek4.engram.1.scale_offset", Val::U64(98_305_852_864)),
-            ("deepseek4.mtp.tower_count", Val::U32(3)),
-            ("deepseek4.mtp.expert_count", Val::U32(128)),
-            ("deepseek4.mtp.target_layers", Val::ArrayI32(&[37, 38, 39])),
-            ("deepseek4.mtp.markov_rank", Val::U32(256)),
-        ],
-    );
+    let mut kvs: Vec<(&str, Val<'_>)> = vec![
+        ("deepseek4.attention.compress_ratios", Val::ArrayI32(ratios)),
+        ("deepseek4.attention.kv_source_layers", Val::ArrayI32(kv)),
+        (
+            "deepseek4.attention.index_source_layers",
+            Val::ArrayI32(idx),
+        ),
+        ("deepseek4.engram.layer_ids", Val::ArrayI32(ENGRAM_LAYERS)),
+        (
+            "deepseek4.engram.num_embeddings",
+            Val::ArrayU64(&[384_006_168, 384_016_682]),
+        ),
+        ("deepseek4.engram.max_ngram_size", Val::U32(4)),
+        ("deepseek4.engram.head_count", Val::U32(8)),
+        ("deepseek4.engram.head_dim", Val::U32(256)),
+        ("deepseek4.engram.pad_id_compressed", Val::U32(2)),
+        // The artifact's candidate two-level topk (L20 screens, 2048
+        // blocks of 8); required since the ABI carries the triple.
+        ("deepseek4.attention.candidate.source_layer", Val::U32(20)),
+        ("deepseek4.attention.candidate.topk_blocks", Val::U32(2048)),
+        ("deepseek4.attention.candidate.block_size", Val::U32(8)),
+        (
+            "deepseek4.engram.0.table_path",
+            Val::Str("/home/fodelf/ds4-main/hf/model-00047-of-00048.safetensors"),
+        ),
+        ("deepseek4.engram.0.weight_offset", Val::U64(664)),
+        ("deepseek4.engram.0.scale_offset", Val::U64(98_305_579_672)),
+        (
+            "deepseek4.engram.1.table_path",
+            Val::Str("/home/fodelf/ds4-main/hf/model-00048-of-00048.safetensors"),
+        ),
+        ("deepseek4.engram.1.weight_offset", Val::U64(664)),
+        ("deepseek4.engram.1.scale_offset", Val::U64(98_305_852_864)),
+        ("deepseek4.mtp.tower_count", Val::U32(3)),
+        ("deepseek4.mtp.expert_count", Val::U32(128)),
+    ];
+    if let Some(v) = block {
+        kvs.push(("deepseek4.mtp.block_size", Val::U32(v)));
+    }
+    if let Some(v) = used {
+        kvs.push(("deepseek4.mtp.expert_used_count", Val::U32(v)));
+    }
+    if let Some(v) = noise {
+        kvs.push(("deepseek4.mtp.noise_token_id", Val::U32(v)));
+    }
+    if let Some(v) = rank {
+        kvs.push(("deepseek4.mtp.markov_rank", Val::U32(v)));
+    }
+    if let Some(t) = targets {
+        kvs.push(("deepseek4.mtp.target_layers", Val::ArrayI32(t)));
+    }
+    write_gguf(&path, &kvs);
     GgufFile::open(&path).unwrap()
 }
 
@@ -244,6 +274,13 @@ fn wire_matches_the_artifacts_wiring() {
     let w = artifact_wire();
     assert_eq!(w.mtp_towers, 3);
     assert_eq!(w.mtp_experts, 128);
+    // P5: the draft parameters, as the artifact carries them.
+    assert_eq!(w.mtp_block, Some(5));
+    assert_eq!(w.mtp_used, Some(3));
+    assert_eq!(w.mtp_noise_id, Some(128_799));
+    assert_eq!(w.mtp_markov_rank, Some(256));
+    assert_eq!(w.mtp_targets, vec![37, 38, 39]);
+    assert!(w.mtp_armed());
     assert_eq!(w.engram_layers, vec![1, 14]);
     // Sources: the nearest earlier kv/index source per compressing layer.
     assert_eq!(w.kv_source_of[2], 2);
@@ -270,6 +307,76 @@ fn wire_matches_the_artifacts_wiring() {
     let inv = inventory_from(&artifact_names());
     assert!(w.tower_uses_blob(&inv, 0));
     assert!(w.tower_uses_blob(&inv, 2));
+}
+
+#[test]
+fn draft_parameters_arm_only_when_complete() {
+    // A GGUF converted before the draft parameters existed: the towers bind
+    // but speculation stays off (the engine warns and decodes one token at a
+    // time; core_validate_v41.c:105-110).  The list still parses -- layout
+    // needs it for the main_proj shape.
+    let g = artifact_gguf_mtp(
+        "mtp-unarmed.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        None,
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&[37, 38, 39]),
+    );
+    let w = V41Wire::load(&g, &shape()).unwrap();
+    assert!(!w.mtp_armed());
+    assert_eq!(w.mtp_block, None);
+    assert_eq!(w.mtp_targets, vec![37, 38, 39]);
+
+    // With the scalars complete the target list is required, not optional:
+    // the engine exits when it is missing (v41_arr_i32), never guesses.
+    let g = artifact_gguf_mtp(
+        "mtp-no-targets.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        None,
+    );
+    let err = V41Wire::load(&g, &shape()).expect_err("scalars without targets");
+    assert_eq!(err, V41WireError::MissingKey("deepseek4.mtp.target_layers"));
+
+    // An empty target list parses but never arms.
+    let g = artifact_gguf_mtp(
+        "mtp-empty-targets.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&[]),
+    );
+    let w = V41Wire::load(&g, &shape()).unwrap();
+    assert!(!w.mtp_armed());
+
+    // An over-cap target list is the engine's hard stop (v41_arr_i32).
+    let over: Vec<i32> = (0..9).collect();
+    let g = artifact_gguf_mtp(
+        "mtp-over-targets.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&over),
+    );
+    let err = V41Wire::load(&g, &shape()).expect_err("over-cap targets");
+    assert_eq!(err, V41WireError::ArrayLen("deepseek4.mtp.target_layers"));
 }
 
 #[test]

@@ -378,6 +378,15 @@ pub struct ds4_host_shape {
     pub v41_engram_weight_off: *const u64,
     pub v41_engram_scale_off: *const u64,
     pub v41_engram_table_path: *const *const c_char,
+    /* P5: the draft parameters; block == 0 = the drafter stays unarmed and
+     * the rest is ignored.  v41_mtp_target is borrowed, v41_n_mtp_target
+     * entries. */
+    pub v41_mtp_block: u32,
+    pub v41_mtp_used: u32,
+    pub v41_mtp_noise_id: u32,
+    pub v41_mtp_markov_rank: u32,
+    pub v41_n_mtp_target: u32,
+    pub v41_mtp_target: *const i16,
 }
 
 #[repr(C)]
