@@ -1121,15 +1121,17 @@ a3b3f8c (E2), ed0e408 + 783f9ff + 74d012a (E3).
 
 Unit: E complete
 
-## 6.16 Unit F evidence: the serving surface (P5.4 recorded; P5.5 pending)
+## 6.16 Unit F evidence: the serving surface (2026-10-10)
 
 Unit commits: e1f62a7 (P5.1, the draft parameters on the host-shape ABI),
 61e4e12 (P5.2, the run surface: native switches, the host rows provider,
 the bridge entry, the CLI flags, the Rust feed), ef6cd09 (P5.3, the
 serving contract row), 3b6ad8f (P5.4a, the [emit] instrument + the Rust
 gate runner + the ds4.o dependency fix), f730e0a (P5.4b, the ctx/vocab
-host-shape wiring). P5.5 (the push-based server route) is not in this
-section yet; the closing commit adds it and carries "Unit: F complete".
+host-shape wiring), 25c970c (the P5.4 evidence close), 591ae82 (P5.5, the
+push-based server route), c1a1f70 (the HTTP gate script + target), d1a375a
++ 2e3b13e + 7a7f34b (the three boot/first-request fixes), 7c2bd9a (the
+gate reorder: the CLI reference runs before the server boot).
 
 1. What P5.1-P5.3 ported (engine-cited in the file headers). The
    host-shape ABI carries the draft parameters (block_size, expert_used_
@@ -1216,6 +1218,76 @@ section yet; the closing commit adds it and carries "Unit: F complete".
    C gate has the same shape. Sampling, the V4.1 chat rendering (DSML/
    thinking), the lanes scheduler and the sidecars remain their units;
    the caps row refuses them by name.
+
+7. What P5.5 ported (engine-cited in the file headers). The engine's V4.1
+   server answer is the one-shot generate with two callbacks
+   (server_generate_v41.c:412-414: set_progress + generate_argmax with
+   v41_emit; the req object belongs to the --batch lanes scheduler and
+   --multi-probe, NOT this path). The port mirrors it: DecodeIo gained
+   is_v41/v41_generate/v41_last_spec_stats (defaults refuse by name),
+   NativeDecode implements them through V41ServeRoute (model path +
+   V41RunOptions), the dispatch is one variant check at the top of
+   generate_terminal_prepared (the engine's own one-line check,
+   server_generate.c:19), and generate_terminal_v41 reuses the port's
+   stream/stop/tool machinery (v41_gen/v41_emit/v41_finish). The finish
+   drops exactly the session-addressed pieces the engine drops there too:
+   no invalid-DSML retry, no tool replay / live bindings / checkpoints,
+   and no tool-memory write (the port's tool memory is wired to a session
+   store this route never creates); an unterminated tool call is an
+   error, never a repair. The DSML output parse was already live
+   (syntax_for_model_id(16) -> DeepSeek). Server flags (cli_opts.c:258-395
+   spellings): --engram-dir, --v41-no-engram, --no-dspark, --dspark
+   (bare; the server has no V4-era collision), --dspark-verify, --no-graph,
+   --emit-trace, --v41-prof; --zchain is refused by name (the sidecar
+   mount is not ported) and an explicit --ctx on a V4.1 model is refused
+   by name (core_validate_v41.c:51-53). Six route tests cover the surface
+   (completion, stream deltas, budget, ctx clamp, stop string, empty
+   prompt) against a scripted v41 engine.
+
+8. The gate found three boot/first-request crashes, all fixed and pushed.
+   (a) d1a375a — boot quote_overflow: the host quote priced a V4 session
+   bank at the 1M metadata ctx for the v41 row (serving.rs); the v41 row
+   is the only one with reuse None and now prices no persistent bank.
+   (b) 2e3b13e — boot SIGSEGV (exit 139): the port-only boot prewarm
+   crashed on v41 (the engine has NO prewarm); the DS4_NO_BOOT_PREWARM=1
+   control proved it (139 without the skip, boots with); prewarm is now
+   skipped for the v41 family.  (c) 7a7f34b — first-request SIGSEGV:
+   serial admission asked the native for a session-graph fit quote on a
+   family that never has a session (gdb: run_serial ->
+   NativeDecode::native_graph_fit -> Model::session_graph_fit_quote ->
+   ds4_bridge_session_graph_fit_quote -> ds4_engine_session_graph_fit_quote
+   -> metal_graph_session_fit_check -> metal_graph_alloc_bytes_estimate);
+   serial_session_probe and native_graph_fit now answer None for v41 —
+   the engine creates a session only for non-v41 (server_main.c:65) and
+   dispatches v41 before any session machinery (server_generate.c:19).
+   The class is "port machinery a session-less family must not enter";
+   each fix carries its own reasoning in the commit.
+
+9. Gate F-3 — the HTTP serving gate (tests/ds41_serving_http_gate.sh +
+   `make test-ds41-serving-http`; Spark /tmp/httpgate_c.log,
+   HTTPGATE_C_RC=0 at 14:49:38). PASS line: "CLI reference, boot +
+   /v1/models, non-stream and stream completions, the served ids equal
+   the CLI's on the same prompt, --ctx and --zchain refused by name".
+   Evidence: the served [emit] ids == the CLI's 3/3 (`5 11111`, `6 16`,
+   `7 1`; prompt 5 tokens, positions sequential from the prompt length);
+   non-stream " Paris." finish stop, prompt_tokens 5 / completion_tokens
+   2, ttft 162.8 ms, 8.7 tok/s decode; stream 3 JSON chunks + [DONE];
+   both boot refusals fire by name. The gate runs the CLI reference
+   FIRST — the single-instance guard admits one model-loading process at
+   a time, and the first attempt (14:38, /tmp/httpgate_b.log) failed
+   exactly there; fixed in 7c2bd9a. The full gate is 2 CLI loads + 1
+   server boot, ~6 min on the Spark.
+
+10. Recorded limits (P5.5). /v1/completions is the gateable surface;
+    chat + tools stay refused until P6 (the prompt side admits model_id 0
+    or completions only, chat_input.rs:20; the artifact carries no chat
+    template — all 73 metadata keys scanned — so the engine's C renderer
+    is the source). Sampling stays refused by name until unit G. The
+    lanes scheduler (server_sched_v41.c + core_v41_req.c), the amp/
+    distillation sidecars, --v41-chunk / --dspark-block and the sampling
+    draft arm remain their units.
+
+Unit: F complete
 
 ## 7. Numerics contract
 
