@@ -78,6 +78,15 @@ typedef struct {
     uint32_t v41_mtp_markov_rank;
     uint32_t v41_n_mtp_target;
     const int16_t *v41_mtp_target;
+    /* P5.4: the context length and the engram vocab pair.  The C GGUF path
+     * reads all three as required keys (v41_load_wiring; core_validate_v41.c
+     * :51-53, :152-153); without ctx the native generate entry and the state
+     * alloc refuse ("no deepseek4.context_length"), so the Rust host must
+     * carry it.  The vocab pair has no native reader yet but the C path
+     * fills it; the host shape must not leave it zero. */
+    uint32_t v41_ctx;
+    uint32_t v41_engram_vocab;
+    uint32_t v41_engram_cvocab;
 } ds4_host_shape;
 
 void ds4_host_shape_install(const ds4_host_shape *s);

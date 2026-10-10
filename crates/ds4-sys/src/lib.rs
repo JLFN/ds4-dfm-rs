@@ -398,6 +398,12 @@ pub struct ds4_host_shape {
     pub v41_mtp_markov_rank: u32,
     pub v41_n_mtp_target: u32,
     pub v41_mtp_target: *const i16,
+    /* P5.4: context length + the engram vocab pair (deepseek4.context_length,
+     * .engram.vocab_size, .engram.compressed_vocab_size; the native refuses
+     * ctx == 0). */
+    pub v41_ctx: u32,
+    pub v41_engram_vocab: u32,
+    pub v41_engram_cvocab: u32,
 }
 
 #[repr(C)]

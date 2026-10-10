@@ -2642,6 +2642,14 @@ static void model_apply_host_v41_wiring(const ds4_host_shape *s) {
     }
     memset(v, 0, sizeof *v);
     v->active = 1;
+    /* Context comes only from the metadata (deepseek4.context_length): no
+     * default and no --ctx (core_validate_v41.c:51-53); the generate entry
+     * and the state alloc refuse a zero, so an empty shape field is a bridge
+     * bug, not an artifact property. */
+    if (s->v41_ctx == 0) {
+        ds4_die("V4.1 host shape carries no context length (deepseek4.context_length)");
+    }
+    v->ctx = s->v41_ctx;
     memcpy(v->is_kv_source, s->v41_kv_source, DS4_N_LAYER);
     memcpy(v->is_index_source, s->v41_index_source, DS4_N_LAYER);
     memcpy(v->kv_source_of, s->v41_kv_source_of, DS4_N_LAYER * sizeof(v->kv_source_of[0]));
@@ -2658,6 +2666,8 @@ static void model_apply_host_v41_wiring(const ds4_host_shape *s) {
     v->engram_heads     = s->v41_engram_heads;
     v->engram_head_dim  = s->v41_engram_head_dim;
     v->engram_pad       = s->v41_engram_pad;
+    v->engram_vocab     = s->v41_engram_vocab;
+    v->engram_cvocab    = s->v41_engram_cvocab;
     v->candidate_source_layer = s->v41_candidate_source_layer;
     v->candidate_topk_blocks  = s->v41_candidate_topk_blocks;
     v->candidate_block_size   = s->v41_candidate_block_size;

@@ -33,6 +33,7 @@ pub const MTP_MAX_EXPERTS: u32 = 256;
 pub const V41_MAX_COMPRESS_RATIO: u32 = 2;
 
 const KEY_COMPRESS_RATIOS: &str = "deepseek4.attention.compress_ratios";
+const KEY_CTX: &str = "deepseek4.context_length";
 const KEY_KV_SOURCE_LAYERS: &str = "deepseek4.attention.kv_source_layers";
 const KEY_INDEX_SOURCE_LAYERS: &str = "deepseek4.attention.index_source_layers";
 const KEY_ENGRAM_LAYER_IDS: &str = "deepseek4.engram.layer_ids";
@@ -41,6 +42,8 @@ const KEY_ENGRAM_MAX_NGRAM: &str = "deepseek4.engram.max_ngram_size";
 const KEY_ENGRAM_HEADS: &str = "deepseek4.engram.head_count";
 const KEY_ENGRAM_HEAD_DIM: &str = "deepseek4.engram.head_dim";
 const KEY_ENGRAM_PAD: &str = "deepseek4.engram.pad_id_compressed";
+const KEY_ENGRAM_VOCAB: &str = "deepseek4.engram.vocab_size";
+const KEY_ENGRAM_CVOCAB: &str = "deepseek4.engram.compressed_vocab_size";
 const KEY_CANDIDATE_SOURCE_LAYER: &str = "deepseek4.attention.candidate.source_layer";
 const KEY_CANDIDATE_TOPK_BLOCKS: &str = "deepseek4.attention.candidate.topk_blocks";
 const KEY_CANDIDATE_BLOCK_SIZE: &str = "deepseek4.attention.candidate.block_size";
@@ -60,6 +63,9 @@ pub enum V41WireError {
     MissingKeyAt(String),
     ArrayType(&'static str),
     ArrayLen(&'static str),
+    /// `deepseek4.context_length` present but 0 or over `u32::MAX`
+    /// (`core_validate_v41.c:52-53`).
+    CtxInvalid,
     LayerRange(&'static str, i64),
     NoSourceBefore(u32),
     KvSourceNotIndexSource(u32),
@@ -75,6 +81,7 @@ impl V41WireError {
             V41WireError::MissingKeyAt(k) => format!("v41-missing-key {k}"),
             V41WireError::ArrayType(k) => format!("v41-array-type {k}"),
             V41WireError::ArrayLen(k) => format!("v41-array-len {k}"),
+            V41WireError::CtxInvalid => "v41-ctx-invalid".into(),
             V41WireError::LayerRange(k, id) => format!("v41-layer-range {k} {id}"),
             V41WireError::NoSourceBefore(il) => format!("v41-no-source-before {il}"),
             V41WireError::KvSourceNotIndexSource(il) => {
@@ -97,6 +104,11 @@ impl std::error::Error for V41WireError {}
 /// The V4.1 wiring table, per layer and per tower.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct V41Wire {
+    /// `deepseek4.context_length` (the HF `max_position_embeddings`; 1M in
+    /// the artifact).  The engine's only context source -- no default, no
+    /// cap constant, no `--ctx` (`core_validate_v41.c:51-53`); the native
+    /// generate entry and state alloc refuse a zero.
+    pub ctx: u32,
     /// `deepseek4.attention.compress_ratios`, first `n_layer` entries (V4.1:
     /// 0/1/2). `core_validate.c:14-46`.
     pub compress_ratios: Vec<u32>,
@@ -136,6 +148,11 @@ pub struct V41Wire {
     /// before the start of the sequence and for out-of-vocab tokens
     /// (`core_v41_engram.c:104-107`).
     pub engram_pad: u32,
+    /// `deepseek4.engram.vocab_size` / `deepseek4.engram.compressed_vocab_size`
+    /// (required keys, `core_validate_v41.c:152-153`; no native reader yet,
+    /// but the C GGUF path fills them and the host shape must not diverge).
+    pub engram_vocab: u32,
+    pub engram_cvocab: u32,
     /// `deepseek4.attention.candidate.source_layer` / `.topk_blocks` /
     /// `.block_size`: the layer that screens candidate blocks and the two
     /// two-level-topk widths (`core_validate_v41.c:113-115`). Stored signed
@@ -220,6 +237,17 @@ impl V41Wire {
         }
         let n = shape.n_layer as usize;
 
+        // The context length is the engine's only context source
+        // (core_validate_v41.c:51-53): a missing key is a hard stop and a
+        // zero or over-u32::MAX value is invalid.
+        let ctx = g
+            .get_u64_compat(KEY_CTX)
+            .ok_or(V41WireError::MissingKey(KEY_CTX))?;
+        if ctx == 0 || ctx > u32::MAX as u64 {
+            return Err(V41WireError::CtxInvalid);
+        }
+        let ctx = ctx as u32;
+
         let ratios = i32_array(g, KEY_COMPRESS_RATIOS)?;
         if ratios.len() < n {
             return Err(V41WireError::ArrayLen(KEY_COMPRESS_RATIOS));
@@ -284,6 +312,12 @@ impl V41Wire {
         let engram_pad = g
             .get_u32(KEY_ENGRAM_PAD)
             .ok_or(V41WireError::MissingKey(KEY_ENGRAM_PAD))?;
+        let engram_vocab = g
+            .get_u32(KEY_ENGRAM_VOCAB)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_VOCAB))?;
+        let engram_cvocab = g
+            .get_u32(KEY_ENGRAM_CVOCAB)
+            .ok_or(V41WireError::MissingKey(KEY_ENGRAM_CVOCAB))?;
 
         // The candidate two-level-topk triple is required (core_validate_v41.c:113-115).
         let candidate_source_layer = g
@@ -382,6 +416,7 @@ impl V41Wire {
         };
 
         Ok(Self {
+            ctx,
             compress_ratios,
             is_kv_source,
             kv_source_of,
@@ -397,6 +432,8 @@ impl V41Wire {
             engram_scale_off,
             engram_table_path,
             engram_pad,
+            engram_vocab,
+            engram_cvocab,
             candidate_source_layer: candidate_source_layer as i32,
             candidate_topk_blocks: candidate_topk_blocks as i32,
             candidate_block_size: candidate_block_size as i32,

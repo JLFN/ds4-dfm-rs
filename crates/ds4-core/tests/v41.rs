@@ -113,13 +113,26 @@ fn tmp(name: &str) -> PathBuf {
 
 /// The artifact's metadata, with the arrays overridable for the refusal cases.
 fn artifact_gguf(name: &str, kv: &[i32], idx: &[i32], ratios: &[i32]) -> GgufFile {
-    artifact_gguf_mtp(name, kv, idx, ratios, Some(5), Some(3), Some(128_799), Some(256), Some(&[37, 38, 39]))
+    artifact_gguf_mtp(
+        name,
+        kv,
+        idx,
+        ratios,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&[37, 38, 39]),
+        Some(1_048_576),
+    )
 }
 
 /// `artifact_gguf` with the draft keys overridable: the engine arms the
 /// drafter only when all four scalars and a nonempty target list are present,
 /// and requires the list once the scalars are complete
-/// (`core_validate_v41.c:97-110`; a `None` drops that key).
+/// (`core_validate_v41.c:97-110`; a `None` drops that key).  `ctx` likewise:
+/// `None` drops `deepseek4.context_length` (the engine's hard stop,
+/// `core_validate_v41.c:51-53`).
 #[allow(clippy::too_many_arguments)]
 fn artifact_gguf_mtp(
     name: &str,
@@ -131,6 +144,7 @@ fn artifact_gguf_mtp(
     noise: Option<u32>,
     rank: Option<u32>,
     targets: Option<&[i32]>,
+    ctx: Option<u64>,
 ) -> GgufFile {
     let path = tmp(name);
     let mut kvs: Vec<(&str, Val<'_>)> = vec![
@@ -149,6 +163,10 @@ fn artifact_gguf_mtp(
         ("deepseek4.engram.head_count", Val::U32(8)),
         ("deepseek4.engram.head_dim", Val::U32(256)),
         ("deepseek4.engram.pad_id_compressed", Val::U32(2)),
+        // The engram vocab pair: required keys (core_validate_v41.c:152-153),
+        // artifact values read from the GGUF on 2026-10-10.
+        ("deepseek4.engram.vocab_size", Val::U32(16_000_000)),
+        ("deepseek4.engram.compressed_vocab_size", Val::U32(99_092)),
         // The artifact's candidate two-level topk (L20 screens, 2048
         // blocks of 8); required since the ABI carries the triple.
         ("deepseek4.attention.candidate.source_layer", Val::U32(20)),
@@ -183,6 +201,9 @@ fn artifact_gguf_mtp(
     }
     if let Some(t) = targets {
         kvs.push(("deepseek4.mtp.target_layers", Val::ArrayI32(t)));
+    }
+    if let Some(v) = ctx {
+        kvs.push(("deepseek4.context_length", Val::U64(v)));
     }
     write_gguf(&path, &kvs);
     GgufFile::open(&path).unwrap()
@@ -272,6 +293,11 @@ fn artifact_inventory() -> TensorInventory {
 #[test]
 fn wire_matches_the_artifacts_wiring() {
     let w = artifact_wire();
+    // P5.4: the context length and the engram vocab pair (artifact values
+    // read from the GGUF on 2026-10-10).
+    assert_eq!(w.ctx, 1_048_576);
+    assert_eq!(w.engram_vocab, 16_000_000);
+    assert_eq!(w.engram_cvocab, 99_092);
     assert_eq!(w.mtp_towers, 3);
     assert_eq!(w.mtp_experts, 128);
     // P5: the draft parameters, as the artifact carries them.
@@ -325,6 +351,7 @@ fn draft_parameters_arm_only_when_complete() {
         Some(128_799),
         Some(256),
         Some(&[37, 38, 39]),
+        Some(1_048_576),
     );
     let w = V41Wire::load(&g, &shape()).unwrap();
     assert!(!w.mtp_armed());
@@ -343,6 +370,7 @@ fn draft_parameters_arm_only_when_complete() {
         Some(128_799),
         Some(256),
         None,
+        Some(1_048_576),
     );
     let err = V41Wire::load(&g, &shape()).expect_err("scalars without targets");
     assert_eq!(err, V41WireError::MissingKey("deepseek4.mtp.target_layers"));
@@ -358,6 +386,7 @@ fn draft_parameters_arm_only_when_complete() {
         Some(128_799),
         Some(256),
         Some(&[]),
+        Some(1_048_576),
     );
     let w = V41Wire::load(&g, &shape()).unwrap();
     assert!(!w.mtp_armed());
@@ -374,9 +403,62 @@ fn draft_parameters_arm_only_when_complete() {
         Some(128_799),
         Some(256),
         Some(&over),
+        Some(1_048_576),
     );
     let err = V41Wire::load(&g, &shape()).expect_err("over-cap targets");
     assert_eq!(err, V41WireError::ArrayLen("deepseek4.mtp.target_layers"));
+}
+
+#[test]
+fn context_length_is_required_and_range_checked() {
+    // The engine's only context source (core_validate_v41.c:51-53): a
+    // missing key is a hard stop, and 0 or over-u32::MAX is invalid.  The
+    // Rust host must refuse here because the native generate entry and the
+    // state alloc treat a zero ctx as "no metadata" and refuse too.
+    let g = artifact_gguf_mtp(
+        "ctx-missing.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&[37, 38, 39]),
+        None,
+    );
+    let err = V41Wire::load(&g, &shape()).expect_err("no context_length");
+    assert_eq!(err, V41WireError::MissingKey("deepseek4.context_length"));
+
+    let g = artifact_gguf_mtp(
+        "ctx-zero.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&[37, 38, 39]),
+        Some(0),
+    );
+    let err = V41Wire::load(&g, &shape()).expect_err("zero context_length");
+    assert_eq!(err, V41WireError::CtxInvalid);
+
+    let g = artifact_gguf_mtp(
+        "ctx-over.gguf",
+        KV_SOURCES,
+        INDEX_SOURCES,
+        COMPRESS_RATIOS,
+        Some(5),
+        Some(3),
+        Some(128_799),
+        Some(256),
+        Some(&[37, 38, 39]),
+        Some(u32::MAX as u64 + 1),
+    );
+    let err = V41Wire::load(&g, &shape()).expect_err("over-u32 context_length");
+    assert_eq!(err, V41WireError::CtxInvalid);
 }
 
 #[test]

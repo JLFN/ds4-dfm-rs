@@ -1684,6 +1684,9 @@ impl Model {
             } else {
                 v41_mtp_target.as_ptr()
             },
+            v41_ctx: v41_wire.as_ref().map(|w| w.ctx).unwrap_or(0),
+            v41_engram_vocab: v41_wire.as_ref().map(|w| w.engram_vocab).unwrap_or(0),
+            v41_engram_cvocab: v41_wire.as_ref().map(|w| w.engram_cvocab).unwrap_or(0),
         };
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;
         let mut ffi_bind = pack_host_bind_map(&bind_plan)?;
