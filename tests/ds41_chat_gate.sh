@@ -44,10 +44,11 @@ kill "$EPID" 2>/dev/null; wait "$EPID" 2>/dev/null
 trap - EXIT
 
 # The trace: the prompt id line is one line starting with "prompt:"; the
-# generated ids are the next line.  Extract both.
+# generated ids are the next line.  Extract both (single lines, no trailing
+# newline, so the two sides compare byte for byte).
 grep -q '^prompt:' "$LOG.eng.trace" || fail "engine trace has no prompt id line"
-sed -n 's/^prompt: *//p' "$LOG.eng.trace" > "$LOG.eng.prompt.ids"
-sed -n 's/^generated: *//p' "$LOG.eng.trace" > "$LOG.eng.gen.ids"
+sed -n 's/^prompt: *//p' "$LOG.eng.trace" | tr '\n' ' ' | sed 's/ $//' > "$LOG.eng.prompt.ids"
+sed -n 's/^generated: *//p' "$LOG.eng.trace" | tr '\n' ' ' | sed 's/ $//' > "$LOG.eng.gen.ids"
 grep -q '^--- rendered prompt ---' "$LOG.eng.trace" || fail "engine trace has no rendered prompt"
 
 # ---- port side: the same request through ds4-server-rs --emit-trace ----
