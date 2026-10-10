@@ -25,16 +25,18 @@
  * error, acceptance rots over the session; 3. a GGUF without the draft
  * parameters leaves ready=0 and the caller decodes one token at a time.
  *
- * Not ported here (named): the per-round CUDA graph (core_v41_draft.c:326-360
- * — the port's eager path IS the engine's direct dispatch, E3 adds the graph),
- * the amp/distillation sidecars (core_v41_draft_amp.c), the confidence
- * scheduler's cost accounting (core_draft_sched.c, E2), --dspark-block, and
- * the sampling draft arm (dev_sample).  The dense per-expert MoE exists for
- * the per-expert artifact form; this artifact's towers carry VQ blobs. */
+ * Not ported here (named): the amp/distillation sidecars
+ * (core_v41_draft_amp.c), --dspark-block, and the sampling draft arm
+ * (dev_sample).  The dense per-expert MoE exists for the per-expert artifact
+ * form; this artifact's towers carry VQ blobs.  The per-round CUDA graph is
+ * ported below (E3; core_v41_draft.c:326-370). */
 #ifndef DS4_DS41_DRAFT_INC
 #define DS4_DS41_DRAFT_INC
 
 #define DS4_V41_MKCACHE_SLOTS 256u   /* core_v41.h:168 (64 slots 50% hit / 256 slots 59%) */
+/* core_v41.h:167: draft graphs are indexed by the window top-up width; 1+block
+ * (6) is the steady width, a round that sat out a few steps tops up more. */
+#define DS4_V41_DRAFT_GROWS 8u
 
 typedef struct {
     ds4_v41_state st;          /* the towers' own buffers (draft=1, layer id = tower index) */
@@ -55,7 +57,19 @@ typedef struct {
     int32_t *p_tok, *p_bpos, *p_wpos, *p_first, *p_ids;   /* pinned slots the puts upload from */
     float *p_onehot, *p_conf;
     ds4_gpu_tensor *firstd;    /* device int: the ring-rows start (graph path; the eager path passes the value directly) */
-    int cap_mode;              /* capture mode: 1 changes the puts to zero-copy kernels (always 0 until E3) */
+    int cap_mode;              /* capture mode: 1 changes the puts to zero-copy kernels (E3) */
+    /* Draft graph state (core_v41.h:199-210, core_v41_draft.c:326-370): one
+     * exec per rows bucket, its scratch generation, and the direct warm-up
+     * count that gates capture.  graph_off = a capture failed, drafts walk
+     * direct from then on (loud).  pending = a graph was launched and not yet
+     * waited (v41_draft_wait).  h_* = the host-gap account. */
+    void *gexec[DS4_V41_DRAFT_GROWS + 1u];
+    uint64_t ggen[DS4_V41_DRAFT_GROWS + 1u];
+    uint32_t gwarm[DS4_V41_DRAFT_GROWS + 1u];
+    int graph_off, pending;
+    uint32_t gsteps, gcaps;    /* rounds walked on graphs / captures */
+    double h_slots, h_launch, h_capture, t_launched;   /* slot-write seconds / cudaGraphLaunch seconds / capture seconds / this round's launch time */
+    int last_warm;             /* the last round was a warm-up (request's first round, or a bucket's first direct round): the scheduler excludes its wall time */
     uint32_t rounds;           /* draft rounds produced */
 } ds4_v41_draft;
 
@@ -194,9 +208,10 @@ static bool v41_draft_alloc(ds4_engine *e, ds4_v41_draft *dr) {
     return true;
 }
 
-/* core_v41_draft.c:179-200, minus the graph teardown. */
+/* core_v41_draft.c:179-200, minus the amp teardown. */
 static void v41_draft_free(ds4_v41_draft *dr) {
     ds4_v41_state *st = &dr->st;
+    for (uint32_t r = 0; r <= DS4_V41_DRAFT_GROWS; r++) { if (dr->gexec[r]) ds4_gpu_decode_graph_free(dr->gexec[r]); dr->gexec[r] = NULL; }
     ds4_gpu_host_free(dr->p_tok); ds4_gpu_host_free(dr->p_bpos); ds4_gpu_host_free(dr->p_wpos); ds4_gpu_host_free(dr->p_first);
     ds4_gpu_host_free(dr->p_ids); ds4_gpu_host_free(dr->p_conf); ds4_gpu_host_free(dr->p_onehot);
     dr->p_tok = dr->p_bpos = dr->p_wpos = dr->p_first = dr->p_ids = NULL; dr->p_conf = dr->p_onehot = NULL;
@@ -389,11 +404,65 @@ static bool v41_draft_gpu_round(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_d
     return v41_draft_block(e, dr, pos0);
 }
 
-/* core_v41_draft.c:373-416, the direct path only (the graph round and the
- * scheduler's warm/cost accounting are E2/E3).  Returns 0 = cannot draft
- * (missing inputs), 2 = the direct dispatch ran synchronously (results in
- * host_ids/host_conf).  The engine's return 1 (graph in flight) never
- * happens here. */
+/* ---- the draft round's CUDA graph (core_v41_draft.c:326-360) ----
+ * One graph per rows bucket (the window top-up width): the fill's shapes move
+ * with rows, so each width captures its own, warmed direct first (gwarm).
+ * Capture failure turns every draft graph off, loudly -- a silent fallback
+ * would leave "spec == pure decode" vacuously green while every draft walked
+ * direct (the engine's 2026-09-18 conviction). */
+static bool v41_draft_graph_round(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int64_t first, uint32_t rows, uint32_t pos0) {
+    const uint64_t gen = ds4_gpu_v41_scratch_generation();
+    if (dr->gexec[rows] && dr->ggen[rows] != gen) {   /* a scratch pointer moved: every draft graph baked the old ones */
+        for (uint32_t r = 0; r <= DS4_V41_DRAFT_GROWS; r++) { if (dr->gexec[r]) ds4_gpu_decode_graph_free(dr->gexec[r]); dr->gexec[r] = NULL; }
+        fprintf(stderr, "ds4: [graph] draft graphs: backend scratch moved, all re-capturing\n");
+    }
+    if (!dr->gexec[rows]) {
+        const double tc0 = now_sec();
+        dr->cap_mode = 1;
+        if (!ds4_gpu_decode_graph_capture_begin()) { dr->cap_mode = 0; dr->graph_off = 1; return false; }
+        bool ok = v41_draft_gpu_round(e, main_st, dr, first, rows, pos0);
+        if (ok) ok = ds4_gpu_tensor_read_zerocopy(dr->p_ids, dr->ids, 0, (uint64_t)(dr->block + 1u) * 4) != 0 &&
+                     ds4_gpu_tensor_read_zerocopy(dr->p_conf, dr->conf, 0, (uint64_t)dr->block * 4) != 0;
+        dr->cap_mode = 0;
+        void *exec = ds4_gpu_decode_graph_capture_end();   /* end the capture on every path or the stream stays in capture mode */
+        if (!ok || !exec) {
+            if (exec) ds4_gpu_decode_graph_free(exec);
+            fprintf(stderr, "ds4: *[graph] draft graph (top-up %u rows) capture failed: drafts walk direct*\n", rows);
+            dr->graph_off = 1;
+            return false;
+        }
+        dr->gexec[rows] = exec; dr->ggen[rows] = gen; dr->gcaps++; dr->h_capture += now_sec() - tc0;
+        fprintf(stderr, "ds4: [graph] draft graph (top-up %u rows) captured\n", rows);
+    }
+    /* Replay reads the slots at replay time: refill them for this round (the
+     * capture pass filled the same values; harmless).  Launch only (the
+     * 2026-10-07 split): the wait and readback live in v41_draft_wait so the
+     * caller can emit while the draft runs. */
+    const double tl0 = now_sec();
+    v41_draft_slots(main_st, dr, first, rows, pos0);
+    const double tl1 = now_sec();
+    if (!ds4_gpu_decode_graph_launch(dr->gexec[rows])) return false;
+    dr->t_launched = now_sec(); dr->h_slots += tl1 - tl0; dr->h_launch += dr->t_launched - tl1;
+    dr->pending = 1;
+    return true;
+}
+/* The other half of a launched draft graph: wait, then read the pinned
+ * landing (v41_draft_launch returned 1).  A direct round already has its
+ * results; its wait is a no-op. */
+static bool v41_draft_wait(ds4_v41_draft *dr) {
+    if (!dr->pending) return true;
+    dr->pending = 0;
+    if (!ds4_gpu_synchronize()) return false;
+    __sync_synchronize();
+    memcpy(dr->host_ids, dr->p_ids, (size_t)(dr->block + 1u) * 4);
+    memcpy(dr->host_conf, dr->p_conf, (size_t)dr->block * 4);
+    dr->gsteps++;
+    return true;
+}
+
+/* core_v41_draft.c:373-420.  Returns 0 = cannot draft (inputs missing),
+ * 1 = a draft graph is in flight (host_ids/host_conf need v41_draft_wait),
+ * 2 = the direct dispatch ran synchronously (results ready; wait is a no-op). */
 static int v41_draft_launch(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main) {
     if (!dr->ready || !main_st->mainh) return 0;
     if (main_st->mainh_end != (int64_t)pos_main) {   /* the main forward did not write this position into the ring (CED skip / early stop) = inputs missing */
@@ -417,16 +486,37 @@ static int v41_draft_launch(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft
     }
     dr->host_ids[0] = tok; dr->p_tok[0] = tok;
     const uint32_t pos0 = pos_main + 1u;
+    /* Graph eligibility (core_v41_draft.c:395-399): the main state allows
+     * graphs, no capture failed before, this rows width warmed direct (its
+     * lazy allocations are built), and pos0 >= the window -- the block
+     * attention bakes pos0; below the window the key count varies with the
+     * position and no one graph fits. */
+    if (v41_graph_allowed(main_st) && !dr->graph_off && rows >= 1u && rows <= DS4_V41_DRAFT_GROWS && pos0 >= SWA && dr->gwarm[rows] > 0 &&
+        v41_draft_graph_round(e, main_st, dr, first, rows, pos0)) {
+        dr->win_end = pos_main;
+        dr->rounds++; dr->last_warm = 0;
+        return 1;
+    }
+    /* Warm-up round = the request's first round (all lazy allocations and
+     * first touches pay here) or a rows bucket's first direct round that could
+     * capture next time.  A direct round that can never graph (position below
+     * the window / rows out of range / graphs off) is NOT warm: its wall time
+     * is its true cost and the scheduler counts it (core_v41_draft.c:403-405). */
+    const bool in_grows = rows >= 1u && rows <= DS4_V41_DRAFT_GROWS;
+    dr->last_warm = dr->rounds == 0u || (in_grows && dr->gwarm[rows] == 0u && pos0 >= SWA && !dr->graph_off);
     if (!v41_draft_gpu_round(e, main_st, dr, first, rows, pos0)) return 0;
     if (rows) dr->win_end = pos_main;
     if (!ds4_gpu_synchronize()) return 0;
     if (!ds4_gpu_tensor_read(dr->ids, 0, dr->host_ids, (uint64_t)(dr->block + 1u) * 4)) return 0;
     if (!ds4_gpu_tensor_read(dr->conf, 0, dr->host_conf, (uint64_t)dr->block * 4)) return 0;
+    if (in_grows) dr->gwarm[rows]++;
     dr->rounds++;
+    dr->pending = 0;
     return 2;
 }
 static bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft *dr, int32_t tok, uint32_t pos_main) {
-    return v41_draft_launch(e, main_st, dr, tok, pos_main) == 2;   /* no graph path: launch only returns 0 or 2 */
+    const int r = v41_draft_launch(e, main_st, dr, tok, pos_main);
+    return r == 2 || (r == 1 && v41_draft_wait(dr));   /* core_v41_draft.c:418-420 */
 }
 
 /* ---- the confidence scheduler (core_draft_sched.c:31-97) ----
@@ -549,9 +639,8 @@ static void v41_gen_dump_row(ds4_v41_state *st, FILE *fd) {
  * the rest back.  Temperature-0 output is byte-identical with drafting on and
  * off — pure time saving.  verify_k pins the round's k (the engine's
  * --dspark-verify; the deterministic trace gate uses it), 0 = the confidence
- * scheduler.  Named limits: sampling and the penalties, the decode graph, the
- * draft graph and the emit-trace diagnostics are not ported (their units);
- * no_engram mirrors the engine's --v41-no-engram. */
+ * scheduler.  Named limits: sampling and the penalties are not ported (their
+ * unit); no_engram mirrors the engine's --v41-no-engram. */
 int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram, int verify_k,
                             const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud) {
     ds4_engine *e = (ds4_engine *)engine;
@@ -587,6 +676,16 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     uint32_t spec_rounds = 0, spec_acc = 0, spec_skipped = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
     for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
     double ms_draft = 0, ms_snap = 0, ms_verify = 0, ms_argmax = 0;
+    /* Host-gap account (core_v41_api.c:233-237, the engine's 2026-10-07 split):
+     * h_vd = verify wait return -> the next draft graph's launch return
+     * (accept/rollback/emit/slot write/launch); h_dv = draft step return ->
+     * the verify graph's launch (pick_k/start/launch). */
+    double h_vd = 0, h_dv = 0, t_prev_end = 0; uint32_t h_vdn = 0, h_dvn = 0;
+    /* The next round's draft goes out at the END of a round, before the emit
+     * (core_v41_api.c:237): the emit's fwrite+fflush then rides on the draft
+     * graph's execution instead of stalling the GPU.  draft_r = the launch's
+     * return (0 cannot draft / 1 in flight / 2 direct done). */
+    bool draft_inflight = false; int draft_r = 0; double t_dl0 = 0;
     int rc = 1;
     int32_t tok = 0;
     int produced = 0;
@@ -625,27 +724,47 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
         bool stop = false;
         while (!stop && produced < n_predict) {
             produced++;
-            if (emit && emit((int)tok, ud) != 0) break;   /* the CLI's EOS convention: nonzero = stop */
-            if ((int)tok == ds4_token_eos(e)) break;      /* the engine's own check when emit does not stop */
-            if (st.n_past + 1u > st.ctx) { fprintf(stderr, "[v41] context full %u\n", st.ctx); break; }
-            if (!spec) {   /* no drafter armed: the plain single-token step */
-                if (!v41_forward(e, &st, &tok, 1)) { rc = 1; break; }
-                if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
-                    ds4_gpu_synchronize() == 0 ||
-                    ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) { rc = 1; break; }
+            const bool draft_now = spec;   /* speculation on: every step drafts (the scheduler picks k, may be 0) */
+            /* Pure decode step on the graph (core_v41_api.c:257-267): no
+             * speculation, or a round the scheduler sat out.  The first step
+             * of a shape stays direct (it builds every lazy allocation;
+             * capture must not allocate), then one launch per step.  Emit
+             * rides on the graph: launch, emit, wait. */
+            if (!draft_now && v41_graph_ready(&st) && tok != ds4_token_eos(e) && st.n_past + 1u <= st.ctx) {
+                int32_t nt = 0;
+                const double ts0 = now_sec();
+                if (!v41_graph_launch(e, &st, (int32_t)tok, 0)) { rc = 1; break; }
+                if (emit && emit((int)tok, ud) != 0) { (void)v41_graph_wait(e, &st, &nt); break; }
+                if (!v41_graph_wait(e, &st, &nt)) { rc = 1; break; }
+                if (spec) v41_sched_cost(&cal, 1u, (now_sec() - ts0) * 1e3);   /* one pure step's wall time: the scheduler's price basis */
+                tok = (int)nt;
                 v41_gen_dump_row(&st, gen_fd);
                 continue;
             }
-            /* ---- one spec round (core_v41_api.c:284-390, the eager subset) ---- */
-            const double tr0 = now_sec();
+            if (emit && emit((int)tok, ud) != 0) break;   /* the CLI's EOS convention: nonzero = stop */
+            if ((int)tok == ds4_token_eos(e)) break;      /* the engine's own check when emit does not stop */
+            if (st.n_past + 1u > st.ctx) { fprintf(stderr, "[v41] context full %u\n", st.ctx); break; }
+            /* ---- one round (core_v41_api.c:272-390) ---- */
             uint32_t k = 0;
             int32_t batch[DS4_MTP_MAX_BLOCK + 1];
             batch[0] = tok;
-            float sched_val = 0.f;
-            bool drafted = false;
+            double tr0 = now_sec();
+            float sched_val = 0.f;   /* the scheduler's predicted yield/cost (printed for k=0 rounds too) */
+            bool drafted = false, have_draft = false;
             const uint32_t pos_round = st.n_past;   /* the round's first position (diagnostic) */
-            const int dr_launch = v41_draft_launch(e, &st, &dr, (int32_t)tok, st.n_past - 1u);
-            if (dr_launch != 0) {
+            if (draft_inflight) {
+                /* The previous round's end already sent this draft (core_v41_api.c:279-283): wait only. */
+                draft_inflight = false; tr0 = t_dl0;
+                if (draft_r == 1 && !v41_draft_wait(&dr)) { rc = 1; break; }
+                have_draft = draft_r != 0;
+            } else if (draft_now) {
+                dr.t_launched = 0.0;
+                const int r = v41_draft_launch(e, &st, &dr, (int32_t)tok, st.n_past - 1u);
+                if (r == 1 && t_prev_end > 0.0 && dr.t_launched > t_prev_end) { h_vd += dr.t_launched - t_prev_end; h_vdn++; }
+                if (r == 1 && !v41_draft_wait(&dr)) { rc = 1; break; }
+                have_draft = r != 0;
+            }
+            if (have_draft) {
                 drafted = true;
                 const uint32_t use = verify_k ? (uint32_t)verify_k
                                               : v41_draft_pick_k(dr.host_conf, dr.block, &sched_val, &cal);
@@ -654,21 +773,48 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
                 for (uint32_t i = 0; i < k; i++) batch[i + 1u] = dr.host_ids[i + 1u];
             }
             const uint32_t nb = 1u + k;
-            int32_t want[DS4_MTP_MAX_BLOCK + 1];
             const double tr1 = now_sec();
-            if (k && !v41_spec_snapshot(&st, nb)) { rc = 1; break; }
-            const double tr2 = now_sec();
-            if (!v41_forward(e, &st, batch, nb)) { rc = 1; break; }
-            const double tr3 = now_sec();
-            if (!v41_device_next(&st, am, 0u, nb, want)) { rc = 1; break; }
+            double tr2 = tr1, tr3;
+            int32_t want[DS4_MTP_MAX_BLOCK + 1];
+            bool walked_graph = false;   /* this dispatch walked a graph (steady cost) or direct (warm-up / capture failure) */
+            /* Verify batch on the graph (core_v41_api.c:310-323): once this n
+             * warmed direct, snapshot + forward + n argmax + readback are one
+             * launch; the snapshot bytes are inside the graph.  Otherwise the
+             * direct route below (snapshot -> forward -> per-row argmax) --
+             * the two routes are byte-identical. */
+            if (k && v41_graph_batch_ready(&st, nb) && v41_graph_batch_launch(e, &st, batch, nb)) {
+                h_dv += now_sec() - tr1; h_dvn++;
+                if (!v41_graph_batch_wait(e, &st, want)) { rc = 1; break; }
+                tr3 = now_sec(); walked_graph = true; t_prev_end = tr3;
+            } else if (!k && v41_graph_ready(&st)) {
+                /* A k=0 round (the draft ran, the scheduler sat it out): this
+                 * step is a plain single-token step on the n=1 graph
+                 * (core_v41_api.c:314-320; not in the steady account). */
+                int32_t nt = 0;
+                if (!v41_graph_launch(e, &st, (int32_t)tok, 1) || !v41_graph_wait(e, &st, &nt)) { rc = 1; break; }
+                want[0] = nt;
+                tr3 = now_sec(); walked_graph = true;
+            } else {
+                if (k && !v41_spec_snapshot(&st, nb)) { rc = 1; break; }
+                tr2 = now_sec();
+                if (!v41_forward(e, &st, batch, nb)) { rc = 1; break; }
+                if (k && !ds4_gpu_synchronize()) { rc = 1; break; }   /* the split account wants real wall time */
+                tr3 = now_sec();
+                if (!v41_device_next(&st, am, 0u, nb, want)) { rc = 1; break; }
+            }
+            if (!k) v41_gen_dump_row(&st, gen_fd);   /* the DS41_GEN_LOGITS dump: the logits row behind a single-token decision */
+            if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
+                     ms_verify += (tr3 - tr2) * 1e3; ms_argmax += (now_sec() - tr3) * 1e3; }
             if (drafted) {
-                /* Cost accounting (core_v41_api.c:335-341): the engine counts a
-                 * direct dispatch as steady whenever that n cannot walk a graph;
-                 * the port has no graph, so every dispatch is steady. */
-                v41_sched_draft_cost(&cal, (tr1 - tr0) * 1e3);
-                v41_sched_cost(&cal, nb, (tr3 - tr2) * 1e3);
-                if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
-                         ms_verify += (tr3 - tr2) * 1e3; ms_argmax += (now_sec() - tr3) * 1e3; }
+                /* The scheduler records STEADY costs only (core_v41_api.c:335-339):
+                 * a shape's first direct dispatch is its warm-up (lazy
+                 * allocations, first touches); recording it would make that
+                 * shape look expensive, the scheduler would avoid it and it
+                 * would never collect graph samples -- self-fulfilling.
+                 * Draft cost likewise excluded on a warm-up round. */
+                const bool steady = walked_graph || !(k ? v41_graph_batch_ready(&st, nb) : v41_graph_ready(&st));
+                if (!dr.last_warm) v41_sched_draft_cost(&cal, (tr1 - tr0) * 1e3);
+                if (steady) v41_sched_cost(&cal, nb, (tr3 - tr2) * 1e3);
             }
             uint32_t a = 0;
             while (a < k && want[a] == batch[a + 1u]) a++;   /* accept the longest matching prefix */
@@ -693,9 +839,25 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             }
             if (k) {
                 spec_rounds++; spec_acc += a; spec_hist[a]++;
+                const double tb0 = now_sec();
                 if (!v41_spec_rollback(&st, 1u + a)) { rc = 1; break; }
+                ms_snap += (now_sec() - tb0) * 1e3;   /* the rollback belongs to the snapshot/rollback term (core_v41_api.c:363-366) */
             }
             const int tok_next = (int)want[a];
+            /* Send the next round's draft BEFORE the emit (core_v41_api.c:368-378):
+             * the draft only needs the rolled-back state and tok_next, both
+             * ready here; the emit then rides on the draft's execution instead
+             * of stalling the GPU (nsys measured 1.26 ms idle there).  A
+             * stopping round does not send.  A launch that returns 0 is marked
+             * too: the round top must not retry it. */
+            bool cont = spec && produced + a < n_predict && tok_next != ds4_token_eos(e) && st.n_past + 1 <= st.ctx;
+            for (uint32_t i = 0; cont && i < a; i++) if (batch[i + 1u] == ds4_token_eos(e)) cont = false;
+            if (cont) {
+                t_dl0 = now_sec(); dr.t_launched = 0.0;
+                draft_r = v41_draft_launch(e, &st, &dr, (int32_t)tok_next, st.n_past - 1u);
+                if (draft_r == 1 && t_prev_end > 0.0 && dr.t_launched > t_prev_end) { h_vd += dr.t_launched - t_prev_end; h_vdn++; }
+                draft_inflight = true;
+            }
             /* The earned tokens: the draft matched the main model, emit them
              * straight (core_v41_api.c:384-390; the n_predict cap holds). */
             for (uint32_t i = 0; i < a; i++) {
@@ -706,8 +868,8 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             }
             tok = tok_next;
         }
-        /* The engine's summary (core_v41_api.c:393-406; its graph host-gap
-         * line is not ported). */
+        if (draft_inflight && draft_r == 1) (void)v41_draft_wait(&dr);   /* the loop stopped with a draft in flight (emit stop / cap): drain before free */
+        /* The engine's summary (core_v41_api.c:393-411). */
         if (spec_rounds) {
             fprintf(stderr, "\n[v41] DSpark: %u rounds (scheduler skipped %u), average accept %.2f/%u; histogram",
                     spec_rounds, spec_skipped, (double)spec_acc / (double)spec_rounds, dr.block);
@@ -717,6 +879,17 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             fprintf(stderr, "\n[v41] one round %.1f ms = draft %.1f + snapshot/rollback %.1f + verify %.1f + argmax %.1f"
                             "; yield %.2f token => %.1f ms/token\n",
                     per, ms_draft / R, ms_snap / R, ms_verify / R, ms_argmax / R, ea, per / ea);
+            {   /* printed whenever spec rounds ran (not prof-only: prof's per-stage syncs skew the gaps) */
+                double bp = 0, bl = 0, pb = 0, pe = 0, pc = 0, pa = 0, tc = 0; uint32_t bn = 0, nc = 0;
+                v41_graph_batch_host(&st, &bp, &bl, &bn); v41_graph_batch_prep(&st, &pb, &pe, &pc, &pa); v41_graph_capture_cost(&st, &tc, &nc);
+                const double gs = dr.gsteps ? (double)dr.gsteps : 1.0, bd = bn ? (double)bn : 1.0;
+                fprintf(stderr, "[v41] host gaps/round: verify end->draft graph out %.2f ms (slots %.3f + cudaGraphLaunch(draft, %u graph rounds) %.2f; rest = accept/rollback/emit)"
+                                " | draft end->verify graph out %.2f ms (start %.2f = slots %.3f + engram prep %.3f + graph checks %.3f + arm %.3f; cudaGraphLaunch %.2f); samples %u/%u rounds"
+                                " | capture (one-off, amortized above): verify graphs %u for %.0f ms, draft graphs %u for %.0f ms\n",
+                        h_vdn ? h_vd / h_vdn * 1e3 : 0.0, dr.h_slots / gs * 1e3, dr.gsteps, dr.h_launch / gs * 1e3,
+                        h_dvn ? h_dv / h_dvn * 1e3 : 0.0, bp / bd * 1e3, pb / bd * 1e3, pe / bd * 1e3, pc / bd * 1e3, pa / bd * 1e3, bl / bd * 1e3, h_dvn, h_dvn,
+                        nc, tc * 1e3, dr.gcaps, dr.h_capture * 1e3);
+            }
         }
     } while (0);
     if (gen_fd) fclose(gen_fd);

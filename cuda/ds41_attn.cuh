@@ -109,6 +109,65 @@ extern "C" int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_g
     return cuda_ok(cudaGetLastError(), "v41 compress pool");
 }
 
+/* ---- compressor source, one decode step, n rows (cuda_v41_2.inc.cu:74-128) ----
+ * The graph route's replacement for the direct path's three host-shaped steps
+ * (host-offset memcpy of the batch rows after the pending rows, a host
+ * decision to launch the pool, host-offset memcpy of the remainder to the
+ * head): one launch whose shape does not depend on the position, so a single
+ * captured graph replays every step.  The position comes from the device slot
+ * (posd), the pending slot is pos0 % ratio, and every completed group pools
+ * with the pool kernel's exact arithmetic (same t order, same mx/den/acc,
+ * same bf16 round) -- the direct and graph routes are bit-identical.
+ * snap_kv/snap_sc non-NULL store [old pending rows | this batch's n rows]
+ * linearly (the direct path's snap_cpre layout, so v41_spec_rollback reads it
+ * unchanged); a pure-decode n=1 capture passes NULL. */
+__global__ static void v41_compress_step_n_kernel(float *pooled, int32_t *posg, float *ckv_c, float *csc_c, float *snap_kv, float *snap_sc,
+                                                  const float *ckv, const float *csc, const int32_t *posd, uint32_t ratio, uint32_t dim, uint32_t n) {
+    v41_pdl_wait();
+    const uint32_t pos0 = (uint32_t)posd[0], pend = pos0 % ratio;
+    if (snap_kv)
+        for (uint32_t r = 0; r < pend; r++)
+            for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) { snap_kv[(uint64_t)r * dim + d] = ckv_c[(uint64_t)r * dim + d]; snap_sc[(uint64_t)r * dim + d] = csc_c[(uint64_t)r * dim + d]; }
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t slot = (pend + i) % ratio;
+        __syncthreads();   /* the previous group's pool read slots 0..ratio-1 before the next row may overwrite slot 0 */
+        for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+            const float a = ckv[(uint64_t)i * dim + d], b = csc[(uint64_t)i * dim + d];
+            ckv_c[(uint64_t)slot * dim + d] = a; csc_c[(uint64_t)slot * dim + d] = b;
+            if (snap_kv) { snap_kv[(uint64_t)(pend + i) * dim + d] = a; snap_sc[(uint64_t)(pend + i) * dim + d] = b; }
+        }
+        if (slot + 1u != ratio) continue;   /* not a complete group yet: append only (slot is block-uniform, no divergence) */
+        __syncthreads();
+        if (threadIdx.x == 0) posg[j] = (int32_t)(pos0 + i + 1u - ratio);
+        for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+            float mx = -INFINITY;
+            for (uint32_t t = 0; t < ratio; t++) mx = fmaxf(mx, csc_c[(uint64_t)t * dim + d]);
+            float den = 0.f, acc = 0.f;
+            for (uint32_t t = 0; t < ratio; t++) {
+                const float e = expf(csc_c[(uint64_t)t * dim + d] - mx);
+                den += e; acc += e * ckv_c[(uint64_t)t * dim + d];
+            }
+            pooled[(uint64_t)j * dim + d] = v41_bf16r(acc / den);
+        }
+        j++;
+    }
+}
+extern "C" int ds4_gpu_v41_compress_step_n_tensor(ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv, ds4_gpu_tensor *cpre_sc,
+                                                  ds4_gpu_tensor *snap_kv, ds4_gpu_tensor *snap_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc,
+                                                  const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim, uint32_t n) {
+    if (!pooled || !posg || !cpre_kv || !cpre_sc || !ckv || !csc || !posd || ratio < 2u || n == 0u || n > 8u) return 0;
+    const uint32_t ngmax = (ratio - 1u + n) / ratio;
+    if (cpre_kv->bytes < (uint64_t)ratio * dim * 4 || cpre_sc->bytes < (uint64_t)ratio * dim * 4) return 0;
+    if (pooled->bytes < (uint64_t)ngmax * dim * 4 || posg->bytes < (uint64_t)ngmax * 4 || ckv->bytes < (uint64_t)n * dim * 4) return 0;
+    if ((snap_kv != NULL) != (snap_sc != NULL)) return 0;
+    if (snap_kv && (snap_kv->bytes < (uint64_t)(ratio - 1u + n) * dim * 4 || snap_sc->bytes < (uint64_t)(ratio - 1u + n) * dim * 4)) return 0;
+    v41_compress_step_n_kernel<<<1, 256, 0, ds4_current_stream()>>>((float *)pooled->ptr, (int32_t *)posg->ptr, (float *)cpre_kv->ptr, (float *)cpre_sc->ptr,
+        snap_kv ? (float *)snap_kv->ptr : NULL, snap_sc ? (float *)snap_sc->ptr : NULL,
+        (const float *)ckv->ptr, (const float *)csc->ptr, (const int32_t *)posd->ptr, ratio, dim, n);
+    return cuda_ok(cudaGetLastError(), "v41 compress step (n rows)");
+}
+
 /* ---- act_quant inplace (cuda_kv_pack.inc.cu:107-141) ----
  * fast_round_scale(amax, inv) = 2^ceil(log2(amax*inv)); one warp per block
  * (<= 32 elements), one element per thread.  mode 0: fp8 e4m3 + ue8m0 scale
@@ -333,9 +392,12 @@ extern "C" int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0,
                                              const ds4_gpu_tensor *posd) {
     if (!win || !window || !n) return 0;
     if (win->bytes < (uint64_t)(window + n) * head_dim * 4) return 0;
-    if (posd) { fprintf(stderr, "ds4: [ds41] win commit: the graph path (device position) is not ported yet\n"); return 0; }
+    /* graph route: pure decode 1 row or a verify batch <= 8 rows; the kernel
+     * lands row i at ring cell (posd[0] + i) % window (cuda_kv_ring.inc.cu:49). */
+    if (posd && n > 8u) return 0;
     const uint32_t i0 = n > window ? n - window : 0u, rows = n - i0;
-    v41_win_commit_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)win->ptr, pos0, i0, window, head_dim, NULL);
+    v41_win_commit_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)win->ptr, pos0, i0, window, head_dim,
+                                                                  posd ? (const int32_t *)posd->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "v41 win commit");
 }
 
@@ -360,8 +422,8 @@ extern "C" int ds4_gpu_v41_win_ring_snap_tensor(ds4_gpu_tensor *win, ds4_gpu_ten
                                                 const ds4_gpu_tensor *posd) {
     if (!win || !snap || !window || n <= i0) return 1;   /* no rows to touch = success */
     if (snap->bytes < (uint64_t)n * head_dim * 4) return 0;
-    if (posd) { fprintf(stderr, "ds4: [ds41] win ring snap: the graph path (device position) is not ported yet\n"); return 0; }
     v41_win_ring_snap_kernel<<<n - i0, 256, 0, ds4_current_stream()>>>((float *)win->ptr, (float *)snap->ptr,
-                                                                       pos0, i0, window, head_dim, back ? 1u : 0u, NULL);
+                                                                       pos0, i0, window, head_dim, back ? 1u : 0u,
+                                                                       posd ? (const int32_t *)posd->ptr : NULL);
     return cuda_ok(cudaGetLastError(), back ? "v41 win ring restore" : "v41 win ring save");
 }

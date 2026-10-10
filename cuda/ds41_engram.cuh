@@ -121,3 +121,23 @@ extern "C" int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset,
                                                                                   (const uint32_t *)dev, nw);
     return cuda_ok(cudaGetLastError(), "tensor write zerocopy");
 }
+
+/* The reverse direction (cuda_decode_graph.inc.cu:172-183): a kernel writes a
+ * few device words into the mapped pinned buffer (the graph's per-row argmax
+ * landing), saving the ~170 us D2H memcpy node; the host reads the pinned
+ * buffer after the step's sync.  Same stream rule as the upload: the capture
+ * stream during capture, so the node lands in the graph. */
+__global__ static void decode_hoststore_kernel(uint32_t *dst_host, const uint32_t *src, uint32_t nwords) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nwords) dst_host[i] = src[i];
+}
+extern "C" int ds4_gpu_tensor_read_zerocopy(void *pinned, const ds4_gpu_tensor *t, uint64_t offset, uint64_t bytes) {
+    if (!t || !pinned || offset > t->bytes || bytes > t->bytes - offset || (bytes & 3u) || (offset & 3u)) return 0;
+    if (bytes == 0) return 1;
+    void *dev = NULL;
+    if (cudaHostGetDevicePointer(&dev, pinned, 0) != cudaSuccess || !dev) { (void)cudaGetLastError(); return 0; }
+    const uint32_t nw = (uint32_t)(bytes / 4u);
+    decode_hoststore_kernel<<<(nw + 255u) / 256u, 256, 0, ds4_current_stream()>>>((uint32_t *)dev,
+                                                                                  (const uint32_t *)((const char *)t->ptr + offset), nw);
+    return cuda_ok(cudaGetLastError(), "tensor read zerocopy");
+}

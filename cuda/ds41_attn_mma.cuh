@@ -726,8 +726,23 @@ extern "C" int ds4_gpu_v41_sparse_attn_tensor(ds4_gpu_tensor *o, const ds4_gpu_t
     }
     /* The graph route (posd) only accepts the decode tensor-core path; the
      * scalar split sizes its segments on the host and cannot enter one
-     * captured graph.  Not ported yet (unit E): refuse by name. */
-    if (posd) { fprintf(stderr, "ds4: [ds41] sparse attn: the graph path (device position) is not ported yet\n"); return 0; }
+     * captured graph.  The tensor-core path failing to raise shared fails
+     * HERE, loudly — never a silent switch to another kernel: a different
+     * kernel is a different accumulation order and the byte gate would fork
+     * (engine cuda_v41_2.inc.cu:246-260). */
+    if (posd) {
+        if (full_block || !ring || n_tok > 8u) { fprintf(stderr, "ds4: [ds41] sparse attn: the graph route takes only the main path's n<=8 shape\n"); return 0; }
+        const float *sink = (const float *)cuda_model_range_ptr(model_map, sink_offset, (uint64_t)n_head * 4, "v41 sink");
+        if (!sink) return 0;
+        const int hasc = kv_comp && idx;   /* pure-window layers (ratio 0) come here too: the window range moves with the position as well */
+        if (!v41_attn_mma_decode((float *)o->ptr, (const float *)q->ptr, (const float *)kv_win->ptr,
+                                 hasc ? (const uint8_t *)kv_comp->ptr : NULL, hasc ? (const int32_t *)idx->ptr : NULL,
+                                 sink, n_tok, pos0, window, hasc ? ng : 0u, hasc ? topk : 0u, hasc ? ratio : 0u, n_head, head_dim, scale,
+                                 (const int32_t *)posd->ptr, pos_cap, 0u, 1u)) {
+            fprintf(stderr, "ds4: [ds41] sparse attn: the decode tensor-core attention the graph route needs is unavailable\n"); return 0;
+        }
+        return 1;
+    }
     if (kv_win->bytes < (uint64_t)(window + n_tok) * head_dim * 4) { fprintf(stderr, "ds4: [v41] window buffer short %u+%u rows\n", window, n_tok); return 0; }
     const float *sink = (const float *)cuda_model_range_ptr(model_map, sink_offset, (uint64_t)n_head * 4, "v41 sink");
     if (!sink) return 0;

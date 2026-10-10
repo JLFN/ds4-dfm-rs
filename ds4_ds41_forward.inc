@@ -109,6 +109,21 @@ typedef struct {
     ds4_gpu_tensor *snap_win[DS4_MAX_LAYER], *snap_cpre_kv[DS4_MAX_LAYER], *snap_cpre_sc[DS4_MAX_LAYER];
     uint32_t snap_cpend[DS4_MAX_LAYER], snap_past, snap_on;
     uint32_t snap_n;            /* rows in the snapshotted batch (1+k); the rollback restores [keep, snap_n) */
+    /* Decode-step CUDA graph (core_v41.h:114-119, E3).  graph = 1 while the
+     * step runs under the "device position" convention (position-dependent
+     * kernels read st->pos; grid/shared sized by the bucket cap, never the
+     * true position).  n_direct1 / n_direct_n count the direct warm-up
+     * forwards a graph shape needs before capture (lazy allocations and
+     * kernel attributes must all be built outside a capture).  iscap_gen
+     * bumps whenever the index scratch moves: a captured graph bakes
+     * pointers.  dgraph is the graph module's private state
+     * (ds4_ds41_graph.inc; core_decode_graph.c:29-55). */
+    int graph;
+    uint32_t graph_pos_lo, graph_pos_cap;   /* the graph's valid position window [lo, cap] (bucket), last row cap+n-1 */
+    uint32_t n_direct1;
+    uint32_t n_direct_n[DS4_MTP_MAX_BLOCK + 2u];
+    uint32_t iscap_gen;
+    void *dgraph;
     /* The block's host token ids, set by v41_forward: the engram feed's
      * prepare callback hashes the block's rows from them (the engine hashes
      * from st->hist, core_v41_forward.c:377). */
@@ -188,6 +203,7 @@ static void v41_free_attn(ds4_v41_state *st) {
  * block would otherwise serve another request's KV as history (bug.md 6.2,
  * the win_from clamp is the fix, this is the safety net). */
 static void v41_state_free(ds4_v41_state *st);
+static void v41_graph_free(ds4_v41_state *st);   /* ds4_ds41_graph.inc (core_v41_state.c:233 calls it first, as here) */
 static bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint32_t logits_rows) {
     memset(st, 0, sizeof *st);
     st->cap_tok = cap; st->ctx = ctx; st->idx_owner = -1; st->cand_owner = -1;
@@ -229,8 +245,9 @@ static bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint3
     return ok;
 }
 
-/* core_v41_state.c:233-247, minus the engine's graph/amp/job teardown. */
+/* core_v41_state.c:233-247, minus the engine's amp/job teardown. */
 static void v41_state_free(ds4_v41_state *st) {
+    v41_graph_free(st);
     v41_free_dense(st);
     v41_free_attn(st);
     V41_FREE(&st->wintmp, &st->iscore, &st->cand, &st->erows, &st->ekv, &st->mainh, &st->main_x);
@@ -248,6 +265,13 @@ static void v41_state_free(ds4_v41_state *st) {
 static bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need, uint32_t rows_score, uint32_t rows_cand) {
     const uint32_t kcap = g_ds4_v41.candidate_source_layer >= 0 && g_ds4_v41.candidate_topk_blocks > 0 ? (uint32_t)g_ds4_v41.candidate_topk_blocks : 0u;
     if (ng_need <= st->iscap && rows_score <= st->isrows && rows_cand <= st->icrows && st->iscore && (st->cand || !kcap)) return true;
+    /* The graph route grows this before capture (dg_capture, core_v41_state.c:199-204);
+     * meeting a growth need here means the capture sized it short. */
+    if (st->graph) {
+        fprintf(stderr, "ds4: [v41] index scratch growth asked under capture (needs %u/%u rows x %u groups, has %u/%u x %u)\n",
+                rows_score, rows_cand, ng_need, st->isrows, st->icrows, st->iscap);
+        return false;
+    }
     uint32_t want = st->iscap ? st->iscap * 2u : ng_need;
     if (want < ng_need) want = ng_need;
     if (want > st->ctx) want = st->ctx;
@@ -267,6 +291,7 @@ static bool v41_index_scratch_prepare(ds4_v41_state *st, uint32_t ng_need, uint3
     if (st->iscore) ds4_gpu_tensor_free(st->iscore);
     if (st->cand) ds4_gpu_tensor_free(st->cand);
     st->iscore = is; st->cand = cd; st->iscap = want; st->isrows = rs; st->icrows = rc;
+    st->iscap_gen++;   /* pointers moved: every captured graph baked the old ones (dg_launch checks) */
     return true;
 }
 
@@ -320,6 +345,9 @@ static bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint32_t stride = HD + HD / 32u;
     const uint64_t in_dim = (uint64_t)cols * HD, out_dim = (uint64_t)(DS4_N_HC + 1u) * DS4_N_EMBD;
     if (!st->erows) {   /* three buffers sized to cap once; addresses stay stable for the session */
+        /* No allocation under capture (ThreadLocal voids it): the direct warm
+         * step builds these before any graph captures. */
+        if (st->graph) { fprintf(stderr, "ds4: [v41] engram buffers not built before capture (a direct step must warm first)\n"); return false; }
         for (uint32_t k = 0; k < v->n_engram; k++) st->eraw[k] = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * cols * stride);
         st->erows = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * in_dim * 4);
         st->ekv = ds4_gpu_tensor_alloc((uint64_t)st->cap_tok * out_dim * 4);
@@ -344,7 +372,7 @@ static bool v41_engram_rows(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
      * cannot see a payload error (right ids, wrong bytes); the caller prints
      * the host-side digest of the same range and the two must match. */
     {
-        const char *fdg = getenv("DS41_FEED_DIGEST");
+        const char *fdg = st->graph ? NULL : getenv("DS41_FEED_DIGEST");   /* a device readback would void a capture; the predicate excludes the env in graph mode anyway */
         if (fdg) {
             static FILE *dfp = NULL;
             const uint64_t bytes = (uint64_t)n * cols * stride;
@@ -400,8 +428,50 @@ static bool v41_engram(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
  * New compressor inputs append after the pending rows; completed groups pool
  * (ratio > 1) or project (ratio 1), then the shared chain runs: latent norm
  * -> wk -> k_norm -> rope -> fp4 pack into index_k; latent -> rope -> fp4
- * pack into comp_kv.  No spec snapshot: the port has no spec decode yet. */
+ * pack into comp_kv.  The spec snapshot point is BEFORE the destructive
+ * remainder-to-head shift. */
+/* Graph route (core_v41_attn.c:20-58): the append/pool step is one
+ * position-driven kernel (ds4_gpu_v41_compress_step_n_tensor) and the
+ * downstream chain runs UNCONDITIONALLY every step -- the pack kernels
+ * compute the true group number from the device position, and rows of an
+ * incomplete group land in the trash slot past the group cap (never read).
+ * A host "is the group complete" branch would have to become "issue every
+ * step, decide on device" anyway: one capture, hundreds of replays.  The
+ * host counters are NOT advanced here -- the graph's launch advances them in
+ * closed form (dg_advance). */
+static bool v41_compress_source_graph(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint32_t ratio) {
+    const ds4_model *m = &e->model; const ds4_layer_weights *l = &e->weights.layer[il];
+    const uint32_t n = st->n, E = DS4_N_EMBD, HD = DS4_N_HEAD_DIM, IK = DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t rowb = (uint64_t)HD * 4;
+    const uint32_t g_trash = st->ctx / ratio;   /* same source as the ngcap = ctx/ratio + 2 allocation: this cell is past the group cap */
+    const ds4_gpu_tensor *pg = st->posg;        /* new group positions: ratio>1 written by the append kernel; ratio 1 the position itself */
+    uint32_t np;
+    if (ratio > 1) {
+        if (!ds4_gpu_v41_matmul_bf16_tensor(st->ckv, m->map, m->size, l->attn_compressor_kv->abs_offset, E, HD, st->xn, n)) return false;
+        if (!ds4_gpu_v41_matmul_bf16_tensor(st->csc, m->map, m->size, l->attn_compressor_gate->abs_offset, E, HD, st->xn, n)) return false;
+        /* The snapshot is only for the verify batch (n>1), and its buffers are
+         * built by the direct round (no allocation under capture). */
+        ds4_gpu_tensor *sk = n > 1u ? st->snap_cpre_kv[il] : NULL, *ss = n > 1u ? st->snap_cpre_sc[il] : NULL;
+        if (n > 1u && (!sk || !ss)) { fprintf(stderr, "ds4: [graph] L%u compressor snapshot buffer not built (a verify batch must warm direct first)\n", il); return false; }
+        if (!ds4_gpu_v41_compress_step_n_tensor(st->pooled, st->posg, st->cpre_kv[il], st->cpre_sc[il], sk, ss, st->ckv, st->csc, st->pos, ratio, HD, n)) return false;
+        np = (ratio - 1u + n) / ratio;
+    } else {           /* ratio 1: pure projection (bf16 weights) -> bf16 */
+        if (!ds4_gpu_v41_matmul_bf16_tensor(st->pooled, m->map, m->size, l->attn_compressor_kv->abs_offset, E, HD, st->xn, n)) return false;
+        if (!ds4_gpu_v41_round_bf16_tensor(st->pooled, (uint64_t)n * HD)) return false;
+        pg = st->pos; np = n;
+    }
+    if (!ds4_gpu_v41_rms_norm_tensor(st->latent, st->pooled, m->map, m->size, l->attn_compressor_norm->abs_offset, HD, np, DS4_RMS_EPS)) return false;
+    if (!ds4_gpu_v41_matmul_bf16_tensor(st->ktmp, m->map, m->size, l->indexer_wk->abs_offset, HD, IK, st->latent, np)) return false;
+    if (!ds4_gpu_v41_round_bf16_tensor(st->ktmp, (uint64_t)np * IK)) return false;
+    if (!ds4_gpu_v41_rms_norm_tensor(st->ckv, st->ktmp, m->map, m->size, l->indexer_k_norm->abs_offset, IK, np, DS4_RMS_EPS)) return false;
+    if (!v41_rope(st->ckv, pg, np, 1, IK, ratio, false)) return false;
+    if (!ds4_gpu_v41_idxk_pack_tensor(st->index_k[il], 0, st->ckv, np, st->pos, ratio, g_trash, n)) return false;
+    if (!ds4_gpu_tensor_copy(st->pooled, 0, st->latent, 0, (uint64_t)np * rowb)) return false;
+    if (!v41_rope(st->pooled, pg, np, 1, HD, ratio, false)) return false;
+    return ds4_gpu_v41_ckv_pack_tensor(st->comp_kv[il], 0, st->pooled, np, st->pos, ratio, g_trash, n) != 0;
+}
 static bool v41_compress_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint32_t ratio) {
+    if (st->graph) return v41_compress_source_graph(e, st, il, ratio);
     const ds4_model *m = &e->model; const ds4_layer_weights *l = &e->weights.layer[il];
     const uint32_t n = st->n, E = DS4_N_EMBD, HD = DS4_N_HEAD_DIM, IK = DS4_N_INDEXER_HEAD_DIM;
     const uint64_t rowb = (uint64_t)HD * 4;
@@ -473,12 +543,19 @@ static bool v41_index_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint
     const uint32_t n = st->n, E = DS4_N_EMBD, IH = DS4_N_INDEXER_HEAD, IK = DS4_N_INDEXER_HEAD_DIM;
     const int16_t src = v->kv_source_of[il];
     if (src < 0 || !st->index_k[src]) return false;
-    const uint32_t ng = st->ng_src[src];
+    /* Graph route: ng/topk are the bucket CAPS and the position comes from the
+     * device slot (ds4_gpu_v41.h "device position"); the "no completed groups
+     * yet" case is handled by the kernels themselves (device ng = 0: score and
+     * topk run empty, attention reads the window only) -- the host does not
+     * branch.  Direct route: the host's true values. */
+    const ds4_gpu_tensor *posd = st->graph ? st->pos : NULL;
+    const uint32_t ng = st->graph ? (st->graph_pos_cap + n) / ratio : st->ng_src[src];
     st->idx_owner = (int16_t)il;
     if (!ng) { st->idx_topk = 0; st->idx_ratio = 0; return true; }   /* no completed groups yet: window only */
     const uint32_t dec_rows = DS4_MTP_MAX_BLOCK + 2u;
     uint32_t Rb = n <= dec_rows ? n : n / 32u;
     if (Rb < dec_rows) Rb = dec_rows < n ? dec_rows : n;
+    if (st->graph && Rb < n) { fprintf(stderr, "ds4: [v41] graph route's index scoring does not block (n %u)\n", n); return false; }
     if (!v41_index_scratch_prepare(st, ng, Rb, n)) return false;
     if (!v41_tproj(m, st->iq, l->indexer_attn_q_b, DS4_N_LORA_Q, (uint64_t)IH * IK, st->qrn, n, 1)) return false;
     if (!v41_rope(st->iq, st->pos, n, IH, IK, ratio, false)) return false;
@@ -505,10 +582,10 @@ static bool v41_index_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, uint
         ds4_gpu_tensor *ix = whole ? st->idx : ds4_gpu_tensor_view(st->idx, (uint64_t)b0 * topk * 4, (uint64_t)nr * topk * 4);
         const ds4_gpu_tensor *cl = uses_cand ? cd : NULL;
         bool ok = iq && iw && ix && (cd || !st->cand);
-        if (ok) ok = ds4_gpu_v41_indexer_score_tensor(st->iscore, iq, st->index_k[src], iw, cl, bs, kcap, nr, st->pos0 + b0, ng, IH, IK, ratio, NULL) != 0;
+        if (ok) ok = ds4_gpu_v41_indexer_score_tensor(st->iscore, iq, st->index_k[src], iw, cl, bs, kcap, nr, st->pos0 + b0, ng, IH, IK, ratio, posd) != 0;
         if (ok && is_cand)
-            ok = ds4_gpu_v41_candidate_blocks_tensor(cd, st->iscore, nr, st->pos0 + b0, ng, ratio, kcap, bs, NULL) != 0;
-        if (ok) ok = ds4_gpu_v41_indexer_topk_tensor(ix, st->iscore, nr, ng, topk, ratio, NULL, cl, bs, kcap) != 0;
+            ok = ds4_gpu_v41_candidate_blocks_tensor(cd, st->iscore, nr, st->pos0 + b0, ng, ratio, kcap, bs, posd) != 0;
+        if (ok) ok = ds4_gpu_v41_indexer_topk_tensor(ix, st->iscore, nr, ng, topk, ratio, posd, cl, bs, kcap) != 0;
         if (!whole) { ds4_gpu_tensor_free(iq); ds4_gpu_tensor_free(iw); if (cd) ds4_gpu_tensor_free(cd); ds4_gpu_tensor_free(ix); }
         if (!ok) return false;
     }
@@ -557,23 +634,36 @@ static bool v41_attn_cache(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const uint64_t rowb = (uint64_t)HD * 4;
     if (!ds4_gpu_tensor_copy(st->win[il], (uint64_t)SWA * rowb, st->kvn, 0, (uint64_t)n * rowb)) return false;
     uint32_t ng = 0, topk = 0, iratio = 0; const ds4_gpu_tensor *comp = NULL;
+    const ds4_gpu_tensor *posd = st->graph ? st->pos : NULL;   /* graph: the position is the device slot, ng/topk are the bucket caps */
     if (ratio) {
         if (v->is_kv_source[il] && !v41_compress_source(e, st, il, ratio)) return false;
         if (v->is_index_source[il] && !v41_index_source(e, st, il, ratio)) return false;
         const int16_t src = v->kv_source_of[il];
         if (src < 0 || !st->comp_kv[src]) { fprintf(stderr, "ds4: [v41] L%u compressed layer has no source\n", il); return false; }
-        ng = st->ng_src[src];
+        ng = st->graph ? (st->graph_pos_cap + n) / ratio : st->ng_src[src];
         if (ng) {
             if (st->idx_owner < 0) { fprintf(stderr, "ds4: [v41] L%u compressed layer has no topk\n", il); return false; }
             comp = st->comp_kv[src]; topk = st->idx_topk; iratio = st->idx_ratio;
+            /* Graph kernels derive ng and the segment length from ONE ratio, so
+             * the topk source layer's ratio must equal this layer's (the
+             * wiring table guarantees it; refuse rather than misread). */
+            if (st->graph && iratio != ratio) { fprintf(stderr, "ds4: [v41] L%u graph route: topk source ratio %u != layer ratio %u\n", il, iratio, ratio); return false; }
         }
     }
     /* sparse attention (window 128 + topk compressed rows, sink in the denominator only) -> bf16 -> inverse rope */
     if (!ds4_gpu_v41_sparse_attn_tensor(st->o, st->q, st->win[il], (ng && topk) ? comp : NULL, (ng && topk) ? st->idx : NULL, m->map, m->size,
                                         l->attn_sinks->abs_offset, n, st->pos0, SWA, ng, topk, iratio, NH, HD,
-                                        (float)(1.0 / sqrt((double)HD)), 0, 1, st->win_from[il], NULL, 0)) return false;   /* win_from clamps CED-unwritten ring slots */
+                                        (float)(1.0 / sqrt((double)HD)), 0, 1, st->win_from[il], posd, st->graph_pos_cap)) return false;   /* win_from clamps CED-unwritten ring slots */
+    /* Graph route's verify batch: save the ring cells the commit below is
+     * about to overwrite (same cells the direct route's v41_spec_snapshot
+     * saves; the snapshot buffer was built by the direct warm round -- no
+     * allocation under capture). */
+    if (st->graph && n > 1u) {
+        if (!st->snap_win[il]) { fprintf(stderr, "ds4: [graph] L%u window-ring snapshot buffer not built (a verify batch must warm direct first)\n", il); return false; }
+        if (!ds4_gpu_v41_win_ring_snap_tensor(st->win[il], st->snap_win[il], 0u, 0u, n, SWA, HD, 0, posd)) return false;
+    }
     /* commit this block's rows into the ring AFTER the attention read the history */
-    return ds4_gpu_v41_win_commit_tensor(st->win[il], st->pos0, n, SWA, HD, NULL) != 0;
+    return ds4_gpu_v41_win_commit_tensor(st->win[il], st->pos0, n, SWA, HD, posd) != 0;
 }
 
 static bool v41_attn_out(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
@@ -710,14 +800,14 @@ static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     /* DSpark: capture the target layers' attention input (the hc four-route
      * mean, after the engram and before the layer; core_v41_forward.c:197-207)
      * into the main-hidden ring.  Only the last mainh_cap rows of the block
-     * move; the eager path passes no device position slot (only the engine's
-     * graph does).  A wrong capture point does not error — acceptance
-     * collapses to about 1. */
+     * move; the graph route passes the device position slot so the ring cell
+     * follows the replayed step (the eager path passes it directly).  A wrong
+     * capture point does not error — acceptance collapses to about 1. */
     if (!st->draft && st->mainh && g_ds4_v41.mtp_target_slot[il] >= 0) {
         const uint32_t rows = n < st->mainh_cap ? n : st->mainh_cap, src0 = n - rows;
         if (!ds4_gpu_v41_hc_mean_tensor(st->mainh, st->hc, E, DS4_N_HC, rows, src0,
                                         (uint32_t)g_ds4_v41.mtp_target_slot[il], g_ds4_v41.n_mtp_target,
-                                        st->pos0 + src0, st->mainh_cap, NULL)) return false;
+                                        st->pos0 + src0, st->mainh_cap, st->graph ? st->pos : NULL)) return false;
         st->mainh_wrote = rows;
     }
     if (!v41_hc_half(e, st, l, true)) return false;
@@ -843,6 +933,7 @@ static bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, ui
     if (n == 0 || n > st->cap_tok) { fprintf(stderr, "ds4: [v41] forward block %u exceeds cap %u\n", n, st->cap_tok); return false; }
     if (st->n_past + n > st->ctx) { fprintf(stderr, "ds4: [v41] context full (%u+%u > %u)\n", st->n_past, n, st->ctx); return false; }
     st->n = n; st->pos0 = st->n_past; st->idx_owner = -1; st->cand_owner = -1; st->idx_topk = 0; st->idx_ratio = 0;
+    st->graph = 0;   /* direct dispatch: position-dependent kernels take the host's true values (core_v41_forward.c:374) */
     {
         int32_t *pos = xmalloc((size_t)n * 4);
         for (uint32_t i = 0; i < n; i++) pos[i] = (int32_t)(st->pos0 + i);
@@ -880,6 +971,13 @@ static bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, ui
         st->mainh_end = (int64_t)st->pos0 + (int64_t)n - 1;
     }
     st->n_past += n;
+    /* Warm counters for the decode graph (core_v41_forward.c:402-405): a
+     * direct forward of this shape has built every lazy allocation and kernel
+     * attribute, so capture is allowed for it afterwards.  CED blocks never
+     * count (they skip whole layers).  (The engine also excludes its hook
+     * early-stop; the port has no hooks.) */
+    if (n == 1u && !st->draft && !st->ced_done) st->n_direct1++;
+    if (n < DS4_MTP_MAX_BLOCK + 2u && !st->draft && !st->ced_done) st->n_direct_n[n]++;
     return true;
 }
 

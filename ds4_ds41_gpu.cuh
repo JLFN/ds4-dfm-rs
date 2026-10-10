@@ -47,6 +47,7 @@ int g_ds4_v41_vq_group = 1;
 #include "cuda/ds41_indexer.cuh"  /* P4-4: the indexer three-piece (score / candidate blocks / topk) */
 #include "cuda/ds41_router.cuh"   /* P4-4: the router (sqrtsoftplus + bias topk) and SwiGLU */
 #include "cuda/ds41_draft.cuh"    /* P5/E1: the DSpark draft towers (dense MoE, mainh ring, markov rows/cache) */
+#include "cuda/ds41_graph.cuh"    /* E3: the decode-step CUDA graph primitives (capture/launch/free, PDL edges) */
 
 /* Raw decode entry for tests and the P4-2 forward wiring: all pointers are
  * device pointers; `nc` and `ver` come from the blob header (ds4vq_blob_nexp /
@@ -285,4 +286,25 @@ extern "C" int ds4_gpu_v41_routed_moe_tensor(ds4_gpu_tensor *out, const void *mo
         free(ptmp);
     }
     return rc;
+}
+
+/* PDL small-kernel registration, in one place (engine ds4_cuda.cu:110-124):
+ * these kernels wait for their upstream as the first instruction
+ * (v41_pdl_wait), so the capture-end edge rewrite may turn their in-edges
+ * into programmatic ones — the saving is launch/ramp overlap with the
+ * upstream's tail.  Defined at the aggregation root because every kernel
+ * address must be visible.  To add a kernel: put v41_pdl_wait() first in its
+ * body, then add it here; adding it here WITHOUT the wait reads the previous
+ * step's half-finished output. */
+static void v41_pdl_register_small(void) {
+    const void *fns[] = {
+        (const void *)v41_rms_norm_kernel, (const void *)v41_round_bf16_kernel, (const void *)v41_rope_kernel,
+        (const void *)v41_compress_step_n_kernel, (const void *)v41_act_quant_kernel, (const void *)v41_kv_pack_kernel,
+        (const void *)v41_hc_post_kernel, (const void *)v41_hc_fused_kernel, (const void *)v41_router_kernel,
+        (const void *)v41_swiglu_kernel, (const void *)v41_engram_gate_kernel, (const void *)v41_vq_xpack_kernel,
+        (const void *)v41_vq_tail_kernel, (const void *)v41_win_commit_kernel, (const void *)v41_attn_mma_seg_kernel,
+        (const void *)v41_sparse_attn_merge_kernel, (const void *)v41_indexer_score_kernel, (const void *)v41_topk_kernel,
+        (const void *)v41_candidate_kernel, (const void *)v41_scale_round_kernel, (const void *)v41_fp8blk_gemv_kernel<1u, 0u>,
+    };
+    for (size_t i = 0; i < sizeof fns / sizeof fns[0]; i++) v41_pdl_register(fns[i]);
 }

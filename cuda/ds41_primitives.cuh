@@ -28,7 +28,7 @@
 typedef struct { void *p; uint64_t cap; } v41_scratch;
 
 static uint64_t g_v41_scratch_gen = 0;
-uint64_t ds4_gpu_v41_scratch_generation(void) { return g_v41_scratch_gen; }
+extern "C" uint64_t ds4_gpu_v41_scratch_generation(void) { return g_v41_scratch_gen; }   /* the host TU reads it (dg_launch's stale-pointer check) */
 
 static void *v41_grow(v41_scratch *s, uint64_t bytes, const char *what) {
     if (bytes <= s->cap) return s->p;

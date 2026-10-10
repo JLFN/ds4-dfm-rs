@@ -5263,6 +5263,24 @@ void *ds4_gpu_host_alloc(uint64_t bytes);
 void ds4_gpu_host_free(void *p);
 int ds4_gpu_host_flag_wait(const void *flag_pinned, const void *want_pinned, void *err_pinned);
 int ds4_gpu_tensor_write_zerocopy(ds4_gpu_tensor *t, uint64_t offset, const void *pinned, uint64_t bytes);
+/* device->pinned zero-copy readback (the graph's argmax landing; cuda_decode_graph.inc.cu:172-183) */
+int ds4_gpu_tensor_read_zerocopy(void *pinned, const ds4_gpu_tensor *t, uint64_t offset, uint64_t bytes);
+
+/* Decode-step CUDA graph primitives (cuda_decode_graph.inc.cu, cuda/ds41_graph.cuh).
+ * capture_begin routes ds4_current_stream() onto the port's dedicated blocking
+ * capture stream and returns 0 when another capture owns the routing;
+ * capture_end restores the routing on every path and returns NULL when the
+ * capture was voided (the caller must then run that step by direct dispatch).
+ * The orchestration (buckets, device positions, accounting) lives in
+ * ds4_ds41_graph.inc (the port of core_decode_graph.c). */
+int ds4_gpu_decode_graph_capture_begin(void);
+void *ds4_gpu_decode_graph_capture_end(void);
+int ds4_gpu_decode_graph_launch(void *exec);
+void ds4_gpu_decode_graph_free(void *exec);
+/* The ds41 grow-only scratch generation (cuda/ds41_primitives.cuh): bumps
+ * whenever a grow moves a pointer, so a captured graph can detect stale
+ * addresses (the engine's ds4_gpu_v41_scratch_generation). */
+uint64_t ds4_gpu_v41_scratch_generation(void);
 
 /* DeepSeek V4.1 forward primitives (P4-4).  The q4_K skeleton family
  * (cuda/ds41_q4k.cuh), the dense GEMVs and elementwise kernels
@@ -5310,6 +5328,15 @@ int ds4_gpu_v41_rope_tensor(ds4_gpu_tensor *x, const ds4_gpu_tensor *pos, uint32
         float factor, float beta_fast, float beta_slow, bool inverse);
 int ds4_gpu_v41_compress_pool_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv, const ds4_gpu_tensor *score,
         uint32_t n_tok, uint32_t ratio, uint32_t dim);
+/* The graph route's compressor source step (cuda_v41_2.inc.cu:74-128): append
+ * this batch's n rows after the pending rows at slot pos0%ratio, pool each
+ * completed group (bit-identical arithmetic to the pool entry above), write
+ * the new group positions g*ratio into posg, and (snap_kv non-NULL) store
+ * [old pending rows | this batch's n rows] linearly for the spec rollback.
+ * Position comes from the device slot posd; n <= 8. */
+int ds4_gpu_v41_compress_step_n_tensor(ds4_gpu_tensor *pooled, ds4_gpu_tensor *posg, ds4_gpu_tensor *cpre_kv, ds4_gpu_tensor *cpre_sc,
+        ds4_gpu_tensor *snap_kv, ds4_gpu_tensor *snap_sc, const ds4_gpu_tensor *ckv, const ds4_gpu_tensor *csc,
+        const ds4_gpu_tensor *posd, uint32_t ratio, uint32_t dim, uint32_t n);
 int ds4_gpu_v41_act_quant_fp8_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block);
 int ds4_gpu_v41_act_quant_fp4_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t dim, uint32_t block, bool e4m3_scale);
 int ds4_gpu_v41_ckv_pack_tensor(ds4_gpu_tensor *cache, uint32_t g0, const ds4_gpu_tensor *rows, uint32_t n_rows,
