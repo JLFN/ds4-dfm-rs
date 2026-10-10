@@ -83,6 +83,7 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
  * per-round `[dspark]` trace lines (the engine's core_v41_api.c:346-357).  The
  * C harness sets it for the spec trace gate; the Rust host will own the flag. */
 extern int g_ds4_v41_prof;
+extern int g_ds4_v41_emit_trace;   /* the engine's --emit-trace (the [dspark] lines without the draft/main sections) */
 
 /* Engram table metadata for the feed builder: the engine's C loader filled it
  * from the GGUF, so a caller that hashes + preads rows itself (the Rust host,

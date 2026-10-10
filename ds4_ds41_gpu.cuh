@@ -24,6 +24,7 @@
  * and g_ds4_v41_vq_group (--no-vq-group, :21; 1 = grouped path on). The CLI
  * setters land with the serving unit. */
 int g_ds4_v41_prof = 0;
+int g_ds4_v41_emit_trace = 0;   /* the engine's --emit-trace: the per-round [dspark] lines (without the draft/main id sections) */
 int g_ds4_v41_vq_group = 1;
 
 #include "cuda/ds41_primitives.cuh"

@@ -542,7 +542,7 @@ int main(int argc, char **argv) {
     int verify_k = 0;
     if (const char *vk = getenv("DS41_VERIFY_K")) { verify_k = atoi(vk); printf("verify k pinned: %d (--dspark-verify)\n", verify_k); }
     if (getenv("DS41_NO_DSPARK")) { printf("spec decode disabled (DS41_NO_DSPARK; the engine's --no-dspark)\n"); }
-    g_ds4_v41_prof = 1;
+    g_ds4_v41_emit_trace = 1;   /* the [dspark] lines (the engine's --emit-trace capture; --v41-prof would add the draft/main sections) */
     const int rc = ds4_v41_generate_argmax(e, prompt.data(), (int)prompt.size(), n_predict,
                                            no_engram || n_eng == 0 ? 1 : 0, verify_k,
                                            g.layers.empty() ? NULL : &feed, emit_feed, &g);

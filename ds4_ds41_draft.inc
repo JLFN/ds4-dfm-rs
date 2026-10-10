@@ -677,16 +677,18 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             if (drafted && !verify_k) v41_sched_observe(&cal, dr.host_conf, k ? (a >= 1u) : (want[0] == dr.host_ids[1]));
             /* The engine's per-round account (core_v41_api.c:346-357), the
              * spec trace gate's instrument. */
-            if (drafted && g_ds4_v41_prof) {
+            if (drafted && (g_ds4_v41_prof || g_ds4_v41_emit_trace)) {
                 fprintf(stderr, "[dspark] pos %u k %u val %.3f acc %u conf", pos_round, k, (double)sched_val, a);
                 for (uint32_t i = 0; i < dr.block; i++) {
                     const float c = dr.host_conf[i];
                     fprintf(stderr, " %.3f", isfinite(c) ? 1.0 / (1.0 + exp(-(double)c)) : 0.0);
                 }
-                fprintf(stderr, " | draft");
-                for (uint32_t i = 0; i < k; i++) fprintf(stderr, " %d", batch[i + 1u]);
-                fprintf(stderr, " | main");
-                for (uint32_t i = 0; i < nb; i++) fprintf(stderr, " %d", want[i]);
+                if (g_ds4_v41_prof) {   /* the draft vs main-model ids (core_v41_api.c:352-356) */
+                    fprintf(stderr, " | draft");
+                    for (uint32_t i = 0; i < k; i++) fprintf(stderr, " %d", batch[i + 1u]);
+                    fprintf(stderr, " | main");
+                    for (uint32_t i = 0; i < nb; i++) fprintf(stderr, " %d", want[i]);
+                }
                 fprintf(stderr, "\n");
             }
             if (k) {
