@@ -646,6 +646,37 @@ pub fn parse_disk_space(raw: &str) -> Result<u64, String> {
 }
 
 pub fn serving_caps(family: ModelFamily, variant: Variant) -> ServingCaps {
+    // V4.1 (ds41) rides the DeepSeek4 family but has none of the V4 session
+    // surface: the engine's own server note is "no ds4_session -- no KV
+    // reuse, no disk KV, no concurrent batch" (server_main.c:29-40), context
+    // comes from the model metadata and --ctx is rejected.  Speculation is
+    // embedded in the artifact and greedy-only (the sampling path is a
+    // recorded gap).  The requested/effective/qualified report and every
+    // refusal below come from these supports.
+    if variant == Variant::DeepSeek41Flash {
+        return ServingCaps {
+            family,
+            variant,
+            banks: BankLane::Serial,
+            bank_support: Support::None,
+            reuse: ReuseKind::None,
+            reuse_support: Support::None,
+            disk: Support::None,
+            snapshot: Support::None,
+            mtp: MtpKind::Embedded,
+            mtp_support: Support::Qualified,
+            spec_lane: SpecLane::Serial,
+            spec_draft_min: 1,
+            host: HostNeed::Cuda,
+            // No session cap exists; the runtime context IS the model
+            // metadata (deepseek4.context_length), never a --ctx constant.
+            ctx_max: None,
+            qualified_ctx: None,
+            qualified_banks: Some(1),
+            qualified_prompt: None,
+            media_serial: false,
+        };
+    }
     if variant == Variant::K2Horizon375B {
         return ServingCaps {
             family,
@@ -1576,6 +1607,12 @@ impl ResolvedPlan {
     }
 
     fn native_prefill_env(&self) -> Option<&'static str> {
+        // V4.1 has no settable prefill chunk in the port yet (the engine's
+        // --v41-chunk is a recorded gap); the DeepSeek4 family default
+        // (DS4_METAL_PREFILL_CHUNK) would mislead.
+        if self.variant == Some(Variant::DeepSeek41Flash) {
+            return None;
+        }
         match self.family {
             Some(ModelFamily::Qwen4Exp) => Some("DS4_QWEN_PREFILL_CHUNK"),
             Some(ModelFamily::Step37) => Some("DS4_STEP37_PREFILL_CHUNK"),
@@ -2464,6 +2501,9 @@ fn measured_limits(
 
 fn qualified_note(caps: ServingCaps) -> &'static str {
     match caps.variant {
+        Variant::DeepSeek41Flash => {
+            "greedy single-request speculation (embedded towers, decode graph on) passed the Spark gates (56-token and 1,100-token byte-identical runs, [dspark] traces equal to the engine); banks, prefix reuse, disk KV, snapshots and the sampling profile are not present on this path; context is the model metadata, --ctx is rejected"
+        }
         Variant::NaiveN05Flash => {
             "main-only chunk-2048 buffered retrieval and disk continuation: 256K/two banks, 512K/one bank; draft-loaded and other shapes retain the bounded 8K gate; DSpark acceleration unqualified"
         }
@@ -3732,6 +3772,55 @@ mod tests {
         assert!(p.effective.disk);
         assert_eq!(p.qualified.disk, Support::Present);
         assert!(p.issues.iter().any(|i| i.code == "disk_unverified"));
+    }
+
+    #[test]
+    fn v41_serving_contract_refuses_what_it_lacks() {
+        // The engine's own V4.1 limits (server_main.c:29-40): one request at a
+        // time, no KV reuse, no disk KV, no snapshots; speculation embedded
+        // and greedy-only.  A default request boots and stays serial.
+        let p = plan(
+            ServingRequest::default(),
+            ModelFamily::DeepSeek4,
+            Variant::DeepSeek41Flash,
+        );
+        assert!(!p.has_errors(), "{:?}", p.issues);
+        assert_eq!(p.effective.max_seqs, 1);
+        assert_eq!(p.effective.prefix_reuse, ReuseKind::None);
+
+        // Forced unsupported settings are refused by name, never silently
+        // ignored (the AGENTS.md serving contract).
+        let p = plan(
+            ServingRequest {
+                max_seqs: MaxSeqs::Fixed(2),
+                ..ServingRequest::default()
+            },
+            ModelFamily::DeepSeek4,
+            Variant::DeepSeek41Flash,
+        );
+        assert!(p.issues.iter().any(|i| i.code == "banks_unsupported"));
+        let p = plan(
+            ServingRequest {
+                prefix_reuse: PrefixReuse::Exact,
+                ..ServingRequest::default()
+            },
+            ModelFamily::DeepSeek4,
+            Variant::DeepSeek41Flash,
+        );
+        assert!(p.issues.iter().any(|i| i.code == "reuse_unsupported"));
+
+        // The caps row itself, requested/effective/qualified in one place.
+        let caps = serving_caps(ModelFamily::DeepSeek4, Variant::DeepSeek41Flash);
+        assert_eq!(caps.banks, BankLane::Serial);
+        assert_eq!(caps.bank_support, Support::None);
+        assert_eq!(caps.reuse, ReuseKind::None);
+        assert_eq!(caps.disk, Support::None);
+        assert_eq!(caps.snapshot, Support::None);
+        assert_eq!(caps.mtp, MtpKind::Embedded);
+        assert_eq!(caps.mtp_support, Support::Qualified);
+        assert_eq!(caps.spec_lane, SpecLane::Serial);
+        assert_eq!(caps.ctx_max, None);
+        assert_eq!(caps.qualified_banks, Some(1));
     }
 
     #[test]
