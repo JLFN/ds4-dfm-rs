@@ -863,6 +863,20 @@ void ds4_bridge_v41_last_spec_stats(int *rounds, int *offered, int *accepted) {
     ds4_engine_v41_last_spec_stats(rounds, offered, accepted);
 }
 
+void ds4_bridge_v41_set_sampling(const ds4_bridge_v41_sampling *sp) {
+    if (!sp) {
+        ds4_engine_set_decode_sampling(NULL);   /* the engine's NULL: back to the all-zero face = bare argmax */
+        return;
+    }
+    const ds4_decode_sampling face = {
+        .temperature = sp->temperature, .top_p = sp->top_p, .min_p = sp->min_p,
+        .top_k = sp->top_k, .seed = sp->seed,
+        .freq_penalty = sp->freq_penalty, .presence_penalty = sp->presence_penalty,
+        .dry_multiplier = sp->dry_multiplier, .dry_base = sp->dry_base, .dry_allowed_length = sp->dry_allowed_length,
+    };
+    ds4_engine_set_decode_sampling(&face);
+}
+
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,

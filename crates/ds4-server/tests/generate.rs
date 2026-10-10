@@ -23,6 +23,7 @@ fn env() -> ParseEnv {
         default_effort: ThinkMode::None,
         default_temp: 0.0,
         live_ids: Vec::new(),
+        engine_defaults: false,
     }
 }
 
@@ -2409,6 +2410,7 @@ impl DecodeIo for ScriptedV41 {
         &self,
         prompt: &[i32],
         n_predict: i32,
+        _sampling: Option<ds4_core::V41Sampling>,
         emit: &mut dyn FnMut(i32) -> bool,
         progress: &mut dyn FnMut(&str, i32, i32) -> bool,
     ) -> Result<(), GenerateError> {

@@ -20,6 +20,7 @@ use std::path::Path;
 use ds4_sys::{
     ds4_bridge_v41_generate, ds4_bridge_v41_last_spec_stats, ds4_bridge_v41_set_dspark,
     ds4_bridge_v41_set_emit_trace, ds4_bridge_v41_set_graph, ds4_bridge_v41_set_prof,
+    ds4_bridge_v41_set_sampling,
 };
 
 use crate::engram::{EngramHash, EngramShard};
@@ -37,6 +38,28 @@ pub fn v41_last_spec_stats() -> (i32, i32, i32) {
         ds4_bridge_v41_last_spec_stats(&mut rounds, &mut offered, &mut accepted);
     }
     (rounds, offered, accepted)
+}
+
+/// The decode-sampling face for one V4.1 run (the engine's
+/// `ds4_decode_sampling`, `ds4_v41_api.h:69-75`): temperature > 0 with no
+/// penalties takes the device sampling kernel (speculation runs, rejection
+/// sampling in-kernel); any non-zero penalty takes the host penalty route
+/// (the V4 sampler after freq / presence / DRY rewrite the row; temperature 0
+/// yields argmax there); all-zero is bare argmax.  `seed` 0 = clock (the V4
+/// CLI's rule, `core_v41_api.c:163-164`).  `dry_base` / `dry_allowed_length`
+/// matter only when `dry_multiplier` > 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct V41Sampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub top_k: i32,
+    pub seed: u64,
+    pub freq_penalty: f32,
+    pub presence_penalty: f32,
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: i32,
 }
 
 /// The per-run switches (the engine's CLI globals, `cli_diag.c:58`).
@@ -59,6 +82,12 @@ pub struct V41RunOptions<'a> {
     pub emit_trace: bool,
     /// `--v41-prof`: per-layer ms and the full `[dspark]` lines.
     pub prof: bool,
+    /// The per-request sampling face (`ds4_engine_set_decode_sampling`,
+    /// `core_v41_api.c:10-13`).  Some = set it before the run (the engine's
+    /// server and CLI always do, `server_generate_v41.c:409` /
+    /// `cli_diag.c:50`); None resets it to the all-zero face = bare argmax,
+    /// so a run never inherits the previous request's face.
+    pub sampling: Option<V41Sampling>,
 }
 
 impl Default for V41RunOptions<'_> {
@@ -71,6 +100,7 @@ impl Default for V41RunOptions<'_> {
             verify_k: 0,
             emit_trace: false,
             prof: false,
+            sampling: None,
         }
     }
 }
@@ -278,6 +308,27 @@ impl Model {
             }
             ds4_bridge_v41_set_emit_trace(i32::from(opts.emit_trace));
             ds4_bridge_v41_set_prof(i32::from(opts.prof));
+            // The sampling face is per request (the engine's server sets it
+            // right before the generate, server_generate_v41.c:409); None
+            // resets it, so a run never inherits the previous request's face.
+            match opts.sampling {
+                Some(s) => {
+                    let face = ds4_sys::ds4_bridge_v41_sampling {
+                        temperature: s.temperature,
+                        top_p: s.top_p,
+                        min_p: s.min_p,
+                        top_k: s.top_k,
+                        seed: s.seed,
+                        freq_penalty: s.freq_penalty,
+                        presence_penalty: s.presence_penalty,
+                        dry_multiplier: s.dry_multiplier,
+                        dry_base: s.dry_base,
+                        dry_allowed_length: s.dry_allowed_length,
+                    };
+                    ds4_bridge_v41_set_sampling(&face);
+                }
+                None => ds4_bridge_v41_set_sampling(std::ptr::null()),
+            }
         }
         let mut feed = if opts.no_engram {
             None

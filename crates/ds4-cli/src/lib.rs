@@ -70,7 +70,11 @@ pub struct ShadowArgs {
     pub temp: f32,
     pub top_p: f32,
     pub min_p: f32,
+    pub min_p_set: bool,
     pub seed: u64,
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: i32,
     pub lifecycle_only: bool,
     pub identify: bool,
     pub inventory: bool,
@@ -129,7 +133,11 @@ impl Default for ShadowArgs {
             temp: 1.0,
             top_p: 1.0,
             min_p: 0.05,
+            min_p_set: false,
             seed: 0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
             lifecycle_only: false,
             identify: false,
             inventory: false,
@@ -245,10 +253,23 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             "--min-p" => {
                 let v = require_value(&arg, iter.next())?;
                 parsed.min_p = parse_f32_range(&arg, &v, 0.0, 1.0)?;
+                parsed.min_p_set = true;
             }
             "--seed" => {
                 let v = require_value(&arg, iter.next())?;
                 parsed.seed = parse_positive_u64(&arg, &v)?;
+            }
+            "--dry-multiplier" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.dry_multiplier = parse_f32_range(&arg, &v, 0.0, 100.0)?;
+            }
+            "--dry-base" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.dry_base = parse_f32_range(&arg, &v, 0.0, 100.0)?;
+            }
+            "--dry-allowed-length" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.dry_allowed_length = parse_positive_i32(&arg, &v)?;
             }
             "--think" => parsed.nothink = false,
             "--nothink" => parsed.nothink = true,
@@ -647,13 +668,10 @@ fn run_v41_one_shot(
         "ds4-rs: the V4.1 family runs on --gen-ids <file> (raw token ids; its chat rendering is not ported yet)"
             .to_string()
     })?;
-    if args.temp > 0.0 {
-        return Err(format!(
-            "ds4-rs: V4.1 sampling is not ported (--temp {} given); pass --temp 0",
-            args.temp
-        ));
-    }
     let prompt = read_ids_file(ids_path)?;
+    // The engine CLI's sampling face (cli_diag.c:44-50): --temp / --top-p /
+    // --min-p / --seed from the flags (defaults 1.0 / 1.0 / 0.05 / 0), the
+    // DRY trio (freq / presence have no CLI flags in the engine, they stay 0).
     let opts = ds4_core::V41RunOptions {
         engram_dir: args.engram_dir.as_deref(),
         no_engram: args.no_engram,
@@ -662,6 +680,21 @@ fn run_v41_one_shot(
         verify_k: args.dspark_verify,
         emit_trace: args.emit_trace,
         prof: args.v41_prof,
+        sampling: Some(ds4_core::V41Sampling {
+            temperature: args.temp,
+            top_p: args.top_p,
+            // The engine CLI's min_p default is 0.0 (DS4_DEFAULT_MIN_P,
+            // ds4.h:56); the port CLI's shared default is 0.05 for the other
+            // families, so the v41 path takes 0.0 unless --min-p was given.
+            min_p: if args.min_p_set { args.min_p } else { 0.0 },
+            top_k: 0,
+            seed: args.seed,
+            freq_penalty: 0.0,
+            presence_penalty: 0.0,
+            dry_multiplier: args.dry_multiplier,
+            dry_base: args.dry_base,
+            dry_allowed_length: args.dry_allowed_length,
+        }),
     };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

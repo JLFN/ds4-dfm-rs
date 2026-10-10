@@ -294,6 +294,19 @@ void ds4_bridge_v41_set_prof(int on);
  * ds4_engine_v41_last_spec_stats, core_v41_api.c:41-46): rounds/offered/
  * accepted, cleared by the next generate entry.  Any pointer may be NULL. */
 void ds4_bridge_v41_last_spec_stats(int *rounds, int *offered, int *accepted);
+/* The per-request decode-sampling face (the engine's
+ * ds4_engine_set_decode_sampling, core_v41_api.c:10-13; the struct and its
+ * semantics at ds41_forward.h).  All-zero = bare argmax; NULL resets to that.
+ * The engine's server sets this once per request before the generate
+ * (server_generate_v41.c:409); the Rust host does the same through this
+ * bridge.  The struct is laid out like ds4_decode_sampling, spelled out here
+ * so the header stays self-contained for the Rust side. */
+typedef struct {
+    float temperature, top_p, min_p; int32_t top_k; uint64_t seed;
+    float freq_penalty, presence_penalty;
+    float dry_multiplier, dry_base; int32_t dry_allowed_length;
+} ds4_bridge_v41_sampling;
+void ds4_bridge_v41_set_sampling(const ds4_bridge_v41_sampling *sp);
 int ds4_bridge_v41_generate(ds4_bridge_model *m,
                             const int32_t *prompt, int n_prompt, int n_predict,
                             int no_engram, int verify_k,

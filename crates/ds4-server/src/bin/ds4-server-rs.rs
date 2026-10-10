@@ -515,6 +515,11 @@ fn main() {
                         }
                         cfg.ctx = ctx as i32;
                         serve_req.ctx = cfg.ctx;
+                        // Unit H: the engine's request-omitted parse defaults
+                        // (thinking off unless asked, effort HIGH, min_p 0.0)
+                        // apply to the engine's own model set -- exactly this
+                        // branch's model.
+                        cfg.engine_defaults = true;
                         if v41_flags.no_dspark && v41_flags.dspark {
                             cli_error("ds4-server-rs: --no-dspark and --dspark are mutually exclusive");
                         }

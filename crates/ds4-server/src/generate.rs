@@ -139,13 +139,17 @@ pub trait DecodeIo {
         false
     }
     /// The V4.1 push entry: the engine's one-shot generate with callbacks
-    /// (`ds4_engine_v41_generate_argmax`).  `emit` returns false to stop,
-    /// `progress` returns false to abort the prefill.  Only an engine with a
-    /// loaded v41 route answers; the default refuses by name.
+    /// (`ds4_engine_v41_generate_argmax`).  `sampling` is the per-request
+    /// decode face (the engine's ds4_engine_set_decode_sampling,
+    /// server_generate_v41.c:409); None resets to bare argmax.  `emit`
+    /// returns false to stop, `progress` returns false to abort the prefill.
+    /// Only an engine with a loaded v41 route answers; the default refuses
+    /// by name.
     fn v41_generate(
         &self,
         _prompt: &[i32],
         _n_predict: i32,
+        _sampling: Option<ds4_core::V41Sampling>,
         _emit: &mut dyn FnMut(i32) -> bool,
         _progress: &mut dyn FnMut(&str, i32, i32) -> bool,
     ) -> Result<(), GenerateError> {
@@ -3009,12 +3013,37 @@ fn generate_terminal_v41(
         last_heartbeat: Instant::now(),
         err: None,
     });
+    // The per-request sampling face (server_generate_v41.c:355-366): request
+    // values win, omitted fields keep the parse's defaults (temp 1.0 / top_p
+    // 1.0 / min_p 0.0 for this model set); DRY follows dry_set with the
+    // engine's base / allowed fallbacks (1.75 / 2; the service dry defaults
+    // have no port flags yet, and their values are the same defaults).
+    let sampling = ds4_core::V41Sampling {
+        temperature: parsed.temperature,
+        top_p: parsed.top_p,
+        min_p: parsed.min_p,
+        top_k: parsed.top_k,
+        seed: parsed.seed,
+        freq_penalty: parsed.frequency_penalty,
+        presence_penalty: parsed.presence_penalty,
+        dry_multiplier: if parsed.dry_set { parsed.dry_multiplier } else { 0.0 },
+        dry_base: if parsed.dry_set && parsed.dry_base > 1.0 {
+            parsed.dry_base
+        } else {
+            1.75
+        },
+        dry_allowed_length: if parsed.dry_set && parsed.dry_allowed_length > 0 {
+            parsed.dry_allowed_length
+        } else {
+            2
+        },
+    };
     let result = {
         let mut emit = |token: i32| state.borrow_mut().emit_token(token);
         let mut progress = |event: &str, current: i32, total: i32| {
             state.borrow_mut().prefill_progress(event, current, total)
         };
-        engine.v41_generate(tokens, max_tokens, &mut emit, &mut progress)
+        engine.v41_generate(tokens, max_tokens, Some(sampling), &mut emit, &mut progress)
     };
     let mut st = state.into_inner();
 
@@ -3890,6 +3919,7 @@ impl DecodeIo for NativeDecode<'_> {
         &self,
         prompt: &[i32],
         n_predict: i32,
+        sampling: Option<ds4_core::V41Sampling>,
         emit: &mut dyn FnMut(i32) -> bool,
         progress: &mut dyn FnMut(&str, i32, i32) -> bool,
     ) -> Result<(), GenerateError> {
@@ -3904,6 +3934,7 @@ impl DecodeIo for NativeDecode<'_> {
             verify_k: route.verify_k,
             emit_trace: route.emit_trace,
             prof: route.prof,
+            sampling,
         };
         self.model
             .v41_generate(&route.model_path, prompt, n_predict, &opts, emit, progress)
@@ -6428,6 +6459,7 @@ mod disk_sync_tests {
             default_effort: ThinkMode::None,
             default_temp: 0.0,
             live_ids: Vec::new(),
+            engine_defaults: false,
         };
         let ordinary = parse_request(
             WireSurface::OpenaiChat,

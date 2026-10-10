@@ -130,6 +130,24 @@ pub type ds4_bridge_v41_emit_fn = Option<unsafe extern "C" fn(i32, *mut c_void) 
 pub type ds4_bridge_v41_progress_fn =
     Option<unsafe extern "C" fn(*mut c_void, *const c_char, i32, i32) -> c_int>;
 
+/* The decode-sampling face (native/bridge/ds4_bridge.h): the engine's
+ * ds4_decode_sampling layout (ds4_v41_api.h:69-75).  All-zero = bare argmax;
+ * a NULL pointer to the setter resets to that. */
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ds4_bridge_v41_sampling {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub top_k: c_int,
+    pub seed: u64,
+    pub freq_penalty: f32,
+    pub presence_penalty: f32,
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: c_int,
+}
+
 pub type ds4_bridge_backend = c_int;
 
 pub const DS4_BRIDGE_BACKEND_CUDA: ds4_bridge_backend = 0;
@@ -799,6 +817,10 @@ extern "C" {
     pub fn ds4_bridge_v41_set_emit_trace(on: c_int);
     pub fn ds4_bridge_v41_set_prof(on: c_int);
     pub fn ds4_bridge_v41_last_spec_stats(rounds: *mut c_int, offered: *mut c_int, accepted: *mut c_int);
+    /* The per-request decode-sampling face (the engine's
+     * ds4_engine_set_decode_sampling, core_v41_api.c:10-13).  NULL resets to
+     * the all-zero face = bare argmax. */
+    pub fn ds4_bridge_v41_set_sampling(sp: *const ds4_bridge_v41_sampling);
     pub fn ds4_bridge_v41_generate(
         m: *mut ds4_bridge_model,
         prompt: *const i32,
