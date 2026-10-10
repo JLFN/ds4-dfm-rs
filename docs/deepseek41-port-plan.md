@@ -1289,6 +1289,102 @@ gate reorder: the CLI reference runs before the server boot).
 
 Unit: F complete
 
+## 6.17 Unit G evidence: the V4.1 chat rendering (2026-10-10)
+
+Unit commits: 350d34f (the admission + the V4.1 head + the tail fix + the
+[ptok] instrument + the golden tests), 9cd321a (the special-token scan
+entry), 9a84a4d (the gate's id-list comparison), b236968 (the gate
+completes the tool call), 53a091c (the gate compares the answer as the
+engine returns it).
+
+1. What unit G ported (engine-cited in the file headers). Admission:
+   chat_input.rs admits Variant::DeepSeek41Flash (16) beside Flash (0) --
+   the engine renders every chat request through its C renderer regardless
+   of model (server_parse_chat.c:205), and the artifact carries no chat
+   template (all 73 metadata keys scanned). The head:
+   render_dsml_chat_choice writes BOS, then -- if the effort prefix or the
+   system body is non-empty -- the <｜System｜> token
+   (server_dsml_render.c:381), then the effort prefix, then the system
+   body; the token text comes from the tokenizer that owns it
+   (core_bpe.c:332-333; core_engine_api.c:94-96), so a V4 tokenizer falls
+   back to plain text. The effort prefixes are the official encoding.py
+   texts (core_globals.c:14-17: HIGH "Reasoning Effort: 75 ...", MAX
+   "... 100 ..."), not the port's pre-2026-09-21 V4-era texts; the head is
+   selected explicitly (V4 vs V41).
+
+2. The live-tool-tail fix. The Rust DSML tail arm delegated to the full
+   renderer and stripped only BOS, so High/Max think modes leaked the
+   effort prefix into the suffix; both sources write EOS + the messages
+   only, no head (the port's own C ds4_server.c:4700-4748; the engine
+   server_live_prep.c:21-69). It is now a standalone port.
+
+3. The [ptok] instrument. The engine's --emit-trace prints the rendered
+   prompt's ids as `[ptok] <pos> <id>` (core_v41_api.c:171-173); the
+   port's generate entry prints the same, under the same switch -- the
+   gate's measuring stick, because the engine server --trace dumps the
+   rendered prompt text plus both id lists (server_trace.c:222-230).
+
+4. The gate found a tokenizer gap. The port's rendered-chat special scan
+   lacked the <｜System｜> entry (the engine's table has it, core_bpe.c:360),
+   so the head text split into three plain pieces (28217/27824/28217)
+   instead of the single id 128799; 9cd321a added the entry.
+
+5. Gate G-1 (local). The engine's official encoding.py golden
+   (tests/server_tests_render_v41.c:36: the four cases plus the
+   V4-tokenizer fallback) ported 1:1 into tests/render.rs
+   (dsml_v41_head_matches_official_encoding), the tail pin
+   (dsml_live_tool_tail_has_no_head), and the admission test with a
+   scripted engine; render 33/33 and generate 72/72 green this session.
+
+6. Gate G-2 (Spark; /tmp/chat_gate.log, CHAT_GATE_RC=0 at 16:17:23;
+   `make test-ds41-chat`). One chat+tools request (temp 0,
+   reasoning_effort none), engine first (--trace), then the port
+   (--emit-trace). PASS line: "prompt ids, generated ids and the response
+   message equal the engine's on the same chat+tools request". Evidence:
+   prompt ids 354/354 byte-identical (head `0 128799 372 ...` -- BOS,
+   <｜System｜>, then the system body and the tool-schema block;
+   prompt.diff empty); generated ids 41/41 identical (gen.diff empty);
+   the response message identical (msg.diff empty; tool-call ids dropped
+   -- random per process, server_msgs.c random_tool_id); finish_reason
+   equal on both (stop).
+
+7. The artifact's tool-call style, recorded. At greedy on this request the
+   model emitted the DSML block in a mixed tag style: the <｜DSML｜tool_calls>
+   and <｜DSML｜invoke opens are decorated but the parameter tags and the
+   closing tags are plain. The engine's parser picks one style from the
+   open tag (server_dsml_parse.c:338; three accepted styles) and the mix
+   matches none, so the engine returns the call as assistant text with
+   finish=stop -- no tool_calls array, no repair -- and the port
+   reproduced that byte for byte. Tool calling on this path is exactly as
+   capable as the engine's; the mixed style is the artifact's behavior at
+   this quant, and it is the datum to watch for opencode/Claude Code tool
+   use.
+
+8. The gate's speed reading, and a named port gap (recorded, not yet
+   fixed). Same request: port prefill 354 tokens 4.5 s (78.0 t/s; ttft
+   4.65 s) against the engine's 1.4 s (254.3 t/s); port decode 38.4
+   ms/token (25.7 t/s; DSpark 16 rounds, accept 1.50/5) against the
+   engine's 23.9 ms/token (14 rounds, 1.93/5). A --v41-prof run localized
+   the prefill difference: the forward body is at parity (1224.7 ms
+   total, layers ~1150, head 3.0 ms) and the ~3.1 s sits in the Rust
+   engram feed's prepare (crates/ds4-core/src/v41_run.rs:135: one
+   positioned read per row per layer), which the engine does with an
+   io_uring batch (its boot line says "取行走 io_uring";
+   core_v41_engram.c). The decode round's engram prep (24.668 ms, in the
+   port's own host-gaps line) sits inside the verify window (87.4 vs 60.5
+   ms) and inflates the scheduler's cost model. Porting the batched
+   io_uring row reads is the next performance unit.
+
+9. Recorded limits. Sampling (temperature/top_p/min_p/penalties and the
+   engine's request-omitted defaults, server_generate_v41.c:355-366) is
+   unit H; the v41 route serves greedy today and ignores the request's
+   temperature (the CLI refuses --temp != 0). The Anthropic and Responses
+   surfaces have the machinery (http.rs:285-288; generate_terminal_v41)
+   but no live gate yet; the thinking/effort aliases and the effort-name
+   mapping divergence are recorded for unit H.
+
+Unit: G complete
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
