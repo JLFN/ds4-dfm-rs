@@ -71589,6 +71589,13 @@ void ds4_engine_boot_prewarm(ds4_engine *e) {
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
         getenv("DS4_NO_BOOT_PREWARM") != NULL)
         return;
+    /* V4.1 (ds41) has no session graph to warm: the engine's server never
+     * prewarms (no boot_prewarm anywhere in its tree) and this warmup's
+     * ring / token-tile dispatch machinery segfaults on the v41 artifact
+     * (measured on the Spark 2026-10-10: SIGSEGV, exit 139, right after the
+     * plan note; the same boot reaches "listening on" under
+     * DS4_NO_BOOT_PREWARM=1). */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_V41) return;
     e->boot_prewarm_done = true;
     const double warm_t0 = now_sec();
     /* memgov D0b-3 (S8): prewarm allocates by design (post-placement
