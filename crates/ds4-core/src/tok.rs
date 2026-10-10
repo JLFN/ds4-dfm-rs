@@ -2499,6 +2499,9 @@ fn special_token_at(vocab: &Vocab, p: &[u8]) -> Option<(i32, usize)> {
         (b"<|tool:end|>", vocab.tool_schema_end_id),
         ("<｜User｜>".as_bytes(), vocab.user_id),
         ("<｜Assistant｜>".as_bytes(), vocab.assistant_id),
+        // V4.1 tokenizer only; -1 is skipped and the text is cut as
+        // ordinary chars (core_bpe.c:360).
+        ("<｜System｜>".as_bytes(), vocab.system_id),
         (b"<think>", vocab.think_start_id),
         (b"</think>", vocab.think_end_id),
         (b"<|think:start|>", vocab.think_start_id),
