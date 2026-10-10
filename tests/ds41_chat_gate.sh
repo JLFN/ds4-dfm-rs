@@ -18,7 +18,7 @@ REQ=/tmp/ds41_chat_gate.req.json
 fail() { echo "ds41 chat gate: FAIL ($1)"; exit 1; }
 
 cat > "$REQ" <<'JSON'
-{"messages":[{"role":"system","content":"You are a terse assistant."},{"role":"user","content":"What is the weather in Paris? Use the tool."}],"max_tokens":24,"temperature":0,"reasoning_effort":"none","tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}
+{"messages":[{"role":"system","content":"You are a terse assistant."},{"role":"user","content":"What is the weather in Paris? Use the tool."}],"max_tokens":96,"temperature":0,"reasoning_effort":"none","tools":[{"type":"function","function":{"name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}
 JSON
 
 # ---- engine side: boot with --trace (the oracle) ----
@@ -79,10 +79,24 @@ grep -q '\[ptok\]' "$LOG.srv.log" || fail "port log has no [ptok] lines (--emit-
 grep -o '\[ptok\] [0-9]* [0-9]*' "$LOG.srv.log" | awk '{print $3}' | tr '\n' ' ' | sed 's/ $//' > "$LOG.srv.prompt.ids"
 grep -o '\[emit\] [0-9]* [0-9]*' "$LOG.srv.log" | awk '{print $3}' | tr '\n' ' ' | sed 's/ $//' > "$LOG.srv.gen.ids"
 
-# ---- parity: prompt ids, generated ids, and the answer text ----
+# ---- parity: prompt ids, generated ids, and the response message ----
 diff "$LOG.eng.prompt.ids" "$LOG.srv.prompt.ids" > "$LOG.prompt.diff" 2>&1 \
   || fail "the port's prompt ids differ from the engine's (see $LOG.prompt.diff)"
 diff "$LOG.eng.gen.ids" "$LOG.srv.gen.ids" > "$LOG.gen.diff" 2>&1 \
   || fail "the port's generated ids differ from the engine's (see $LOG.gen.diff)"
 
-echo "ds41 chat gate: PASS (prompt ids and generated ids equal the engine's on the same chat+tools request)"
+# The response message (content + parsed tool_calls) must match too.  The
+# tool-call id is random per process (server_msgs.c random_tool_id), so drop it.
+jq -S '.choices[0].message | del(.tool_calls[]?.id)' "$LOG.eng.resp.json" > "$LOG.eng.msg.json"
+jq -S '.choices[0].message | del(.tool_calls[]?.id)' "$LOG.srv.resp.json" > "$LOG.srv.msg.json"
+diff "$LOG.eng.msg.json" "$LOG.srv.msg.json" > "$LOG.msg.diff" 2>&1 \
+  || fail "the port's response message differs from the engine's (see $LOG.msg.diff)"
+
+# Both must have parsed the DSML call into finish_reason tool_calls
+# (server_generate_v41.c:205); anything else means the call was truncated.
+efin=$(sed -n 's/.*"finish_reason":"\([^"]*\)".*/\1/p' "$LOG.eng.resp.json")
+sfin=$(sed -n 's/.*"finish_reason":"\([^"]*\)".*/\1/p' "$LOG.srv.resp.json")
+[ "$efin" = "$sfin" ] || fail "finish_reason differs (engine=$efin port=$sfin)"
+[ "$efin" = "tool_calls" ] || fail "the response did not complete the tool call (finish=$efin)"
+
+echo "ds41 chat gate: PASS (prompt ids, generated ids and the completed tool-call message equal the engine's)"
