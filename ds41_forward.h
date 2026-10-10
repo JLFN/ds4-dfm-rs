@@ -43,11 +43,13 @@ typedef struct {
      * block's token ids at positions pos0..pos0+n-1 — and the provider fills
      * raw[.][0..n-1] with the rows for those positions (the n-gram window
      * reads earlier tokens from the provider's own history) and sets pos0
-     * (still asserted at the point of use).  The engine hashes from st->hist,
-     * which it memcpys a full block at a time up front (core_v41_forward.c:377)
-     * — including draft tokens later rejected, whose slots the next block's
-     * write overwrites before any read.  A provider that pre-fills one block
-     * (the score harness) may pass NULL and set pos0 itself. */
+     * (still asserted at the point of use).  Return convention like emit:
+     * 0 = filled, nonzero = refuse the block.  The engine hashes from
+     * st->hist, which it memcpys a full block at a time up front
+     * (core_v41_forward.c:377) — including draft tokens later rejected, whose
+     * slots the next block's write overwrites before any read.  A provider
+     * that pre-fills one block (the score harness) may pass NULL and set pos0
+     * itself. */
     int (*prepare)(uint32_t pos0, const int *tokens, int n, void *ud);
     void *ud;
 } ds41_engram_feed;

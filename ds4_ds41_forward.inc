@@ -858,9 +858,10 @@ static bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, ui
     st->mainh_wrote = 0;
     st->blk_ids = ids;   /* the engram feed's prepare hashes this block's rows from these (the engine's hist memcpy, core_v41_forward.c:377) */
     /* The feed's block provider: a spec verify batch's tokens exist only
-     * inside the forward, so the provider is told the exact block.  pos0 is
-     * still asserted at the point of use (v41_engram_rows). */
-    if (st->efeed && st->efeed->prepare && !st->efeed->prepare(st->pos0, ids, (int)n, st->efeed->ud)) {
+     * inside the forward, so the provider is told the exact block.  Return
+     * convention like emit: 0 = filled, nonzero = refuse.  pos0 is still
+     * asserted at the point of use (v41_engram_rows). */
+    if (st->efeed && st->efeed->prepare && st->efeed->prepare(st->pos0, ids, (int)n, st->efeed->ud) != 0) {
         fprintf(stderr, "ds4: [v41] engram feed prepare failed (pos0 %u n %u)\n", st->pos0, n);
         return false;
     }
