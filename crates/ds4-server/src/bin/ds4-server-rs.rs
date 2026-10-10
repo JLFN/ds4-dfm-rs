@@ -300,6 +300,16 @@ fn main() {
     let ident = model_path
         .as_deref()
         .and_then(|path| identify_gguf(std::path::Path::new(path)).ok());
+    // V4.1 (ds41): the context comes only from the metadata
+    // (core_validate_v41.c:51-53) — refuse --ctx before the model load, not
+    // after it (the engine refuses it at parse time, cli_opts.c:285-293).
+    if ctx_set
+        && ident
+            .as_ref()
+            .is_some_and(|id| id.shape.variant == ds4_core::Variant::DeepSeek41Flash)
+    {
+        cli_error("ds4-server-rs: V4.1 context comes from the model metadata (deepseek4.context_length); --ctx is refused");
+    }
     // Auto admission needs the requested workload before any cache is sized.
     let mut preflight_options = model_options.clone();
     preflight_options.push(ModelOpenOption::ServingBudget(serve_req.clone()));

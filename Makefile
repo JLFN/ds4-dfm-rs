@@ -1046,6 +1046,20 @@ test-ds41-serving: ds4
 	  sh tests/ds41_serving_gate.sh ./ds4 "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$${NPRED:-56}" "$(ENGRAM_DIR)" "$(ENGLOG_SPEC)" "$${VK:-5}"; \
 	fi
 
+# DeepSeek V4.1 (ds41) HTTP serving gate (unit F, P5.5): boots ds4-server on
+# the artifact and drives the push route over HTTP (non-stream + stream),
+# proving the served ids equal the CLI's on the same prompt text; plus the
+# boot refusals (--ctx, --zchain).  Artifact- and Spark-only:
+#   make test-ds41-serving-http MODEL=<gguf> ENGRAM_DIR=<shard dir> \
+#        [PORT=8477] [PROMPT="The capital of France is"] [NPRED=16]
+.PHONY: test-ds41-serving-http
+test-ds41-serving-http: ds4 ds4-server
+	@if [ -z "$(MODEL)" ] || [ -z "$(ENGRAM_DIR)" ]; then \
+	  echo "usage: make test-ds41-serving-http MODEL=<gguf> ENGRAM_DIR=<shard dir> [PORT=8477] [PROMPT=\"The capital of France is\"] [NPRED=16]"; \
+	else \
+	  sh tests/ds41_serving_http_gate.sh ./ds4-server ./ds4 "$(MODEL)" "$(ENGRAM_DIR)" "$${PORT:-8477}" "$${PROMPT:-The capital of France is}" "$${NPRED:-16}"; \
+	fi
+
 # The Rust host (./ds4) is the default binary, and the one the server shares.
 # It pins the shape and the tensor directory instead of parsing the GGUF, so its
 # load-time configuration is not the C validator's: this gate pins the two
