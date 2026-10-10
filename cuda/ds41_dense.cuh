@@ -210,6 +210,21 @@ extern "C" int ds4_gpu_v41_matmul_f32_tensor(ds4_gpu_tensor *out, const void *mo
 /* Prefill activation scratch (the engine's shared g_v41_xbf; each port family
  * owns its own slot, ds41_fp8blk.cuh precedent). */
 static v41_scratch g_v41_dense_xbf;
+
+/* The decode-only bf16 GEMV with a device skip flag (cuda_v41_1.inc.cu:326-336):
+ * the markov-bias-cache hit makes the whole grid return (the bias comes from
+ * the cache slot).  Decode batches only (n <= 8), never the prefill GEMM. */
+extern "C" int ds4_gpu_v41_matmul_bf16_skip_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                                   uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                                   const ds4_gpu_tensor *x, uint32_t n_tok, const ds4_gpu_tensor *skip) {
+    if (!out || !x || !skip || n_tok == 0 || n_tok > V41_GEMV_MAX_TOK || (in_dim % 256u) != 0u) return 0;
+    const uint64_t wbytes = in_dim * out_dim * 2;
+    if (weight_offset > model_size || wbytes > model_size - weight_offset) return 0;
+    const __nv_bfloat16 *W = (const __nv_bfloat16 *)cuda_model_range_ptr(model_map, weight_offset, wbytes, "v41 bf16 w(skip)");
+    if (!W) return 0;
+    return v41_bf16_gemv(W, in_dim, out_dim, (const float *)x->ptr, (float *)out->ptr, n_tok, "v41 bf16 gemv(skip)",
+                         (const int32_t *)skip->ptr);
+}
 extern "C" int ds4_gpu_v41_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                               uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
                                               const ds4_gpu_tensor *x, uint32_t n_tok) {

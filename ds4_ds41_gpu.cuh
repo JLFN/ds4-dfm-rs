@@ -45,6 +45,7 @@ int g_ds4_v41_vq_group = 1;
 #include "cuda/ds41_attn_mma.cuh" /* P4-5: the sparse-attn mma family (seg decode, prefill, split-K, merge) + the entry */
 #include "cuda/ds41_indexer.cuh"  /* P4-4: the indexer three-piece (score / candidate blocks / topk) */
 #include "cuda/ds41_router.cuh"   /* P4-4: the router (sqrtsoftplus + bias topk) and SwiGLU */
+#include "cuda/ds41_draft.cuh"    /* P5/E1: the DSpark draft towers (dense MoE, mainh ring, markov rows/cache) */
 
 /* Raw decode entry for tests and the P4-2 forward wiring: all pointers are
  * device pointers; `nc` and `ver` come from the blob header (ds4vq_blob_nexp /

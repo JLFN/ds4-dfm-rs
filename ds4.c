@@ -78813,4 +78813,7 @@ int ds4_session_iquest_commit(ds4_session *s, int keep, char *err, size_t errlen
  * Guarded out of CPU-only builds; ds4_v41_score_ids is the C gate driver. */
 #ifndef DS4_NO_GPU
 #include "ds4_ds41_forward.inc"
+/* DSpark draft towers (P5/E1): the host side of core_v41_draft.c; same TU
+ * (it calls the forward's statics). */
+#include "ds4_ds41_draft.inc"
 #endif /* DS4_NO_GPU */

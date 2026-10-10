@@ -87,6 +87,21 @@ typedef struct {
     ds4_gpu_tensor *eraw[DS4_V41_MAX_ENGRAM], *erows, *ekv;   /* engram: raw row bytes [cap][cols][stride], decoded rows, wkv output */
     const v41_engram_feed *efeed;    /* caller-supplied rows (hash + pread are host work) */
     int no_engram;              /* compare-only mode: skip the engram layers */
+    /* Draft towers (P5/E1, core_v41.h:64-167): the same struct doubles as the
+     * tower state when draft is set — layer ids are tower indices, no engram,
+     * no compressed KV/indexer, and the window holds main_x projections pushed
+     * by v41_draft_push_main instead of the tower's own KV. */
+    int draft;
+    ds4_gpu_tensor *main_x;      /* [pcap][E] the current position's main-hidden projection (block attention KV source) */
+    const ds4_tensor *tower_exps_vq[DS4_MTP_MAX_TOWERS];   /* blob form: the tower's VQ blob (main fused decode kernel) */
+    const uint64_t *tower_exp_off[DS4_MTP_MAX_TOWERS];   /* per-expert form: [3][n_expert] offset table */
+    /* The main-hidden ring (core_v41.h:144-151): [mainh_cap][n_target][E],
+     * cell = position % cap; only the contiguous run ending at mainh_end is
+     * real.  mainh_wrote is set by v41_layer, accounted by v41_forward. */
+    ds4_gpu_tensor *mainh;
+    uint32_t mainh_cap, mainh_wrote;
+    int64_t mainh_end;
+    uint32_t mainh_n;
     int ced_done;               /* v41_forward_body: this block stopped at the CED edge (no logits) */
     int ced_skip;               /* this block runs only the encoder segment + the edge layer's KV */
     const char *dump_prefix;    /* non-NULL: per-layer MoE in/out dumps (single block, n <= 64) */
@@ -173,6 +188,13 @@ static bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint3
     v41_alloc_attn_rows(st, cap, &ok);
     v41_alloc_attn_cache(st, cap, &ok);
     st->wintmp = v41_alloc(SWA * HD * 4, &ok);
+    /* core_v41_state.c:104-108: the main-hidden ring exists only when the
+     * model carries draft towers (and its target layers are known). */
+    if (g_ds4_v41.mtp_towers && g_ds4_v41.n_mtp_target) {
+        st->mainh_cap = (uint32_t)SWA;
+        st->mainh = v41_alloc((uint64_t)st->mainh_cap * g_ds4_v41.n_mtp_target * DS4_N_EMBD * 4, &ok);
+        st->mainh_end = -1; st->mainh_n = 0;
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         st->win[il] = v41_alloc((SWA + cap) * HD * 4, &ok);
         if (ok && !ds4_gpu_tensor_fill_f32(st->win[il], 0.f, (uint64_t)(SWA + cap) * HD)) ok = false;
@@ -200,7 +222,7 @@ static bool v41_state_alloc(ds4_v41_state *st, uint32_t cap, uint32_t ctx, uint3
 static void v41_state_free(ds4_v41_state *st) {
     v41_free_dense(st);
     v41_free_attn(st);
-    V41_FREE(&st->wintmp, &st->iscore, &st->cand, &st->erows, &st->ekv);
+    V41_FREE(&st->wintmp, &st->iscore, &st->cand, &st->erows, &st->ekv, &st->mainh, &st->main_x);
     for (uint32_t k = 0; k < DS4_V41_MAX_ENGRAM; k++) V41_FREE(&st->eraw[k]);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         V41_FREE(&st->win[il], &st->comp_kv[il], &st->index_k[il], &st->cpre_kv[il], &st->cpre_sc[il]);
@@ -573,15 +595,33 @@ static bool v41_hc_half(ds4_engine *e, ds4_v41_state *st, const ds4_layer_weight
  * expert in one launch (the engine's tail path). */
 static bool v41_moe(const ds4_model *m, const ds4_layer_weights *l, ds4_v41_state *st, uint32_t il) {
     const uint32_t n = st->n, E = DS4_N_EMBD, FF = DS4_N_FF_EXP;
-    const bool tail = n <= DS4_V41_GEMV_MAX_TOK;
+    /* Decode small batches fold the routed partials into the shared expert in
+     * one launch; the towers never take that arm (core_v41_forward.c:77). */
+    const bool tail = !st->draft && n <= DS4_V41_GEMV_MAX_TOK;
+    /* Draft towers: 128 experts top-3, their own router shape
+     * (core_v41_forward.c:78-80). */
+    const uint32_t NE = st->draft ? g_ds4_v41.mtp_experts : DS4_N_EXPERT;
+    const uint32_t KU = st->draft ? g_ds4_v41.mtp_used : DS4_N_EXPERT_USED;
     /* router gate: bf16 on the main layers, f32 on the towers (two converter plans) */
     if (l->ffn_gate_inp->type == DS4_TENSOR_F32) {
-        if (!ds4_gpu_v41_matmul_f32_tensor(st->glog, m->map, m->size, l->ffn_gate_inp->abs_offset, E, DS4_N_EXPERT, st->xn, n)) return false;
-    } else if (!ds4_gpu_v41_matmul_bf16_tensor(st->glog, m->map, m->size, l->ffn_gate_inp->abs_offset, E, DS4_N_EXPERT, st->xn, n)) return false;
-    if (!ds4_gpu_v41_router_tensor(st->sel, st->rw, st->glog, m->map, m->size, l->ffn_exp_probs_b->abs_offset, n, DS4_N_EXPERT,
-                                   DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE)) return false;
-    /* routed experts: one VQ blob per layer (the per-expert tensors do not exist in this artifact) */
-    if (!ds4_gpu_v41_routed_moe_tensor(tail ? NULL : st->routed, m->map, m->size, l->ffn_exps_vq->abs_offset, l->ffn_exps_vq->bytes,
+        if (!ds4_gpu_v41_matmul_f32_tensor(st->glog, m->map, m->size, l->ffn_gate_inp->abs_offset, E, NE, st->xn, n)) return false;
+    } else if (!ds4_gpu_v41_matmul_bf16_tensor(st->glog, m->map, m->size, l->ffn_gate_inp->abs_offset, E, NE, st->xn, n)) return false;
+    if (!ds4_gpu_v41_router_tensor(st->sel, st->rw, st->glog, m->map, m->size, l->ffn_exp_probs_b->abs_offset, n, NE,
+                                   KU, DS4_EXPERT_WEIGHT_SCALE)) return false;
+    if (st->draft) {
+        /* The two on-disk tower expert forms (core_v41_forward.c:108-120).
+         * Blob: the main fused decode kernel with layer = DS4_N_LAYER + tower
+         * (that id only picks the gr sidecar / head-cache slot; towers have no
+         * gr).  Per-expert: the dense fp4x32 MoE.  Reading a blob with the
+         * per-expert kernel yields a full set of fake drafts and shows up only
+         * as low acceptance — the two forms must never be mixed. */
+        const ds4_tensor *tb = st->tower_exps_vq[il];
+        if (tb) {
+            if (!ds4_gpu_v41_routed_moe_tensor(st->routed, m->map, m->size, tb->abs_offset, tb->bytes, E, FF, E, st->sel, st->rw,
+                                               NE, KU, DS4_SWIGLU_CLAMP_EXP, st->xn, (uint32_t)DS4_N_LAYER + il, n)) return false;
+        } else if (!ds4_gpu_v41_mtp_moe_tensor(st->routed, m->map, il, st->tower_exp_off[il], E, FF, E, st->sel, st->rw,
+                                               NE, KU, DS4_SWIGLU_CLAMP_EXP, st->xn, n)) return false;
+    } else if (!ds4_gpu_v41_routed_moe_tensor(tail ? NULL : st->routed, m->map, m->size, l->ffn_exps_vq->abs_offset, l->ffn_exps_vq->bytes,
                                        E, FF, E, st->sel, st->rw, DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, st->xn, il, n)) return false;
     /* shared expert: w1/w3 -> bf16 -> swiglu(clamp) -> bf16 -> w2 -> bf16 */
     if (!v41_tproj(m, st->sg, l->ffn_gate_shexp, E, FF, st->xn, n, 1) ||
@@ -624,9 +664,13 @@ static void v41_trace_probe(uint32_t il, const char *tag, const ds4_gpu_tensor *
 
 /* One layer (official Block.forward): engram -> attn half -> attention ->
  * hc_post -> ffn half -> MoE -> hc_post; pre_mix carries ffn_pre forward. */
+/* The draft towers' attention arm (ds4_ds41_draft.inc, core_v41_attn.c:239-261). */
+static bool v41_draft_attention(ds4_engine *e, ds4_v41_state *st, uint32_t il);
 static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const ds4_model *m = &e->model;
-    const ds4_layer_weights *l = &e->weights.layer[il];
+    /* Draft towers reuse this layer body with the tower weights (layer id =
+     * tower index; core_v41_forward.c:184). */
+    const ds4_layer_weights *l = st->draft ? &e->weights.v41_towers.tower[il] : &e->weights.layer[il];
     const uint32_t n = st->n, E = DS4_N_EMBD;
     static int tr_on = -1;
     if (tr_on < 0) tr_on = getenv("DS41_FWD_TRACE") ? 1 : 0;
@@ -635,8 +679,21 @@ static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
     const int l0 = l0_on && il == 0u && st->dump_prefix != NULL;
     const int tr = tr_on && il >= 27u;
     if (tr) v41_trace_probe(il, "hc_in", st->hc, (uint64_t)n * DS4_N_HC * E);
-    if (!st->no_engram && g_ds4_v41.engram_index_of[il] >= 0) {
+    if (!st->draft && !st->no_engram && g_ds4_v41.engram_index_of[il] >= 0) {
         if (!v41_engram(e, st, il)) return false;
+    }
+    /* DSpark: capture the target layers' attention input (the hc four-route
+     * mean, after the engram and before the layer; core_v41_forward.c:197-207)
+     * into the main-hidden ring.  Only the last mainh_cap rows of the block
+     * move; the eager path passes no device position slot (only the engine's
+     * graph does).  A wrong capture point does not error — acceptance
+     * collapses to about 1. */
+    if (!st->draft && st->mainh && g_ds4_v41.mtp_target_slot[il] >= 0) {
+        const uint32_t rows = n < st->mainh_cap ? n : st->mainh_cap, src0 = n - rows;
+        if (!ds4_gpu_v41_hc_mean_tensor(st->mainh, st->hc, E, DS4_N_HC, rows, src0,
+                                        (uint32_t)g_ds4_v41.mtp_target_slot[il], g_ds4_v41.n_mtp_target,
+                                        st->pos0 + src0, st->mainh_cap, NULL)) return false;
+        st->mainh_wrote = rows;
     }
     if (!v41_hc_half(e, st, l, true)) return false;
     if (l0) v41_dump_rows(st, st->xn, "l0axn", il, E);
@@ -646,7 +703,9 @@ static bool v41_layer(ds4_engine *e, ds4_v41_state *st, uint32_t il) {
         v41_trace_probe(il, "x_attn", st->x, (uint64_t)n * E);
         v41_trace_probe(il, "xn_attn", st->xn, (uint64_t)n * E);
     }
-    if (!v41_attention(e, st, il)) return false;
+    if (st->draft) {
+        if (!v41_draft_attention(e, st, il)) return false;   /* the tower window arm */
+    } else if (!v41_attention(e, st, il)) return false;
     if (l0) { v41_dump_rows(st, st->o, "l0ao", il, (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM); v41_dump_rows(st, st->attn_out, "l0aout", il, E); }
     if (tr) v41_trace_probe(il, "o", st->o, (uint64_t)n * DS4_N_HEAD * DS4_N_HEAD_DIM);
     if (!ds4_gpu_v41_hc_post_tensor(st->hc2, st->attn_out, st->hc, st->post, st->comb, E, DS4_N_HC, n)) return false;
@@ -771,9 +830,21 @@ static bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, ui
     const bool okpm = ds4_gpu_tensor_write(st->pre_mix, 0, pm, (uint64_t)n * DS4_N_HC * 4) != 0;
     free(pm);
     if (!okpm) return false;
+    st->mainh_wrote = 0;
     if (ds4_gpu_begin_commands() == 0) return false;
     if (!v41_forward_body(e, st)) return false;
     if (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0) return false;
+    /* The main-hidden ring's accounting (core_v41_forward.c:391-400): continue
+     * the run when this block touches the previous one, restart it otherwise
+     * (a CED block writes no ring rows).  Only the contiguous run ending at
+     * mainh_end is real — the draft window fill may read nothing else. */
+    if (st->mainh && st->mainh_wrote) {
+        const int64_t first = (int64_t)st->pos0 + (int64_t)(n - st->mainh_wrote);
+        const bool contig = st->mainh_n > 0 && st->mainh_end == first - 1;
+        const uint32_t nn = contig ? st->mainh_n + st->mainh_wrote : st->mainh_wrote;
+        st->mainh_n = nn > st->mainh_cap ? st->mainh_cap : nn;
+        st->mainh_end = (int64_t)st->pos0 + (int64_t)n - 1;
+    }
     st->n_past += n;
     return true;
 }

@@ -5375,6 +5375,50 @@ int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_ex
  * index. */
 int ds4_gpu_v41_argmax_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *logits, uint32_t row, uint32_t n_vocab);
 
+/* ---- DSpark draft towers (cuda/ds41_draft.cuh, src/cuda/cuda_v41_draft.inc.cu) ---- */
+
+/* The dense per-expert fp4x32 MoE (engine :101-141): out = sum_k rw_k *
+ * down_e(x) with e from `selected`; used only by the per-expert tower form
+ * (this artifact's towers carry one VQ blob and take the main fused decode
+ * kernel with layer = DS4_N_LAYER + tower instead). */
+int ds4_gpu_v41_mtp_moe_tensor(ds4_gpu_tensor *out, const void *model_map, uint32_t tower, const uint64_t *exp_off,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights, uint32_t n_expert, uint32_t topk, float clamp,
+        const ds4_gpu_tensor *x, uint32_t n_tok);
+
+/* The main-hidden ring writer (engine :143-166): mean over the hc lanes of
+ * n_rows rows -> slot `slot` of the [cap][n_slot][E] ring, row t at cell
+ * (pos + t) % cap; posd (device int) overrides dst_pos0 for the graph path. */
+int ds4_gpu_v41_hc_mean_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *hc, uint32_t n_embd, uint32_t n_hc,
+        uint32_t n_rows, uint32_t src_row0, uint32_t slot, uint32_t n_slot, uint32_t dst_pos0, uint32_t cap,
+        const ds4_gpu_tensor *posd);
+
+/* Ring -> contiguous (engine :169-189): dst[t] = ring[(first_row + t) % cap]. */
+int ds4_gpu_v41_ring_rows_tensor(ds4_gpu_tensor *dst, const ds4_gpu_tensor *ring, uint32_t row_floats, uint32_t cap,
+        uint32_t first_row, uint32_t count, const ds4_gpu_tensor *firstd);
+
+/* markov embed row gather by a device token id (engine :191-215); elem_bytes
+ * from the GGUF type (2 = bf16, 4 = f32). */
+int ds4_gpu_v41_row_gather_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t tab_offset, uint64_t n_rows, uint32_t dim, uint32_t elem_bytes,
+        const ds4_gpu_tensor *ids, uint32_t which, uint32_t out_row);
+
+/* logits row += bias row (engine :218-229). */
+int ds4_gpu_v41_row_add_tensor(ds4_gpu_tensor *dst, uint64_t dst_row, const ds4_gpu_tensor *src, uint64_t n);
+
+/* The markov bias cache (engine :232-267): lookup writes hit[0] = slot (>=0)
+ * or -(slot)-2 on a miss (claiming the slot); add applies cache or bias+store. */
+int ds4_gpu_v41_mkcache_lookup_tensor(ds4_gpu_tensor *hit, ds4_gpu_tensor *cache_ids, ds4_gpu_tensor *next,
+        const ds4_gpu_tensor *ids, uint32_t which, uint32_t n_slots);
+int ds4_gpu_v41_mkcache_add_tensor(ds4_gpu_tensor *logits, uint64_t row, const ds4_gpu_tensor *bias,
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *hit, uint64_t n);
+
+/* The decode bf16 GEMV with a device skip flag (cuda/ds41_dense.cuh, engine
+ * cuda_v41_1.inc.cu:326-336): the markov cache hit returns the whole grid. */
+int ds4_gpu_v41_matmul_bf16_skip_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok,
+        const ds4_gpu_tensor *skip);
+
 #ifdef __cplusplus
 }
 #endif
