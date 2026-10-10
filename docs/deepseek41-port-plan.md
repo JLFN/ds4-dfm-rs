@@ -1121,6 +1121,102 @@ a3b3f8c (E2), ed0e408 + 783f9ff + 74d012a (E3).
 
 Unit: E complete
 
+## 6.16 Unit F evidence: the serving surface (P5.4 recorded; P5.5 pending)
+
+Unit commits: e1f62a7 (P5.1, the draft parameters on the host-shape ABI),
+61e4e12 (P5.2, the run surface: native switches, the host rows provider,
+the bridge entry, the CLI flags, the Rust feed), ef6cd09 (P5.3, the
+serving contract row), 3b6ad8f (P5.4a, the [emit] instrument + the Rust
+gate runner + the ds4.o dependency fix), f730e0a (P5.4b, the ctx/vocab
+host-shape wiring). P5.5 (the push-based server route) is not in this
+section yet; the closing commit adds it and carries "Unit: F complete".
+
+1. What P5.1-P5.3 ported (engine-cited in the file headers). The
+   host-shape ABI carries the draft parameters (block_size, expert_used_
+   count, noise_token_id, markov_rank, target_layers) and the native arms
+   the drafter with the GGUF path's rules (core_validate_v41.c:91-110;
+   block 0 = unarmed + the engine's warning, mtp_target_slot starts at -1).
+   The native switches (ds4_engine_v41_set_dspark/set_graph/set_emit_trace/
+   set_prof/set_progress) mirror the engine's CLI wiring, and the rows
+   provider (ds4_v41_feed_open) owns the PINNED buffers the captured graphs
+   read (ds4_gpu_host_alloc is not on the Rust ABI; pinned memory is
+   device-adjacent, so the buffers stay native-owned). The bridge entry
+   ds4_bridge_v41_generate mirrors the engine's single-request server path
+   1:1 (server_generate_v41.c:412-414: set_progress + generate_argmax with
+   the emit callback; the req object is only for the --batch lanes). The
+   Rust route (crates/ds4-core/src/v41_run.rs) opens the feed (hash +
+   shard preads), sets the switches, and drives the callbacks through
+   catch_unwind tramps; the CLI runs it on --gen-ids with the engine's own
+   flag spellings. The serving contract row declares serial/none banks,
+   no reuse, no disk KV, no snapshots, embedded MTP (qualified) and
+   metadata-only context; --max-seqs>1 and prefix reuse are refused by
+   name (v41_serving_contract_refuses_what_it_lacks).
+
+2. The [emit] instrument (P5.4a). The engine's --emit-trace prints
+   `[emit] <absolute position> <token id>` once per emitted token
+   (core_v41_api.c:246 at the loop top, :387 for a spec round's earned
+   tokens), and the port's round drive now prints both sites verbatim,
+   gated by g_ds4_v41_emit_trace. NAMED DEVIATION from the P5.4 plan
+   text: the instrument lives in the native round drive, not in the CLI's
+   emit closure — the closure sees only the token id, and a Rust-side
+   position counter would re-derive what the live state knows and could
+   never show a rollback position drift, which is the failure the
+   instrument exists to catch (core_v41_api.c:244-245).
+
+3. The gate found a real wiring gap (P5.4b, f730e0a). The Rust route's
+   first live run refused at the generate entry: "ds4: [v41] model
+   metadata has no deepseek4.context_length". The C loader path fills
+   g_ds4_v41.ctx from the GGUF (ds4.c:7226-7228) but the host-shape ABI
+   carried no ctx, so model_apply_host_v41_wiring left it zero and both
+   the generate entry (ds4_ds41_draft.inc:650) and the state alloc
+   (ds4_ds41_forward.inc:280) refused. The fix appends v41_ctx (and the
+   engram vocab pair, which the C path fills as required keys,
+   core_validate_v41.c:152-153, and the Rust path left zero — inert today,
+   same divergence class) to the host shape; V41Wire reads the three keys
+   with the engine's hard stops (missing ctx = MissingKey, 0/over-u32::MAX
+   = CtxInvalid). Artifact values read first-hand from the GGUF on
+   2026-10-10: context_length 1048576, engram vocab_size 16000000,
+   compressed_vocab_size 99092. The Makefile's ds4.o rule was also
+   missing ds4_ds41_draft.inc among its dependencies (ds4.c includes it
+   at :78847), so an edit to that file alone did not trigger a rebuild —
+   make ds4 would have linked a stale loop; added.
+
+4. Gate F-1 — the C generate gate re-run after the P5.2/P5.4a native
+   changes (tests/ds41_generate_gate.sh, the same pin as E: p1.ids, N=56,
+   ROWS_REF p1g56.logits.bin, ENGLOG_SPEC /tmp/gen56_spec_a.log, VK=5;
+   Spark /tmp/p54_cgate.log, CGATE_RC=0): positive PASS (non-spec + spec,
+   row reference and history clean, n=1 and batch graphs walked with
+   reuse, no-graph control golden), negative controls FAIL as required.
+   The port's own [emit] lines ride in the harness logs now (56 lines in
+   both the non-spec and spec runs, first line `[emit] 8 455` == the
+   engine golden's first line).
+
+5. Gate F-2 — the Rust serving gate (tests/ds41_serving_gate.sh; Spark
+   /tmp/ds41_serving_gate.{default,nograph,nodspark,spec,noids,temp}.log,
+   RGATE2_RC=0): "positive PASS (default + no-graph + no-dspark + spec,
+   [emit] ids and positions equal to the engine golden, [dspark] trace
+   identical, n=1 and batch graphs walked with reuse), negative controls
+   FAIL as required". Per mode: default (drafter armed, graph on) — 56/56
+   ids equal to the engine's [emit] golden, positions sequential from the
+   prompt length, 4 verify-batch captures (6/2/1/3-row) reused over 20
+   walked rounds, DSpark 25 rounds (scheduler skipped 3), average accept
+   1.04/5; --no-graph — the same ids with no [graph] line (direct ==
+   graph == golden); --no-dspark — the same ids, the n=1 graph walked 55
+   pure-decode steps on 1 capture (43.85 ms/step steady = 22.80 t/s),
+   no DSpark summary; --dspark-verify 5 — the same ids, the [dspark]
+   round lines identical to the engine's spec golden (19 rounds, average
+   accept 1.95/5, one 6-row capture reused over 18 walked rounds), and
+   the port's own spec ids == its non-spec ids (the engine's byte-identity
+   rule). Negatives refused by name: a text prompt without --gen-ids
+   ("the V4.1 family runs on --gen-ids <file>") and --temp 0.5 ("V4.1
+   sampling is not ported").
+
+6. Recorded limits. The Rust gate runs one process per mode (six model
+   loads, ~21 min on the Spark) — the CLI has no batch-mode harness; the
+   C gate has the same shape. Sampling, the V4.1 chat rendering (DSML/
+   thinking), the lanes scheduler and the sidecars remain their units;
+   the caps row refuses them by name.
+
 ## 7. Numerics contract
 
 - Device arithmetic and every format detail follow the C engine's code, and the
