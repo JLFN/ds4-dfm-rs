@@ -52,6 +52,13 @@ typedef struct {
     ds4_gpu_tensor *mainh_lin; /* [SWA][n_target][E] contiguous rows out of the main ring (main_proj's batch) */
     int64_t win_end;           /* newest absolute position in the tower windows (-1 = empty); the fill tops up (win_end, pos_main] */
     uint32_t block, ready;
+    /* Sampling under speculation (core_v41_api.c:222): dev_sample = 1 makes
+     * the per-row draft pick draw from the tower's own distribution (the same
+     * device sample kernel, samp.stream = 1 so the coins are independent of
+     * the verify's stream 0); the tower's logits become the verify kernel's q
+     * (st.spec_q) for the rejection sampling.  0 = point-mass draft (argmax). */
+    int dev_sample;
+    ds4_gpu_sample_params samp;
     int32_t host_ids[DS4_MTP_MAX_BLOCK + 1];
     float host_conf[DS4_MTP_MAX_BLOCK];
     int32_t *p_tok, *p_bpos, *p_wpos, *p_first, *p_ids;   /* pinned slots the puts upload from */
@@ -360,8 +367,14 @@ static bool v41_draft_block(ds4_engine *e, ds4_v41_draft *dr, uint32_t pos0) {
         if (mkc ? !ds4_gpu_v41_mkcache_add_tensor(st->logits, i, dr->mk_bias, dr->mk_cache, dr->mk_hit, DS4_N_VOCAB)
                 : !ds4_gpu_v41_row_add_tensor(st->logits, i, dr->mk_bias, DS4_N_VOCAB)) return false;
         /* argmax writes only the first int of its own row slot: land it in
-         * ids_next, then copy to ids[i+1] (official output_ids[:, i+1]). */
-        if (!ds4_gpu_v41_argmax_tensor(dr->ids_next, st->logits, i, DS4_N_VOCAB)) return false;
+         * ids_next, then copy to ids[i+1] (official output_ids[:, i+1]).
+         * Under sampling the draft also draws from the tower's distribution
+         * (2026-09-29, core_v41_draft.c:285-287): the accept-rate ceiling
+         * becomes sum min(p,q) instead of p(argmax q); the sample lands in the
+         * same slot's first int. */
+        if (dr->dev_sample) {
+            if (!ds4_gpu_v41_sample_tensor(dr->ids_next, st->logits, i, 1u, DS4_N_VOCAB, st->pos, st->tok, &dr->samp, NULL)) return false;
+        } else if (!ds4_gpu_v41_argmax_tensor(dr->ids_next, st->logits, i, DS4_N_VOCAB)) return false;
         if (!ds4_gpu_tensor_copy(dr->ids, (uint64_t)(i + 1u) * 4, dr->ids_next, 0, 4)) return false;
     }
     /* confidence = proj([h_i; markov_embed_i]) */
@@ -678,13 +691,62 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
     const char *gen_lg = getenv("DS41_GEN_LOGITS");
     FILE *gen_fd = gen_lg ? fopen(gen_lg, "wb") : NULL;
     ds4_gpu_tensor *am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);   /* per-row 16 B slots (sampling layout; argmax uses the first int) */
+    /* Three routes (core_v41_api.c:139-167, executed by ds4_ds41_sample.inc):
+     * temperature > 0 and no penalties = the device sample kernel (speculation
+     * runs, the kernel does the rejection sampling); any penalty non-zero =
+     * read the whole row back, penalize on the host and sample (penalties look
+     * at the token history, speculation does not take them: an explicit
+     * --dspark is refused by name, a default-on dspark turns this request into
+     * pure decode, loudly -- a silent route change would leave the user
+     * thinking speculation was on); otherwise the device argmax. */
+    const bool penal = g_decode_sampling.dry_multiplier > 0.f || g_decode_sampling.freq_penalty != 0.f || g_decode_sampling.presence_penalty != 0.f;
+    const bool dev_sample = g_decode_sampling.temperature > 0.f && !penal;
+    int dspark = v41_dspark_mode();
+    if (penal && dspark == 2) {
+        fprintf(stderr, "ds4: *repetition penalties (dry %.2f freq %.2f presence %.2f) and --dspark speculation cannot be combined* "
+                        "(penalties rewrite logits from the token history, the verify does not take them; drop --dspark or the penalties)\n",
+                (double)g_decode_sampling.dry_multiplier, (double)g_decode_sampling.freq_penalty, (double)g_decode_sampling.presence_penalty);
+        if (gen_fd) fclose(gen_fd);
+        if (am) ds4_gpu_tensor_free(am);
+        v41_state_free(&st);
+        return 1;
+    }
+    if (penal && dspark) {
+        fprintf(stderr, "ds4: [v41] this request turns on repetition penalties (dry %.2f freq %.2f presence %.2f), "
+                        "speculation does not take penalties => this request runs pure decode\n",
+                (double)g_decode_sampling.dry_multiplier, (double)g_decode_sampling.freq_penalty, (double)g_decode_sampling.presence_penalty);
+        dspark = 0;
+    }
+    float *rowbuf = penal ? xmalloc((size_t)DS4_N_VOCAB * 4u) : NULL;
+    v41_hist hist = {NULL, 0, 0, NULL};
+    if (penal) {
+        hist.cap = (uint32_t)(n_predict > 0 ? n_predict : 0) + 2u;
+        hist.tok = xmalloc((size_t)hist.cap * sizeof(int32_t));
+        if (g_decode_sampling.dry_multiplier > 0.f) hist.brk = ds4_decode_breakers(e, DS4_N_VOCAB);
+    }
+    uint64_t rng = g_decode_sampling.seed ? g_decode_sampling.seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());   /* the V4 CLI's rule (core_v41_api.c:163-164) */
+    const bool sampling = dev_sample || penal;   /* log only: this request is not bare argmax */
+    st.dev_sample = dev_sample ? 1 : 0;
+    st.samp = (ds4_gpu_sample_params){ .temperature = g_decode_sampling.temperature, .top_p = g_decode_sampling.top_p,
+                                       .min_p = g_decode_sampling.min_p, .top_k = g_decode_sampling.top_k, .seed = rng };
     /* Spec decode arms when the GGUF carries the towers + draft parameters
      * (core_v41_api.c:219-221); ready=0 keeps the single-token loop.  The
      * three-way switch (--no-dspark / default / --dspark) is
      * ds4_engine_v41_set_dspark (ds41_forward.h); DS41_NO_DSPARK remains the
      * env fallback until a setter is called. */
     ds4_v41_draft dr;
-    const bool spec = v41_dspark_mode() != 0 && v41_draft_alloc(e, &dr);
+    const bool spec = dspark && v41_draft_alloc(e, &dr);
+    /* Sampling + speculation (core_v41_api.c:216-222): the draft draws from
+     * the tower's own distribution (coin stream 1) and its logits become the
+     * verify kernel's q for the rejection sampling (accept <=> u < min(1,p/q),
+     * reject draws from max(0,p-q)).  The engine's accept-rate jury (the same
+     * text parsed position by position, d1 accjury): first-position expected
+     * accept 0.693 -> 0.744 (temperature 1.0, CFO), 0.634 -> 0.757 (the
+     * broad set), 0.834 -> 0.842 (temperature 0.6, CFO) -- point mass
+     * E[p(argmax q)] vs distribution draft E[sum min(p,q)].  Greedy is
+     * untouched (temperature 0 stays argmax, the byte-for-byte gate). */
+    if (spec && dev_sample) { dr.dev_sample = 1; dr.samp = st.samp; dr.samp.stream = 1u; st.spec_q = dr.st.logits; }
     v41_sched cal; memset(&cal, 0, sizeof cal);
     uint32_t spec_rounds = 0, spec_acc = 0, spec_off = 0, spec_skipped = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
     g_v41_last_spec_rounds = g_v41_last_spec_off = g_v41_last_spec_acc = 0;   /* the monitor account clears per run (core_v41_api.c:42) */
@@ -725,6 +787,13 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
         }
         if (!ok || aborted) break;
         fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, now_sec() - t0, (double)np / (now_sec() - t0 + 1e-9));
+        /* The sampling account (core_v41_api.c:192-196), one line per request. */
+        if (sampling) fprintf(stderr, "[v41] decode sampling (%s) temp %.2f top_p %.2f min_p %.2f top_k %d seed %llu%s dry %.2f/%.2f/%d freq %.2f presence %.2f\n",
+                              dev_sample ? "device kernel" : "host penalty route",
+                              (double)g_decode_sampling.temperature, (double)g_decode_sampling.top_p, (double)g_decode_sampling.min_p,
+                              g_decode_sampling.top_k, (unsigned long long)rng, penal ? " + penalties" : "", (double)g_decode_sampling.dry_multiplier,
+                              (double)g_decode_sampling.dry_base, g_decode_sampling.dry_allowed_length,
+                              (double)g_decode_sampling.freq_penalty, (double)g_decode_sampling.presence_penalty);
         if (getenv("DS41_ADDR_DUMP")) {   /* the A/B layout discriminator (see the harness) */
             fprintf(stderr, "addr am %p logits %p x %p xn %p tok %p pos %p\n", ds4_gpu_tensor_ptr(am), ds4_gpu_tensor_ptr(st.logits),
                     ds4_gpu_tensor_ptr(st.x), ds4_gpu_tensor_ptr(st.xn), ds4_gpu_tensor_ptr(st.tok), ds4_gpu_tensor_ptr(st.pos));
@@ -733,14 +802,17 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             if (st.erows) fprintf(stderr, "addr erows %p ekv %p\n", ds4_gpu_tensor_ptr(st.erows), st.ekv ? ds4_gpu_tensor_ptr(st.ekv) : NULL);
         }
         /* the last prefill position's logits -> the first token (last_logit_row
-         * says which row the head wrote; row 0 under head_last_only) */
-        if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
-            ds4_gpu_synchronize() == 0 ||
-            ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) break;
+         * says which row the head wrote; row 0 under head_last_only).  The
+         * pick goes through v41_next_token (core_v41_api.c:198): rowbuf = the
+         * host penalty route, else the device arm (sample kernel / argmax). */
+        int32_t tok32 = 0;
+        if (!v41_next_token(&st, am, st.last_logit_row, rowbuf, &rng, &hist, &tok32)) break;
+        tok = (int)tok32;
         v41_gen_dump_row(&st, gen_fd);
-        {   /* the engine's one-shot argmax self-check (core_v41_api.c:193-200):
+        if (!rowbuf && !dev_sample) {   /* the engine's one-shot argmax self-check (core_v41_api.c:193-200):
              * a wrong kernel would silently emit wrong tokens, so compare the
-             * device index against a host scan of the same row once. */
+             * device index against a host scan of the same row once.  The
+             * sampling arm has no such reference (the kernel is the sampler). */
             float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
             if (row && ds4_gpu_tensor_read(st.logits, (uint64_t)st.last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
                 uint32_t best = 0;
@@ -773,6 +845,12 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
                 if (emit && emit((int)tok, ud) != 0) { (void)v41_graph_wait(e, &st, &nt); break; }
                 if (!v41_graph_wait(e, &st, &nt)) { rc = 1; break; }
                 if (spec) v41_sched_cost(&cal, 1u, (now_sec() - ts0) * 1e3);   /* one pure step's wall time: the scheduler's price basis */
+                /* The penalty route (core_v41_api.c:264-266): the token in the
+                 * graph's tail slot is not used; read this step's logits row
+                 * (row 0, n=1) back and sample on the host after the
+                 * penalties.  The device routes (sampling / argmax): nt is the
+                 * slot's pick. */
+                if (rowbuf && !v41_next_token(&st, am, 0, rowbuf, &rng, &hist, &nt)) { rc = 1; break; }
                 tok = (int)nt;
                 v41_gen_dump_row(&st, gen_fd);
                 continue;
@@ -836,8 +914,13 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
                 if (!v41_forward(e, &st, batch, nb)) { rc = 1; break; }
                 if (k && !ds4_gpu_synchronize()) { rc = 1; break; }   /* the split account wants real wall time */
                 tr3 = now_sec();
-                if (!v41_device_next(&st, am, 0u, nb, want)) { rc = 1; break; }
+                if (!v41_device_next(&st, am, 0u, nb, batch, want)) { rc = 1; break; }   /* sample kernel / per-row argmax, assembled into want[] */
             }
+            /* The penalty route (core_v41_api.c:329-330): with penalties
+             * speculation is off, so nb is always 1 and only want[0] matters;
+             * the direct step (warm-up / capture-failure re-run) also takes the
+             * host route here. */
+            if (rowbuf && !v41_next_token(&st, am, 0, rowbuf, &rng, &hist, &want[0])) { rc = 1; break; }
             if (!k) v41_gen_dump_row(&st, gen_fd);   /* the DS41_GEN_LOGITS dump: the logits row behind a single-token decision */
             if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
                      ms_verify += (tr3 - tr2) * 1e3; ms_argmax += (now_sec() - tr3) * 1e3; }
@@ -935,6 +1018,7 @@ int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n
             }
         }
     } while (0);
+    free(rowbuf); free(hist.tok); free((void *)hist.brk);   /* the penalty route's buffers (core_v41_api.c:419) */
     if (gen_fd) fclose(gen_fd);
     if (spec) v41_draft_free(&dr);
     if (am) ds4_gpu_tensor_free(am);

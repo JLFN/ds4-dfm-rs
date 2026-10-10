@@ -193,6 +193,20 @@ typedef struct {
     uint32_t n_direct_n[DS4_MTP_MAX_BLOCK + 2u];
     uint32_t iscap_gen;
     void *dgraph;
+    /* Device sampling (2026-09-28, core_v41_sample.c; core_v41.h:122-124):
+     * dev_sample = 1 makes the graph/direct tail use the sampling kernel
+     * instead of argmax (temperature > 0 and no penalties); speculation runs
+     * on this route too (the kernel does the rejection sampling).  The
+     * penalty route still reads the whole row back and samples on the host,
+     * dev_sample stays 0 there.  samp is the per-request face (constant,
+     * baked into the captured graph).  spec_q = the draft tower's logits
+     * [block][V] (row i = the draft distribution q for verify row i) while
+     * speculating under sampling; NULL = point-mass draft.  The engine's
+     * psamp (the batch path's per-request face, core_v41.h:123) has no port
+     * counterpart: there is no batch path. */
+    int dev_sample;
+    ds4_gpu_sample_params samp;
+    const ds4_gpu_tensor *spec_q;
     /* The block's host token ids, set by v41_forward: the engram feed's
      * prepare callback hashes the block's rows from them (the engine hashes
      * from st->hist, core_v41_forward.c:377). */
@@ -1122,19 +1136,10 @@ static bool v41_spec_rollback(ds4_v41_state *st, uint32_t keep) {
     return true;
 }
 
-/* The greedy per-row next-token (core_v41_sample.c:24-37, the non-sampling
- * arm): the argmax kernel writes only the first int of its slot, so the rows
- * are argmaxed and read back one at a time (the direct path only pays this on
- * verify batches). */
-static bool v41_device_next(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row0, uint32_t n, int32_t *want) {
-    if (!am || n == 0u || n > DS4_MTP_MAX_BLOCK + 2u) return false;
-    for (uint32_t i = 0; i < n; i++) {
-        if (!ds4_gpu_v41_argmax_tensor(am, st->logits, row0 + i, DS4_N_VOCAB) ||
-            !ds4_gpu_synchronize() ||
-            !ds4_gpu_tensor_read(am, 0, &want[i], 4)) return false;
-    }
-    return true;
-}
+/* The greedy per-row next-token pick (v41_device_next) and the sampling
+ * routes moved to ds4_ds41_sample.inc (unit H): the engine keeps them in
+ * src/core/core_v41_sample.c, and the graph module calls v41_sample_pick from
+ * there.  The old argmax-only helper that lived here was its greedy arm. */
 
 /* Engram table metadata for the feed builder (ds41_forward.h): the C loader
  * filled g_ds4_v41 from the GGUF (v41_load_wiring), so the harness never

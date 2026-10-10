@@ -31,9 +31,12 @@
  *    the graphs and re-captures).
  *  - no hist buffer: the provider owns the history the engine keeps in
  *    st->hist (its prepare gets the block's tokens directly).
- *  - no dev_sample / spec_q: the argmax tail records one argmax per row and
- *    the wait picks next[i] = slot[4i] (core_v41_sample.c:24-37's argmax arm);
- *    sampling is its own unit.
+ *  - the tail follows st->dev_sample (unit H): sampling launches the device
+ *    sample kernel over the n rows (per-request params baked into the graph;
+ *    spec_q feeds the rejection sampling for n > 1) and the wait assembles
+ *    the rows with v41_sample_pick; the greedy arm keeps one argmax per row
+ *    and picks next[i] = slot[4i].  The state is per request, so dev_sample
+ *    and spec_q are constants for the life of its graphs.
  *  - the --idx-mma indexer scratch prepare (core_decode_graph.c:179) has no
  *    counterpart (the indexer mma is not ported).
  *  - DS41_NO_GRAPH=1 disables the graph (the engine's
@@ -234,10 +237,14 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
               ds4_gpu_tensor_write_zerocopy(st->pos, 0, g->posv, (uint64_t)n * sizeof(int32_t)) &&
               ds4_gpu_tensor_write_zerocopy(st->pre_mix, 0, g->onehot, (uint64_t)n * DS4_N_HC * sizeof(float));
     if (ok) ok = v41_forward_body(e, st);
-    /* Tail: one argmax per row (each writes its own 16-byte slot's first
-     * int), then ONE zero-copy readback of the whole block.  The engine
-     * samples instead when dev_sample is set; sampling is not ported. */
-    for (uint32_t i = 0; ok && i < n; i++) ok = ds4_gpu_v41_argmax_tensor(g->amv[i], st->logits, i, DS4_N_VOCAB) != 0;
+    /* Tail: sampling on => ONE sample-kernel launch over the n rows (full
+     * samples / accept flags / residual samples, 16 bytes each; the params are
+     * per-request constants baked into the graph); otherwise one argmax per
+     * row (each writes its own 16-byte slot's first int).  Either way, ONE
+     * zero-copy readback of the whole block (core_decode_graph.c:186-192). */
+    if (ok && st->dev_sample) ok = ds4_gpu_v41_sample_tensor(g->am, st->logits, 0u, n, DS4_N_VOCAB, st->pos, st->tok, &st->samp,
+                                                             n > 1u ? st->spec_q : NULL) != 0;
+    else for (uint32_t i = 0; ok && i < n; i++) ok = ds4_gpu_v41_argmax_tensor(g->amv[i], st->logits, i, DS4_N_VOCAB) != 0;
     if (ok) ok = ds4_gpu_tensor_read_zerocopy(g->next, g->am, 0, (uint64_t)n * 16u) != 0;
     st->graph = 0;
     void *exec = ds4_gpu_decode_graph_capture_end();   /* end the capture on every path or the stream stays in capture mode */
@@ -255,7 +262,7 @@ static bool dg_capture(ds4_engine *e, ds4_v41_state *st, uint32_t n) {
 static bool dg_direct_step(ds4_engine *e, ds4_v41_state *st, int32_t tok, int32_t *next_tok) {
     decode_graph *g = (decode_graph *)st->dgraph;
     if (!v41_forward(e, st, &tok, 1u)) return false;
-    return v41_device_next(st, g->am, 0u, 1u, next_tok);
+    return v41_device_next(st, g->am, 0u, 1u, NULL, next_tok);
 }
 
 /* A scratch pointer moved: every graph baked the old ones (core_decode_graph.c:210-215). */
@@ -365,9 +372,10 @@ static bool dg_wait(ds4_engine *e, ds4_v41_state *st, int32_t *next) {
     if (g->cur_pure) { g->t_sync += t3 - g->t_launched; g->t_last_sync = t3; }
     else g->t_last_sync = 0.0;   /* after a batch/k0 step the next pure step's gap is not counted */
     __sync_synchronize();
-    /* Per-row pick, the argmax arm of core_v41_sample.c:24-37: each slot's
-     * first int is that row's argmax (the sampling arm is not ported). */
-    for (uint32_t i = 0; i < n; i++) next[i] = g->next[4u * i];
+    /* Per-row pick (core_decode_graph.c:300): sampling assembles "accepted =>
+     * the draft / rejected => the residual" from the four ints per row, argmax
+     * takes each slot's first int (core_v41_sample.c:17-22). */
+    v41_sample_pick(g->next, g->tokv, n, st->dev_sample, next);
     dg_advance(st, n);
     if (n != 1u) g->bsteps++; else if (g->cur_pure) g->steps++; else g->k0steps++;
     return true;

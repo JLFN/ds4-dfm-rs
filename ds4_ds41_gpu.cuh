@@ -27,6 +27,15 @@ int g_ds4_v41_prof = 0;
 int g_ds4_v41_emit_trace = 0;   /* the engine's --emit-trace: the per-round [dspark] lines (without the draft/main id sections) */
 int g_ds4_v41_vq_group = 1;
 
+/* The sampling face the device kernel consumes (the engine's ds4_gpu_v41.h:328).
+ * ds4_cuda.cu intentionally does not include ds4_gpu.h; keep this mirror in
+ * lockstep with the public declaration there.  `stream` separates the RNG
+ * streams: 0 = the verify / pure-decode pick, 1 = the draft tower's own draw
+ * (core_v41_api.c:222). */
+typedef struct {
+    float temperature, top_p, min_p; int top_k; uint64_t seed; uint32_t stream;
+} ds4_gpu_sample_params;
+
 #include "cuda/ds41_primitives.cuh"
 #include "cuda/ds41_vq_row.cuh"
 #include "cuda/ds41_vq_probe.cuh"
@@ -48,6 +57,7 @@ int g_ds4_v41_vq_group = 1;
 #include "cuda/ds41_router.cuh"   /* P4-4: the router (sqrtsoftplus + bias topk) and SwiGLU */
 #include "cuda/ds41_draft.cuh"    /* P5/E1: the DSpark draft towers (dense MoE, mainh ring, markov rows/cache) */
 #include "cuda/ds41_graph.cuh"    /* E3: the decode-step CUDA graph primitives (capture/launch/free, PDL edges) */
+#include "cuda/ds41_sample.cuh"   /* unit H: the device sampling kernel (Gumbel-max + speculative rejection), the engine's cuda_v41_sample.inc.cu */
 
 /* Raw decode entry for tests and the P4-2 forward wiring: all pointers are
  * device pointers; `nc` and `ver` come from the blob header (ds4vq_blob_nexp /

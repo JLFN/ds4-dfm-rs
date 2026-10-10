@@ -5409,6 +5409,23 @@ int ds4_gpu_v41_set_gr_override(uint32_t layer, const float *host, uint32_t n_ex
  * index. */
 int ds4_gpu_v41_argmax_tensor(ds4_gpu_tensor *idx, const ds4_gpu_tensor *logits, uint32_t row, uint32_t n_vocab);
 
+/* The decode-sampling face the device kernel consumes (the engine's
+ * ds4_gpu_v41.h:328).  `stream` separates the RNG streams: 0 = the verify /
+ * pure-decode pick, 1 = the draft tower's own draw (core_v41_api.c:222). */
+typedef struct {
+    float temperature, top_p, min_p; int top_k; uint64_t seed; uint32_t stream;
+} ds4_gpu_sample_params;
+
+/* Device sampling kernel for the generate loop (cuda/ds41_sample.cuh, the
+ * engine's src/cuda/cuda_v41_sample.inc.cu): one block per row, Gumbel-max
+ * over the temperature/top_k/top_p/min_p kept set, each row's 16-byte slot
+ * gets [full sample, accept flag, residual sample, kept-set size]; with
+ * qlogits (the draft tower's rows) the accept/reject pair is the speculative
+ * rejection sampling.  Row i's draft is tok[i+1]; the last row has none.
+ * Returns 1 on success (launch only, no sync). */
+int ds4_gpu_v41_sample_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *logits, uint32_t row0, uint32_t n_rows, uint32_t n_vocab,
+                              const ds4_gpu_tensor *pos, const ds4_gpu_tensor *tok, const ds4_gpu_sample_params *sp, const ds4_gpu_tensor *qlogits);
+
 /* ---- DSpark draft towers (cuda/ds41_draft.cuh, src/cuda/cuda_v41_draft.inc.cu) ---- */
 
 /* The dense per-expert fp4x32 MoE (engine :101-141): out = sum_k rw_k *

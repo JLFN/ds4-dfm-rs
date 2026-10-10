@@ -107,6 +107,33 @@ void ds4_engine_v41_set_graph(int on);
 void ds4_engine_v41_set_emit_trace(int on);
 void ds4_engine_v41_set_prof(int on);
 
+/* ---- the decode-sampling face (unit H) -------------------------------------
+ * The engine's ds4_engine_set_decode_sampling (core_v41_api.c:10-13, the
+ * struct at ds4_v41_api.h:69-75; semantics documented there and in
+ * src/core/core_v41_sample.c).  All-zero = bare argmax, the device argmax
+ * tail, byte-for-byte the old path (the greedy gate).  temperature > 0 with
+ * no penalties = the device sampling kernel, speculation runs (the kernel
+ * does the rejection sampling).  Any non-zero penalty (dry_multiplier /
+ * freq_penalty / presence_penalty) = read the logits row back and sample on
+ * the host with the V4 sampler (ds4_sample_logits), where temperature 0 also
+ * yields argmax; penalties look at the token history, so speculation does not
+ * take them: an explicit --dspark is refused by name, a default-on dspark
+ * turns this request into pure decode with a printed line (silently changing
+ * the route would leave the user thinking speculation was on).  seed 0 =
+ * clock (time ^ pid << 32 ^ clock, the V4 CLI's rule, core_v41_api.c:163-164).
+ * NULL resets to the all-zero face (bare argmax). */
+typedef struct {
+    float temperature, top_p, min_p; int top_k; uint64_t seed;
+    float freq_penalty, presence_penalty;
+    float dry_multiplier, dry_base; int dry_allowed_length;
+} ds4_decode_sampling;
+void ds4_engine_set_decode_sampling(const ds4_decode_sampling *sp);
+
+/* The penalty route's generated-token history (the engine's v41_hist,
+ * core_v41.h:253): tok[0..n) are the generated ids (prompt excluded), cap the
+ * allocation, brk the DRY breaker table (NULL when DRY is off). */
+typedef struct { int32_t *tok; uint32_t n, cap; const uint8_t *brk; } v41_hist;
+
 /* The last run's speculation account (core_v41_api.c:41-46): the generate
  * entry clears the three counters and the spec summary writes them, so the
  * server can report the round/accept rates after the call returns. */
