@@ -4,13 +4,17 @@
 # the CLI's on the same prompt text — the HTTP plumbing must not change what
 # the engine produces.  Plus the boot refusals (fast, before the model load).
 #
+#   cli-ref     the CLI's [emit] ids for the prompt text, captured FIRST:
+#               the single-instance guard admits one model-loading process
+#               at a time, so the CLI cannot run while the server holds the
+#               lock (and two concurrent 105 GiB loads are forbidden anyway).
+#               --dump-tokens prints the prompt ids the CLI then generates
+#               from, so both sides run the identical prompt tokens.
 #   boot        /v1/models answers and the log carries the V4.1 route line
 #   completion  POST /v1/completions (non-stream): 200, nonempty text, a
-#               finish_reason, and the log's [emit] ids equal the CLI's on
-#               the same prompt (the CLI takes the ids --dump-tokens prints,
-#               so both sides run the identical prompt tokens; the requests
-#               are serialized, so the log's [emit] block at this point is
-#               exactly this request's)
+#               finish_reason, and the log's [emit] ids equal the CLI's
+#               (the requests are serialized, so the log's [emit] block at
+#               this point is exactly this request's)
 #   stream      POST /v1/completions (stream): SSE data deltas + [DONE]
 #   refusals    --ctx on a V4.1 model and --zchain are refused by name
 #
@@ -21,6 +25,18 @@ SRV="$1" CLI="$2" MODEL="$3" ENGRAM="$4" PORT="$5" PROMPT="$6" N="${7:-16}"
 LOG=/tmp/ds41_http_gate
 
 fail() { echo "ds41 http gate: FAIL ($1)"; exit 1; }
+
+# ---- CLI reference (before the server: one model-loading process at a time) ----
+"$CLI" -m "$MODEL" --dump-tokens -p "$PROMPT" > "$LOG.tokens.txt" 2>&1 \
+  || fail "CLI --dump-tokens failed (see $LOG.tokens.txt)"
+IDS=$(head -1 "$LOG.tokens.txt" | tr -d '[],')
+[ -n "$IDS" ] || fail "CLI --dump-tokens printed no id line"
+"$CLI" -m "$MODEL" --engram-dir "$ENGRAM" --gen-ids /dev/stdin -n "$N" --temp 0 --no-dspark --emit-trace <<EOF > "$LOG.cli.log" 2>&1
+$IDS
+EOF
+[ $? -eq 0 ] || fail "CLI generate failed (see $LOG.cli.log)"
+grep -o '\[emit\] [0-9]* [0-9]*' "$LOG.cli.log" | sed 's/\[emit\] //' > "$LOG.cli.emit"
+[ -s "$LOG.cli.emit" ] || fail "CLI run printed no [emit] lines"
 
 # ---- boot (the model load takes ~2.5 min; poll the listener line) ----
 "$SRV" -m "$MODEL" --port "$PORT" --engram-dir "$ENGRAM" --emit-trace --no-dspark > "$LOG.server.log" 2>&1 &
@@ -51,16 +67,6 @@ grep -q '"finish_reason"' "$LOG.completion.json" || fail "completion: no finish_
 grep -q '"text":""' "$LOG.completion.json" && fail "completion: empty text (see $LOG.completion.json)"
 
 # ---- parity: the server's [emit] ids == the CLI's on the same prompt text ----
-"$CLI" -m "$MODEL" --dump-tokens -p "$PROMPT" > "$LOG.tokens.txt" 2>&1 \
-  || fail "CLI --dump-tokens failed (see $LOG.tokens.txt)"
-IDS=$(head -1 "$LOG.tokens.txt" | tr -d '[],')
-[ -n "$IDS" ] || fail "CLI --dump-tokens printed no id line"
-"$CLI" -m "$MODEL" --engram-dir "$ENGRAM" --gen-ids /dev/stdin -n "$N" --temp 0 --no-dspark --emit-trace <<EOF > "$LOG.cli.log" 2>&1
-$IDS
-EOF
-[ $? -eq 0 ] || fail "CLI generate failed (see $LOG.cli.log)"
-grep -o '\[emit\] [0-9]* [0-9]*' "$LOG.cli.log" | sed 's/\[emit\] //' > "$LOG.cli.emit"
-[ -s "$LOG.cli.emit" ] || fail "CLI run printed no [emit] lines"
 grep -o '\[emit\] [0-9]* [0-9]*' "$LOG.server.log" | sed 's/\[emit\] //' > "$LOG.srv.emit"
 [ -s "$LOG.srv.emit" ] || fail "server run printed no [emit] lines (--emit-trace wired?)"
 diff "$LOG.cli.emit" "$LOG.srv.emit" > "$LOG.emit.diff" 2>&1 \
@@ -88,4 +94,4 @@ rc=$?
 [ "$rc" -ne 0 ] || fail "negative control (--zchain) PASSED (blind gate)"
 grep -q -- "--zchain is not supported" "$LOG.zchain.log" || fail "--zchain: not refused by name"
 
-echo "ds41 http gate: PASS (boot + /v1/models, non-stream and stream completions, the served ids equal the CLI's on the same prompt, --ctx and --zchain refused by name)"
+echo "ds41 http gate: PASS (CLI reference, boot + /v1/models, non-stream and stream completions, the served ids equal the CLI's on the same prompt, --ctx and --zchain refused by name)"
