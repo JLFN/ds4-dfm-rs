@@ -92,11 +92,17 @@ jq -S '.choices[0].message | del(.tool_calls[]?.id)' "$LOG.srv.resp.json" > "$LO
 diff "$LOG.eng.msg.json" "$LOG.srv.msg.json" > "$LOG.msg.diff" 2>&1 \
   || fail "the port's response message differs from the engine's (see $LOG.msg.diff)"
 
-# Both must have parsed the DSML call into finish_reason tool_calls
-# (server_generate_v41.c:205); anything else means the call was truncated.
+# finish_reason must match, and the answer must not be cut by the token cap.
+# On this artifact at greedy the model emits the tool call in a mixed tag
+# style; the engine's parser picks one style from the open tag
+# (server_dsml_parse.c:338) and the mix matches none, so the engine returns
+# the call as assistant text with finish=stop -- the port must say the same,
+# not repair it.
 efin=$(sed -n 's/.*"finish_reason":"\([^"]*\)".*/\1/p' "$LOG.eng.resp.json")
 sfin=$(sed -n 's/.*"finish_reason":"\([^"]*\)".*/\1/p' "$LOG.srv.resp.json")
 [ "$efin" = "$sfin" ] || fail "finish_reason differs (engine=$efin port=$sfin)"
-[ "$efin" = "tool_calls" ] || fail "the response did not complete the tool call (finish=$efin)"
+if [ "$efin" = "length" ]; then
+    fail "the response hit the token cap (raise max_tokens in REQ)"
+fi
 
-echo "ds41 chat gate: PASS (prompt ids, generated ids and the completed tool-call message equal the engine's)"
+echo "ds41 chat gate: PASS (prompt ids, generated ids and the response message equal the engine's on the same chat+tools request)"
