@@ -4059,6 +4059,12 @@ impl DecodeIo for NativeDecode<'_> {
     }
 
     fn native_graph_fit(&self, ctx: i32) -> Option<NativeGraphFit> {
+        // The quote sizes a session graph; v41 has no session at all
+        // (server_main.c:65 creates one only for non-v41), so there is no
+        // graph to quote and the unquoted margin applies.
+        if self.is_v41() {
+            return None;
+        }
         let quote = self.model.session_graph_fit_quote(ctx)?;
         Some(NativeGraphFit {
             fits: quote.fits,
@@ -4071,6 +4077,12 @@ impl DecodeIo for NativeDecode<'_> {
     }
 
     fn serial_session_probe(&self) -> Option<SerialSessionProbe> {
+        // v41 has no serial session to probe or right-size
+        // (server_main.c:65); answer like an engine without a native
+        // session so ensure_serial_session_fit passes native.
+        if self.is_v41() {
+            return None;
+        }
         Some(match &self.session {
             Some(s) => SerialSessionProbe {
                 cur_ctx: s.ctx(),
