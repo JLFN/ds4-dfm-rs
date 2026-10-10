@@ -5331,6 +5331,13 @@ int ds4_gpu_v41_attn_scratch_prepare(uint32_t n_tok, uint32_t n_head, uint32_t h
 int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
         const ds4_gpu_tensor *posd);
 
+/* Spec verify: save (back=0) / restore (back=1) the window-ring cells a verify
+ * batch's commit overwrites (cuda/ds41_attn.cuh, engine cuda_kv_ring.inc.cu:34-68).
+ * snap is indexed by batch row; the rollback restores the [keep, n) interval. */
+int ds4_gpu_v41_win_ring_snap_tensor(ds4_gpu_tensor *win, ds4_gpu_tensor *snap, uint32_t pos0,
+        uint32_t i0, uint32_t n, uint32_t window, uint32_t head_dim, int back,
+        const ds4_gpu_tensor *posd);
+
 /* DeepSeek V4.1 indexer (P4-4): score / candidate blocks / topk
  * (cuda/ds41_indexer.cuh, src/cuda/cuda_v41_indexer.inc.cu).  The candidate
  * list is the C2 compact form: [0] = selected block count, then ascending

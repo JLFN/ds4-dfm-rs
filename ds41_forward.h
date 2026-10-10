@@ -38,6 +38,18 @@ typedef struct {
      * index, not from a counter incremented on a different event; the decode
      * caller refills slot 0 per step and updates pos0 with it. */
     uint32_t pos0;
+    /* Optional block provider (required for spec decode): the forward calls it
+     * with the EXACT block it is about to run — `tokens[0..n-1]` are the
+     * block's token ids at positions pos0..pos0+n-1 — and the provider fills
+     * raw[.][0..n-1] with the rows for those positions (the n-gram window
+     * reads earlier tokens from the provider's own history) and sets pos0
+     * (still asserted at the point of use).  The engine hashes from st->hist,
+     * which it memcpys a full block at a time up front (core_v41_forward.c:377)
+     * — including draft tokens later rejected, whose slots the next block's
+     * write overwrites before any read.  A provider that pre-fills one block
+     * (the score harness) may pass NULL and set pos0 itself. */
+    int (*prepare)(uint32_t pos0, const int *tokens, int n, void *ud);
+    void *ud;
 } ds41_engram_feed;
 
 /* Teacher-forced scoring of `ids` through an opened V4.1 engine.  Writes the
@@ -49,18 +61,28 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
                       int no_engram, int chunk, const ds41_engram_feed *feed);
 
 /* Greedy generate (the engine's ds4_engine_v41_generate_argmax,
- * core_v41_api.c:426-470 + the round drive): prompt prefill in chunks, then
- * n=1 decode steps with device argmax.  emit is called per produced token in
- * order (nonzero return stops, the CLI's EOS convention); the entry itself
- * also stops at EOS and at the context edge.  Greedy only — sampling, the
- * penalties, the DSpark spec round and the decode graph are their own units.
- * no_engram mirrors the engine's --v41-no-engram; the engine's generate path
- * has no such switch, so the gate runs with the engram live and the caller
- * refreshes `feed` per step (its emit hook owns the hash + pread) and sets
- * feed->pos0 to the step's position — the entry asserts it against the state
- * at the point of use and refuses a drifted feed. */
+ * core_v41_api.c:426-470 + the round drive :175-425): prompt prefill in
+ * chunks, then n=1 decode steps with device argmax.  emit is called per
+ * produced token in order (nonzero return stops, the CLI's EOS convention);
+ * the entry itself also stops at EOS and at the context edge.  Greedy only —
+ * sampling and the penalties are their own unit.  When the GGUF carries the
+ * draft towers and parameters the entry speculates by default: each round
+ * drafts a block, verifies 1+k positions in one batch, accepts the longest
+ * matching prefix and rolls the rest back (temperature-0 output is
+ * byte-identical with drafting on and off).  verify_k pins the round's k
+ * (the engine's --dspark-verify; the deterministic trace gate uses it),
+ * 0 = the confidence scheduler.  no_engram mirrors the engine's
+ * --v41-no-engram; the engine's generate path has no such switch, so the gate
+ * runs with the engram live — the feed's prepare callback is called with each
+ * block the forward runs (see ds41_engram_feed), or the caller pre-fills slot
+ * 0 per step and sets pos0 (the E0-hardened protocol). */
 int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
-                            const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud);
+                            int verify_k, const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud);
+
+/* --v41-prof (defined in the CUDA TU, ds4_ds41_gpu.cuh): per-layer ms and the
+ * per-round `[dspark]` trace lines (the engine's core_v41_api.c:346-357).  The
+ * C harness sets it for the spec trace gate; the Rust host will own the flag. */
+extern int g_ds4_v41_prof;
 
 /* Engram table metadata for the feed builder: the engine's C loader filled it
  * from the GGUF, so a caller that hashes + preads rows itself (the Rust host,

@@ -338,3 +338,30 @@ extern "C" int ds4_gpu_v41_win_commit_tensor(ds4_gpu_tensor *win, uint32_t pos0,
     v41_win_commit_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)win->ptr, pos0, i0, window, head_dim, NULL);
     return cuda_ok(cudaGetLastError(), "v41 win commit");
 }
+
+/* Spec decode: save/restore the ring cells a verify batch's commit will
+ * overwrite (cuda_kv_ring.inc.cu:34-68).  save (back=0) copies ring cell
+ * (pos0+i)%window into snap[i] (indexed by batch row, so the rollback can take
+ * the [keep, n) interval); back=1 writes them back.  The block rows of a
+ * verify batch sit in the window buffer's block region until commit, so only
+ * the cells about to be overwritten need saving: 40 layers x n(<=6) rows x
+ * 512 x 4 B ~ 0.5 MB, against 10.5 MB for the whole 128-row window. */
+__global__ static void v41_win_ring_snap_kernel(float *win, float *snap, uint32_t pos0, uint32_t i0,
+                                                uint32_t window, uint32_t hd, uint32_t back, const int32_t *posd) {
+    const uint32_t j = blockIdx.x, i = i0 + j;
+    if (posd) pos0 = (uint32_t)posd[0];
+    float *ring = win + (uint64_t)((pos0 + i) % window) * hd;
+    float *sp = snap + (uint64_t)i * hd;
+    if (back) { for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) ring[d] = sp[d]; }
+    else      { for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) sp[d] = ring[d]; }
+}
+extern "C" int ds4_gpu_v41_win_ring_snap_tensor(ds4_gpu_tensor *win, ds4_gpu_tensor *snap, uint32_t pos0,
+                                                uint32_t i0, uint32_t n, uint32_t window, uint32_t head_dim, int back,
+                                                const ds4_gpu_tensor *posd) {
+    if (!win || !snap || !window || n <= i0) return 1;   /* no rows to touch = success */
+    if (snap->bytes < (uint64_t)n * head_dim * 4) return 0;
+    if (posd) { fprintf(stderr, "ds4: [ds41] win ring snap: the graph path (device position) is not ported yet\n"); return 0; }
+    v41_win_ring_snap_kernel<<<n - i0, 256, 0, ds4_current_stream()>>>((float *)win->ptr, (float *)snap->ptr,
+                                                                       pos0, i0, window, head_dim, back ? 1u : 0u, NULL);
+    return cuda_ok(cudaGetLastError(), back ? "v41 win ring restore" : "v41 win ring save");
+}

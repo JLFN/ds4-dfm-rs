@@ -30,16 +30,24 @@
  * token index, declares it in feed->pos0 and the PORT asserts it against the
  * state at the point of use (ds4_ds41_forward.inc) — the E0 class (a drifted
  * counter feeding shifted rows, invisible to every device instrument) now
- * refuses loudly.  Two deliberate corruptions keep the gate falsifiable:
+ * refuses loudly.  With spec decode the per-emit refresh cannot work (a
+ * verify batch's rows must exist before the batch, and only the forward knows
+ * its tokens), so the harness implements ds41_engram_feed.prepare: the port
+ * hands over every block it is about to run and the provider hashes its rows
+ * (the engine's full-block hist memcpy, core_v41_forward.c:377).  The final
+ * history is checked against the golden sequence — a maintenance bug there is
+ * exactly the E0 class.  Two deliberate corruptions keep the gate falsifiable:
  *   DS41_EMIT_OFFSET=n  shifts the declared position itself (the E0 shape):
- *                       the row reference must MISMATCH and the port must
- *                       refuse the step;
+ *                       the port must refuse the block;
  *   DS41_ROW_SHIFT=n    keeps the declaration right but hashes rows for the
  *                       wrong position: the row reference must MISMATCH while
  *                       the port's assertion stays quiet (the two defenses are
  *                       independent).
+ * The spec mode (DS41_VERIFY_K=<k>, the engine's --dspark-verify) compares the
+ * per-round [dspark] lines against the engine's capture (g_ds4_v41_prof turns
+ * them on); DS41_NO_DSPARK disables speculation (the engine's --no-dspark).
  * The runner (tests/ds41_generate_gate.sh, make test-ds41-generate) requires
- * the positive run to PASS with full coverage and both controls to FAIL.
+ * the positive runs to PASS with full coverage and both controls to FAIL.
  *
  * The engine's generate path has NO no-engram switch (only the score path
  * takes --v41-no-engram), so the gate runs with the engram layers live: the
@@ -116,13 +124,16 @@ struct engram_layer {
     uint32_t il, cols, hd, stride;
     uint64_t nrows, woff, soff;
     int fd;
-    void *raw;      /* pinned [np][cols][stride]; row 0 is refreshed per step */
+    void *raw;      /* pinned [np][cols][stride]; slots 0..n-1 hold the current block's rows */
     /* --rows-ref: the engine's own rows for every position of the reference
      * sequence (the score dump's erows file), compared against every row set
-     * this harness hashes; ref_first_bad = -1 until the first mismatch. */
+     * this harness hashes; ref_first_bad = -1 until the first mismatch.
+     * ref_skip counts positions the comparison had to skip (the port's token
+     * there left the golden sequence — a rejected draft is EXPECTED to, so a
+     * skip is not a failure; the ids comparison is the failure signal). */
     std::vector<int64_t> ref;
     uint64_t ref_lines;
-    uint64_t ref_prompt, ref_emit;      /* positions checked */
+    uint64_t ref_prompt, ref_emit, ref_skip;   /* positions checked / skipped */
     uint64_t ref_bad;
     int64_t ref_first_bad;
     uint32_t ref_first_col;
@@ -130,17 +141,19 @@ struct engram_layer {
 
 struct gen_feed {
     ds41_engram_hash_ref ref;
-    ds41_engram_feed *feed;         /* pos0 is updated per emit (the port asserts it) */
-    std::vector<int> *gids;         /* the golden ids: the live divergence stop */
+    ds41_engram_feed *feed;         /* pos0 declared per block by feed_prepare (the port asserts it) */
+    std::vector<int> *gids;         /* the golden ids */
     std::vector<int32_t> token_map;
     std::vector<int64_t> mult, prim, offs;
     std::vector<int32_t> hist;      /* absolute position -> token id */
+    std::vector<int32_t> gold_hist; /* prompt + golden ids: the reference history */
     std::vector<engram_layer> layers;
     uint32_t np;
     uint32_t emitted;
     uint32_t emit_offset;           /* DS41_EMIT_OFFSET: shifts the declared position (the E0 shape) */
     int row_shift;                  /* DS41_ROW_SHIFT: hashes the wrong position, declares the right one */
-    int ref_valid;                  /* 0 once the port's token left the golden history */
+    uint64_t hist_bad;              /* final history vs golden mismatches */
+    int64_t hist_first_bad;
     int32_t eos;
     std::vector<int> *ids;          /* emitted ids for the comparison */
 };
@@ -247,45 +260,66 @@ static FILE *feed_digest_file(void) {
     return f;
 }
 
-/* The emit hook: record the token, then refresh every engram layer's row 0
- * with the rows for this token's position — the forward's next step (n=1)
- * reads exactly that slot, and the port asserts the declared pos0 against its
- * own state position (ds4_ds41_forward.inc).  The position is derived from
- * this harness's token index (np + emitted); DS41_EMIT_OFFSET shifts the
- * declaration itself (the E0 shape), DS41_ROW_SHIFT hashes the wrong position
- * under a right declaration. */
-static int emit_feed(int token, void *ud) {
+/* The block provider (ds41_engram_feed.prepare): the forward hands over the
+ * EXACT block it is about to run — for a spec verify batch that is [round
+ * token, draft ids...], which only the forward knows.  The provider writes the
+ * block's tokens into the history (the engine's full-block hist memcpy,
+ * core_v41_forward.c:377: rejected draft tails are overwritten by the next
+ * block's write before any read), hashes every slot's rows and declares the
+ * position (the port asserts it at the point of use).  DS41_EMIT_OFFSET shifts
+ * the declared position itself (the E0 shape); DS41_ROW_SHIFT hashes the wrong
+ * position under a right declaration. */
+static int feed_prepare(uint32_t pos0, const int *tokens, int n, void *ud) {
     gen_feed *g = (gen_feed *)ud;
-    const uint32_t i = g->emitted;
-    const int64_t declared = (int64_t)g->np + (int64_t)i + (int64_t)g->emit_offset;
-    const int64_t hash_pos = declared + g->row_shift;
-    if (declared < 0 || (size_t)declared >= g->hist.size() ||
-        hash_pos < 0 || (size_t)hash_pos >= g->hist.size()) {
-        fprintf(stderr, "harness: emit position %lld (hash %lld) outside the history window (%zu)\n",
-                (long long)declared, (long long)hash_pos, g->hist.size());
+    const int64_t declared = (int64_t)pos0 + (int64_t)g->emit_offset;
+    if (n <= 0 || declared < 0 || (size_t)(declared + n) > g->hist.size() ||
+        (size_t)(declared + n + g->row_shift) > g->hist.size()) {
+        fprintf(stderr, "harness: prepare block %u+%d (declared %lld) outside the history window (%zu)\n",
+                pos0, n, (long long)declared, g->hist.size());
         return 1;
     }
-    /* Once the port's token leaves the golden sequence the reference rows are
-     * for a different history: stop comparing (and say so). */
-    if (g->ref_valid && g->gids && i < g->gids->size() && token != (*g->gids)[i]) {
-        g->ref_valid = 0;
-        fprintf(stderr, "harness: row reference check stopped at the first id divergence (emitted index %u: port %d != golden %d)\n",
-                i, token, (*g->gids)[i]);
-    }
-    g->hist[(size_t)declared] = token;
-    if (!g->layers.empty() && !feed_fill(g, 0, declared, hash_pos, g->ref_valid)) {
-        fprintf(stderr, "harness: feed refresh failed at pos %lld\n", (long long)declared);
-        return 1;
+    for (int i = 0; i < n; i++) g->hist[(size_t)declared + (size_t)i] = tokens[i];
+    /* The reference comparison is valid only where the history still equals
+     * the golden sequence (a rejected draft is EXPECTED to differ, so a
+     * mismatch skips, never fails; the ids comparison is the failure signal).
+     * The in-block prefix decides per slot; the whole history's consistency is
+     * re-checked at the end of the run. */
+    for (int i = 0; i < n; i++) {
+        const int64_t p = declared + (int64_t)i;
+        int comparable = 0;
+        if (!g->layers.empty() && !g->layers[0].ref.empty()) {
+            comparable = 1;
+            for (int j = 0; j <= i && comparable; j++) {
+                const int64_t q = declared + (int64_t)j;
+                comparable = q >= 0 && (size_t)q < g->gold_hist.size() && tokens[j] == g->gold_hist[(size_t)q];
+            }
+            if (!comparable) {
+                for (uint32_t k = 0; k < g->layers.size(); k++) g->layers[k].ref_skip++;
+            }
+        }
+        if (!feed_fill(g, (uint32_t)i, p, p + g->row_shift, comparable)) {
+            fprintf(stderr, "harness: feed fill failed at pos %lld\n", (long long)p);
+            return 1;
+        }
     }
     if (g->feed) { g->feed->pos0 = (uint32_t)declared; }   /* the port asserts this at the point of use */
     FILE *df = feed_digest_file();
     if (df) {
         for (uint32_t k = 0; k < g->layers.size(); k++) {
             const engram_layer &L = g->layers[k];
-            fprintf(df, "host pos %lld k %u fnv %016llx\n", (long long)declared, k, (unsigned long long)fnv1a(L.raw, (size_t)L.cols * L.stride));
+            fprintf(df, "host pos0 %lld n %d k %u fnv %016llx\n", (long long)declared, n, k,
+                    (unsigned long long)fnv1a(L.raw, (size_t)n * L.cols * L.stride));
         }
         fflush(df);
     }
+    return 0;
+}
+
+/* The emit hook: record the token (the ids are the gate's primary
+ * instrument).  The feed itself is the block provider's job now — the verify
+ * batch's rows must exist before the batch runs, which only prepare can do. */
+static int emit_feed(int token, void *ud) {
+    gen_feed *g = (gen_feed *)ud;
     g->ids->push_back(token);
     g->emitted++;
     return 0;
@@ -299,11 +333,24 @@ static void print_ref_summary(const gen_feed *g) {
         const engram_layer &L = g->layers[k];
         if (L.ref.empty()) { continue; }
         any = 1;
-        printf("row reference L%02u: prompt %llu/%u, emitted %llu/%zu checked, %llu mismatches\n",
+        printf("row reference L%02u: prompt %llu/%u, emitted %llu checked, %llu skipped (draft/golden), %llu mismatches\n",
                L.il, (unsigned long long)L.ref_prompt, g->np, (unsigned long long)L.ref_emit,
-               g->gids ? g->gids->size() : 0, (unsigned long long)L.ref_bad);
+               (unsigned long long)L.ref_skip, (unsigned long long)L.ref_bad);
     }
     if (!any) { printf("row reference: none (the emitted positions' rows are ungated)\n"); }
+    printf("harness history vs golden: %llu mismatches (first at %s)\n",
+           (unsigned long long)g->hist_bad, g->hist_first_bad < 0 ? "none" : std::to_string((long)g->hist_first_bad).c_str());
+}
+
+/* The history's final state must equal the accepted (golden) sequence: the
+ * rows are hashed from this history, so a maintenance bug here is exactly the
+ * E0 class — invisible to every device instrument. */
+static void hist_vs_golden(gen_feed *g, size_t emitted) {
+    for (size_t i = 0; i < (size_t)g->np + emitted && i < g->gold_hist.size(); i++) {
+        if (g->hist[i] == g->gold_hist[i]) { continue; }
+        g->hist_bad++;
+        if (g->hist_first_bad < 0) { g->hist_first_bad = (int64_t)i; }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -363,7 +410,8 @@ int main(int argc, char **argv) {
     g.gids = NULL;
     g.emit_offset = 0;
     g.row_shift = 0;
-    g.ref_valid = 1;
+    g.hist_bad = 0;
+    g.hist_first_bad = -1;
     if (const char *eo = getenv("DS41_EMIT_OFFSET")) {
         g.emit_offset = (uint32_t)atoi(eo);
         printf("emit offset: %u (deliberate)\n", g.emit_offset);
@@ -376,8 +424,15 @@ int main(int argc, char **argv) {
     if (!no_engram && n_eng > 0) {
         if (!engram_dir) { fprintf(stderr, "harness: the model has engram layers; pass --engram-dir <dir> (or --no-engram for the port-only debug mode)\n"); return 2; }
         if (!ds4_v41_engram_hash_ref(e, &g.ref) || !hash_tables(&g)) { fprintf(stderr, "harness: engram hash tables unavailable\n"); return 1; }
-        g.hist.assign((size_t)g.np + (size_t)n_predict + 8u + g.emit_offset + (g.row_shift > 0 ? (size_t)g.row_shift : 0u), 0);
+        /* The history window must hold a verify batch past n_predict (block+1
+         * rows; DS4_MTP_MAX_BLOCK = 8, ds4_ds41_forward.inc:36). */
+        g.hist.assign((size_t)g.np + (size_t)n_predict + 16u + g.emit_offset + (g.row_shift > 0 ? (size_t)g.row_shift : 0u), 0);
         for (uint32_t i = 0; i < g.np; i++) g.hist[i] = prompt[i];
+        /* The reference history: prompt + the golden ids, -1 where the golden
+         * sequence does not reach (those positions skip the row comparison). */
+        g.gold_hist.assign(g.hist.size(), -1);
+        for (uint32_t i = 0; i < g.np; i++) g.gold_hist[i] = prompt[i];
+        for (size_t i = 0; i < gids.size(); i++) g.gold_hist[(size_t)g.np + i] = gids[i];
         for (int k = 0; k < n_eng; k++) {
             engram_layer L;
             char tpath[4096];
@@ -424,20 +479,10 @@ int main(int argc, char **argv) {
                        L.ref_lines < need ? "  -- SHORT: the tail is NOT covered" : "");
             }
         }
-        for (uint32_t i = 0; i < g.np; i++) if (!feed_fill(&g, i, (int64_t)i, (int64_t)i, g.ref_valid)) { fprintf(stderr, "harness: prompt feed fill failed at %u\n", i); return 1; }
-        printf("engram feed: %zu layers, cols %u, head_dim %u, %u prompt rows hashed\n",
+        /* No initial prompt fill: the prefill block's prepare does it (and
+         * every later block), so the multi-chunk case is correct too. */
+        printf("engram feed: %zu layers, cols %u, head_dim %u, %u prompt positions\n",
                g.layers.size(), g.layers.empty() ? 0 : g.layers[0].cols, g.layers.empty() ? 0 : g.layers[0].hd, g.np);
-        {   /* host-side digest of the prompt region the prefill will upload (dev pos0 0 n np) */
-            FILE *df = feed_digest_file();
-            if (df) {
-                for (uint32_t k = 0; k < g.layers.size(); k++) {
-                    const engram_layer &L = g.layers[k];
-                    fprintf(df, "host prefill k %u n %u fnv %016llx\n", k, g.np,
-                            (unsigned long long)fnv1a(L.raw, (size_t)g.np * L.cols * L.stride));
-                }
-                fflush(df);
-            }
-        }
         /* Self-check: the engine's own captured rows for this prompt (the
          * golden erows next to the ids file, written by the score capture)
          * must equal what this harness's hash produces — the P2 instrument,
@@ -473,9 +518,11 @@ int main(int argc, char **argv) {
     g.ids = &oids;
     ds41_engram_feed feed;
     memset(&feed, 0, sizeof feed);
-    feed.pos0 = 0;   /* the prompt block starts at 0 (the prefill asserts this) */
-    g.feed = &feed;  /* the hook declares the decode steps' positions; the port asserts them */
-    g.gids = &gids;  /* the golden sequence: the live divergence stop for the row reference */
+    feed.pos0 = 0;   /* the prefill's prepare declares it too; the port asserts at the point of use */
+    feed.prepare = feed_prepare;   /* every block: prefill chunks, decode steps, verify batches */
+    feed.ud = &g;
+    g.feed = &feed;
+    g.gids = &gids;  /* the golden sequence (the reference history's tail) */
     for (uint32_t k = 0; k < g.layers.size(); k++) feed.raw[k] = g.layers[k].raw;   /* k == the engram index (ds41_forward.h) */
     /* DS41_GEN_DELAY_MS=<n>: a bare delay before the generate call (the
      * timing-vs-content discriminator; no reads, no allocations). */
@@ -487,10 +534,20 @@ int main(int argc, char **argv) {
             printf("pre-generate delay: %d ms\n", ms);
         }
     }
+    /* Spec controls: DS41_VERIFY_K pins the round's k (the engine's
+     * --dspark-verify; the trace gate needs it because the scheduler's k
+     * follows measured wall-clock costs), DS41_NO_DSPARK disables speculation
+     * (the engine's --no-dspark).  g_ds4_v41_prof turns on the per-round
+     * [dspark] trace lines (the engine's --v41-prof/--emit-trace). */
+    int verify_k = 0;
+    if (const char *vk = getenv("DS41_VERIFY_K")) { verify_k = atoi(vk); printf("verify k pinned: %d (--dspark-verify)\n", verify_k); }
+    if (getenv("DS41_NO_DSPARK")) { printf("spec decode disabled (DS41_NO_DSPARK; the engine's --no-dspark)\n"); }
+    g_ds4_v41_prof = 1;
     const int rc = ds4_v41_generate_argmax(e, prompt.data(), (int)prompt.size(), n_predict,
-                                           no_engram || n_eng == 0 ? 1 : 0,
+                                           no_engram || n_eng == 0 ? 1 : 0, verify_k,
                                            g.layers.empty() ? NULL : &feed, emit_feed, &g);
     if (rc != 0) {
+        hist_vs_golden(&g, oids.size());
         print_ref_summary(&g);
         fprintf(stderr, "harness: generate entry failed\n");
         return 1;
@@ -516,19 +573,21 @@ int main(int argc, char **argv) {
     printf("\nport   ids:");
     for (size_t i = 0; i < oids.size(); i++) printf(" %d", oids[i]);
     printf("\n");
+    hist_vs_golden(&g, oids.size());
     print_ref_summary(&g);
-    /* The reference verdict: with --rows-ref, every layer must have checked
-     * the full prompt + every emitted position with zero mismatches — a check
-     * narrower than the claim is how the next wrong-index bug survives it. */
+    /* The verdict: ids match, positions contiguous, the row reference shows no
+     * mismatch over everything comparable (its prompt coverage must be full),
+     * and the final history equals the golden sequence.  A check narrower than
+     * the claim is how the next wrong-index bug survives it. */
     uint64_t ref_bad = 0;
     int ref_short = 0;
     for (uint32_t k = 0; k < g.layers.size(); k++) {
         const engram_layer &L = g.layers[k];
         if (L.ref.empty()) { continue; }
         ref_bad += L.ref_bad;
-        if (L.ref_prompt != g.np || L.ref_emit != oids.size()) { ref_short = 1; }
+        if (L.ref_prompt != g.np) { ref_short = 1; }   /* the prompt is always comparable */
     }
-    const bool pass = (diffs == 0) && (gids.size() == oids.size()) && !pos_bad && !ref_bad && !ref_short;
+    const bool pass = (diffs == 0) && (gids.size() == oids.size()) && !pos_bad && !ref_bad && !ref_short && !g.hist_bad;
     printf("DS41 generate gate: %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

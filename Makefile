@@ -992,24 +992,26 @@ test-ds41-forward: tests/test_ds41_forward
 	    $${ENGRAM_DIR:+--engram-dir "$(ENGRAM_DIR)"} $${ZCHAIN:+--zchain "$(ZCHAIN)"} $(NAMES); \
 	fi
 
-# DeepSeek V4.1 (ds41) greedy-generate gate (unit E, E0): the port's generate
-# entry against the engine's own --emit-trace capture, with the independent
-# row reference over the full prompt+emitted sequence (--rows-ref, the score
-# dump over those exact ids; the pin is NPRED=56 with the 8-token prompt so
-# every emitted position has a reference).  The runner also runs the two
-# required failing negative controls (see tests/ds41_generate_gate.sh).
+# DeepSeek V4.1 (ds41) greedy-generate gate (unit E): the port's generate
+# entry against the engine's own --emit-trace captures, in both modes
+# (non-spec and spec with the [dspark] trace diff), with the independent row
+# reference over the full prompt+emitted sequence (--rows-ref, the score dump
+# over those exact ids; the pin is NPRED=56 with the 8-token prompt so every
+# emitted position has a reference).  The runner also runs the two required
+# failing negative controls (see tests/ds41_generate_gate.sh).
 # Artifact- and Spark-only, so the runner takes the paths from the environment:
 #   make test-ds41-generate MODEL=<gguf> IDS=<ids file> ENGLOG=<engine log> \
-#        ENGRAM_DIR=<shard dir> ROWS_REF=<score dump prefix> [NPRED=56]
+#        ENGRAM_DIR=<shard dir> ROWS_REF=<score dump prefix> \
+#        [ENGLOG_SPEC=<engine --dspark-verify log>] [VK=5] [NPRED=56]
 tests/test_ds41_generate: tests/test_ds41_generate.cu ds4_gpu.h ds41_forward.h $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -o $@ tests/test_ds41_generate.cu $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
 
 .PHONY: test-ds41-generate
 test-ds41-generate: tests/test_ds41_generate
 	@if [ -z "$(MODEL)" ] || [ -z "$(IDS)" ] || [ -z "$(ENGLOG)" ] || [ -z "$(ENGRAM_DIR)" ] || [ -z "$(ROWS_REF)" ]; then \
-	  echo "usage: make test-ds41-generate MODEL=<gguf> IDS=<ids file> ENGLOG=<engine --emit-trace log> ENGRAM_DIR=<shard dir> ROWS_REF=<score dump prefix> [NPRED=56]"; \
+	  echo "usage: make test-ds41-generate MODEL=<gguf> IDS=<ids file> ENGLOG=<engine --emit-trace log> ENGRAM_DIR=<shard dir> ROWS_REF=<score dump prefix> [ENGLOG_SPEC=<engine --dspark-verify log>] [VK=5] [NPRED=56]"; \
 	else \
-	  sh tests/ds41_generate_gate.sh ./tests/test_ds41_generate "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$${NPRED:-56}" "$(ENGRAM_DIR)" "$(ROWS_REF)"; \
+	  sh tests/ds41_generate_gate.sh ./tests/test_ds41_generate "$(MODEL)" "$(IDS)" "$(ENGLOG)" "$${NPRED:-56}" "$(ENGRAM_DIR)" "$(ROWS_REF)" "$(ENGLOG_SPEC)" "$${VK:-5}"; \
 	fi
 
 # The Rust host (./ds4) is the default binary, and the one the server shares.

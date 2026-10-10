@@ -429,4 +429,299 @@ static bool v41_draft_step(ds4_engine *e, ds4_v41_state *main_st, ds4_v41_draft 
     return v41_draft_launch(e, main_st, dr, tok, pos_main) == 2;   /* no graph path: launch only returns 0 or 2 */
 }
 
+/* ---- the confidence scheduler (core_draft_sched.c:31-97) ----
+ * How many positions to verify each round: the drafter's own confidence says
+ * how likely position j survives, and the engine measures the costs per
+ * request (walked-graph step / one draft round / a verify of n rows) instead
+ * of baking constants — a kernel that gets faster leaves stale constants
+ * behind and the scheduler then blocks speculation entirely (the 2026-09-17
+ * conviction: zero draft rounds in 40 tokens after a new kernel landed).
+ *   round yield = 1 + sum_{j<=k} prod_{i<=j} rho*sigmoid(conf_i)
+ *   round cost  = draft + verify(1+k rows)
+ * pick k = argmax yield/cost; > 1 (vs one pure-decode step) means worth it.
+ * k only affects speed, never the output: temperature-0 spec == pure decode
+ * byte for byte (the d1 gate re-runs on every change).  rho (the acceptance
+ * calibration for sampling) is history-only, so it is reproducible at temp 0;
+ * the measured costs are not, which is why the trace gate pins k
+ * (--dspark-verify / verify_k). */
+typedef struct {
+    double pred1, real1;
+    double ms[DS4_MTP_MAX_BLOCK + 2u]; uint32_t cnt[DS4_MTP_MAX_BLOCK + 2u];
+    double draft_ms; uint32_t draft_n;
+} v41_sched;
+
+static float v41_sched_sigmoid(float c) { return isfinite(c) ? 1.0f / (1.0f + expf(-c)) : 0.0f; }   /* non-finite conf = no confidence */
+
+/* Sampling calibration (core_draft_sched.c:33-36): the conf head learned
+ * "does greedy pick the same token", which is systematically optimistic under
+ * sampling.  rho = first-position hits / sum of first sigmoids over this
+ * request's drafted rounds, multiplied into every position's sigma (capped
+ * at 1).  Observed every round, k=0 included, or a first-round rejection
+ * deadlocks rho at 0. */
+static void v41_sched_observe(v41_sched *s, const float *conf, int hit) {
+    if (!s) return;
+    s->pred1 += (double)v41_sched_sigmoid(conf[0]);
+    s->real1 += hit ? 1.0 : 0.0;
+}
+/* Cost samples: n_rows = 1 is a single-token step, >= 2 a verify of 1+k rows. */
+static void v41_sched_cost(v41_sched *s, uint32_t n_rows, double ms) {
+    if (!s || n_rows == 0u || n_rows > DS4_MTP_MAX_BLOCK + 1u || !(ms > 0.0)) return;
+    s->ms[n_rows] += ms; s->cnt[n_rows]++;
+}
+static void v41_sched_draft_cost(v41_sched *s, double ms) { if (s && ms > 0.0) { s->draft_ms += ms; s->draft_n++; } }
+
+/* Weighted least squares ms(n) = v1 + tok*(n-1) over the per-n means (counts
+ * as weights); one distinct x degenerates to a constant.  false = no samples. */
+static bool v41_sched_fit(const v41_sched *s, double *v1, double *tok) {
+    double W = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+    uint32_t nx = 0; double x0 = 0;
+    for (uint32_t n = 1; n <= DS4_MTP_MAX_BLOCK + 1u; n++) {
+        if (!s->cnt[n]) continue;
+        const double w = (double)s->cnt[n], x = (double)(n - 1u), y = s->ms[n] / w;
+        if (nx == 0) x0 = x;
+        if (nx == 0 || x != x0) nx++;
+        W += w; Sx += w * x; Sy += w * y; Sxx += w * x * x; Sxy += w * x * y;
+    }
+    if (W <= 0.0) return false;
+    const double den = W * Sxx - Sx * Sx;
+    if (nx < 2u || den <= 0.0) { *v1 = Sy / W; *tok = 0.0; return true; }
+    *tok = (W * Sxy - Sx * Sy) / den;
+    *v1 = (Sy - *tok * Sx) / W;
+    return true;
+}
+
+/* conf[0..block-1] = per-position confidence logits.  Returns how many
+ * positions to verify (0 = not even the draft is worth its cost);
+ * *value_out = the predicted yield/cost ratio (1.0 = break-even with one
+ * pure-decode step). */
+static uint32_t v41_draft_pick_k(const float *conf, uint32_t block, float *value_out, const v41_sched *s) {
+    if (value_out) *value_out = 1.0f;
+    if (!s || block == 0u) return block;
+    /* Startup: no verify samples => measure the longest block once; one n>=2
+     * point => add an n=2 (or the longest) point so the fit has a slope. */
+    uint32_t nmeas = 0, first = 0;
+    for (uint32_t n = 2; n <= block + 1u; n++) if (s->cnt[n]) { if (!nmeas) first = n; nmeas++; }
+    if (nmeas == 0u) return block;
+    if (nmeas == 1u && !s->cnt[1]) return first == 2u ? block : 1u;
+    double v1, tok;
+    if (!v41_sched_fit(s, &v1, &tok)) return block;
+    /* One pure-decode step's ms: the real single-token samples when present,
+     * else the fit at n=1 (verify 1 row ~ one step). */
+    const double step = s->cnt[1] ? s->ms[1] / (double)s->cnt[1] : v1;
+    const double draft = s->draft_n ? s->draft_ms / (double)s->draft_n : 0.0;
+    if (!(step > 0.0)) return block;
+    const float rho = s->pred1 > 0.0 ? (float)(s->real1 / s->pred1) : 1.0f;
+    float surv = 1.0f, sum = 0.0f;
+    double best = 1.0 / (draft + v1);   /* k=0: the draft is wasted, one single-token step runs */
+    uint32_t bestk = 0;
+    for (uint32_t j = 0; j < block; j++) {
+        const float pj = rho * v41_sched_sigmoid(conf[j]);
+        surv *= pj < 1.0f ? pj : 1.0f;
+        sum += surv;
+        const double cost = draft + v1 + tok * (double)(j + 1u);   /* verify 1+(j+1) rows */
+        const double val = (1.0 + (double)sum) / (cost > 0.0 ? cost : step);
+        if (val > best) { best = val; bestk = j + 1u; }
+    }
+    if (value_out) *value_out = (float)(best * step);   /* 1.0 = break-even with one pure-decode step */
+    return bestk;
+}
+
+/* The DS41_GEN_LOGITS dump (see the generate entry): one full logits row per
+ * emitted position, in emission order. */
+static void v41_gen_dump_row(ds4_v41_state *st, FILE *fd) {
+    if (!fd) return;
+    float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
+    if (row && ds4_gpu_tensor_read(st->logits, (uint64_t)st->last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
+        fwrite(row, 4, DS4_N_VOCAB, fd);
+    }
+    free(row);
+}
+
+/* ---- the greedy generate entry (core_v41_api.c:426-470 + the round drive
+ * :175-425, the eager subset) ----
+ * Prompt prefill in chunks (the shared v41_prefill_chunk), then decode steps:
+ * device argmax on the last logits row -> emit -> next token.  The engine's
+ * generate path sets head_last_only so a prefill block computes ONE logits
+ * row (the head GEMV on xlast, core_v41_forward.c:334-342).
+ * Spec decode runs by default when the GGUF carries the draft towers and
+ * parameters (core_v41_api.c:219-221): each round drafts a block, verifies
+ * 1+k positions in one batch, accepts the longest matching prefix and rolls
+ * the rest back.  Temperature-0 output is byte-identical with drafting on and
+ * off — pure time saving.  verify_k pins the round's k (the engine's
+ * --dspark-verify; the deterministic trace gate uses it), 0 = the confidence
+ * scheduler.  Named limits: sampling and the penalties, the decode graph, the
+ * draft graph and the emit-trace diagnostics are not ported (their units);
+ * no_engram mirrors the engine's --v41-no-engram. */
+int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram, int verify_k,
+                            const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud) {
+    ds4_engine *e = (ds4_engine *)engine;
+    if (!e || !prompt || n_prompt < 1 || DS4_MODEL_VARIANT != DS4_VARIANT_V41) return 1;
+    const uint32_t np = (uint32_t)n_prompt;
+    uint32_t ctx = g_ds4_v41.ctx;
+    if (ctx == 0u) { fprintf(stderr, "ds4: [v41] model metadata has no deepseek4.context_length\n"); return 1; }
+    if (np + 1u > ctx) { fprintf(stderr, "ds4: [v41] prompt %u tokens over context %u\n", np, ctx); return 1; }
+    /* allocate only what this run can reach (core_v41_api.c:120-135) */
+    const uint64_t need = (uint64_t)np + (uint64_t)(n_predict > 0 ? n_predict : 0) + DS4_MTP_MAX_BLOCK + 2u;
+    if ((uint64_t)ctx > need) ctx = (uint32_t)need;
+    const int room = ctx > np ? (int)(ctx - np) : 0;
+    if (n_predict > room) n_predict = room;
+    const uint32_t cap = DS4_V41_CHUNK < np ? DS4_V41_CHUNK : np;
+    ds4_v41_state st;
+    if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;
+    st.head_last_only = 1;
+    st.no_engram = no_engram;   /* the gate's compare-only mode (the engine's --v41-no-engram) */
+    st.efeed = feed;            /* rows: the feed's prepare callback runs per block (spec), or the caller pre-fills and sets pos0 */
+    /* Diagnostic (kept): DS41_GEN_LOGITS=<path> appends the full logits row of
+     * every emitted position (f32, DS4_N_VOCAB per row) so the step path can
+     * be diffed against the score path on the same sequence. */
+    const char *gen_lg = getenv("DS41_GEN_LOGITS");
+    FILE *gen_fd = gen_lg ? fopen(gen_lg, "wb") : NULL;
+    ds4_gpu_tensor *am = ds4_gpu_tensor_alloc((uint64_t)(DS4_MTP_MAX_BLOCK + 2u) * 16u);   /* per-row 16 B slots (sampling layout; argmax uses the first int) */
+    /* Spec decode arms when the GGUF carries the towers + draft parameters
+     * (core_v41_api.c:219-221); ready=0 keeps the single-token loop.  The
+     * engine's --no-dspark equivalent is the env switch (the CLI flag lands
+     * with the serving unit). */
+    ds4_v41_draft dr;
+    const bool spec = !getenv("DS41_NO_DSPARK") && v41_draft_alloc(e, &dr);
+    v41_sched cal; memset(&cal, 0, sizeof cal);
+    uint32_t spec_rounds = 0, spec_acc = 0, spec_skipped = 0, spec_hist[DS4_MTP_MAX_BLOCK + 1];
+    for (uint32_t i = 0; i <= DS4_MTP_MAX_BLOCK; i++) spec_hist[i] = 0;
+    double ms_draft = 0, ms_snap = 0, ms_verify = 0, ms_argmax = 0;
+    int rc = 1;
+    int32_t tok = 0;
+    int produced = 0;
+    do {
+        if (!am) break;
+        const double t0 = now_sec();
+        bool ok = true;
+        for (uint32_t c0 = 0; ok && c0 < np;) ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);
+        if (!ok) break;
+        fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, now_sec() - t0, (double)np / (now_sec() - t0 + 1e-9));
+        if (getenv("DS41_ADDR_DUMP")) {   /* the A/B layout discriminator (see the harness) */
+            fprintf(stderr, "addr am %p logits %p x %p xn %p tok %p pos %p\n", ds4_gpu_tensor_ptr(am), ds4_gpu_tensor_ptr(st.logits),
+                    ds4_gpu_tensor_ptr(st.x), ds4_gpu_tensor_ptr(st.xn), ds4_gpu_tensor_ptr(st.tok), ds4_gpu_tensor_ptr(st.pos));
+            for (uint32_t k = 0; k < g_ds4_v41.n_engram; k++)
+                if (st.eraw[k]) fprintf(stderr, "addr eraw[%u] %p\n", k, ds4_gpu_tensor_ptr(st.eraw[k]));
+            if (st.erows) fprintf(stderr, "addr erows %p ekv %p\n", ds4_gpu_tensor_ptr(st.erows), st.ekv ? ds4_gpu_tensor_ptr(st.ekv) : NULL);
+        }
+        /* the last prefill position's logits -> the first token (last_logit_row
+         * says which row the head wrote; row 0 under head_last_only) */
+        if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
+            ds4_gpu_synchronize() == 0 ||
+            ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) break;
+        v41_gen_dump_row(&st, gen_fd);
+        {   /* the engine's one-shot argmax self-check (core_v41_api.c:193-200):
+             * a wrong kernel would silently emit wrong tokens, so compare the
+             * device index against a host scan of the same row once. */
+            float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
+            if (row && ds4_gpu_tensor_read(st.logits, (uint64_t)st.last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
+                uint32_t best = 0;
+                for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (row[v] > row[best]) best = v;
+                if ((int32_t)best != tok) fprintf(stderr, "ds4: *[v41] argmax kernel %d != host %u*\n", tok, best);
+            }
+            free(row);
+        }
+        rc = 0;
+        bool stop = false;
+        while (!stop && produced < n_predict) {
+            produced++;
+            if (emit && emit((int)tok, ud) != 0) break;   /* the CLI's EOS convention: nonzero = stop */
+            if ((int)tok == ds4_token_eos(e)) break;      /* the engine's own check when emit does not stop */
+            if (st.n_past + 1u > st.ctx) { fprintf(stderr, "[v41] context full %u\n", st.ctx); break; }
+            if (!spec) {   /* no drafter armed: the plain single-token step */
+                if (!v41_forward(e, &st, &tok, 1)) { rc = 1; break; }
+                if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
+                    ds4_gpu_synchronize() == 0 ||
+                    ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) { rc = 1; break; }
+                v41_gen_dump_row(&st, gen_fd);
+                continue;
+            }
+            /* ---- one spec round (core_v41_api.c:284-390, the eager subset) ---- */
+            const double tr0 = now_sec();
+            uint32_t k = 0;
+            int32_t batch[DS4_MTP_MAX_BLOCK + 1];
+            batch[0] = tok;
+            float sched_val = 0.f;
+            bool drafted = false;
+            const uint32_t pos_round = st.n_past;   /* the round's first position (diagnostic) */
+            const int dr_launch = v41_draft_launch(e, &st, &dr, (int32_t)tok, st.n_past - 1u);
+            if (dr_launch != 0) {
+                drafted = true;
+                const uint32_t use = verify_k ? (uint32_t)verify_k
+                                              : v41_draft_pick_k(dr.host_conf, dr.block, &sched_val, &cal);
+                if (!verify_k && sched_val < 1.0f) spec_skipped++;   /* predicted not to repay even the draft */
+                k = dr.block < use ? dr.block : use;
+                for (uint32_t i = 0; i < k; i++) batch[i + 1u] = dr.host_ids[i + 1u];
+            }
+            const uint32_t nb = 1u + k;
+            int32_t want[DS4_MTP_MAX_BLOCK + 1];
+            const double tr1 = now_sec();
+            if (k && !v41_spec_snapshot(&st, nb)) { rc = 1; break; }
+            const double tr2 = now_sec();
+            if (!v41_forward(e, &st, batch, nb)) { rc = 1; break; }
+            const double tr3 = now_sec();
+            if (!v41_device_next(&st, am, 0u, nb, want)) { rc = 1; break; }
+            if (drafted) {
+                /* Cost accounting (core_v41_api.c:335-341): the engine counts a
+                 * direct dispatch as steady whenever that n cannot walk a graph;
+                 * the port has no graph, so every dispatch is steady. */
+                v41_sched_draft_cost(&cal, (tr1 - tr0) * 1e3);
+                v41_sched_cost(&cal, nb, (tr3 - tr2) * 1e3);
+                if (k) { ms_draft += (tr1 - tr0) * 1e3; ms_snap += (tr2 - tr1) * 1e3;
+                         ms_verify += (tr3 - tr2) * 1e3; ms_argmax += (now_sec() - tr3) * 1e3; }
+            }
+            uint32_t a = 0;
+            while (a < k && want[a] == batch[a + 1u]) a++;   /* accept the longest matching prefix */
+            /* Observe the first position every drafted round (k=0 included), or
+             * the calibration deadlocks at rho=0 (core_draft_sched.c:33). */
+            if (drafted && !verify_k) v41_sched_observe(&cal, dr.host_conf, k ? (a >= 1u) : (want[0] == dr.host_ids[1]));
+            /* The engine's per-round account (core_v41_api.c:346-357), the
+             * spec trace gate's instrument. */
+            if (drafted && g_ds4_v41_prof) {
+                fprintf(stderr, "[dspark] pos %u k %u val %.3f acc %u conf", pos_round, k, (double)sched_val, a);
+                for (uint32_t i = 0; i < dr.block; i++) {
+                    const float c = dr.host_conf[i];
+                    fprintf(stderr, " %.3f", isfinite(c) ? 1.0 / (1.0 + exp(-(double)c)) : 0.0);
+                }
+                fprintf(stderr, " | draft");
+                for (uint32_t i = 0; i < k; i++) fprintf(stderr, " %d", batch[i + 1u]);
+                fprintf(stderr, " | main");
+                for (uint32_t i = 0; i < nb; i++) fprintf(stderr, " %d", want[i]);
+                fprintf(stderr, "\n");
+            }
+            if (k) {
+                spec_rounds++; spec_acc += a; spec_hist[a]++;
+                if (!v41_spec_rollback(&st, 1u + a)) { rc = 1; break; }
+            }
+            const int tok_next = (int)want[a];
+            /* The earned tokens: the draft matched the main model, emit them
+             * straight (core_v41_api.c:384-390; the n_predict cap holds). */
+            for (uint32_t i = 0; i < a; i++) {
+                if (produced >= n_predict) break;
+                produced++;
+                const int t = (int)batch[i + 1u];
+                if ((emit && emit(t, ud) != 0) || t == ds4_token_eos(e)) { stop = true; break; }
+            }
+            tok = tok_next;
+        }
+        /* The engine's summary (core_v41_api.c:393-406; its graph host-gap
+         * line is not ported). */
+        if (spec_rounds) {
+            fprintf(stderr, "\n[v41] DSpark: %u rounds (scheduler skipped %u), average accept %.2f/%u; histogram",
+                    spec_rounds, spec_skipped, (double)spec_acc / (double)spec_rounds, dr.block);
+            for (uint32_t i = 0; i <= dr.block; i++) fprintf(stderr, " %u:%u", i, spec_hist[i]);
+            const double R = (double)spec_rounds, ea = 1.0 + (double)spec_acc / R;
+            const double per = (ms_draft + ms_snap + ms_verify + ms_argmax) / R;
+            fprintf(stderr, "\n[v41] one round %.1f ms = draft %.1f + snapshot/rollback %.1f + verify %.1f + argmax %.1f"
+                            "; yield %.2f token => %.1f ms/token\n",
+                    per, ms_draft / R, ms_snap / R, ms_verify / R, ms_argmax / R, ea, per / ea);
+        }
+    } while (0);
+    if (gen_fd) fclose(gen_fd);
+    if (spec) v41_draft_free(&dr);
+    if (am) ds4_gpu_tensor_free(am);
+    v41_state_free(&st);
+    return rc;
+}
+
 #endif /* DS4_DS41_DRAFT_INC */

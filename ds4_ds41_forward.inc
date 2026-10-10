@@ -102,6 +102,17 @@ typedef struct {
     uint32_t mainh_cap, mainh_wrote;
     int64_t mainh_end;
     uint32_t mainh_n;
+    /* Spec verify snapshot (core_v41.h:83-85, core_v41_forward.c:241/267):
+     * the ring cells a verify batch's commit overwrites (snap_win, per layer,
+     * lazily allocated) and the compressor pending rows taken BEFORE the shift
+     * (snap_cpre_*, allocated when snap_on is first seen). */
+    ds4_gpu_tensor *snap_win[DS4_MAX_LAYER], *snap_cpre_kv[DS4_MAX_LAYER], *snap_cpre_sc[DS4_MAX_LAYER];
+    uint32_t snap_cpend[DS4_MAX_LAYER], snap_past, snap_on;
+    uint32_t snap_n;            /* rows in the snapshotted batch (1+k); the rollback restores [keep, snap_n) */
+    /* The block's host token ids, set by v41_forward: the engram feed's
+     * prepare callback hashes the block's rows from them (the engine hashes
+     * from st->hist, core_v41_forward.c:377). */
+    const int32_t *blk_ids;
     int ced_done;               /* v41_forward_body: this block stopped at the CED edge (no logits) */
     int ced_skip;               /* this block runs only the encoder segment + the edge layer's KV */
     const char *dump_prefix;    /* non-NULL: per-layer MoE in/out dumps (single block, n <= 64) */
@@ -226,6 +237,7 @@ static void v41_state_free(ds4_v41_state *st) {
     for (uint32_t k = 0; k < DS4_V41_MAX_ENGRAM; k++) V41_FREE(&st->eraw[k]);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         V41_FREE(&st->win[il], &st->comp_kv[il], &st->index_k[il], &st->cpre_kv[il], &st->cpre_sc[il]);
+        V41_FREE(&st->snap_win[il], &st->snap_cpre_kv[il], &st->snap_cpre_sc[il]);
         if (st->posg_pin[il]) { ds4_gpu_host_free(st->posg_pin[il]); st->posg_pin[il] = NULL; }
     }
 }
@@ -403,6 +415,19 @@ static bool v41_compress_source(ds4_engine *e, ds4_v41_state *st, uint32_t il, u
         if (!ds4_gpu_tensor_copy(st->cpre_sc[il], (uint64_t)pend * rowb, st->csc, 0, (uint64_t)n * rowb)) return false;
         const uint32_t tot = pend + n, rem = tot % ratio;
         ng_new = tot / ratio;
+        /* Spec rollback point (core_v41_attn.c:76-85, speed.md 6 D1): the
+         * remainder-to-the-head move below is destructive — after it the
+         * batch's compressor inputs are gone.  Save the whole block first;
+         * the rollback takes the accepted prefix's rows back out of it. */
+        if (st->snap_on) {
+            bool sok = true;
+            const uint64_t nb = ((uint64_t)ratio + st->cap_tok) * rowb;   /* same formula as the cpre_* allocation */
+            if (!st->snap_cpre_kv[il]) { st->snap_cpre_kv[il] = v41_alloc(nb, &sok); st->snap_cpre_sc[il] = v41_alloc(nb, &sok); }
+            if (!sok) return false;
+            if (!ds4_gpu_tensor_copy(st->snap_cpre_kv[il], 0, st->cpre_kv[il], 0, (uint64_t)tot * rowb)) return false;
+            if (!ds4_gpu_tensor_copy(st->snap_cpre_sc[il], 0, st->cpre_sc[il], 0, (uint64_t)tot * rowb)) return false;
+            st->snap_cpend[il] = pend;
+        }
         if (ng_new) {
             if (!ds4_gpu_v41_compress_pool_tensor(st->pooled, st->cpre_kv[il], st->cpre_sc[il], tot, ratio, HD)) return false;
             if (rem) {   /* move the remainder to the head (source rows >= ratio > rem, no overlap) */
@@ -831,6 +856,14 @@ static bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, ui
     free(pm);
     if (!okpm) return false;
     st->mainh_wrote = 0;
+    st->blk_ids = ids;   /* the engram feed's prepare hashes this block's rows from these (the engine's hist memcpy, core_v41_forward.c:377) */
+    /* The feed's block provider: a spec verify batch's tokens exist only
+     * inside the forward, so the provider is told the exact block.  pos0 is
+     * still asserted at the point of use (v41_engram_rows). */
+    if (st->efeed && st->efeed->prepare && !st->efeed->prepare(st->pos0, ids, (int)n, st->efeed->ud)) {
+        fprintf(stderr, "ds4: [v41] engram feed prepare failed (pos0 %u n %u)\n", st->pos0, n);
+        return false;
+    }
     if (ds4_gpu_begin_commands() == 0) return false;
     if (!v41_forward_body(e, st)) return false;
     if (ds4_gpu_end_commands() == 0 || ds4_gpu_synchronize() == 0) return false;
@@ -846,6 +879,92 @@ static bool v41_forward(ds4_engine *e, ds4_v41_state *st, const int32_t *ids, ui
         st->mainh_end = (int64_t)st->pos0 + (int64_t)n - 1;
     }
     st->n_past += n;
+    return true;
+}
+
+/* ---- spec verify snapshot / rollback (core_v41_forward.c:241/267) ----
+ * Why back up: a verify batch computes 1+k positions into the cache; the ones
+ * not accepted must be undone.  Window: the batch's rows first sit in the
+ * buffered block region; after each layer win_commit writes them into the
+ * ring, overwriting the cell from 128 steps ago — still inside the next
+ * step's visible window.  So only the n cells about to be overwritten are
+ * saved (40 layers x n(<=6) rows x 512 x 4 B ~ 0.5 MB, against 10.5 MB for
+ * the whole 128-row window).  Compressor pending rows: that is a genuine left
+ * shift and the snapshot point is BEFORE the shift (taken in
+ * v41_compress_source).  comp_kv/index_k are written by absolute group number
+ * and the counters are overwritten next round — no backup needed. */
+static bool v41_spec_snapshot(ds4_v41_state *st, uint32_t n) {
+    const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
+    const uint32_t nmax = DS4_MTP_MAX_BLOCK + 1u;
+    bool ok = true;
+    if (!n || n > nmax) { fprintf(stderr, "ds4: [v41] spec snapshot batch %u over limit %u\n", n, nmax); return false; }
+    /* snap stores the ring cell batch row i is about to overwrite, indexed by
+     * row, so the restore interval is exactly [keep, n). */
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!st->snap_win[il]) st->snap_win[il] = v41_alloc((uint64_t)nmax * rowb, &ok);
+        if (ok && !ds4_gpu_v41_win_ring_snap_tensor(st->win[il], st->snap_win[il], st->n_past,
+                                                    0u, n, DS4_N_SWA, DS4_N_HEAD_DIM, 0, NULL)) ok = false;
+    }
+    st->snap_n = n;
+    st->snap_past = st->n_past;
+    st->snap_on = ok ? 1u : 0u;
+    return ok;
+}
+
+/* keep = accepted positions in this batch (including the confirmed head).
+ * Three things (core_v41_forward.c:267-296): (1) the window ring — batch rows
+ * [keep, n) were committed by the layers and overwrote real rows from 128
+ * steps back; write the snapshot's cells back (the accepted head rows stay).
+ * (2) compressed KV/index keys: rewind only the group COUNT to
+ * (pos0+keep)/ratio; contents are by absolute group number and get
+ * overwritten next round.  (3) compressor pending rows: take the last pend'
+ * rows of the pre-shift snapshot — those are the accepted tokens' inputs.
+ * Miss (3) and the next pool mixes a rejected draft token into a group: no
+ * error, the group's global KV just stops matching pure decode (the byte
+ * gate catches it).  Miss (1) and the next step reads "future drafts" as
+ * history. */
+static bool v41_spec_rollback(ds4_v41_state *st, uint32_t keep) {
+    if (!st->snap_on) return false;
+    const uint64_t rowb = (uint64_t)DS4_N_HEAD_DIM * 4;
+    const uint32_t pos0 = st->snap_past, np = pos0 + keep;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (keep < st->snap_n &&
+            !ds4_gpu_v41_win_ring_snap_tensor(st->win[il], st->snap_win[il], pos0,
+                                              keep, st->snap_n, DS4_N_SWA, DS4_N_HEAD_DIM, 1, NULL)) return false;
+        if (!g_ds4_v41.is_kv_source[il]) continue;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ratio) continue;
+        st->ng_src[il] = np / ratio;
+        if (ratio == 1u || !st->cpre_kv[il]) { st->cpend[il] = 0; continue; }
+        const uint32_t pend2 = np % ratio;
+        if (pend2) {   /* snapshot rows (snap_cpend + keep - pend2) onward = the last accepted tokens' inputs */
+            const uint64_t src = (uint64_t)(st->snap_cpend[il] + keep - pend2) * rowb;
+            if (!ds4_gpu_tensor_copy(st->cpre_kv[il], 0, st->snap_cpre_kv[il], src, (uint64_t)pend2 * rowb)) return false;
+            if (!ds4_gpu_tensor_copy(st->cpre_sc[il], 0, st->snap_cpre_sc[il], src, (uint64_t)pend2 * rowb)) return false;
+        }
+        st->cpend[il] = pend2;
+    }
+    st->n_past = np;
+    st->snap_on = 0;
+    if (st->mainh) {   /* rejected rows leave the ring's contiguous run (their cells get overwritten next step; until then they must not be read) */
+        const uint32_t dropped = st->snap_n - keep;
+        st->mainh_n = st->mainh_n > dropped ? st->mainh_n - dropped : 0;
+        st->mainh_end = (int64_t)np - 1;
+    }
+    return true;
+}
+
+/* The greedy per-row next-token (core_v41_sample.c:24-37, the non-sampling
+ * arm): the argmax kernel writes only the first int of its slot, so the rows
+ * are argmaxed and read back one at a time (the direct path only pays this on
+ * verify batches). */
+static bool v41_device_next(ds4_v41_state *st, ds4_gpu_tensor *am, uint32_t row0, uint32_t n, int32_t *want) {
+    if (!am || n == 0u || n > DS4_MTP_MAX_BLOCK + 2u) return false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!ds4_gpu_v41_argmax_tensor(am, st->logits, row0 + i, DS4_N_VOCAB) ||
+            !ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(am, 0, &want[i], 4)) return false;
+    }
     return true;
 }
 
@@ -965,100 +1084,3 @@ int ds4_v41_score_ids(void *engine, const int *ids, int n_ids, const char *out_p
     return ok ? 0 : 1;
 }
 
-/* The DS41_GEN_LOGITS dump (see the generate entry): one full logits row per
- * emitted position, in emission order. */
-static void v41_gen_dump_row(ds4_v41_state *st, FILE *fd) {
-    if (!fd) return;
-    float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
-    if (row && ds4_gpu_tensor_read(st->logits, (uint64_t)st->last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
-        fwrite(row, 4, DS4_N_VOCAB, fd);
-    }
-    free(row);
-}
-
-/* ---- the greedy generate entry (core_v41_api.c:426-470 + the round drive
- * :175-425, the non-spec eager subset) ----
- * Prompt prefill in chunks (the shared v41_prefill_chunk), then n=1 decode
- * steps: device argmax on the last logits row -> emit -> next token.  The
- * engine's generate path sets head_last_only so a prefill block computes ONE
- * logits row (the head GEMV on xlast, core_v41_forward.c:334-342).  Named
- * limits: sampling and the penalties, the DSpark spec round, the decode graph
- * and the emit-trace diagnostics are not ported (their units); no_engram
- * mirrors the engine's --v41-no-engram. */
-int ds4_v41_generate_argmax(void *engine, const int *prompt, int n_prompt, int n_predict, int no_engram,
-                            const ds41_engram_feed *feed, int (*emit)(int token, void *ud), void *ud) {
-    ds4_engine *e = (ds4_engine *)engine;
-    if (!e || !prompt || n_prompt < 1 || DS4_MODEL_VARIANT != DS4_VARIANT_V41) return 1;
-    const uint32_t np = (uint32_t)n_prompt;
-    uint32_t ctx = g_ds4_v41.ctx;
-    if (ctx == 0u) { fprintf(stderr, "ds4: [v41] model metadata has no deepseek4.context_length\n"); return 1; }
-    if (np + 1u > ctx) { fprintf(stderr, "ds4: [v41] prompt %u tokens over context %u\n", np, ctx); return 1; }
-    /* allocate only what this run can reach (core_v41_api.c:120-135) */
-    const uint64_t need = (uint64_t)np + (uint64_t)(n_predict > 0 ? n_predict : 0) + DS4_MTP_MAX_BLOCK + 2u;
-    if ((uint64_t)ctx > need) ctx = (uint32_t)need;
-    const int room = ctx > np ? (int)(ctx - np) : 0;
-    if (n_predict > room) n_predict = room;
-    const uint32_t cap = DS4_V41_CHUNK < np ? DS4_V41_CHUNK : np;
-    ds4_v41_state st;
-    if (!v41_state_alloc(&st, cap, ctx, DS4_MTP_MAX_BLOCK + 2u)) return 1;
-    st.head_last_only = 1;
-    st.no_engram = no_engram;   /* the gate's compare-only mode (the engine's --v41-no-engram) */
-    st.efeed = feed;            /* live rows: the caller refreshes them per step (emit hook) */
-    /* Diagnostic (kept): DS41_GEN_LOGITS=<path> appends the full logits row of
-     * every emitted position (f32, DS4_N_VOCAB per row) so the step path can
-     * be diffed against the score path on the same sequence. */
-    const char *gen_lg = getenv("DS41_GEN_LOGITS");
-    FILE *gen_fd = gen_lg ? fopen(gen_lg, "wb") : NULL;
-    ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(16u);   /* the engine's 16 B device slot; argmax writes the first int */
-    int rc = 1;
-    int32_t tok = 0;
-    int produced = 0;
-    do {
-        if (!am) break;
-        const double t0 = now_sec();
-        bool ok = true;
-        for (uint32_t c0 = 0; ok && c0 < np;) ok = v41_prefill_chunk(e, &st, prompt, np, &c0, cap);
-        if (!ok) break;
-        fprintf(stderr, "[v41] prefill %u token %.1fs (%.1f t/s)\n", np, now_sec() - t0, (double)np / (now_sec() - t0 + 1e-9));
-        if (getenv("DS41_ADDR_DUMP")) {   /* the A/B layout discriminator (see the harness) */
-            fprintf(stderr, "addr am %p logits %p x %p xn %p tok %p pos %p\n", ds4_gpu_tensor_ptr(am), ds4_gpu_tensor_ptr(st.logits),
-                    ds4_gpu_tensor_ptr(st.x), ds4_gpu_tensor_ptr(st.xn), ds4_gpu_tensor_ptr(st.tok), ds4_gpu_tensor_ptr(st.pos));
-            for (uint32_t k = 0; k < g_ds4_v41.n_engram; k++)
-                if (st.eraw[k]) fprintf(stderr, "addr eraw[%u] %p\n", k, ds4_gpu_tensor_ptr(st.eraw[k]));
-            if (st.erows) fprintf(stderr, "addr erows %p ekv %p\n", ds4_gpu_tensor_ptr(st.erows), st.ekv ? ds4_gpu_tensor_ptr(st.ekv) : NULL);
-        }
-        /* the last prefill position's logits -> the first token (last_logit_row
-         * says which row the head wrote; row 0 under head_last_only) */
-        if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
-            ds4_gpu_synchronize() == 0 ||
-            ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) break;
-        v41_gen_dump_row(&st, gen_fd);
-        {   /* the engine's one-shot argmax self-check (core_v41_api.c:193-200):
-             * a wrong kernel would silently emit wrong tokens, so compare the
-             * device index against a host scan of the same row once. */
-            float *row = xmalloc((size_t)DS4_N_VOCAB * 4);
-            if (row && ds4_gpu_tensor_read(st.logits, (uint64_t)st.last_logit_row * DS4_N_VOCAB * 4, row, (uint64_t)DS4_N_VOCAB * 4)) {
-                uint32_t best = 0;
-                for (uint32_t v = 1; v < DS4_N_VOCAB; v++) if (row[v] > row[best]) best = v;
-                if ((int32_t)best != tok) fprintf(stderr, "ds4: *[v41] argmax kernel %d != host %u*\n", tok, best);
-            }
-            free(row);
-        }
-        rc = 0;
-        while (produced < n_predict) {
-            produced++;
-            if (emit && emit((int)tok, ud) != 0) break;   /* the CLI's EOS convention: nonzero = stop */
-            if ((int)tok == ds4_token_eos(e)) break;      /* the engine's own check when emit does not stop */
-            if (st.n_past + 1u > st.ctx) { fprintf(stderr, "[v41] context full %u\n", st.ctx); break; }
-            if (!v41_forward(e, &st, &tok, 1)) { rc = 1; break; }
-            if (!ds4_gpu_v41_argmax_tensor(am, st.logits, st.last_logit_row, DS4_N_VOCAB) ||
-                ds4_gpu_synchronize() == 0 ||
-                ds4_gpu_tensor_read(am, 0, &tok, 4) == 0) { rc = 1; break; }
-            v41_gen_dump_row(&st, gen_fd);
-        }
-    } while (0);
-    if (gen_fd) fclose(gen_fd);
-    if (am) ds4_gpu_tensor_free(am);
-    v41_state_free(&st);
-    return rc;
-}
