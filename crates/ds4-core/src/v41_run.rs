@@ -1344,8 +1344,13 @@ impl Drop for V41Feed {
                 let (hits, misses, evictions) = rc.stats();
                 let total = hits + misses;
                 if total > 0 {
+                    let stalls = if rc.stalls() > 0 {
+                        format!(", inserts paused {}x (memory floor)", rc.stalls())
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "ds4: [v41] engram row cache: {hits} hits / {total} rows ({:.1}%), {misses} disk, {evictions} evictions, {} MiB cap",
+                        "ds4: [v41] engram row cache: {hits} hits / {total} rows ({:.1}%), {misses} disk, {evictions} evictions, {} MiB cap{stalls}",
                         100.0 * hits as f64 / total as f64,
                         rc.bytes() / (1024 * 1024)
                     );

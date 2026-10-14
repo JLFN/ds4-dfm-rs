@@ -18,9 +18,11 @@
  */
 use std::ptr;
 
-/// `DS41_FEED_ROW_CACHE_MB` default: 1 GiB, which is about 4M rows, roughly
-/// 80k tokens of unique content.  `0` disables the cache.
-const DEFAULT_CAP_MB: usize = 1024;
+/// `DS41_FEED_ROW_CACHE_MB`, opt-in: `0` (the default) leaves the feed reading
+/// straight from the shards, and any positive value is a hard cap in MiB on
+/// the payload.  1024 is about 4M rows, roughly 80k tokens of unique content;
+/// 256 is about 20k tokens.  `install.sh --row-cache-mb N` sets it.
+const DEFAULT_CAP_MB: usize = 0;
 
 pub struct RowCache {
     /// `0` marks an empty set; a live key is stored as `key + 1`.
@@ -31,6 +33,29 @@ pub struct RowCache {
     hits: u64,
     misses: u64,
     evictions: u64,
+    /// Insertions are refused while `MemAvailable` is below this floor, so a
+    /// cap set too high on a tight box degrades to "no more caching" instead
+    /// of pushing the host into its own watchdog.  `DS41_FEED_ROW_CACHE_FLOOR_MB`
+    /// (default 3072) sets it; 0 disables the check.
+    floor_mb: u64,
+    /// Checked every this many insertions, not on every one: `/proc/meminfo`
+    /// is a syscall pair and a row insert is 264 bytes.
+    check_every: u64,
+    inserts: u64,
+    stalls: u64,
+    refused: bool,
+}
+
+/// `MemAvailable` in MiB, or `None` when it cannot be read.
+fn mem_available_mb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
 }
 
 impl RowCache {
@@ -56,6 +81,14 @@ impl RowCache {
             hits: 0,
             misses: 0,
             evictions: 0,
+            floor_mb: std::env::var("DS41_FEED_ROW_CACHE_FLOOR_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(3072),
+            check_every: 4096,
+            inserts: 0,
+            stalls: 0,
+            refused: false,
         })
     }
 
@@ -89,8 +122,27 @@ impl RowCache {
     }
 
     /// Store one row's bytes; `src` must be the round's destination slot, read
-    /// back after the preads completed.
+    /// back after the preads completed.  Refused outright while the host is
+    /// below the memory floor, so the cache never competes with the model for
+    /// the last of the box's RAM.
     pub fn put(&mut self, layer: u8, row: u32, src: *const u8) {
+        self.inserts += 1;
+        if self.floor_mb > 0 && self.inserts % self.check_every == 0 {
+            let ok = mem_available_mb().map_or(true, |mb| mb >= self.floor_mb);
+            if !ok && !self.refused {
+                self.stalls += 1;
+                eprintln!(
+                    "ds4: [v41] engram row cache: MemAvailable under {} MiB, inserts paused",
+                    self.floor_mb
+                );
+            } else if ok && self.refused {
+                eprintln!("ds4: [v41] engram row cache: MemAvailable recovered, inserts resumed");
+            }
+            self.refused = !ok;
+        }
+        if self.refused {
+            return;
+        }
         let key = ((layer as u64) << 32) | row as u64;
         let idx = self.index(key);
         if self.keys[idx] != 0 && self.keys[idx] != key + 1 {
@@ -104,6 +156,10 @@ impl RowCache {
 
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.hits, self.misses, self.evictions)
+    }
+
+    pub fn stalls(&self) -> u64 {
+        self.stalls
     }
 
     pub fn bytes(&self) -> usize {

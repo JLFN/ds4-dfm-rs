@@ -42,6 +42,11 @@
 #   --port N           listen port (default 8000)
 #   --no-build         do not run `make ds4-server` even if the binary is stale
 #   --no-start         install/check only
+#   --row-cache-mb N   engram row cache in host RAM, in MiB (default 0 = off,
+#                      experimental).  A hit skips the shard pread and copies
+#                      the same bytes, so output is unchanged; it pays on
+#                      repeated context.  Each 1k tokens of context is about
+#                      13 MB of rows: 256 covers ~20k tokens, 1024 ~80k.
 #
 # The start contract is the reference install.sh's own, same constants: the
 # START_FLOOR_MB 100000 check before loading, the KILL_MB 2500 watchdog (two
@@ -81,6 +86,7 @@ RUN_FLOOR_MB=10000      # engine install.sh RUN_FLOOR_MB
 KILL_MB=2500            # engine install.sh KILL_MB
 
 CMD="install"; DIR="$HOME/youngai"; HOST="0.0.0.0"; PORT=8000; DOMAIN="finance"
+ROW_CACHE_MB=0          # engram row cache, off unless --row-cache-mb says otherwise
 WITH_PT=0; START=1; BUILD=1
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -90,6 +96,7 @@ while [ $# -gt 0 ]; do
         --posttrain) WITH_PT=1; shift;;
         --host) HOST="$2"; shift 2;;
         --port) PORT="$2"; shift 2;;
+        --row-cache-mb) ROW_CACHE_MB="$2"; shift 2;;
         --no-build) BUILD=0; shift;;
         --no-start) START=0; shift;;
         -h|--help) awk 'NR > 1 && /^#/ {sub(/^# ?/, ""); print; next} NR > 1 {exit}' "$0"; exit 0;;
@@ -182,7 +189,8 @@ start() {
         case "$help" in *--vision-gguf*) ;; *) die "ds4-server predates the vision tower: rebuild with 'make ds4-server'";; esac
         vis=(--vision-gguf "$MODEL/$VISION")
     fi
-    say "starting ./ds4-server on $HOST:$PORT, domain $DOMAIN${vis:+, images on} (loading takes ~2 minutes; log: $LOG)"
+    say "starting ./ds4-server on $HOST:$PORT, domain $DOMAIN${vis:+, images on}${ROW_CACHE_MB:+, row cache ${ROW_CACHE_MB} MiB} (loading takes ~2 minutes; log: $LOG)"
+    DS41_FEED_ROW_CACHE_MB="$ROW_CACHE_MB" \
     nohup "$REPO/ds4-server" --cuda -m "$MODEL/$GGUF" "${zc[@]}" --engram-dir "$ENGRAM" "${vis[@]}" "${pt[@]}" \
         --mem-budget-mb "$BUDGET_MB" --host "$HOST" --port "$PORT" >"$LOG" 2>&1 </dev/null &
     echo $! >"$PIDF"; echo "domain $DOMAIN on $HOST:$PORT" >"$INFOF"
