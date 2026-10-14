@@ -199,8 +199,18 @@ static int v41_q4k_gemv(const void *model_map, uint64_t model_size, uint64_t off
     while (ksplit > 1u && ksplit > nb) ksplit >>= 1;
     const uint32_t rpb1 = V41_GEMV_WARPS / ksplit, ngrp = (uint32_t)((out_dim + rpb1 - 1u) / rpb1);
     const uint32_t grp = rpb1 * nb * V41_Q4K_BYTES;
+    /* Diagnostic arm (2026-10-14, A/B on the box's real shapes):
+     * DS41_Q4K_GEMV=stage pins the stage arm for every group; =pipe lets pipe
+     * take every group inside its shared-memory cap.  Unset keeps the
+     * group-byte rule below, which is the release path. */
+    static int s_arm = -1;
+    if (s_arm < 0) {
+        const char *e = getenv("DS41_Q4K_GEMV");
+        s_arm = (e && *e == 's') ? 0 : ((e && *e == 'p') ? 1 : 2);
+    }
     uint32_t gx = 0;
-    if (grp > V41_Q4K_PIPE_MIN && grp <= V41_Q4K_PIPE_MAX) {
+    const bool pipe_arm = s_arm != 0 && grp <= V41_Q4K_PIPE_MAX && (s_arm == 1 || grp > V41_Q4K_PIPE_MIN);
+    if (pipe_arm) {
         static int s_sm = 0;
         if (!s_sm && cudaDeviceGetAttribute(&s_sm, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) return cuda_ok(cudaGetLastError(), what);
         gx = (uint32_t)s_sm * 4u / n_groups;   /* 4 = the CTA/SM count __launch_bounds__ pins */
