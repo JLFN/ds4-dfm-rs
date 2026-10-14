@@ -548,7 +548,17 @@ impl V41Feed {
             hist: Vec::new(),
             image_mask: Vec::new(),
             shadow: Vec::new(),
+            rowcache: crate::rowcache::RowCache::from_env((head_dim + head_dim / 32) as usize),
+            rc_pending: Vec::new(),
+            rc_layer: 0,
+            rc_base: 0,
         }));
+        if let Some(rc) = core.lock().unwrap().rowcache.as_ref() {
+            eprintln!(
+                "ds4: [v41] engram row cache: {} MiB in front of the shards (DS41_FEED_ROW_CACHE_MB)",
+                rc.bytes() / (1024 * 1024)
+            );
+        }
         let ctl = Arc::new((
             Mutex::new(Ctl {
                 go: false,
@@ -1025,6 +1035,16 @@ struct FeedCore {
     /// need more, and a grow could move the buffer under the worker's
     /// in-flight reads.
     shadow: Vec<u8>,
+    /// The row cache in front of the two shards (`DS41_FEED_ROW_CACHE_MB`,
+    /// default 1 GiB, 0 disables).  A hit skips both preads of a row and
+    /// memcpys the bytes the disk would have returned.
+    rowcache: Option<crate::rowcache::RowCache>,
+    /// This round's cache misses, as `(row_id, slot_offset)`, inserted after
+    /// the ring's completions land; `rc_base` is the round's destination
+    /// (kept as `usize` so `FeedCore` stays `Send` for the fetch worker).
+    rc_pending: Vec<(u32, u32)>,
+    rc_layer: u8,
+    rc_base: usize,
 }
 
 impl FeedCore {
@@ -1050,15 +1070,20 @@ impl FeedCore {
         end: usize,
         base: *mut u8,
     ) -> std::result::Result<(), String> {
-        let ring = self.ring.as_mut().expect("ring round without a ring");
         let hd = self.head_dim as u64;
         let nsc = hd / 32;
         let k = ei as usize;
         let direct = self.shards[k].is_direct();
         let fd = self.shards[k].raw_fd();
-        let reqs = ring.reqs_mut();
-        reqs.clear();
-        reqs.reserve((end - start) * self.cols as usize * 2);
+        self.rc_layer = ei as u8;
+        self.rc_base = base as usize;
+        self.rc_pending.clear();
+        /* Hash and place the block's rows first: a row the cache holds is
+         * memcpy'd straight into its slot and never reaches the ring, so the
+         * request list is built from the misses alone.  Two passes because
+         * `reqs` borrows the ring out of `self`. */
+        let nrows = (end - start) * self.cols as usize;
+        let mut miss: Vec<(u32, u32)> = Vec::with_capacity(nrows);
         for (i, p) in (start..end).enumerate() {
             let rows = self
                 .hash
@@ -1070,28 +1095,42 @@ impl FeedCore {
                         self.rows[k]
                     ));
                 }
-                let r = row_id as u64;
                 let slot = (i * self.cols as usize + c) * self.stride as usize;
-                let wdst = unsafe { base.add(slot) };
-                reqs.push(Req {
-                    fd,
-                    direct,
-                    len: hd as u32,
-                    off: self.weight_off[k] + r * hd,
-                    dst: wdst,
-                });
-                reqs.push(Req {
-                    fd,
-                    direct,
-                    len: nsc as u32,
-                    off: self.scale_off[k] + r * nsc,
-                    dst: unsafe { wdst.add(hd as usize) },
-                });
+                let cached = match self.rowcache.as_mut() {
+                    Some(rc) => rc.get(ei as u8, row_id as u32, unsafe { base.add(slot) }),
+                    None => false,
+                };
+                if !cached {
+                    miss.push((row_id as u32, slot as u32));
+                }
             }
+        }
+        let ring = self.ring.as_mut().expect("ring round without a ring");
+        let reqs = ring.reqs_mut();
+        reqs.clear();
+        reqs.reserve(miss.len() * 2);
+        for &(row_id, slot) in &miss {
+            let r = row_id as u64;
+            let wdst = unsafe { base.add(slot as usize) };
+            reqs.push(Req {
+                fd,
+                direct,
+                len: hd as u32,
+                off: self.weight_off[k] + r * hd,
+                dst: wdst,
+            });
+            reqs.push(Req {
+                fd,
+                direct,
+                len: nsc as u32,
+                off: self.scale_off[k] + r * nsc,
+                dst: unsafe { wdst.add(hd as usize) },
+            });
         }
         if !ring.submit() {
             return Err("engram io_uring submit failed".into());
         }
+        self.rc_pending = miss;
         Ok(())
     }
 
@@ -1103,6 +1142,18 @@ impl FeedCore {
         if !ring.wait() {
             return Err("engram io_uring round failed".into());
         }
+        /* The misses have landed in their destination slots: that memory now
+         * holds exactly the row bytes the disk returned, so this is the
+         * earliest and cheapest place to fill the cache. */
+        if self.rowcache.is_some() {
+            let base = self.rc_base as *const u8;
+            let layer = self.rc_layer;
+            let rc = self.rowcache.as_mut().expect("row cache");
+            for &(row_id, slot) in &self.rc_pending {
+                rc.put(layer, row_id, unsafe { base.add(slot as usize) });
+            }
+        }
+        self.rc_pending.clear();
         Ok(())
     }
 
@@ -1127,6 +1178,14 @@ impl FeedCore {
                         self.rows[k]
                     ));
                 }
+                let slot = (i * self.cols as usize + c) * self.stride as usize;
+                let cached = match self.rowcache.as_mut() {
+                    Some(rc) => rc.get(ei as u8, row_id as u32, unsafe { base.add(slot) }),
+                    None => false,
+                };
+                if cached {
+                    continue;
+                }
                 let row = self.shards[k]
                     .row(
                         self.weight_off[k],
@@ -1144,6 +1203,9 @@ impl FeedCore {
                         dst.add(row.weights.len()),
                         row.scale.len(),
                     );
+                }
+                if let Some(rc) = self.rowcache.as_mut() {
+                    rc.put(ei as u8, row_id as u32, unsafe { base.add(slot) });
                 }
             }
         }
@@ -1275,6 +1337,21 @@ fn worker_loop(
 impl Drop for V41Feed {
     fn drop(&mut self) {
         let _ = self.drain();
+        /* One line per request: what the row cache absorbed over its life
+         * (the counter a row-cache A/B reads). */
+        if let Ok(c) = self.core.lock() {
+            if let Some(rc) = c.rowcache.as_ref() {
+                let (hits, misses, evictions) = rc.stats();
+                let total = hits + misses;
+                if total > 0 {
+                    eprintln!(
+                        "ds4: [v41] engram row cache: {hits} hits / {total} rows ({:.1}%), {misses} disk, {evictions} evictions, {} MiB cap",
+                        100.0 * hits as f64 / total as f64,
+                        rc.bytes() / (1024 * 1024)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2209,6 +2286,10 @@ mod tests {
                 stride: 0,
                 hist: Vec::new(),
                 image_mask: Vec::new(),
+                rowcache: None,
+                rc_pending: Vec::new(),
+                rc_layer: 0,
+                rc_base: 0,
                 shadow: Vec::new(),
             }));
             let weak = Arc::downgrade(&core);

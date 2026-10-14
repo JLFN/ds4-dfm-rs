@@ -31,6 +31,7 @@ mod naive;
 mod naive_mtp;
 mod payload;
 mod progress;
+mod rowcache;
 mod qwen35;
 mod serving;
 mod serving_cuda;
