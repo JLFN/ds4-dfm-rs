@@ -9,6 +9,7 @@ Branch `feature/minimax-h3`. Model root on the Spark: `/mnt/h3-artifacts`.
 | Document | Covers |
 |---|---|
 | [port-plan.md](port-plan.md) | The port plan: phases P0-P10, the Spark budget, the DiT rung, the render gate |
+| [post-port-phases.md](post-port-phases.md) | After the port: P9 speed, P10 server with a resident engine, P11 YouTube/Instagram presets, P12 conditioning, P13 close |
 | [cheatsheet.md](cheatsheet.md) | Sizes, quality, reach, memory and layout in one page |
 | [vq-recipe.md](vq-recipe.md) | The 13-bit GVQ1 v1 conversion of the DiT and its fallback |
 | [openai-videos.md](openai-videos.md) | The OpenAI Videos API surface, its renderer bridge and its deviations |
