@@ -438,8 +438,14 @@ tests/h3/attn_bm: tests/h3/attn_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_g
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
 # Same reproducer shape for the video VAE's F32 attention kernel, which the
-# decoder calls once per layer per tile (36 layers, 12 tiles).
+# decoder calls once per layer per tile: 54 submissions of 2,532 rows at
+# 768x768 and 12 of 2,273 at 512x512, by `configured_tile_pixels`/`tile_axis`.
 tests/h3/attn_f32_bm: tests/h3/attn_f32_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# The video VAE decoder's four F32 matmuls at the tile shape, one call per
+# block, so a per-call figure times 1,944 prices the block's matmul set.
+tests/h3/vae_gemm_bm: tests/h3/vae_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
 # Portable reference tests: host-only, without model weights.

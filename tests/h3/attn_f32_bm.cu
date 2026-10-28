@@ -1,19 +1,33 @@
 /*
  * Bounded reproducer for `h3d_sdpa_f32`, the video VAE's F32 attention kernel:
- * it times the kernel at a real decode shape and hashes the output, so a variant
+ * it times the kernel at a decode shape and hashes the output, so a variant
  * can be measured and checked bit-equal without decoding a clip. Build it with
  * `make tests/h3/attn_f32_bm` (the same H3_NVCCFLAGS and sibling objects as
  * `tests/h3/attn_bm`), then run:
  *
- *   tests/h3/attn_f32_bm 16133 32 2   the 768x768 tile: 7 latent steps of
- *                                     48x48 plus the five suffix rows
- *   tests/h3/attn_f32_bm 7173 32 2    the 512x512 tile: 7 steps of 32x32 + 5
+ *   tests/h3/attn_f32_bm 2532 32 5     the 768x768 decoder tile, the shape the
+ *                                      job actually runs
+ *   tests/h3/attn_f32_bm 2273 32 5     the 512x512 decoder tile
+ *   tests/h3/attn_f32_bm 16133 32 2    the campaign's gate shape: one chunk's
+ *                                      whole 48x48 plane, seven latent steps
+ *                                      plus the five suffix rows. It is a BOUND
+ *                                      on any tile the decoder ever passes, not
+ *                                      a shape it runs, so its timings are not
+ *                                      an attribution of the job.
  *
- * The shapes are `CHUNK_LATENT_TIME * latent_h * latent_w + SUFFIX` rows at 32
- * heads of 64 dimensions, which is what `crates/ds4-core/src/minimax_h3/
- * vae_video.rs` passes to `h3d_sdpa_f32` once per layer per tile (36 layers,
- * 12 tiles, so 432 calls per decode). A change to the kernel must leave the
- * printed `out_fnv` unchanged; only then are its timings comparable.
+ * The shapes the decoder passes are `CHUNK_LATENT_TIME * tile_h * tile_w +
+ * SUFFIX`, where `configured_tile_pixels`/`tile_axis` pick the tile
+ * (`crates/ds4-core/src/minimax_h3/vae_video.rs:156-205`): 768x768 takes 304-px
+ * tiles, 19x19 latents, three per axis over six chunks, so 54 tile submissions
+ * of 2,532 rows and 1,944 block calls; 512x512 takes 288-px tiles, 18x18, four
+ * per chunk over three chunks, so 12 submissions of 2,273 rows and 432 block
+ * calls. A change to the kernel must leave the printed `out_fnv` unchanged at
+ * the gate shape; only then are its timings comparable.
+ *
+ * A trailing `--compare` runs the byte-exact arm and the `H3_VAE_*` arm on the
+ * same inputs and prints the deviation between them (max absolute, rms, the
+ * fraction of values that differ), which is the quantity a numerical change
+ * has to be judged on. Both arms run in one process and one binary.
  */
 #include "../../native/h3/h3_dit_gpu.cu"
 
@@ -22,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 static void fail(const char *what, const char *detail) {
@@ -54,6 +69,10 @@ int main(int argc, char **argv) {
     const uint32_t sequence = argc > 1 ? (uint32_t)std::atoi(argv[1]) : 16133;
     const uint32_t heads = argc > 2 ? (uint32_t)std::atoi(argv[2]) : 32;
     const int calls = argc > 3 ? std::atoi(argv[3]) : 2;
+    bool compare = false;
+    for (int index = 1; index < argc; index++) {
+        if (std::strcmp(argv[index], "--compare") == 0) compare = true;
+    }
     constexpr uint32_t head_dim = 64;
     char error[512] = {};
 
@@ -112,6 +131,40 @@ int main(int argc, char **argv) {
                 sequence, heads, calls, total_ms / calls,
                 (unsigned long long)fnv1a(result.data(), result.size() * 4));
     std::printf("first=%.6f last=%.6f\n", result.front(), result.back());
+
+    if (compare) {
+        /* `result` already holds the arm the environment selected. The base is
+         * the byte-exact kernel in the reference's CTA order, set through the
+         * host option rather than the environment so both arms are one binary. */
+        if (!h3d_set_vae_option(gpu, "attention", "scalar") ||
+            !h3d_set_vae_option(gpu, "sdpa_order", "heads")) {
+            fail("set reference options", "refused");
+        }
+        if (!h3d_sdpa_f32(gpu, output, query, key, value, sequence, heads,
+                          head_dim, scale, error, sizeof(error))) {
+            fail("sdpa reference", error);
+        }
+        std::vector<float> reference(elements);
+        if (!h3d_read(gpu, reference.data(), output, error, sizeof(error))) {
+            fail("read reference", error);
+        }
+        const char *attention = std::getenv("H3_VAE_ATTENTION");
+        const char *order = std::getenv("H3_VAE_SDPA_ORDER");
+        double worst = 0.0, square = 0.0;
+        size_t differing = 0;
+        for (size_t index = 0; index < elements; index++) {
+            const double delta = (double)result[index] - (double)reference[index];
+            if (result[index] != reference[index]) differing++;
+            if (std::fabs(delta) > worst) worst = std::fabs(delta);
+            square += delta * delta;
+        }
+        std::printf("compare base=scalar+heads arm=%s+%s\n",
+                    attention ? attention : "scalar(default)",
+                    order ? order : "heads(default)");
+        std::printf("max_abs=%.8g rms=%.8g differing=%.2f%%\n", worst,
+                    std::sqrt(square / (double)elements),
+                    100.0 * (double)differing / (double)elements);
+    }
 
     h3d_free(output);
     h3d_free(value);

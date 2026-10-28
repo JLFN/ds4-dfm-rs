@@ -281,6 +281,10 @@ tests/naive_banks
 # /tests/h3/, which this rule does not cover.
 /tests/h3-*
 /tests/h3/native_test
+# H3 kernel reproducers (`make tests/h3/<name>`).
+/tests/h3/attn_bm
+/tests/h3/attn_f32_bm
+/tests/h3/vae_gemm_bm
 
 # h3 host binaries (`make h3-rs`, `make h3-server-rs`)
 /h3-rs
