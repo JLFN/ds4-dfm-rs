@@ -286,6 +286,7 @@ tests/naive_banks
 /tests/h3/attn_f32_bm
 /tests/h3/vae_gemm_bm
 /tests/h3/sol_route_bm
+/tests/h3/sol_forward_bm
 
 # h3 host binaries (`make h3-rs`, `make h3-server-rs`)
 /h3-rs
