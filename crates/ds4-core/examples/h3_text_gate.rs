@@ -1,7 +1,12 @@
 //! The E4 gate: the port's prompt encoder against the reference's golden.
 //!
 //! Usage: h3_text_gate <FL2VA/text_encoder> <tokenizer.json> <prompt>
-//!                     [--layers N] [--expect HEX]
+//!                     [--layers N] [--expect HEX] [--nvfp4 PATH]
+//!
+//! `--nvfp4 PATH` reads the reference's NVFP4-AWQ artifact instead of the
+//! BF16 shards. The layer walk is the same either way, so the two arms are
+//! directly comparable per layer (`--layers 1` localizes a decode fault to
+//! the first block).
 //!
 //! Prints the prompt ids, then one PARITY line with the shape, the FNV-1a hash
 //! over the BF16 payload, both edges and the wall time. With `--expect` the
@@ -68,8 +73,13 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         ids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
     );
 
+    let source = match &options.nvfp4 {
+        Some(path) => text_forward::Encoder::Quantized(std::path::PathBuf::from(path)),
+        None => text_forward::Encoder::Bf16,
+    };
+
     let start = Instant::now();
-    let embedding = text_forward::encode_layers(std::path::Path::new(encoder), &ids, layers)
+    let embedding = text_forward::encode_with(&source, std::path::Path::new(encoder), &ids)
         .map_err(|error| error.token())?;
     let seconds = start.elapsed().as_secs_f64();
 
@@ -120,6 +130,7 @@ fn parse_hash(text: &str) -> Option<u64> {
 struct Options {
     layers: Option<u32>,
     expect: Option<String>,
+    nvfp4: Option<String>,
 }
 
 fn split(args: &[String]) -> Result<(Vec<String>, Options), String> {
@@ -127,6 +138,7 @@ fn split(args: &[String]) -> Result<(Vec<String>, Options), String> {
     let mut options = Options {
         layers: None,
         expect: None,
+        nvfp4: None,
     };
     let mut index = 0;
 
@@ -150,6 +162,13 @@ fn split(args: &[String]) -> Result<(Vec<String>, Options), String> {
                     .get(index + 1)
                     .ok_or_else(|| usage("--expect needs a value"))?;
                 options.expect = Some(value.clone());
+                index += 2;
+            }
+            "--nvfp4" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage("--nvfp4 needs a value"))?;
+                options.nvfp4 = Some(value.clone());
                 index += 2;
             }
             _ if argument.starts_with("--") => {

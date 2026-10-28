@@ -34,6 +34,10 @@ pub const LENGTH_BYTES: u64 = 8;
 pub const MAX_RANK: usize = 8;
 
 /// `h3_dtype` (`h3_safetensors.h:9-23`), minus the UNKNOWN failure case.
+///
+/// `F8E4M3` is this port's addition: the reference reads BF16 checkpoints only,
+/// and the NVFP4-AWQ prompt encoder carries its block scales in E4M3 under
+/// safetensors' `F8_E4M3` name (`minimax_h3::nvfp4`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dtype {
     Bool,
@@ -43,6 +47,7 @@ pub enum Dtype {
     U16,
     F16,
     Bf16,
+    F8E4M3,
     I32,
     U32,
     F32,
@@ -62,6 +67,7 @@ impl Dtype {
             "U16" => Self::U16,
             "F16" => Self::F16,
             "BF16" => Self::Bf16,
+            "F8_E4M3" => Self::F8E4M3,
             "I32" => Self::I32,
             "U32" => Self::U32,
             "F32" => Self::F32,
@@ -82,6 +88,7 @@ impl Dtype {
             Self::U16 => "U16",
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
+            Self::F8E4M3 => "F8_E4M3",
             Self::I32 => "I32",
             Self::U32 => "U32",
             Self::F32 => "F32",
@@ -94,7 +101,7 @@ impl Dtype {
     /// `h3_dtype_size` (`h3_safetensors.c:200-217`).
     pub fn size(self) -> u64 {
         match self {
-            Self::Bool | Self::I8 | Self::U8 => 1,
+            Self::Bool | Self::I8 | Self::U8 | Self::F8E4M3 => 1,
             Self::I16 | Self::U16 | Self::F16 | Self::Bf16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::I64 | Self::U64 | Self::F64 => 8,

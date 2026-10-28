@@ -34,6 +34,7 @@ pub mod local_api;
 pub mod lora;
 pub mod media;
 pub mod multimodal;
+pub mod nvfp4;
 pub mod partition;
 pub mod presets;
 pub mod reference;

@@ -85,6 +85,9 @@ struct Options {
     /// `--vae-gemm`: `fp32` is the reference rounding, `bf16` the one
     /// tensor-core computation four orders below the value scale.
     vae_gemm: VaeGemm,
+    /// `--text-nvfp4`: the reference's NVFP4-AWQ prompt encoder. Absent means
+    /// the released BF16 shards under `-d`.
+    text_encoder: text_forward::Encoder,
     /// `--frames-dir` (`main.c:57`, `:339`, `:492`): the decoded frames.
     frames_dir: Option<PathBuf>,
     /// `--preview-dir` (`main.c:58`, `:340`, `:493`).
@@ -195,7 +198,8 @@ fn run() -> Result<ExitCode, String> {
         let ids = tokenizer
             .encode(&options.prompt, EmptyPrompt::Pad)
             .map_err(|error| format!("tokenizer: {}", error.token()))?;
-        text_forward::encode(&component("text_encoder"), &ids).map_err(|error| error.token())
+        text_forward::encode_with(&options.text_encoder, &component("text_encoder"), &ids)
+            .map_err(|error| error.token())
     }?;
     println!(
         "TEXT tokens={} width={} fnv={:016x} seconds={:.3}",
@@ -745,6 +749,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         attention: Attention::Tensor,
         vae_attention: VaeAttention::Scalar,
         vae_gemm: VaeGemm::Fp32,
+        text_encoder: text_forward::Encoder::Bf16,
         frames_dir: None,
         preview_dir: None,
         show: false,
@@ -873,6 +878,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                     other => return Err(format!("--vae-gemm must be fp32 or bf16, not {other}")),
                 }
             }
+            "--text-nvfp4" => {
+                options.text_encoder =
+                    text_forward::Encoder::Quantized(PathBuf::from(value(&mut argv, &flag)?))
+            }
             "--info" => options.info = true,
             "--hash" => options.hash = true,
             other => return Err(format!("unknown flag {other}; see --help")),
@@ -991,6 +1000,9 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
   --vae-gemm fp32|bf16      decoder GEMM; fp32 is the reference rounding, bf16
                             is one tensor-core computation below its scale
                             (window from H3_TOKEN_REDUCTION_* env)
+  --text-nvfp4 PATH         encode the prompt with the reference's NVFP4-AWQ
+                            artifact instead of the BF16 shards; the same
+                            forward, a smaller read
   --core-reuse N            core refresh: 1 exact, 4 fast, 6 aggressive
   --frames-dir PATH         write one PPM per generated frame
   --preview-dir PATH        write one PPM preview per denoising step

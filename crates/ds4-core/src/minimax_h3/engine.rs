@@ -27,7 +27,7 @@ use super::partition::{Catalog, Partition, TOKENIZER};
 use super::reference::{self, fnv_f32};
 use super::render::{check_frames, mux_mp4, Canvas, RgbFrames};
 use super::sequence::{self, Spec};
-use super::text_forward::{self, Embedding};
+use super::text_forward::{self, Embedding, Encoder};
 use super::tokenizer::{EmptyPrompt, Tokenizer};
 use super::{condition, vae_audio, vae_encoder, vae_video};
 
@@ -61,6 +61,10 @@ pub struct RenderRequest {
     pub vae_attention: VaeAttention,
     /// The video decoder's GEMM mode; `Fp32` is the reference rounding.
     pub vae_gemm: VaeGemm,
+    /// Which checkpoint encodes the prompt: the released BF16 shards, or the
+    /// reference's NVFP4-AWQ artifact. The same forward either way, so this
+    /// changes the phase's read time and nothing else the graph sees.
+    pub text_encoder: Encoder,
     pub output: PathBuf,
 }
 
@@ -146,8 +150,10 @@ pub struct Engine {
     catalog: Catalog,
     tokenizer: Tokenizer,
     /// `h3.c:223-309`: one conditioning entry is enough for a server; the
-    /// reference keeps a small table and counts hits and misses.
-    embedding: Option<([u8; 32], Embedding)>,
+    /// reference keeps a small table and counts hits and misses. The encoder
+    /// is part of the key because two checkpoints answer one prompt with two
+    /// different embeddings.
+    embedding: Option<([u8; 32], Encoder, Embedding)>,
     prepared: Option<Prepared>,
 }
 
@@ -225,10 +231,9 @@ impl Engine {
         // Position, presentation and original vision pixels belong to the key
         // along with the VAE rows; both consumers must see the same request.
         let text_started = Instant::now();
-        let cached = self
-            .embedding
-            .as_ref()
-            .and_then(|(key, text)| (*key == conditioning).then(|| text.clone()));
+        let cached = self.embedding.as_ref().and_then(|(key, encoder, text)| {
+            (*key == conditioning && *encoder == request.text_encoder).then(|| text.clone())
+        });
         let text_hit = cached.is_some();
         let text = match cached {
             Some(text) => text,
@@ -258,11 +263,14 @@ impl Engine {
                         .map_err(|error| {
                             EngineError::new(format!("tokenizer: {}", error.token()))
                         })?;
-                    text_forward::encode(&self.component("text_encoder"), &ids).map_err(
-                        |error| EngineError::new(format!("text encoder: {}", error.token())),
-                    )?
+                    text_forward::encode_with(
+                        &request.text_encoder,
+                        &self.component("text_encoder"),
+                        &ids,
+                    )
+                    .map_err(|error| EngineError::new(format!("text encoder: {}", error.token())))?
                 };
-                self.embedding = Some((conditioning, text.clone()));
+                self.embedding = Some((conditioning, request.text_encoder.clone(), text.clone()));
                 text
             }
         };

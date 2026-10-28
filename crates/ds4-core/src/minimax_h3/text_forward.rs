@@ -28,13 +28,15 @@
 //! FNV-1a hash over the BF16 output, so a change here is measured against
 //! `fnv=1d9d71e8dd8544d6` for the recorded prompt.
 
+use std::borrow::Cow;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread::{Scope, ScopedJoinHandle};
 
 use ds4_sys::h3_text::{Dtype, Gpu, Tensor};
 
 use crate::minimax_h3::multimodal::VisionSpan;
+use crate::minimax_h3::nvfp4::Nvfp4;
 use crate::minimax_h3::text::{
     Part, Role, HEAD_DIM, HIDDEN, INTERMEDIATE, KV_HEADS, LAYERS, QUERY_HEADS, RMS_EPSILON, VOCAB,
 };
@@ -131,6 +133,9 @@ fn words(values: &[u8], start: usize, count: usize) -> Vec<u16> {
 pub enum ForwardError {
     /// The checkpoint is not the encoder the layout proved.
     Weights(TextLoadError),
+    /// The quantized source refused a role or failed to decode it
+    /// (`crate::minimax_h3::nvfp4`).
+    Quantized(String),
     /// A device call failed; the native side's message.
     Gpu(String),
     /// No token to encode.
@@ -144,6 +149,7 @@ impl ForwardError {
     pub fn token(&self) -> String {
         match self {
             ForwardError::Weights(error) => format!("weights: {}", error.token()),
+            ForwardError::Quantized(detail) => format!("quantized: {detail}"),
             ForwardError::Gpu(detail) => format!("gpu: {detail}"),
             ForwardError::Empty => "the prompt has no tokens".to_string(),
             ForwardError::Invalid(detail) => {
@@ -167,6 +173,88 @@ impl From<TextLoadError> for ForwardError {
     }
 }
 
+/// Where the encoder's weights come from: the released BF16 shard set, or the
+/// reference's single-file NVFP4-AWQ artifact.
+///
+/// The two stores differ in which bytes are read and how they are decoded, and
+/// in nothing the layer walk sees: both hand back BF16 tensors, so the
+/// quantization is a load-time choice rather than a second execution path.
+pub enum Weights<'a> {
+    /// `FL2VA/text_encoder`: fourteen BF16 shards.
+    Bf16(&'a TextWeights),
+    /// `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`: packed E2M1 codes and
+    /// their scales (`crate::minimax_h3::nvfp4`).
+    Quantized(&'a Nvfp4),
+}
+
+impl Weights<'_> {
+    /// One tensor as BF16 bytes: borrowed from the BF16 mapping, or decoded.
+    fn read(&self, role: Role) -> Result<Cow<'_, [u8]>, ForwardError> {
+        match self {
+            Weights::Bf16(weights) => weights
+                .bytes(role)
+                .map(Cow::Borrowed)
+                .map_err(ForwardError::Weights),
+            Weights::Quantized(weights) => {
+                let mut buffer = Vec::new();
+                weights
+                    .read_into(role, &mut buffer)
+                    .map_err(|error| ForwardError::Quantized(error.token()))?;
+
+                Ok(Cow::Owned(buffer))
+            }
+        }
+    }
+
+    /// One tensor into a caller-owned buffer, the form the ring's lanes use.
+    fn read_into(&self, role: Role, buffer: &mut Vec<u8>) -> Result<(), ForwardError> {
+        match self {
+            Weights::Bf16(weights) => weights
+                .read_into(role, buffer)
+                .map_err(ForwardError::Weights),
+            Weights::Quantized(weights) => weights
+                .read_into(role, buffer)
+                .map_err(|error| ForwardError::Quantized(error.token())),
+        }
+    }
+}
+
+/// Which store the prompt encoder reads its weights from.
+///
+/// One choice, two checkpoints: the released BF16 shard set, or the
+/// reference's NVFP4-AWQ artifact (`minimax_h3::nvfp4`). Both run this
+/// forward; the difference is which bytes are read and how they decode.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Encoder {
+    /// `FL2VA/text_encoder`: fourteen BF16 shards.
+    #[default]
+    Bf16,
+    /// `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`, opened by path.
+    Quantized(PathBuf),
+}
+
+impl Encoder {
+    /// The name a gate line reports.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Encoder::Bf16 => "bf16",
+            Encoder::Quantized(_) => "nvfp4-awq",
+        }
+    }
+}
+
+/// Encode `ids` with the chosen checkpoint.
+///
+/// `dir` is `FL2VA/text_encoder`; the quantized path reads its own file and
+/// ignores it, so the caller passes the component the catalog resolved either
+/// way.
+pub fn encode_with(encoder: &Encoder, dir: &Path, ids: &[u32]) -> Result<Embedding, ForwardError> {
+    match encoder {
+        Encoder::Bf16 => encode(dir, ids),
+        Encoder::Quantized(file) => encode_quantized(file, ids),
+    }
+}
+
 /// `1.0f / sqrtf(TEXT_HEAD_DIM)` (`h3_text_encoder.c:457-458`).
 pub fn attention_scale() -> f32 {
     1.0 / (HEAD_DIM as f32).sqrt()
@@ -175,6 +263,20 @@ pub fn attention_scale() -> f32 {
 /// Encode `ids` with the checkpoint under `dir`.
 pub fn encode(dir: &Path, ids: &[u32]) -> Result<Embedding, ForwardError> {
     encode_layers(dir, ids, LAYERS)
+}
+
+/// Encode `ids` with the reference's NVFP4-AWQ artifact.
+///
+/// `FL2VA/text_encoder`'s own `config.json` is not read: the geometry is this
+/// crate's constants (`text.rs:39-57`), and the artifact is checked against
+/// them by name, dtype and shape when it opens.
+pub fn encode_quantized(file: &Path, ids: &[u32]) -> Result<Embedding, ForwardError> {
+    require_tokens(ids)?;
+
+    let weights = Nvfp4::open(file).map_err(|error| ForwardError::Quantized(error.token()))?;
+    let gpu = Gpu::create().map_err(ForwardError::Gpu)?;
+
+    run(&Weights::Quantized(&weights), &gpu, ids, LAYERS, None)
 }
 
 /// Encode `ids` through the first `layers` layers, for the E4 bisection: the
@@ -186,7 +288,13 @@ pub fn encode_layers(dir: &Path, ids: &[u32], layers: u32) -> Result<Embedding, 
     let weights = TextWeights::open(dir)?;
     let gpu = Gpu::create().map_err(ForwardError::Gpu)?;
 
-    run(&weights, &gpu, ids, layers.min(LAYERS), None)
+    run(
+        &Weights::Bf16(&weights),
+        &gpu,
+        ids,
+        layers.min(LAYERS),
+        None,
+    )
 }
 
 /// Encode a prompt that carries Qwen vision spans
@@ -213,7 +321,13 @@ pub fn encode_multimodal(
         tags,
     };
 
-    run(&weights, &gpu, ids, LAYERS, Some(&presentation))
+    run(
+        &Weights::Bf16(&weights),
+        &gpu,
+        ids,
+        LAYERS,
+        Some(&presentation),
+    )
 }
 
 /// Refuse an empty prompt before the device is touched.
@@ -306,7 +420,7 @@ impl<'scope> Slot<'scope> {
 /// `h3_text_encoder.c:267-277`, `:324-359`).
 fn start_read<'scope>(
     scope: &'scope Scope<'scope, '_>,
-    weights: &'scope TextWeights,
+    weights: &'scope Weights<'scope>,
     layer: u32,
     lanes: usize,
 ) -> Slot<'scope> {
@@ -326,7 +440,7 @@ fn start_read<'scope>(
 
 /// One lane's share: `pread` its tensors into buffers it owns.
 fn read_items(
-    weights: &TextWeights,
+    weights: &Weights<'_>,
     layer: u32,
     parts: Vec<usize>,
 ) -> Result<Vec<(usize, Vec<u8>)>, ForwardError> {
@@ -343,7 +457,7 @@ fn read_items(
 
 /// Read one layer on this thread, for layer 0 and for the ring turned off
 /// (`layer_weights_load`, `h3_text_encoder.c:145-180`).
-fn read_sync(weights: &TextWeights, layer: u32) -> Result<Vec<Vec<u8>>, ForwardError> {
+fn read_sync(weights: &Weights<'_>, layer: u32) -> Result<Vec<Vec<u8>>, ForwardError> {
     let mut buffers = Vec::with_capacity(PARTS.len());
 
     for part in PARTS {
@@ -382,7 +496,7 @@ fn take(slot: &mut Slot<'_>) -> Result<Vec<Vec<u8>>, ForwardError> {
 
 /// The sixteen-op layer walk (`h3_text_encoder.c:411-463`).
 fn run(
-    weights: &TextWeights,
+    weights: &Weights<'_>,
     gpu: &Gpu,
     ids: &[u32],
     layers: u32,
@@ -421,13 +535,8 @@ fn run(
     // stream their own weights (`h3_text_encoder.c:622-625`, `:659`).
     {
         let embedding = allocate(gpu, Dtype::Bf16, VOCAB as usize * HIDDEN as usize)?;
-        gpu.upload(
-            &embedding,
-            weights
-                .bytes(Role::Embedding)
-                .map_err(ForwardError::Weights)?,
-        )
-        .map_err(ForwardError::Gpu)?;
+        gpu.upload(&embedding, &weights.read(Role::Embedding)?)
+            .map_err(ForwardError::Gpu)?;
         gpu.embed(
             &activations.hidden,
             &embedding,
@@ -491,7 +600,7 @@ fn run(
                 None => {
                     return Err(ForwardError::Gpu(format!(
                         "Qwen layer {index} is absent from the prefetch ring"
-                    )))
+                    )));
                 }
             };
 

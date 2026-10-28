@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use ds4_core::minimax_h3::engine::{EngineHandle, RenderRequest};
 use ds4_core::minimax_h3::local_api::{Plan, ReferenceKind};
 use ds4_core::minimax_h3::reference;
+use ds4_core::minimax_h3::text_forward::Encoder;
 
 use crate::h3_video::{MediaFile, RenderError, Renderer, RendererState};
 
@@ -18,6 +19,8 @@ pub struct EngineRenderer {
     engine: EngineHandle,
     steps: usize,
     reuse: usize,
+    /// Which checkpoint encodes the prompt (`prompt_encoder`).
+    text_encoder: Encoder,
 }
 
 impl EngineRenderer {
@@ -31,7 +34,20 @@ impl EngineRenderer {
             engine,
             steps,
             reuse,
+            text_encoder: prompt_encoder(),
         })
+    }
+}
+
+/// `H3_TEXT_NVFP4`: the path of the reference's NVFP4-AWQ prompt encoder.
+/// Unset, the engine reads the released BF16 shards in the model directory.
+/// The port's Qwen read path already takes its knobs from the environment
+/// (`H3_QWEN_PREFETCH`), and this one is a startup setting like steps and
+/// reuse rather than a field of the local body.
+fn prompt_encoder() -> Encoder {
+    match std::env::var("H3_TEXT_NVFP4") {
+        Ok(path) if !path.trim().is_empty() => Encoder::Quantized(PathBuf::from(path.trim())),
+        _ => Encoder::Bf16,
     }
 }
 
@@ -81,6 +97,7 @@ impl Renderer for EngineRenderer {
             attention: spec.attention,
             vae_attention: spec.vae_attention,
             vae_gemm: spec.vae_gemm,
+            text_encoder: self.text_encoder.clone(),
             output: output.to_path_buf(),
         };
         let report = self
