@@ -3331,8 +3331,15 @@ enum {
     H3D_SOL_THREADS = 128,       /* pooling and statistics kernel width */
     H3D_SOL_WARP = 32,           /* route kernel: one lane per mask bit */
     H3D_SOL_QM = 64,             /* query blocks one route CTA covers */
-    H3D_SOL_KLD = H3D_SOL_HEAD_DIM + 8,  /* +8 bf16 keeps kc rows off a bank */
-    H3D_SOL_QLD = H3D_SOL_HEAD_DIM + 4,  /* +4 f32 ditto for the centroids */
+    /* +2 bf16 makes a kc row 65 words long, which is odd: lane `l` reads its
+     * block's summary at word `l * 65 + dim / 2`, and an odd stride spreads the
+     * 32 lanes over 32 different banks. The earlier +8 gave 68 words, where
+     * lanes eight apart share a bank - four-way serialization on every one of
+     * the kernel's summary reads. */
+    H3D_SOL_KLD = H3D_SOL_HEAD_DIM + 2,
+    /* +4 f32 on the centroids is padding, not a bank fix: every lane reads the
+     * same centroid address and the hardware broadcasts it. */
+    H3D_SOL_QLD = H3D_SOL_HEAD_DIM + 4,
 };
 
 uint32_t h3d_sol_words(uint32_t sequence) {
@@ -3477,20 +3484,22 @@ __global__ static void h3d_sol_route_kernel(
 
     for (uint32_t word = 0; word < words; ++word) {
         /* Stage one word of kc: 32 blocks of 128 dimensions, zero-filled past
-         * the last block so the lane's dot is defined. */
-        enum { CHUNKS = H3D_SOL_GROUP * H3D_SOL_HEAD_DIM / 8 };  /* uint4 */
-        for (uint32_t index = lane; index < CHUNKS; index += H3D_SOL_WARP) {
-            const uint32_t block =
-                word * H3D_SOL_GROUP + index / (H3D_SOL_HEAD_DIM / 8);
-            const uint32_t chunk = index % (H3D_SOL_HEAD_DIM / 8);
-            uint4 packed = make_uint4(0u, 0u, 0u, 0u);
+         * the last block so the lane's dot is defined. Four-byte pieces, not
+         * 16-byte: a padded row is 260 B, which a uint4 store cannot address.
+         * The granularity is not what the kernel costs - 64 pieces per lane
+         * against the 8,192 summary reads the row loop makes below. */
+        enum { PIECES = H3D_SOL_GROUP * H3D_SOL_HEAD_DIM / 2 };  /* uint */
+        for (uint32_t index = lane; index < PIECES; index += H3D_SOL_WARP) {
+            const uint32_t row = index / (H3D_SOL_HEAD_DIM / 2);
+            const uint32_t piece = index % (H3D_SOL_HEAD_DIM / 2);
+            const uint32_t block = word * H3D_SOL_GROUP + row;
+            uint32_t packed = 0u;
             if (block < blocks) {
-                packed = *(const uint4 *)((const char *)kc +
+                packed = *(const uint32_t *)((const char *)kc +
                     ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM * 2 +
-                    chunk * 16);
+                    piece * 4);
             }
-            *(uint4 *)((char *)s_kc[index / (H3D_SOL_HEAD_DIM / 8)] +
-                       chunk * 16) = packed;
+            *(uint32_t *)((char *)s_kc[row] + piece * 4) = packed;
         }
         __syncwarp();
         const uint32_t block = word * H3D_SOL_GROUP + lane;
