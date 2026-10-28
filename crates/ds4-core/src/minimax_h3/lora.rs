@@ -573,11 +573,12 @@ const GLOBAL_MAP: &[(&str, &str)] = &[
 /// The served tensor a module's weight (or bias) lands on, and the row order
 /// that carries it there.
 fn destination(module: &str, bias: bool) -> Result<(String, Rows), MergeError> {
-    if !bias {
-        for (from, to) in GLOBAL_MAP {
-            if module == *from {
-                return Ok((format!("{to}.weight"), Rows::Identity));
-            }
+    // The nine global projections carry both a weight and a bias, and the
+    // adapter states a `.diff_b` for every one of them.
+    for (from, to) in GLOBAL_MAP {
+        if module == *from {
+            let suffix = if bias { "bias" } else { "weight" };
+            return Ok((format!("{to}.{suffix}"), Rows::Identity));
         }
     }
 
@@ -907,6 +908,16 @@ fn apply(
             }
             Delta::Add { diff } => {
                 let factor = adapter.find(diff).expect("checked when the plan was built");
+                if factor.elements() != tensor.elements() {
+                    return Err(MergeError::Adapter {
+                        detail: format!(
+                            "{diff} holds {} values, {} holds {}",
+                            factor.elements(),
+                            tensor.name,
+                            tensor.elements()
+                        ),
+                    });
+                }
                 Prepared::Add {
                     diff: adapter.read(diff)?,
                     dtype: factor.dtype,
@@ -1008,22 +1019,25 @@ fn run_task(
             );
         }
         (Delta::Add { .. }, Prepared::Add { diff, dtype }) => {
-            if diff.len() as u64 != tensor.bytes() {
+            // The delta's own dtype indexes it: an F32 boundary projection
+            // takes a BF16 delta of the same element count.
+            let diff_stride = cols * dtype.size();
+            let start = (task.dest * diff_stride) as usize;
+            let span = &diff[start..start + (task.rows * diff_stride) as usize];
+            let adds = decode(span, *dtype)?;
+
+            if adds.len() != values.len() {
                 return Err(MergeError::Adapter {
                     detail: format!(
-                        "{} holds {} bytes, the delta holds {}",
+                        "{}: {} values against {} of delta",
                         tensor.name,
-                        tensor.bytes(),
-                        diff.len()
+                        values.len(),
+                        adds.len()
                     ),
                 });
             }
 
-            let start = (task.dest * stride) as usize;
-            let span = &diff[start..start + values.len() * width];
-            let deltas = decode(span, *dtype)?;
-
-            for (value, add) in values.iter_mut().zip(deltas.iter()) {
+            for (value, add) in values.iter_mut().zip(adds.iter()) {
                 *value += *add;
             }
         }
@@ -1310,6 +1324,13 @@ mod tests {
             ("proj_in", false, "video_patch_proj.weight", Rows::Identity),
             ("time_embedder.linear_2", false, "time_embedder.proj_out.weight", Rows::Identity),
             ("norm_out.norm", false, "final_layer.norm.weight", Rows::Identity),
+            ("audio_proj_in", true, "audio_patch_proj.bias", Rows::Identity),
+            ("audio_proj_out", true, "final_layer.audio_out.bias", Rows::Identity),
+            ("proj_out", true, "final_layer.video_out.bias", Rows::Identity),
+            ("norm_out.linear", true, "final_layer.adaln_proj.linear.bias", Rows::Identity),
+            ("context_embedder", true, "condition_proj.bias", Rows::Identity),
+            ("time_embedder.linear_1", true, "time_embedder.proj_in.bias", Rows::Identity),
+            ("proj_in", true, "video_patch_proj.bias", Rows::Identity),
         ];
 
         for (module, bias, name, rows) in cases {
@@ -1413,6 +1434,7 @@ mod tests {
         push("blocks.0.adaln_proj.linear.bias", Dtype::Bf16, vec![12], 6.0);
         push("condition_proj.weight", Dtype::Bf16, vec![8, 4], 7.0);
         push("video_patch_proj.weight", Dtype::F32, vec![8, 4], 8.0);
+        push("video_patch_proj.bias", Dtype::F32, vec![8], 0.0);
         push("final_layer.video_out.weight", Dtype::F32, vec![4, 8], 9.0);
 
         let store = dir.join(PARTITION).join(TRANSFORMER);
@@ -1505,6 +1527,20 @@ mod tests {
             vec![8],
             vec![0.25; 8],
         ));
+        // The boundary projections are F32 in the released checkpoint and the
+        // adapter still states their deltas in BF16.
+        adapter.push((
+            "proj_in.diff".into(),
+            Dtype::Bf16,
+            vec![8, 4],
+            vec![0.125; 32],
+        ));
+        adapter.push((
+            "proj_in.diff_b".into(),
+            Dtype::Bf16,
+            vec![8],
+            vec![0.75; 8],
+        ));
         adapter.push((
             "transformer_blocks.0.adaln_proj.linear.diff_b".into(),
             Dtype::Bf16,
@@ -1531,7 +1567,7 @@ mod tests {
             ("format", ADAPTER_FORMAT),
             ("rank", "64"),
             ("low_rank_tensors", "8"),
-            ("diff_tensors", "2"),
+            ("diff_tensors", "4"),
             ("set_weight_tensors", "1"),
         ]
         .into_iter()
@@ -1547,9 +1583,9 @@ mod tests {
 
         // One tensor for the qkv fusion, one for the fused FFN input, and one
         // each for the norm and the AdaLN bias.
-        assert_eq!(report.touched_tensors, 4);
+        assert_eq!(report.touched_tensors, 6);
         assert_eq!(report.low_rank_tensors, 8);
-        assert_eq!(report.additive_tensors, 2);
+        assert_eq!(report.additive_tensors, 4);
         assert_eq!(report.whole_tensors, 1);
 
         let merged = safetensors::open_dir(&out.join(PARTITION).join(TRANSFORMER)).expect("store");
@@ -1569,7 +1605,6 @@ mod tests {
             "blocks.0.attn.out_proj.weight",
             "blocks.0.mlp.fc2.weight",
             "condition_proj.weight",
-            "video_patch_proj.weight",
             "final_layer.video_out.weight",
         ] {
             let released = released[name];
@@ -1588,6 +1623,19 @@ mod tests {
             let expect = released["blocks.0.norm1.weight"].3[index] + 0.25;
             assert_eq!(value, &stored(expect), "norm1 {index}");
         }
+        // An F32 tensor takes a BF16 delta: the add stays in F32 and the
+        // destination keeps its own dtype.
+        let projected = read("video_patch_proj.weight");
+        for (index, value) in projected.iter().enumerate() {
+            let expect = released["video_patch_proj.weight"].3[index] + 0.125;
+            assert_eq!(value, &expect, "proj_in.weight {index}");
+        }
+        let projected = read("video_patch_proj.bias");
+        for (index, value) in projected.iter().enumerate() {
+            let expect = released["video_patch_proj.bias"].3[index] + 0.75;
+            assert_eq!(value, &expect, "proj_in.bias {index}");
+        }
+
         let bias = read("blocks.0.adaln_proj.linear.bias");
         for (index, value) in bias.iter().enumerate() {
             let expect = released["blocks.0.adaln_proj.linear.bias"].3[index] + 0.5;
