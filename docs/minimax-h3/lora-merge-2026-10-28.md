@@ -210,6 +210,31 @@ order of magnitude.
 | 20 steps, released, SOL + fast | 48.2 |
 | 20 steps, released, default arms | 38.9 |
 
+**The same measure over every frame.** The figures above are one frame; the
+whole render says the same thing. Mean of `|frame - luma-4 blur|` over all 107
+frames of each render, one binary and one scale for every row:
+
+| render | detail energy |
+|---|---|
+| 2 steps, released, SOL + fast | 0.824 |
+| 4 steps, released, SOL + fast | 1.734 |
+| 4 steps, derived, SOL + fast | 3.189 |
+| 4 steps, derived, SOL + default | 3.191 |
+| 4 steps, derived, dense + default | 4.563 |
+| 20 steps, released, SOL + fast | 3.282 |
+| 20 steps, released, dense + default | 3.212 |
+
+This settles two things the mid frames could not. The derived four-step render
+sits on the twenty-step references - 3.189 against 3.282 and 3.212 - while the
+un-merged four-step render sits at half of them, 1.734, and the two-step render
+at a quarter, 0.824. And the derived dense arm at four steps is the highest of
+the set, 4.563, above both twenty-step renders; the four-step sparse arm in the
+default decoder, 3.191, repeats the fast one to 0.002, so the decoder swap
+barely moves detail while the checkpoint swap doubles it. The metric remains a
+no-reference content-dependent high-pass energy: what makes it decisive here is
+not the absolute value but that the twenty-step references land on the same
+value as the derived four-step sparse arm.
+
 ### PSNR is the wrong instrument here
 
 Against the twenty-step reference, the merged four-step renders score 15.76 dB
