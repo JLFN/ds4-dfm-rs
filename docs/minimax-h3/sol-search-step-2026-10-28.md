@@ -74,9 +74,15 @@ Deviations, named:
 
 - Head-major `[heads][sequence][128]` tensors with batch 1, the port's layout
   for every H3 attention primitive, against the reference's `[B, T, H, 128]`.
-- `query_bar` is stored F32 rather than the reference's BF16 `q_bar`
-  (`preprocess.py:401-405`), so the routed set depends only on the reference's
-  own BF16 rounding of `kc` and `vc`.
+- `query_bar` is F32, which is what the reference's diagonal path already is:
+  `_diag_threshold_kernel` builds its centroid as
+  `tl.sum(q_values.to(tl.float32), axis=0) / q_len` (`preprocess.py:161-170`),
+  so this is not a deviation. The BF16 `q_bar` at `preprocess.py:401-405`
+  belongs to the separate `thresh_type="exact"` path (`:383-410`), which this
+  port does not implement. An earlier draft of this file cited that BF16
+  `q_bar` as the reference's form and claimed the F32 store avoided a
+  BF16-to-F32 deviation; both halves of that were wrong, and the Astra review
+  caught it.
 - The accumulation orders are this port's. The reference's Triton reduction
   trees are not reproducible here without its runtime; the pooled summaries
   match a sequential-order transcription bit for bit, and the threshold's own
@@ -88,7 +94,7 @@ Deviations, named:
 
 ## Tests
 
-`tests/h3/test_native.cu`: eleven check names across five cases, 33 checks,
+`tests/h3/test_native.cu`: nineteen check names across nine cases, 52 checks,
 added to the existing suite. The oracle is a transcription of the six cited
 steps, including the row-order column mean.
 
@@ -105,6 +111,10 @@ steps, including the row-order column mean.
 | `constant summaries route the diagonal band and nothing else`, `constant risk threshold matches its closed form` | arithmetic, not a second transcription: constant K and Q have no variance, so the threshold is `mean + tau*sqrt(1e-6)` and only the diagonal band can be exact. The threshold matched its closed form to 0.000e+00 |
 | `a spiked summary is routed exactly and no other far block is` | one block's summary spikes in dimension 0 with Q one-hot in that dimension: exactly that block plus the band |
 | `raising tau only removes exact blocks` | a tau sweep with no oracle at all: 7 bits removed, 0 added |
+| `an empty sink range forces no block: the band is the whole route`, `an empty sink range routes exactly as no sink at all` | `_sink_block_range`'s zero case: zero `sink_tokens` is the empty range, never a forced block 0. Both assertions failed before the fix, which is the point of them |
+| `the search step refuses a wrapping sink or shape` | `sink_start + sink_tokens` wrapping to a small number, a sink longer than the sequence, and a `sequence` whose block rounding overflows are all refused before a launch. It fails against the old comparison and passes against the difference |
+| `the multiword fixture is 70 blocks over three words` and the two `multiword` comparisons | a second mask word, a second query CTA and a 30-row final block against the oracle at two taus; tightest margin 3.747e-03 against a 5.245e-06 order delta |
+| `a column mean equal to the threshold is not routed` | the strict `>`: with Q one-hot on dimension 0 and summaries [1, 0, 3, 0] there, block 0's column mean equals the threshold exactly at tau=0 and is not routed |
 
 The two analytic cases are the ones that catch a wrong formula rather than a
 wrong transcription: the constant case pins the `+1e-6` floor and the strict
@@ -142,20 +152,27 @@ route 0.126, total 1.158 ms.
 
 Where the time goes, against the ceilings this campaign measured:
 
-- pool: 504 MB of K and V in 2.493 ms, 202 GB/s, 86% of the 236.8 GB/s DRAM
-  ceiling. It is a streaming kernel and nothing else is left in it.
-- threshold: 252 MB of Q in 1.323 ms, 190 GB/s, 80% of the same ceiling. The
+- pool: 528.4 MB of K and V (252 MiB = 264.2 MB per tensor) in 2.493 ms,
+  212 GB/s, 89% of the 236.8 GB/s DRAM ceiling. It is a streaming kernel and
+  nothing else is left in it.
+- threshold: 264.2 MB of Q in 1.323 ms, 200 GB/s, 84% of the same ceiling. The
   query centroid needs every query row once, so this read is inherent to the
   step.
-- route: the `kc` tensor is 4.13 MB and every one of the 288 query blocks reads
-  all of it, so the kernel moves 1.19 GB from L2 in 0.852 ms, 1.4 TB/s against
-  the measured 2,101.9 GB/s L2 read ceiling. The shared-memory staging is what
-  makes it L2-bound instead of 288 separate DRAM passes.
+- route: not bandwidth-bound at all. Each of the 5 query tiles stages all 288
+  `kc` rows once, so its global reads are 5 x 4.13 MB = 20.6 MB, which at
+  0.852 ms is 24 GB/s. What it does instead is 8,192 shared-memory summary
+  reads per lane per mask word against 64 staging pieces, so it is instruction-
+  and bank-bound inside the SM - and the padding of that shared array decides
+  how many wavefronts those reads cost (see the A/B below).
+  An earlier draft of this file claimed 1.19 GB of L2 traffic and an L2 bound
+  at 1.4 TB/s; that figure counted repeated reads of the *shared* copy, not
+  global traffic, so it was wrong. The Astra review caught this one too.
 - statistics: 4.13 MB in 8 us, 516 GB/s, above the DRAM ceiling because the pool
   kernel wrote that tensor a moment earlier.
 
-So the step is streaming-bound, and its floor at this shape is the 756 MB of K,
-V and Q it must read once: 3.2 ms of the 4.9 ms measured. A per-request figure
+So the step is streaming-bound, and its floor at this shape is the 792.7 MB of
+K, V and Q it must read once: 3.35 ms at 236.8 GB/s against the 4.9 ms measured.
+A per-request figure
 for a Sol-H3-shaped Stage 1 (147 sparse calls) is therefore about 0.72 s of
 routing against the 25.4 s the dense attention it routes would take at 18,432
 tokens. The model's own Stage 1 runs at 672x384x124, a different token count
@@ -174,6 +191,46 @@ That is the FP order of the two compilations against pairs sitting within
 ~2e-6 absolute column-mean order difference, margins spread over ~3). Any
 route A/B must therefore compare two runs on one host.
 
+## The route kernel's bank conflict — predicted, then refuted (2026-10-28)
+
+The Astra review of this unit argued from the source layout that `s_kc` reads
+carry a four-way shared-memory conflict: a row is `H3D_SOL_KLD = 136` bf16, so
+its stride is 68 words, and lane `l` reads word `l*68 + dim/2`; 68 mod 32 = 4,
+so lanes eight apart share a bank, over the 8,192 summary reads each
+query-block tile makes per mask word.
+
+Two changes were made to test that, and both were measured on the Spark against
+a baseline binary kept from the same tree, interleaved in one session at a
+steady 2,444 MHz with five back-to-back launches per figure, at 18,432 tokens x
+56 heads:
+
+| Arm | KLD | staging | route, round 1 | round 2 |
+|---|---|---:|---:|---:|
+| baseline | 136 (68 words) | uint4 | 0.851 ms | 0.853 ms |
+| control | 136 (68 words) | uint | 0.929 ms | 0.923 ms |
+| conflict-free | 130 (65 words, odd) | uint | 0.964 ms | 0.936 ms |
+
+The conflict-free arm is 11-13% **slower**, and the control separates the two
+things it changed: with the stride put back to 68 words and only the staging
+widened to four-byte pieces, it still costs 0.923-0.929 ms. The staging width
+is therefore the whole regression, and the stride moves nothing measurable.
+
+That refutes the review's bank-conflict prediction as a performance claim: at
+this shape the route kernel's time is not made of conflicts on `s_kc`. The
+reading that fits the three arms is instruction-bound — uint4 staging emits 16
+shared stores per lane per mask word against 64 for four-byte pieces, and the
+wider rows stay 16-byte aligned, so `ptxas` keeps issuing wide shared accesses.
+Both arms are reverted (`ec2d3751` reverts `2dc880cc`) and the baseline is
+retained. The route masks were bit-identical in all three arms: the suite
+compares whole mask words against the row-order oracle, and every arm reports
+92 PASS / 0 FAIL.
+
+What is still unmeasured is the counter view. `ncu` cannot read performance
+counters on the Spark without operator action — `ERR_NVGPUCTRPERM`, no
+passwordless sudo, and the restriction is the driver default — so the
+attribution above is inference from a controlled A/B, not a counter
+measurement, and is worth no more than that.
+
 ## What this unit does not establish
 
 - No reference run. The rule is checked against a transcription of the
@@ -187,9 +244,12 @@ route A/B must therefore compare two runs on one host.
   sparse path pays at all. The search step is 2.8% of the dense attention at
   the job shape, so routing is not the prize — the skipped blocks are, and this
   unit prices only the routing.
-- No profile. The per-kernel figures are event-timed back-to-back launches; one
-  nsys capture over the step would attribute the pool's 202 GB/s and the
-  route's L2 traffic rather than infer them from byte counts.
+- No profile. The per-kernel figures are event-timed back-to-back launches, and
+  no counter capture exists for any of the four kernels: `ncu` cannot read
+  performance counters on this host without operator action (see below). One
+  nsys capture over the step would attribute the pool's 212 GB/s and the
+  route kernel's instruction stream rather than infer them from byte counts
+  and a controlled A/B.
 - The host's clock policy changed since the campaign (below), so these absolute
   figures are not directly comparable to `speed-2026-10-27.md`'s.
 
