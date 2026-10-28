@@ -643,6 +643,597 @@ static void short_vision_sdpa_axes(h3v_context *gpu) {
     h3v_free(zero); h3v_free(value); h3v_free(output);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Sol-Attn's search step against the reference's own rule, transcribed here as
+ * the oracle. NVIDIA Sana `sol-engine` @ `6e4a440`:
+ *   preprocess.py:280-322   kc = block mean of K, vc = the block SUM of V,
+ *                           both stored BF16
+ *   preprocess.py:96-135    kc_mean, kc_var_diag over blocks, from BF16 kc
+ *   preprocess.py:143-186   threshold = mean + TAU*std in log2 space
+ *   triton_ref/fwd.py:250-266  col_mean = the column mean of the route logits,
+ *                           summed over the query block's rows
+ *   selector.py:132-142     exact = col_mean > threshold or |q-n| <= 1
+ *   interface.py:134-142    the sink block range, forced exact
+ * ------------------------------------------------------------------------- */
+
+static uint32_t sol_rand(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return (*state >> 8) & 0xffffffu;
+}
+
+static float sol_unit(uint32_t *state) {
+    return (float)sol_rand(state) / 16777216.0f;
+}
+
+/* Round to nearest even, which is what `__float2bfloat16` does on the device;
+ * the pooled summaries are compared bit for bit through this. */
+static uint16_t sol_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+static float sol_float(uint16_t bits) {
+    uint32_t wide = (uint32_t)bits << 16;
+    float value;
+    memcpy(&value, &wide, sizeof(value));
+    return value;
+}
+
+struct SolData {
+    uint32_t sequence = 0, heads = 0, blocks = 0, words = 0;
+    std::vector<uint16_t> query, key, value;
+};
+
+/* Blocks carry a per-block signal, so the route is a mix of exact and skipped
+ * rather than degenerate; V is an order of magnitude above K, so a summary that
+ * is a mean where the reference takes a sum cannot compare equal. */
+static void sol_build(SolData &data, uint32_t sequence, uint32_t heads,
+                      uint32_t seed) {
+    data.sequence = sequence;
+    data.heads = heads;
+    data.blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    data.words = (data.blocks + H3D_SOL_GROUP - 1) / H3D_SOL_GROUP;
+    const size_t elements = (size_t)sequence * heads * H3D_SOL_HEAD_DIM;
+    data.query.assign(elements, 0);
+    data.key.assign(elements, 0);
+    data.value.assign(elements, 0);
+    uint32_t state = seed;
+    for (uint32_t head = 0; head < heads; ++head) {
+        for (uint32_t block = 0; block < data.blocks; ++block) {
+            const float signal = sol_unit(&state);
+            const uint32_t first = block * H3D_SOL_BLOCK;
+            const uint32_t rows = std::min<uint32_t>(H3D_SOL_BLOCK, sequence - first);
+            for (uint32_t row = 0; row < rows; ++row) {
+                for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                    const size_t at =
+                        ((size_t)head * sequence + first + row) * H3D_SOL_HEAD_DIM + dim;
+                    data.key[at] = sol_bf16(0.5f * signal +
+                                            0.02f * (sol_unit(&state) - 0.5f));
+                    data.value[at] = sol_bf16(2.0f * sol_unit(&state));
+                    data.query[at] = sol_bf16(0.5f + sol_unit(&state));
+                }
+            }
+        }
+    }
+}
+
+struct SolExpect {
+    std::vector<float> kc, vc;      /* [heads][blocks][128] */
+    std::vector<float> threshold;   /* [blocks][heads] */
+    std::vector<float> columns;     /* [q][heads][n], the reference's row order */
+    std::vector<float> centroid;    /* [q][heads][n], the port's centroid order */
+    std::vector<uint32_t> mask, count;
+};
+
+static void sol_expect(const SolData &data, float scale, float tau,
+                       uint32_t sink_start, uint32_t sink_tokens,
+                       SolExpect &out) {
+    const uint32_t sequence = data.sequence, heads = data.heads;
+    const uint32_t blocks = data.blocks;
+    const size_t summary = (size_t)heads * blocks * H3D_SOL_HEAD_DIM;
+    out.kc.assign(summary, 0.0f);
+    out.vc.assign(summary, 0.0f);
+    for (uint32_t head = 0; head < heads; ++head) {
+        for (uint32_t block = 0; block < blocks; ++block) {
+            const uint32_t first = block * H3D_SOL_BLOCK;
+            const uint32_t rows = std::min<uint32_t>(H3D_SOL_BLOCK, sequence - first);
+            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                float key_sum = 0.0f, value_sum = 0.0f;
+                for (uint32_t row = 0; row < rows; ++row) {
+                    const size_t at =
+                        ((size_t)head * sequence + first + row) * H3D_SOL_HEAD_DIM + dim;
+                    key_sum += sol_float(data.key[at]);
+                    value_sum += sol_float(data.value[at]);
+                }
+                const size_t into =
+                    ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM + dim;
+                out.kc[into] = sol_float(sol_bf16(key_sum / (float)rows));
+                out.vc[into] = sol_float(sol_bf16(value_sum));
+            }
+        }
+    }
+    const float log2_scale = scale * 1.4426950408889634f;
+    out.threshold.assign((size_t)blocks * heads, 0.0f);
+    out.columns.assign((size_t)blocks * heads * blocks, 0.0f);
+    out.centroid.assign((size_t)blocks * heads * blocks, 0.0f);
+    for (uint32_t head = 0; head < heads; ++head) {
+        std::vector<float> mean_d(H3D_SOL_HEAD_DIM, 0.0f);
+        std::vector<float> var_d(H3D_SOL_HEAD_DIM, 0.0f);
+        for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+            float total = 0.0f, total_sq = 0.0f;
+            for (uint32_t block = 0; block < blocks; ++block) {
+                const float value =
+                    out.kc[((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM + dim];
+                total += value;
+                total_sq += value * value;
+            }
+            const float mean = total / (float)blocks;
+            float variance = total_sq / (float)blocks - mean * mean;
+            mean_d[dim] = mean;
+            var_d[dim] = variance > 0.0f ? variance : 0.0f;
+        }
+        for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
+            const uint32_t first = q_block * H3D_SOL_BLOCK;
+            const uint32_t rows = std::min<uint32_t>(H3D_SOL_BLOCK, sequence - first);
+            std::vector<float> q_bar(H3D_SOL_HEAD_DIM, 0.0f);
+            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                float total = 0.0f;
+                for (uint32_t row = 0; row < rows; ++row) {
+                    total += sol_float(
+                        data.query[((size_t)head * sequence + first + row) *
+                                       H3D_SOL_HEAD_DIM + dim]);
+                }
+                q_bar[dim] = total / (float)rows;
+            }
+            float mean = 0.0f, variance = 0.0f;
+            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                mean += q_bar[dim] * mean_d[dim];
+                variance += q_bar[dim] * q_bar[dim] * var_d[dim];
+            }
+            const float std =
+                sqrtf((variance > 0.0f ? variance : 0.0f) * log2_scale * log2_scale +
+                      1.0e-6f);
+            out.threshold[(size_t)q_block * heads + head] =
+                mean * log2_scale + tau * std;
+            for (uint32_t block = 0; block < blocks; ++block) {
+                float column = 0.0f;
+                for (uint32_t row = 0; row < rows; ++row) {
+                    float dot = 0.0f;
+                    for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                        dot += sol_float(
+                                   data.query[((size_t)head * sequence + first + row) *
+                                                  H3D_SOL_HEAD_DIM + dim]) *
+                               out.kc[((size_t)head * blocks + block) *
+                                          H3D_SOL_HEAD_DIM + dim];
+                    }
+                    column += dot;
+                }
+                const size_t into = ((size_t)q_block * heads + head) * blocks + block;
+                out.columns[into] = column * log2_scale / (float)rows;
+                float centroid = 0.0f;
+                for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                    centroid += q_bar[dim] *
+                                out.kc[((size_t)head * blocks + block) *
+                                           H3D_SOL_HEAD_DIM + dim];
+                }
+                out.centroid[into] = centroid * log2_scale;
+            }
+        }
+    }
+    out.mask.assign((size_t)blocks * heads * data.words, 0u);
+    out.count.assign((size_t)blocks * heads, 0u);
+    const uint32_t sink_first = sink_start / H3D_SOL_BLOCK;
+    const uint32_t sink_last =
+        (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
+        for (uint32_t head = 0; head < heads; ++head) {
+            uint32_t total = 0;
+            for (uint32_t block = 0; block < blocks; ++block) {
+                const float column =
+                    out.columns[((size_t)q_block * heads + head) * blocks + block];
+                const uint32_t distance =
+                    q_block > block ? q_block - block : block - q_block;
+                const bool sink = sink_last > sink_first && block >= sink_first &&
+                                  block < sink_last;
+                if (distance <= 1 || sink ||
+                    column > out.threshold[(size_t)q_block * heads + head]) {
+                    out.mask[((size_t)q_block * heads + head) * data.words +
+                             block / H3D_SOL_GROUP] |= 1u << (block % H3D_SOL_GROUP);
+                    total += 1;
+                }
+            }
+            out.count[(size_t)q_block * heads + head] = total;
+        }
+    }
+}
+
+struct SolPlan {
+    h3d_sol_plan plan;
+    h3d_tensor *kc, *vc, *mask, *count, *threshold, *query_bar, *kc_mean, *kc_var;
+};
+
+static bool sol_alloc(h3d_context *gpu, const SolData &data, SolPlan &out,
+                      char *error, size_t size) {
+    const size_t summary = (size_t)data.heads * data.blocks * H3D_SOL_HEAD_DIM;
+    out.kc = h3d_alloc(gpu, H3D_BF16, summary, error, size);
+    out.vc = h3d_alloc(gpu, H3D_BF16, summary, error, size);
+    out.mask = h3d_alloc(gpu, H3D_U32, (size_t)data.blocks * data.heads * data.words,
+                         error, size);
+    out.count = h3d_alloc(gpu, H3D_U32, (size_t)data.blocks * data.heads, error, size);
+    out.threshold = h3d_alloc(gpu, H3D_F32, (size_t)data.blocks * data.heads, error, size);
+    out.query_bar = h3d_alloc(gpu, H3D_F32, summary, error, size);
+    out.kc_mean = h3d_alloc(gpu, H3D_F32, (size_t)data.heads * H3D_SOL_HEAD_DIM,
+                            error, size);
+    out.kc_var = h3d_alloc(gpu, H3D_F32, (size_t)data.heads * H3D_SOL_HEAD_DIM,
+                           error, size);
+    out.plan = {out.kc, out.vc, out.mask, out.count, out.threshold,
+                out.query_bar, out.kc_mean, out.kc_var};
+    return out.kc && out.vc && out.mask && out.count && out.threshold &&
+           out.query_bar && out.kc_mean && out.kc_var;
+}
+
+static void sol_free(SolPlan &plan) {
+    h3d_tensor *all[] = {plan.kc, plan.vc, plan.mask, plan.count,
+                         plan.threshold, plan.query_bar, plan.kc_mean, plan.kc_var};
+    for (h3d_tensor *tensor : all) {
+        if (tensor) h3d_free(tensor);
+    }
+}
+
+/* Runs the search step and reads all of it back. */
+struct SolActual {
+    std::vector<float> kc, vc, threshold, query_bar;
+    std::vector<uint32_t> mask, count;
+};
+
+static bool sol_run(h3d_context *gpu, const SolData &data, float scale, float tau,
+                    uint32_t sink_start, uint32_t sink_tokens, SolActual &out,
+                    char *error, size_t size) {
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, size)) return false;
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    const size_t summary = (size_t)data.heads * data.blocks * H3D_SOL_HEAD_DIM;
+    out.kc.assign(summary, 0.0f);
+    out.vc.assign(summary, 0.0f);
+    out.threshold.assign((size_t)data.blocks * data.heads, 0.0f);
+    out.query_bar.assign(summary, 0.0f);
+    out.mask.assign((size_t)data.blocks * data.heads * data.words, 0u);
+    out.count.assign((size_t)data.blocks * data.heads, 0u);
+    bool ok = query && key && value &&
+              h3d_upload(gpu, query, data.query.data(), error, size) &&
+              h3d_upload(gpu, key, data.key.data(), error, size) &&
+              h3d_upload(gpu, value, data.value.data(), error, size) &&
+              h3d_sol_search(gpu, &plan.plan, query, key, value, data.sequence,
+                             data.heads, scale, tau, sink_start, sink_tokens,
+                             error, size) &&
+              h3d_sync(gpu, error, size);
+    std::vector<uint16_t> key_out(summary), value_out(summary);
+    ok = ok && h3d_read(gpu, key_out.data(), plan.kc, error, size) &&
+         h3d_read(gpu, value_out.data(), plan.vc, error, size);
+    if (ok) {
+        for (size_t at = 0; at < summary; ++at) {
+            out.kc[at] = sol_float(key_out[at]);
+            out.vc[at] = sol_float(value_out[at]);
+        }
+    }
+    ok = ok && h3d_read(gpu, out.threshold.data(), plan.threshold, error, size) &&
+         h3d_read(gpu, out.query_bar.data(), plan.query_bar, error, size) &&
+         h3d_read(gpu, out.mask.data(), plan.mask, error, size) &&
+         h3d_read(gpu, out.count.data(), plan.count, error, size);
+    if (!ok) fprintf(stderr, "Sol-Attn search: %s\n", error);
+    if (query) h3d_free(query);
+    if (key) h3d_free(key);
+    if (value) h3d_free(value);
+    sol_free(plan);
+    return ok;
+}
+
+/* Compared bit for bit where the port fixed the reference's order (the pooled
+ * summaries), and as a reported margin where F32 order is the port's own (the
+ * threshold). The route itself is compared as the reference's rule computes it
+ * from the raw query rows. */
+static void sol_compare(const char *label, const SolData &data,
+                        const SolExpect &expect, const SolActual &actual,
+                        float scale, float tau) {
+
+    bool summaries = expect.kc == actual.kc && expect.vc == actual.vc;
+    check(summaries, "search pools kc and vc exactly as the reference");
+    double worst = 0.0;
+    for (size_t at = 0; at < expect.threshold.size(); ++at) {
+        const double delta = std::abs((double)expect.threshold[at] -
+                                      (double)actual.threshold[at]);
+        const double relative = delta / (1.0 + std::abs((double)expect.threshold[at]));
+        if (relative > worst) worst = relative;
+    }
+    printf("  [%s tau=%.2f] threshold worst relative delta %.3e\n", label, tau,
+           worst);
+    check(worst < 1.0e-6, "search threshold matches the reference's formula");
+    (void)scale;
+    const bool mask = expect.mask == actual.mask;
+    const bool count = expect.count == actual.count;
+    if (!mask) {
+        uint32_t shown = 0;
+        for (uint32_t q_block = 0; q_block < data.blocks && shown < 8; ++q_block) {
+            for (uint32_t head = 0; head < data.heads && shown < 8; ++head) {
+                for (uint32_t block = 0; block < data.blocks && shown < 8; ++block) {
+                    const size_t word =
+                        ((size_t)q_block * data.heads + head) * data.words +
+                        block / H3D_SOL_GROUP;
+                    const uint32_t bit = 1u << (block % H3D_SOL_GROUP);
+                    if ((expect.mask[word] & bit) == (actual.mask[word] & bit)) {
+                        continue;
+                    }
+                    const size_t into =
+                        ((size_t)q_block * data.heads + head) * data.blocks + block;
+                    printf("  [%s] diff q=%u head=%u block=%u want=%u got=%u "
+                           "row_column=%.6f centroid_column=%.6f threshold=%.6f\n",
+                           label, q_block, head, block,
+                           !!(expect.mask[word] & bit), !!(actual.mask[word] & bit),
+                           (double)expect.columns[into], (double)expect.centroid[into],
+                           (double)expect.threshold[(size_t)q_block * data.heads + head]);
+                    shown += 1;
+                }
+            }
+        }
+    }
+    uint32_t exact = 0;
+    for (uint32_t value : expect.count) {
+        exact += value;
+    }
+    const double share = 100.0 * (double)exact /
+                         (double)((size_t)data.blocks * data.heads * data.blocks);
+    printf("  [%s tau=%.2f] exact blocks %u (%.1f%% of the pairs)\n", label, tau,
+           exact, share);
+    check(mask, "search routes the reference's exact block set");
+    check(count, "search counts the reference's exact blocks");
+    /* The reference's row order against the port's centroid order: the same
+     * column mean, so the same decision, measured rather than asserted. */
+    float worst_column = 0.0f;
+    float tightest = std::numeric_limits<float>::max();
+    for (size_t at = 0; at < expect.columns.size(); ++at) {
+        const float delta = std::abs(expect.columns[at] - expect.centroid[at]);
+        if (delta > worst_column) worst_column = delta;
+        const size_t head = (at / data.blocks) % data.heads;
+        const uint32_t q_block = (uint32_t)(at / ((size_t)data.heads * data.blocks));
+        const float margin =
+            std::abs(expect.columns[at] - expect.threshold[(size_t)q_block * data.heads + head]);
+        if (margin < tightest) tightest = margin;
+    }
+    printf("  [%s tau=%.2f] column mean row-vs-centroid worst delta %.3e, "
+           "tightest threshold margin %.3e\n",
+           label, tau, (double)worst_column, (double)tightest);
+    check(worst_column < tightest,
+          "the centroid order cannot move a route wider than the tightest margin");
+
+    /* Bits past the last KV block are never set: the reference's `valid`. */
+    uint32_t stray = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            for (uint32_t word = 0; word < data.words; ++word) {
+                const uint32_t bits =
+                    actual.mask[((size_t)q_block * data.heads + head) * data.words + word];
+                for (uint32_t bit = 0; bit < H3D_SOL_GROUP; ++bit) {
+                    const uint32_t block = word * H3D_SOL_GROUP + bit;
+                    if (block < data.blocks || !(bits & (1u << bit))) continue;
+                    stray += 1;
+                }
+            }
+        }
+    }
+    check(stray == 0, "search never routes a block past the sequence");
+    uint32_t popcount = 0, mismatch = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            uint32_t total = 0;
+            for (uint32_t word = 0; word < data.words; ++word) {
+                total += __builtin_popcount(
+                    actual.mask[((size_t)q_block * data.heads + head) * data.words + word]);
+            }
+            popcount += total;
+            mismatch += total != actual.count[(size_t)q_block * data.heads + head];
+        }
+    }
+    check(mismatch == 0, "search count is the mask's own population");
+}
+
+/* The random-shape gate: pooled summaries bit for bit, threshold to a reported
+ * margin, and the routed set equal to the reference's rule. T=200 leaves a
+ * final block of 8 rows, so the block length and the query length are
+ * exercised at the tail. */
+static void sol_search_matches_reference(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 200, 3, 20261028u);
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    for (float tau : {0.5f, 1.0f, 1.5f}) {
+        SolExpect expect;
+        sol_expect(data, scale, tau, 0, 0, expect);
+        SolActual actual;
+        if (!sol_run(gpu, data, scale, tau, 0, 0, actual, error, sizeof(error))) {
+            check(false, "search runs the reference's rule");
+            return;
+        }
+        sol_compare("random", data, expect, actual, scale, tau);
+    }
+}
+
+/* The sink range: text and audio tokens ride as sinks and are routed exactly
+ * for every query block (`interface.py:134-142`). */
+static void sol_search_sink(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 400, 3, 777u);
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    const uint32_t sink_start = 200, sink_tokens = 100;
+    SolExpect expect;
+    sol_expect(data, scale, 1.25f, sink_start, sink_tokens, expect);
+    SolActual actual;
+    if (!sol_run(gpu, data, scale, 1.25f, sink_start, sink_tokens, actual, error,
+                 sizeof(error))) {
+        check(false, "search runs with a sink range");
+        return;
+    }
+    sol_compare("sink", data, expect, actual, scale, 1.25f);
+    const uint32_t first = sink_start / H3D_SOL_BLOCK;
+    const uint32_t last = (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    uint32_t missed = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            for (uint32_t block = first; block < last; ++block) {
+                const uint32_t bits =
+                    actual.mask[((size_t)q_block * data.heads + head) * data.words +
+                                block / H3D_SOL_GROUP];
+                missed += !(bits & (1u << (block % H3D_SOL_GROUP)));
+            }
+        }
+    }
+    check(missed == 0, "search routes every sink block exactly");
+}
+
+/* Constant K and constant Q: the summaries have no variance, so the threshold
+ * is mean + tau*sqrt(1e-6) and no block off the diagonal band can clear it,
+ * whatever tau is. The expected set is arithmetic, not a second transcription. */
+static void sol_search_constant(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    data.sequence = 128;
+    data.heads = 2;
+    data.blocks = 2;
+    data.words = 1;
+    const size_t elements = 128 * 2 * H3D_SOL_HEAD_DIM;
+    data.key.assign(elements, sol_bf16(1.0f));
+    data.value.assign(elements, sol_bf16(0.5f));
+    data.query.assign(elements, sol_bf16(1.0f));
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolActual actual;
+    if (!sol_run(gpu, data, scale, 1.5f, 0, 0, actual, error, sizeof(error))) {
+        check(false, "search runs on constant inputs");
+        return;
+    }
+    uint32_t expected = 0, mismatch = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t block = 0; block < data.blocks; ++block) {
+            const uint32_t distance =
+                q_block > block ? q_block - block : block - q_block;
+            expected += distance <= 1;
+        }
+    }
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            const uint32_t bits =
+                actual.mask[((size_t)q_block * data.heads + head) * data.words];
+            uint32_t set = 0;
+            for (uint32_t block = 0; block < data.blocks; ++block) {
+                const uint32_t distance =
+                    q_block > block ? q_block - block : block - q_block;
+                set += !!(bits & (1u << block));
+                mismatch += (distance <= 1) != !!(bits & (1u << block));
+            }
+            mismatch += set != actual.count[(size_t)q_block * data.heads + head];
+        }
+    }
+    (void)expected;
+    check(mismatch == 0,
+          "constant summaries route the diagonal band and nothing else");
+    /* The threshold itself: 128 * log2_scale + tau * sqrt(1e-6). */
+    const float log2_scale = scale * 1.4426950408889634f;
+    const float want = 128.0f * log2_scale + 1.5f * 1.0e-3f;
+    float worst = 0.0f;
+    for (float value : actual.threshold) {
+        worst = std::max(worst, std::abs(value - want));
+    }
+    printf("  [constant] threshold vs 128*log2_scale + 1.5e-3: worst %.3e\n",
+           (double)worst);
+    check(worst < 2.0e-5f, "constant risk threshold matches its closed form");
+}
+
+/* One KV block whose summary spikes in dimension 0: with Q a one-hot row in the
+ * same dimension, only that block's column mean clears mean + tau*std, so the
+ * routed set is the band plus exactly that block. */
+static void sol_search_spike(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    data.sequence = 512;
+    data.heads = 1;
+    data.blocks = 8;
+    data.words = 1;
+    const size_t elements = (size_t)data.sequence * H3D_SOL_HEAD_DIM;
+    data.key.assign(elements, sol_bf16(0.0f));
+    data.value.assign(elements, sol_bf16(0.0f));
+    data.query.assign(elements, sol_bf16(0.0f));
+    for (uint32_t row = 0; row < data.sequence; ++row) {
+        data.query[(size_t)row * H3D_SOL_HEAD_DIM] = sol_bf16(1.0f);
+    }
+    for (uint32_t row = H3D_SOL_BLOCK; row < 2 * H3D_SOL_BLOCK; ++row) {
+        data.key[(size_t)row * H3D_SOL_HEAD_DIM] = sol_bf16(1.0f);
+    }
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolActual actual;
+    if (!sol_run(gpu, data, scale, 1.0f, 0, 0, actual, error, sizeof(error))) {
+        check(false, "search runs on a spiked summary");
+        return;
+    }
+    uint32_t mismatch = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        const uint32_t bits = actual.mask[q_block * data.words];
+        for (uint32_t block = 0; block < data.blocks; ++block) {
+            const uint32_t distance =
+                q_block > block ? q_block - block : block - q_block;
+            const bool want = distance <= 1 || block == 1;
+            mismatch += want != !!(bits & (1u << block));
+        }
+    }
+    check(mismatch == 0,
+          "a spiked summary is routed exactly and no other far block is");
+}
+
+/* Raising tau raises the threshold, so it can only remove blocks from the exact
+ * set: a superset check across a sweep that needs no oracle at all. */
+static void sol_search_tau_monotone(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 200, 3, 20261028u);
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    const float taus[] = {0.0f, 0.5f, 1.0f, 1.5f, 3.0f, 40.0f};
+    SolActual previous;
+    uint32_t added = 0, removed = 0;
+    for (size_t step = 0; step < sizeof(taus) / sizeof(taus[0]); ++step) {
+        SolActual actual;
+        if (!sol_run(gpu, data, scale, taus[step], 0, 0, actual, error,
+                     sizeof(error))) {
+            check(false, "search runs the tau sweep");
+            return;
+        }
+        uint32_t exact = 0;
+        for (uint32_t value : actual.count) {
+            exact += value;
+        }
+        float lowest = std::numeric_limits<float>::max(), highest = -lowest;
+        for (float value : actual.threshold) {
+            lowest = std::min(lowest, value);
+            highest = std::max(highest, value);
+        }
+        printf("  [tau] %.1f routes %u of %u pairs, threshold %.4f..%.4f\n",
+               (double)taus[step], exact,
+               data.blocks * data.heads * data.blocks, (double)lowest,
+               (double)highest);
+        if (step) {
+            for (size_t at = 0; at < actual.mask.size(); ++at) {
+                added += __builtin_popcount(actual.mask[at] & ~previous.mask[at]);
+                removed += __builtin_popcount(previous.mask[at] & ~actual.mask[at]);
+            }
+        }
+        previous = actual;
+    }
+    printf("  [tau] the sweep removes %u bits and adds %u\n", removed, added);
+    check(added == 0 && removed > 0,
+          "raising tau only removes exact blocks");
+}
 int main() {
     char error[512] = {};
     auto *dit = h3d_create(error, sizeof(error));
@@ -672,6 +1263,11 @@ int main() {
     video_vae_attention_order(dit);
     video_vae_attention_mma(dit);
     video_vae_linear_options(dit);
+    sol_search_matches_reference(dit);
+    sol_search_sink(dit);
+    sol_search_constant(dit);
+    sol_search_spike(dit);
+    sol_search_tau_monotone(dit);
     h3v_destroy(vision);
     h3t_destroy(text);
     h3d_destroy(dit);

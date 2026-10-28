@@ -3288,3 +3288,315 @@ int h3d_sdpa_causal_f32(h3d_context *context, h3d_tensor *output,
         heads, head_dim, scale);
     return h3d_launch_ok("F32 causal attention", error, error_size);
 }
+
+/* ---------------------------------------------------------------------------
+ * Sol-Attn's search step: the routing decision that picks which KV blocks
+ * attend exactly and which are approximated from their summaries.
+ *
+ * Port of NVIDIA Sana `sol-engine` @ `6e4a440`,
+ * `techniques/sparse_backends/sol_attn/`. The reference's rule, in order:
+ *
+ *   kc[h,n,:] = sum over the block's 64 rows of k / block_len        (BF16)
+ *   vc[h,n,:] = sum over the block's rows of v                       (BF16)
+ *     `preprocess.py:280-322`, `triton_ref/preprocess.py:34-68`
+ *   kc_mean[h,:] = mean over blocks of kc; kc_var[h,:] = its population
+ *   variance; both read the BF16 kc                                  (`:96-135`)
+ *   threshold[q,h] = q_bar . kc_mean * log2_scale
+ *                  + tau * sqrt(max(q_bar^2 . kc_var * log2_scale^2, 0) + 1e-6)
+ *   with q_bar the query block's mean row and log2_scale = scale*log2(e)
+ *                                                                    (`:143-186`)
+ *   col_mean[n] = column mean over the query block of (q @ kc[n]^T) * log2_scale
+ *                                                                    (`fwd.py:250-266`)
+ *   exact = valid and (col_mean[n] > threshold[q] or |q - n| <= 1), the sink
+ *   block range forced exact                              (`selector.py:132-142`,
+ *                                                     `interface.py:134-142`)
+ *   count[q] = that query block's exact blocks, sinks included
+ *
+ * Against the reference's column mean, which sums 64 row scores:
+ *   sum_q (q.kc) / len = (sum_q q / len).kc = q_bar . kc
+ * so this port routes from `q_bar` directly: the same number with 64x fewer
+ * multiplies. It also keeps the comparison's two sides on one centroid, which
+ * the reference's raw-row mean does not: `threshold`'s mean term is
+ * `q_bar . kc_mean` and the route's column mean is `q_bar . kc[n]`, both in
+ * F32 from the same `q_bar`. The reference's own order stays as the oracle in
+ * `tests/h3/test_native.cu`, and `tests/h3/sol_route_bm` reports what the
+ * substitution moves.
+ *
+ * Layout deviation, named: head-major `[heads][sequence][128]` with batch 1,
+ * the port's layout for every H3 attention primitive, against the reference's
+ * `[batch, tokens, heads, 128]`.
+ * ------------------------------------------------------------------------- */
+
+enum {
+    H3D_SOL_THREADS = 128,       /* pooling and statistics kernel width */
+    H3D_SOL_WARP = 32,           /* route kernel: one lane per mask bit */
+    H3D_SOL_QM = 64,             /* query blocks one route CTA covers */
+    H3D_SOL_KLD = H3D_SOL_HEAD_DIM + 8,  /* +8 bf16 keeps kc rows off a bank */
+    H3D_SOL_QLD = H3D_SOL_HEAD_DIM + 4,  /* +4 f32 ditto for the centroids */
+};
+
+uint32_t h3d_sol_words(uint32_t sequence) {
+    const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    return (blocks + H3D_SOL_GROUP - 1) / H3D_SOL_GROUP;
+}
+
+/* The block summaries: K's block mean and V's block sum. One CTA per (block,
+ * head), one thread per dimension, sequential over the block's rows so the sum
+ * order is the reference's row order. */
+__global__ static void h3d_sol_pool_kernel(
+        __nv_bfloat16 *kc, __nv_bfloat16 *vc, const __nv_bfloat16 *key,
+        const __nv_bfloat16 *value, uint32_t sequence, uint32_t blocks) {
+    const uint32_t head = blockIdx.y;
+    const uint32_t block = blockIdx.x;
+    const uint32_t column = threadIdx.x;
+    if (column >= H3D_SOL_HEAD_DIM) return;
+    const uint32_t first = block * H3D_SOL_BLOCK;
+    uint32_t rows = sequence - first;
+    if (rows > H3D_SOL_BLOCK) rows = H3D_SOL_BLOCK;
+    const size_t base = ((size_t)head * sequence + first) * H3D_SOL_HEAD_DIM;
+    float key_sum = 0.0f;
+    float value_sum = 0.0f;
+    for (uint32_t row = 0; row < rows; ++row) {
+        const size_t at = base + (size_t)row * H3D_SOL_HEAD_DIM + column;
+        key_sum += h3d_value(key[at]);
+        value_sum += h3d_value(value[at]);
+    }
+    const size_t out =
+        ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM + column;
+    kc[out] = h3d_store(key_sum / (float)rows);  /* `preprocess.py:64` */
+    vc[out] = h3d_store(value_sum);              /* `:66`: a sum, no divide */
+}
+
+/* The per-head statistics of kc: its mean over blocks and the diagonal of its
+ * variance, read from the BF16 summaries (`preprocess.py:96-135`). */
+__global__ static void h3d_sol_stats_kernel(float *kc_mean, float *kc_var,
+                                            const __nv_bfloat16 *kc,
+                                            uint32_t blocks) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t dim = threadIdx.x;
+    if (dim >= H3D_SOL_HEAD_DIM) return;
+    float total = 0.0f;
+    float total_sq = 0.0f;
+    for (uint32_t block = 0; block < blocks; ++block) {
+        const float value =
+            h3d_value(kc[((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM +
+                         dim]);
+        total += value;
+        total_sq += value * value;
+    }
+    const float count = (float)blocks;
+    const float mean = total / count;
+    float variance = total_sq / count - mean * mean;
+    if (variance < 0.0f) variance = 0.0f;   /* `:124` tl.maximum(..., 0.0) */
+    kc_mean[(size_t)head * H3D_SOL_HEAD_DIM + dim] = mean;
+    kc_var[(size_t)head * H3D_SOL_HEAD_DIM + dim] = variance;
+}
+
+/* The routing threshold and the query centroid it is built from: one warp per
+ * (query block, head). The centroid is the reference's `_pool_query_kernel`
+ * (`preprocess.py:189-213`) kept F32. */
+__global__ static void h3d_sol_threshold_kernel(
+        float *threshold, float *query_bar, const float *kc_mean,
+        const float *kc_var, const __nv_bfloat16 *query, uint32_t sequence,
+        uint32_t heads, float scale, float tau) {
+    enum { CHUNKS = H3D_SOL_HEAD_DIM / H3D_SOL_WARP };
+    const uint32_t head = blockIdx.y;
+    const uint32_t q_block = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t first = q_block * H3D_SOL_BLOCK;
+    uint32_t rows = sequence - first;
+    if (rows > H3D_SOL_BLOCK) rows = H3D_SOL_BLOCK;
+    const size_t base = ((size_t)head * sequence + first) * H3D_SOL_HEAD_DIM;
+    float centroid[CHUNKS];
+    for (uint32_t chunk = 0; chunk < CHUNKS; ++chunk) {
+        const uint32_t dim = chunk * H3D_SOL_WARP + lane;
+        float total = 0.0f;
+        for (uint32_t row = 0; row < rows; ++row) {
+            total += h3d_value(query[base + (size_t)row * H3D_SOL_HEAD_DIM + dim]);
+        }
+        centroid[chunk] = total / (float)rows;
+        query_bar[((size_t)q_block * heads + head) * H3D_SOL_HEAD_DIM + dim] =
+            centroid[chunk];
+    }
+    /* `:177-186`: the diagonal model's mean and variance of the route logits,
+     * then mean + tau * std in log2 space. */
+    const float log2_scale = scale * 1.4426950408889634f;
+    float mean = 0.0f;
+    float variance = 0.0f;
+    for (uint32_t chunk = 0; chunk < CHUNKS; ++chunk) {
+        const uint32_t dim = chunk * H3D_SOL_WARP + lane;
+        const float m = kc_mean[(size_t)head * H3D_SOL_HEAD_DIM + dim];
+        const float v = kc_var[(size_t)head * H3D_SOL_HEAD_DIM + dim];
+        mean += centroid[chunk] * m;
+        variance += centroid[chunk] * centroid[chunk] * v;
+    }
+    for (int offset = H3D_SOL_WARP / 2; offset > 0; offset >>= 1) {
+        mean += __shfl_xor_sync(0xffffffffu, mean, offset);
+        variance += __shfl_xor_sync(0xffffffffu, variance, offset);
+    }
+    if (lane != 0) return;
+    /* `:179-182`: both moments are scaled before the standard deviation, so
+     * the 1e-6 floor is added in scaled units. */
+    variance *= log2_scale * log2_scale;
+    const float clamped = variance > 0.0f ? variance : 0.0f;
+    const float std = sqrtf(clamped + 1.0e-6f);
+    threshold[(size_t)q_block * heads + head] =
+        mean * log2_scale + tau * std;
+}
+
+/* The route. One CTA per (tile of H3D_SOL_QM query blocks, head), one lane per
+ * KV block of the current mask word, the word's kc rows staged in shared so a
+ * CTA reads each summary once however many query blocks it covers. */
+__global__ static void h3d_sol_route_kernel(
+        uint32_t *mask, uint32_t *count, const __nv_bfloat16 *kc,
+        const float *query_bar, const float *threshold, uint32_t heads,
+        uint32_t blocks, uint32_t words, float scale, uint32_t sink_first,
+        uint32_t sink_last) {
+    const uint32_t q_first = blockIdx.x * H3D_SOL_QM;
+    const uint32_t head = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    uint32_t rows = blocks - q_first;        /* query blocks in this tile */
+    if (rows > H3D_SOL_QM) rows = H3D_SOL_QM;
+    __shared__ __align__(16) float s_query[H3D_SOL_QM][H3D_SOL_QLD];
+    __shared__ __align__(16) __nv_bfloat16 s_kc[H3D_SOL_GROUP][H3D_SOL_KLD];
+    __shared__ uint32_t s_count[H3D_SOL_QM];
+    const float log2_scale = scale * 1.4426950408889634f;
+
+    /* Stage the query centroids one row at a time, all lanes on the same row
+     * and lane `lane` taking every 32nd dimension: any other mapping leaves
+     * the positions of a row that the staging lane does not own uninitialized. */
+    for (uint32_t row = 0; row < rows; ++row) {
+        const float *centroid = query_bar +
+            ((size_t)(q_first + row) * heads + head) * H3D_SOL_HEAD_DIM;
+        for (uint32_t dim = lane; dim < H3D_SOL_HEAD_DIM; dim += H3D_SOL_WARP) {
+            s_query[row][dim] = centroid[dim];
+        }
+        if (lane == 0) s_count[row] = 0;
+    }
+    __syncwarp();
+
+    for (uint32_t word = 0; word < words; ++word) {
+        /* Stage one word of kc: 32 blocks of 128 dimensions, zero-filled past
+         * the last block so the lane's dot is defined. */
+        enum { CHUNKS = H3D_SOL_GROUP * H3D_SOL_HEAD_DIM / 8 };  /* uint4 */
+        for (uint32_t index = lane; index < CHUNKS; index += H3D_SOL_WARP) {
+            const uint32_t block =
+                word * H3D_SOL_GROUP + index / (H3D_SOL_HEAD_DIM / 8);
+            const uint32_t chunk = index % (H3D_SOL_HEAD_DIM / 8);
+            uint4 packed = make_uint4(0u, 0u, 0u, 0u);
+            if (block < blocks) {
+                packed = *(const uint4 *)((const char *)kc +
+                    ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM * 2 +
+                    chunk * 16);
+            }
+            *(uint4 *)((char *)s_kc[index / (H3D_SOL_HEAD_DIM / 8)] +
+                       chunk * 16) = packed;
+        }
+        __syncwarp();
+        const uint32_t block = word * H3D_SOL_GROUP + lane;
+        const bool sink = sink_last > sink_first && block >= sink_first &&
+                          block < sink_last;
+        for (uint32_t row = 0; row < rows; ++row) {
+            /* Four accumulators: the two halves of the dimension range do not
+             * wait on one another's FMA latency. */
+            float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint32_t chunk = 0; chunk < 4; ++chunk) {
+                for (uint32_t step = 0; step < H3D_SOL_WARP; ++step) {
+                    const uint32_t dim = chunk * H3D_SOL_WARP + step;
+                    part[chunk] +=
+                        s_query[row][dim] * h3d_value(s_kc[lane][dim]);
+                }
+            }
+            const float column_mean =
+                ((part[0] + part[1]) + (part[2] + part[3])) * log2_scale;
+            const uint32_t q_block = q_first + row;
+            const uint32_t distance =
+                q_block > block ? q_block - block : block - q_block;
+            bool exact = false;
+            if (block < blocks) {
+                exact = distance <= 1 || sink ||
+                        column_mean >
+                            threshold[(size_t)q_block * heads + head];
+            }
+            const uint32_t bits = __ballot_sync(0xffffffffu, exact);
+            if (lane == 0) {
+                mask[((size_t)q_block * heads + head) * words + word] = bits;
+                s_count[row] += __popc(bits);
+            }
+        }
+        __syncwarp();
+    }
+    for (uint32_t row = lane; row < rows; row += H3D_SOL_WARP) {
+        count[(size_t)(q_first + row) * heads + head] = s_count[row];
+    }
+}
+
+/* Every plan buffer's shape, checked before a kernel writes anything. */
+static int h3d_sol_check(const struct h3d_sol_plan *plan, uint32_t sequence,
+                         uint32_t heads, char *error, size_t error_size) {
+    const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    const uint32_t words = h3d_sol_words(sequence);
+    const size_t summary = (size_t)blocks * heads * H3D_SOL_HEAD_DIM;
+    const size_t threshold = (size_t)blocks * heads;
+    const size_t words_ = (size_t)blocks * heads * words;
+    if (!plan || !h3d_is(plan->kc, H3D_BF16, summary) ||
+        !h3d_is(plan->vc, H3D_BF16, summary) ||
+        !h3d_is(plan->mask, H3D_U32, words_) ||
+        !h3d_is(plan->count, H3D_U32, threshold) ||
+        !h3d_is(plan->threshold, H3D_F32, threshold) ||
+        !h3d_is(plan->query_bar, H3D_F32, summary) ||
+        !h3d_is(plan->kc_mean, H3D_F32,
+                (size_t)heads * H3D_SOL_HEAD_DIM) ||
+        !h3d_is(plan->kc_var, H3D_F32, (size_t)heads * H3D_SOL_HEAD_DIM)) {
+        return h3d_set_error(error, error_size,
+                             "invalid Sol-Attn search tensors or shape");
+    }
+    return 1;
+}
+
+int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
+                   const h3d_tensor *query, const h3d_tensor *key,
+                   const h3d_tensor *value, uint32_t sequence, uint32_t heads,
+                   float scale, float tau, uint32_t sink_start,
+                   uint32_t sink_tokens, char *error, size_t error_size) {
+    if (!context || !sequence || !heads || sink_tokens > sequence ||
+        sink_start + sink_tokens > sequence) {
+        return h3d_set_error(error, error_size,
+                             "invalid Sol-Attn search arguments");
+    }
+    const size_t elements = (size_t)sequence * heads * H3D_SOL_HEAD_DIM;
+    if (!h3d_is(query, H3D_BF16, elements) || !h3d_is(key, H3D_BF16, elements) ||
+        !h3d_is(value, H3D_BF16, elements) ||
+        !h3d_sol_check(plan, sequence, heads, error, error_size)) {
+        return 0;
+    }
+    const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    const uint32_t words = h3d_sol_words(sequence);
+    dim3 pool_grid(blocks, heads);
+    h3d_sol_pool_kernel<<<pool_grid, H3D_SOL_THREADS, 0, context->stream>>>(
+        (__nv_bfloat16 *)plan->kc->data, (__nv_bfloat16 *)plan->vc->data,
+        (const __nv_bfloat16 *)key->data,
+        (const __nv_bfloat16 *)value->data, sequence, blocks);
+    if (!h3d_launch_ok("Sol-Attn pool", error, error_size)) return 0;
+    h3d_sol_stats_kernel<<<heads, H3D_SOL_THREADS, 0, context->stream>>>(
+        (float *)plan->kc_mean->data, (float *)plan->kc_var->data,
+        (const __nv_bfloat16 *)plan->kc->data, blocks);
+    if (!h3d_launch_ok("Sol-Attn statistics", error, error_size)) return 0;
+    dim3 threshold_grid(blocks, heads);
+    h3d_sol_threshold_kernel<<<threshold_grid, H3D_SOL_WARP, 0,
+                               context->stream>>>(
+        (float *)plan->threshold->data, (float *)plan->query_bar->data,
+        (const float *)plan->kc_mean->data,
+        (const float *)plan->kc_var->data,
+        (const __nv_bfloat16 *)query->data, sequence, heads, scale, tau);
+    if (!h3d_launch_ok("Sol-Attn threshold", error, error_size)) return 0;
+    dim3 route_grid((blocks + H3D_SOL_QM - 1) / H3D_SOL_QM, heads);
+    h3d_sol_route_kernel<<<route_grid, H3D_SOL_WARP, 0, context->stream>>>(
+        (uint32_t *)plan->mask->data, (uint32_t *)plan->count->data,
+        (const __nv_bfloat16 *)plan->kc->data,
+        (const float *)plan->query_bar->data,
+        (const float *)plan->threshold->data, heads, blocks, words,
+        scale, sink_start / H3D_SOL_BLOCK,
+        (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK);
+    return h3d_launch_ok("Sol-Attn route", error, error_size);
+}

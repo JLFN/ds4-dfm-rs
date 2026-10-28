@@ -39,8 +39,39 @@ extern "C" {
 
 enum h3d_dtype { H3D_BF16 = 0, H3D_F32 = 1, H3D_U32 = 2 };
 
+/* Sol-Attn's fixed shapes (`techniques/sparse_backends/sol_attn/preprocess.py`
+ * `:11-13` in NVIDIA's Sana `sol-engine` tree: BLOCK_SIZE 64, HEAD_DIM 128;
+ * `triton_ref/fwd.py:23` GROUP 32, the KV blocks one route mask word covers). */
+enum { H3D_SOL_BLOCK = 64, H3D_SOL_HEAD_DIM = 128, H3D_SOL_GROUP = 32 };
+
 typedef struct h3d_context h3d_context;
 typedef struct h3d_tensor h3d_tensor;
+
+/* The search step's per-step workspace. Every shape is documented and checked
+ * before a kernel runs, because an undersized mask reads as an empty one.
+ *
+ *   kc[head][block][128]               bf16 block mean of K
+ *   vc[head][block][128]               bf16 block sum of V
+ *   mask[q_block][head][word]          u32  exact-KV-block bits for that word
+ *   count[q_block][head]               u32  exact blocks, sinks included
+ *   threshold[q_block][head]           f32  the routing threshold
+ *   query_bar[q_block][head][128]      f32  the query block's centroid
+ *   kc_mean[head][128]                 f32  block-mean statistics of kc
+ *   kc_var[head][128]                  f32  their diagonal variance
+ *
+ * `kc` and `vc` are the block summaries the reference derates to BF16 before
+ * anything reads them (`preprocess.py:287-291`): a context that keeps them F32
+ * would route a different set. */
+struct h3d_sol_plan {
+    h3d_tensor *kc;
+    h3d_tensor *vc;
+    h3d_tensor *mask;
+    h3d_tensor *count;
+    h3d_tensor *threshold;
+    h3d_tensor *query_bar;
+    h3d_tensor *kc_mean;
+    h3d_tensor *kc_var;
+};
 
 h3d_context *h3d_create(char *error, size_t error_size);
 void h3d_destroy(h3d_context *context);
@@ -411,6 +442,42 @@ int h3d_sdpa_causal_f32(h3d_context *context, h3d_tensor *output,
                         const h3d_tensor *value, uint32_t batch,
                         uint32_t sequence, uint32_t heads, uint32_t head_dim,
                         float scale, char *error, size_t error_size);
+
+/* -------------------------------------------------------------------------
+ * Sol-Attn's search step: which KV blocks attend exactly and which are
+ * approximated from their summaries. Not on any production path yet; the
+ * consumer is the sparse forward this port has not built.
+ *
+ * Ported from NVIDIA Sana `sol-engine` @ `6e4a440`, `sol_attn/`:
+ *   preprocess.py:280-322   kc = block mean of K, vc = block sum of V (BF16)
+ *   preprocess.py:96-135    kc_mean/kc_var_diag per head
+ *   preprocess.py:143-186   the diag threshold: q centroid, mean + TAU*std
+ *   triton_ref/fwd.py:250-266  col_mean = column mean of the route logits
+ *   selector.py:132-142     exact = col_mean > threshold OR |q-n| <= 1
+ *   sm120/mainloop.py:430-470  the same rule in the SM120 mainloop
+ *   interface.py:134-142    the sink block range, forced exact
+ *
+ * Deviations, named: head-major `[heads][sequence][head_dim]` tensors with
+ * batch 1 (the port's layout for every H3 attention primitive, and the
+ * reference's [B,T,H,D] transposed); `query_bar` stored F32 so the routed
+ * block list depends only on the reference's own BF16 rounding of kc/vc; the
+ * accumulation orders are fixed by this port where the reference's Triton
+ * trees are not reproducible here, and `tests/h3/sol_route_bm` measures what
+ * the choice costs.
+ *
+ * `h3d_sol_search` routes from the query block's centroid, which is the
+ * reference's column mean: sum_q (q.kc) / len = (sum_q q / len).kc, the same
+ * number with 64x fewer multiplies, and both sides of its comparison then
+ * come from one F32 centroid. The reference's own raw-row order is the oracle
+ * `tests/h3/test_native.cu` checks this against, and `tests/h3/sol_route_bm`
+ * reports what the substitution moves on the job's shape. */
+int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
+                   const h3d_tensor *query, const h3d_tensor *key,
+                   const h3d_tensor *value, uint32_t sequence, uint32_t heads,
+                   float scale, float tau, uint32_t sink_start,
+                   uint32_t sink_tokens, char *error, size_t error_size);
+/* Number of `mask` words per query block: ceil(ceil(sequence/64) / 32). */
+uint32_t h3d_sol_words(uint32_t sequence);
 
 #ifdef __cplusplus
 }
