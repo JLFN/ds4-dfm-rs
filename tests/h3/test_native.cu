@@ -1407,6 +1407,527 @@ static void sol_search_tau_monotone(h3d_context *gpu) {
     check(added == 0 && removed > 0,
           "raising tau only removes exact blocks");
 }
+/* ---------------------------------------------------------------------------
+ * Sol-Attn's sparse forward against the reference's own walk, transcribed here
+ * as the oracle. NVIDIA Sana `sol-engine` @ `6e4a440`, `triton_ref/fwd.py`:
+ *   :88-108    per group of 32 KV blocks, the pooled scores
+ *              q @ kc^T * scale*log2(e), and the group's exact/approximated
+ *              split
+ *   :109-131   the approximated blocks folded into the running softmax from
+ *              the pooled summaries: o += P @ vc and row_sum += P *
+ *              block_length, because vc is the block SUM of V
+ *              (`preprocess.py:82`)
+ *   :132-170   the group's exact blocks walked in increasing block order, one
+ *              BLOCK = 64 key tile at a time: o += P @ v, row_sum += sum(P)
+ *   :171-173   o / row_sum, stored BF16
+ * The mask is an input here, not a rule this oracle recomputes: the split is
+ * whatever the caller's mask states, so the consumer is testable apart from
+ * the router.
+ * ------------------------------------------------------------------------- */
+
+/* Rounds to BF16 where the reference's `tl.dot(probability.to(v.dtype), v)`
+ * does, so the only difference left between the two sides is the reduction
+ * order of the F32 accumulators. */
+static void sol_forward_expect(const SolData &data, const SolExpect &summary,
+                               const std::vector<uint32_t> &mask, float scale,
+                               std::vector<uint16_t> &out) {
+    const uint32_t sequence = data.sequence, heads = data.heads;
+    const uint32_t blocks = data.blocks;
+    const float log2_scale = scale * 1.4426950408889634f;
+    out.assign((size_t)sequence * heads * H3D_SOL_HEAD_DIM, 0);
+    std::vector<float> output((size_t)H3D_SOL_BLOCK * H3D_SOL_HEAD_DIM);
+    float row_sum[H3D_SOL_BLOCK];
+    float row_max[H3D_SOL_BLOCK];
+    float scores[H3D_SOL_BLOCK][H3D_SOL_GROUP];
+    for (uint32_t head = 0; head < heads; ++head) {
+        const uint16_t *query = data.query.data() +
+                                (size_t)head * sequence * H3D_SOL_HEAD_DIM;
+        const uint16_t *key = data.key.data() +
+                              (size_t)head * sequence * H3D_SOL_HEAD_DIM;
+        const uint16_t *value = data.value.data() +
+                                (size_t)head * sequence * H3D_SOL_HEAD_DIM;
+        for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
+            const uint32_t first = q_block * H3D_SOL_BLOCK;
+            const uint32_t rows = std::min<uint32_t>(H3D_SOL_BLOCK, sequence - first);
+            std::fill(output.begin(), output.end(), 0.0f);
+            for (uint32_t row = 0; row < H3D_SOL_BLOCK; ++row) {
+                row_sum[row] = 0.0f;
+                row_max[row] = -INFINITY;
+            }
+            for (uint32_t group_start = 0; group_start < blocks;
+                 group_start += H3D_SOL_GROUP) {
+                const uint32_t bits =
+                    mask[((size_t)q_block * heads + head) * data.words +
+                         group_start / H3D_SOL_GROUP];
+                bool exact[H3D_SOL_GROUP];
+                uint32_t approximated = 0;
+                for (uint32_t n = 0; n < H3D_SOL_GROUP; ++n) {
+                    const uint32_t block = group_start + n;
+                    exact[n] = block < blocks && (bits & (1u << n));
+                    approximated += block < blocks && !exact[n];
+                }
+                /* `has_approximate` (`fwd.py:256-262`): a group with nothing
+                 * approximated leaves the running maximum untouched. */
+                if (approximated) {
+                    for (uint32_t row = 0; row < rows; ++row) {
+                        const uint16_t *q = query +
+                            (size_t)(first + row) * H3D_SOL_HEAD_DIM;
+                        for (uint32_t n = 0; n < H3D_SOL_GROUP; ++n) {
+                            const uint32_t block = group_start + n;
+                            if (block >= blocks || exact[n]) {
+                                scores[row][n] = -INFINITY;
+                                continue;
+                            }
+                            const float *kc = summary.kc.data() +
+                                ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM;
+                            float dot = 0.0f;
+                            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                                dot += sol_float(q[dim]) * kc[dim];
+                            }
+                            scores[row][n] = dot * log2_scale;
+                        }
+                    }
+                    for (uint32_t row = 0; row < rows; ++row) {
+                        float next = row_max[row];
+                        for (uint32_t n = 0; n < H3D_SOL_GROUP; ++n) {
+                            next = std::max(next, scores[row][n]);
+                        }
+                        const float alpha = std::exp2(row_max[row] - next);
+                        float *into = output.data() +
+                                      (size_t)row * H3D_SOL_HEAD_DIM;
+                        for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                            into[dim] *= alpha;
+                        }
+                        for (uint32_t n = 0; n < H3D_SOL_GROUP; ++n) {
+                            if (scores[row][n] == -INFINITY) continue;
+                            const float probability =
+                                std::exp2(scores[row][n] - next);
+                            const float packed =
+                                sol_float(sol_bf16(probability));
+                            const uint32_t block = group_start + n;
+                            const float length = (float)std::min<uint32_t>(
+                                H3D_SOL_BLOCK, sequence - block * H3D_SOL_BLOCK);
+                            const float *vc = summary.vc.data() +
+                                ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM;
+                            row_sum[row] += probability * length;
+                            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                                into[dim] += packed * vc[dim];
+                            }
+                        }
+                        row_max[row] = next;
+                    }
+                }
+                for (uint32_t n = 0; n < H3D_SOL_GROUP; ++n) {
+                    if (!exact[n]) continue;
+                    const uint32_t kv_first = (group_start + n) * H3D_SOL_BLOCK;
+                    for (uint32_t row = 0; row < rows; ++row) {
+                        float column[H3D_SOL_BLOCK];
+                        float next = row_max[row];
+                        const uint16_t *q = query +
+                            (size_t)(first + row) * H3D_SOL_HEAD_DIM;
+                        for (uint32_t k = 0; k < H3D_SOL_BLOCK; ++k) {
+                            const uint32_t token = kv_first + k;
+                            if (token >= sequence) {
+                                column[k] = -INFINITY;
+                                continue;
+                            }
+                            const uint16_t *k_row = key +
+                                (size_t)token * H3D_SOL_HEAD_DIM;
+                            float dot = 0.0f;
+                            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                                dot += sol_float(q[dim]) * sol_float(k_row[dim]);
+                            }
+                            column[k] = dot * log2_scale;
+                            next = std::max(next, column[k]);
+                        }
+                        const float alpha = std::exp2(row_max[row] - next);
+                        float *into = output.data() +
+                                      (size_t)row * H3D_SOL_HEAD_DIM;
+                        for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                            into[dim] *= alpha;
+                        }
+                        row_sum[row] *= alpha;
+                        for (uint32_t k = 0; k < H3D_SOL_BLOCK; ++k) {
+                            if (column[k] == -INFINITY) continue;
+                            const uint32_t token = kv_first + k;
+                            const float probability = std::exp2(column[k] - next);
+                            const float packed =
+                                sol_float(sol_bf16(probability));
+                            const uint16_t *v_row = value +
+                                (size_t)token * H3D_SOL_HEAD_DIM;
+                            row_sum[row] += probability;
+                            for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                                into[dim] += packed * sol_float(v_row[dim]);
+                            }
+                        }
+                        row_max[row] = next;
+                    }
+                }
+            }
+            for (uint32_t row = 0; row < rows; ++row) {
+                const float *from = output.data() +
+                                    (size_t)row * H3D_SOL_HEAD_DIM;
+                /* The port's output layout, `[token][head][dim]`, the same one
+                 * `h3d_sdpa` writes (`short_attention_axes` gates it). */
+                uint16_t *into = out.data() + ((size_t)(first + row) * heads +
+                                               head) * H3D_SOL_HEAD_DIM;
+                for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                    into[dim] = sol_bf16(from[dim] / row_sum[row]);
+                }
+            }
+        }
+    }
+}
+
+/* The live elements only: a padded query row is never written by the kernel
+ * and carries no meaning in the reference either. Both sides are in the port's
+ * `[token][head][dim]` output layout. */
+static void sol_forward_compare(const char *label, const SolData &data,
+                                const std::vector<uint16_t> &expect,
+                                const std::vector<uint16_t> &actual) {
+    double worst = 0.0, squared = 0.0, energy = 0.0;
+    size_t live = 0;
+    uint32_t differing = 0;
+    for (uint32_t head = 0; head < data.heads; ++head) {
+        for (uint32_t block = 0; block < data.blocks; ++block) {
+            const uint32_t first = block * H3D_SOL_BLOCK;
+            const uint32_t rows =
+                std::min<uint32_t>(H3D_SOL_BLOCK, data.sequence - first);
+            for (uint32_t row = 0; row < rows; ++row) {
+                const size_t at = ((size_t)(first + row) * data.heads + head) *
+                                  H3D_SOL_HEAD_DIM;
+                for (uint32_t dim = 0; dim < H3D_SOL_HEAD_DIM; ++dim) {
+                    const double want = sol_float(expect[at + dim]);
+                    const double got = sol_float(actual[at + dim]);
+                    const double delta = std::abs(want - got);
+                    if (delta > worst) worst = delta;
+                    squared += delta * delta;
+                    energy += want * want;
+                    differing += delta > 0.0;
+                    live += 1;
+                }
+            }
+        }
+    }
+    const double rms = std::sqrt(squared / (double)live);
+    const double relative = rms / std::sqrt(energy / (double)live);
+    printf("  [%s] worst %.3e, RMS %.3e, relative RMS %.3e, %u of %zu elements "
+           "differ\n",
+           label, worst, rms, relative, differing, live);
+    check(relative < 1.0e-3, "the sparse forward matches the reference's walk");
+}
+
+/* The forward with the summaries and the mask the caller states: the search
+ * step is not called, so a route the router cannot produce (no diagonal band
+ * at all, nothing exact in a group) still reaches the consumer. */
+static bool sol_forward_run(h3d_context *gpu, const SolData &data,
+                            const SolExpect &summary,
+                            const std::vector<uint32_t> &mask, float scale,
+                            std::vector<uint16_t> &out, char *error,
+                            size_t size) {
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, size)) return false;
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    const size_t summaries = (size_t)data.heads * data.blocks * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *output = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    std::vector<uint16_t> kc(summaries), vc(summaries);
+    for (size_t at = 0; at < summaries; ++at) {
+        kc[at] = sol_bf16(summary.kc[at]);
+        vc[at] = sol_bf16(summary.vc[at]);
+    }
+    bool ok = query && key && value && output &&
+              h3d_upload(gpu, query, data.query.data(), error, size) &&
+              h3d_upload(gpu, key, data.key.data(), error, size) &&
+              h3d_upload(gpu, value, data.value.data(), error, size) &&
+              h3d_upload(gpu, plan.kc, kc.data(), error, size) &&
+              h3d_upload(gpu, plan.vc, vc.data(), error, size) &&
+              h3d_upload(gpu, plan.mask, mask.data(), error, size) &&
+              h3d_sol_forward(gpu, output, &plan.plan, query, key, value,
+                              data.sequence, data.heads, scale, error, size) &&
+              h3d_sync(gpu, error, size);
+    out.assign(elements, 0);
+    ok = ok && h3d_read(gpu, out.data(), output, error, size);
+    if (!ok) fprintf(stderr, "Sol-Attn forward: %s\n", error);
+    if (query) h3d_free(query);
+    if (key) h3d_free(key);
+    if (value) h3d_free(value);
+    if (output) h3d_free(output);
+    sol_free(plan);
+    return ok;
+}
+
+/* Search, then the forward, in the order the engine calls them; the mask is
+ * returned so the oracle consumes the router's own decision. */
+static bool sol_forward_search_run(h3d_context *gpu, const SolData &data,
+                                   float scale, float tau, uint32_t sink_start,
+                                   uint32_t sink_tokens, std::vector<uint16_t> &out,
+                                   std::vector<uint32_t> &mask, char *error,
+                                   size_t size) {
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, size)) return false;
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *output = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    bool ok = query && key && value && output &&
+              h3d_upload(gpu, query, data.query.data(), error, size) &&
+              h3d_upload(gpu, key, data.key.data(), error, size) &&
+              h3d_upload(gpu, value, data.value.data(), error, size) &&
+              h3d_sol_search(gpu, &plan.plan, query, key, value, data.sequence,
+                             data.heads, scale, tau, sink_start, sink_tokens,
+                             error, size) &&
+              h3d_sol_forward(gpu, output, &plan.plan, query, key, value,
+                              data.sequence, data.heads, scale, error, size) &&
+              h3d_sync(gpu, error, size);
+    out.assign(elements, 0);
+    mask.assign((size_t)data.blocks * data.heads * data.words, 0u);
+    ok = ok && h3d_read(gpu, out.data(), output, error, size) &&
+         h3d_read(gpu, mask.data(), plan.mask, error, size);
+    if (!ok) fprintf(stderr, "Sol-Attn forward after search: %s\n", error);
+    if (query) h3d_free(query);
+    if (key) h3d_free(key);
+    if (value) h3d_free(value);
+    if (output) h3d_free(output);
+    sol_free(plan);
+    return ok;
+}
+
+static bool sol_dense_run(h3d_context *gpu, const SolData &data, float scale,
+                          std::vector<uint16_t> &out, char *error, size_t size) {
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *output = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    bool ok = query && key && value && output &&
+              h3d_upload(gpu, query, data.query.data(), error, size) &&
+              h3d_upload(gpu, key, data.key.data(), error, size) &&
+              h3d_upload(gpu, value, data.value.data(), error, size) &&
+              h3d_sdpa(gpu, output, query, key, value, data.sequence, data.heads,
+                       H3D_SOL_HEAD_DIM, scale, error, size) &&
+              h3d_sync(gpu, error, size);
+    out.assign(elements, 0);
+    ok = ok && h3d_read(gpu, out.data(), output, error, size);
+    if (!ok) fprintf(stderr, "dense attention: %s\n", error);
+    if (query) h3d_free(query);
+    if (key) h3d_free(key);
+    if (value) h3d_free(value);
+    if (output) h3d_free(output);
+    return ok;
+}
+
+static void sol_report_sparsity(const char *label, const SolData &data,
+                                const std::vector<uint32_t> &mask) {
+    uint64_t exact = 0, pairs = (uint64_t)data.blocks * data.heads * data.blocks;
+    for (uint32_t head = 0; head < data.heads; ++head) {
+        for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+            for (uint32_t word = 0; word < data.words; ++word) {
+                exact += __builtin_popcount(
+                    mask[((size_t)q_block * data.heads + head) * data.words + word]);
+            }
+        }
+    }
+    printf("  [%s] %llu of %llu block pairs exact, %.1f%% folded\n", label,
+           (unsigned long long)exact, (unsigned long long)pairs,
+           100.0 - 100.0 * (double)exact / (double)pairs);
+}
+
+/* The end-to-end case: the router's own mask, both taus, against the oracle's
+ * transcription of `fwd.py:88-173`. */
+static void sol_forward_matches_reference(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 200, 3, 20261028u);
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    for (float tau : {0.5f, 1.5f}) {
+        SolExpect expect;
+        sol_expect(data, scale, tau, 0, 0, expect);
+        std::vector<uint16_t> actual;
+        std::vector<uint32_t> mask;
+        if (!sol_forward_search_run(gpu, data, scale, tau, 0, 0, actual, mask,
+                                    error, sizeof(error))) {
+            check(false, "the sparse forward runs after the search");
+            return;
+        }
+        std::vector<uint16_t> want;
+        sol_forward_expect(data, expect, mask, scale, want);
+        sol_report_sparsity("random", data, mask);
+        sol_forward_compare("random", data, want, actual);
+    }
+}
+
+/* Every block exact: the folded path contributes nothing and the walk is the
+ * dense one, so the sparse forward must agree with the dense attention at the
+ * same shape. This is the property that says the exact half is a plain
+ * attention; the oracle case above says the same for the folded half. */
+static void sol_forward_all_exact(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 200, 3, 20261028u);
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolExpect expect;
+    sol_expect(data, scale, 1.0f, 0, 0, expect);
+    std::vector<uint32_t> mask((size_t)data.blocks * data.heads * data.words, 0u);
+    for (uint32_t word = 0; word < data.words; ++word) {
+        const uint32_t first = word * H3D_SOL_GROUP;
+        const uint32_t rest = data.blocks - first;
+        const uint32_t bits = rest >= H3D_SOL_GROUP ? ~0u : (1u << rest) - 1u;
+        for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+            for (uint32_t head = 0; head < data.heads; ++head) {
+                mask[((size_t)q_block * data.heads + head) * data.words + word] = bits;
+            }
+        }
+    }
+    std::vector<uint16_t> sparse, dense, want;
+    if (!sol_forward_run(gpu, data, expect, mask, scale, sparse, error,
+                         sizeof(error))) {
+        check(false, "the sparse forward runs with every block exact");
+        return;
+    }
+    sol_forward_expect(data, expect, mask, scale, want);
+    sol_forward_compare("all-exact", data, want, sparse);
+    if (!sol_dense_run(gpu, data, scale, dense, error, sizeof(error))) {
+        check(false, "the dense attention runs at the fixture shape");
+        return;
+    }
+    sol_forward_compare("all-exact vs dense", data, dense, sparse);
+}
+
+/* Two mask words, so the group loop crosses its 32-block boundary, and a tail
+ * block of 4,446 - 2,048 = 52 rows that is shorter than the tile. */
+static void sol_forward_multiword(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 2100, 2, 20261028u);
+    check(data.blocks == 33 && data.words == 2,
+          "the multiword forward fixture is 33 blocks over two words");
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolExpect expect;
+    sol_expect(data, scale, 1.25f, 0, 0, expect);
+    std::vector<uint16_t> actual;
+    std::vector<uint32_t> mask;
+    if (!sol_forward_search_run(gpu, data, scale, 1.25f, 0, 0, actual, mask, error,
+                                sizeof(error))) {
+        check(false, "the sparse forward runs across a second mask word");
+        return;
+    }
+    std::vector<uint16_t> want;
+    sol_forward_expect(data, expect, mask, scale, want);
+    sol_report_sparsity("multiword", data, mask);
+    sol_forward_compare("multiword", data, want, actual);
+}
+
+/* The consumer holds no policy of its own: the mask is read literally. Three
+ * routes the router cannot produce, each against the oracle that consumes the
+ * same bits.
+ *   - the two far blocks of one word exact, with no diagonal band at all;
+ *   - nothing exact, so every group folds;
+ *   - one word entirely exact beside a word with nothing exact, which is the
+ *     `has_approximate` skip and the fold in a single call. */
+static void sol_forward_mask_is_literal(h3d_context *gpu) {
+    char error[512] = {};
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    {
+        SolData data;
+        sol_build(data, 512, 1, 99u);
+        SolExpect expect;
+        sol_expect(data, scale, 1.0f, 0, 0, expect);
+        const uint32_t far = (1u << 1) | (1u << 6);
+        std::vector<uint32_t> mask((size_t)data.blocks * data.heads * data.words, far);
+        std::vector<uint16_t> actual, want;
+        if (!sol_forward_run(gpu, data, expect, mask, scale, actual, error,
+                             sizeof(error))) {
+            check(false, "the sparse forward runs on a hand-built mask");
+            return;
+        }
+        sol_forward_expect(data, expect, mask, scale, want);
+        sol_report_sparsity("far-blocks", data, mask);
+        sol_forward_compare("far-blocks", data, want, actual);
+    }
+    {
+        SolData data;
+        sol_build(data, 512, 1, 100u);
+        SolExpect expect;
+        sol_expect(data, scale, 1.0f, 0, 0, expect);
+        std::vector<uint32_t> mask((size_t)data.blocks * data.heads * data.words, 0u);
+        std::vector<uint16_t> actual, want;
+        if (!sol_forward_run(gpu, data, expect, mask, scale, actual, error,
+                             sizeof(error))) {
+            check(false, "the sparse forward runs with nothing exact");
+            return;
+        }
+        sol_forward_expect(data, expect, mask, scale, want);
+        sol_report_sparsity("all-folded", data, mask);
+        sol_forward_compare("all-folded", data, want, actual);
+    }
+    {
+        SolData data;
+        sol_build(data, 2100, 1, 101u);
+        SolExpect expect;
+        sol_expect(data, scale, 1.0f, 0, 0, expect);
+        std::vector<uint32_t> mask((size_t)data.blocks * data.heads * data.words, 0u);
+        for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+            mask[((size_t)q_block * data.heads + 0) * data.words + 0] = ~0u;
+        }
+        std::vector<uint16_t> actual, want;
+        if (!sol_forward_run(gpu, data, expect, mask, scale, actual, error,
+                             sizeof(error))) {
+            check(false, "the sparse forward runs on a split word pair");
+            return;
+        }
+        sol_forward_expect(data, expect, mask, scale, want);
+        sol_report_sparsity("split", data, mask);
+        sol_forward_compare("split", data, want, actual);
+    }
+}
+
+/* The API boundary: the same refusals the search step's own kernel needs, plus
+ * a plan whose summary buffers are absent. */
+static void sol_forward_rejects_bad_args(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 256, 1, 4242u);
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, sizeof(error))) {
+        check(false, "the forward's rejection cases allocate a plan");
+        return;
+    }
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *output = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *wide = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    uint32_t refused = 0;
+    refused += !h3d_sol_forward(gpu, output, &plan.plan, query, key, value, 0,
+                                data.heads, scale, error, sizeof(error));
+    refused += !h3d_sol_forward(gpu, output, &plan.plan, query, key, value,
+                                data.sequence, 0, scale, error, sizeof(error));
+    refused += !h3d_sol_forward(gpu, output, &plan.plan, query, key, wide,
+                                data.sequence, data.heads, scale, error,
+                                sizeof(error));
+    refused += !h3d_sol_forward(gpu, output, &plan.plan, query, key, value,
+                                UINT32_MAX, data.heads, scale, error,
+                                sizeof(error));
+    h3d_sol_plan absent = plan.plan;
+    absent.kc = nullptr;
+    refused += !h3d_sol_forward(gpu, output, &absent, query, key, value,
+                                data.sequence, data.heads, scale, error,
+                                sizeof(error));
+    check(refused == 5, "the sparse forward refuses a bad shape or a bad plan");
+    h3d_free(query);
+    h3d_free(key);
+    h3d_free(value);
+    h3d_free(output);
+    h3d_free(wide);
+    sol_free(plan);
+}
+
 int main() {
     char error[512] = {};
     auto *dit = h3d_create(error, sizeof(error));
@@ -1445,6 +1966,11 @@ int main() {
     sol_search_constant(dit);
     sol_search_spike(dit);
     sol_search_tau_monotone(dit);
+    sol_forward_matches_reference(dit);
+    sol_forward_all_exact(dit);
+    sol_forward_multiword(dit);
+    sol_forward_mask_is_literal(dit);
+    sol_forward_rejects_bad_args(dit);
     h3v_destroy(vision);
     h3t_destroy(text);
     h3d_destroy(dit);

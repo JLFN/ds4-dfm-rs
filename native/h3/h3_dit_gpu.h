@@ -479,6 +479,37 @@ int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
 /* Number of `mask` words per query block: ceil(ceil(sequence/64) / 32). */
 uint32_t h3d_sol_words(uint32_t sequence);
 
+/* The sparse forward the mask was built for: Sol-Attn's attention with the
+ * exact/approximated split `h3d_sol_search` routed. One CTA per (query block,
+ * head), four warps of 16 query rows each. Per group of 32 KV blocks the
+ * group's approximated blocks are folded into the running softmax from the
+ * pooled summaries in one pass, then its exact blocks are walked in increasing
+ * block order, one 64-key block at a time:
+ *
+ *   s = q @ kc[n]^T * scale*log2(e)                 (`triton_ref/fwd.py:88-108`)
+ *   approximated: p = exp2(s - m); o += p @ vc;
+ *     row_sum += p * block_length    (`fwd.py:109-131`, vc is a SUM,
+ *                                     `preprocess.py:82`)
+ *   exact:        p = exp2(q @ k^T * scale*log2(e) - m); o += p @ v;
+ *     row_sum += sum(p)                            (`fwd.py:132-170`)
+ *   output = o / row_sum, BF16                                (`fwd.py:171-173`)
+ *
+ * An approximated block is folded, never skipped, and a group with no
+ * approximated block leaves the running maximum untouched (`fwd.py:256-262`).
+ * The mask is the plan's, so the sink range and the diagonal band arrive
+ * already set and this function adds no policy of its own: it reads `kc`, `vc`
+ * and `mask` and nothing else. Call `h3d_sol_search` for the same plan first.
+ *
+ * Deviations, named: BF16 `P` for both products, as the reference casts too
+ * (`fwd.py:129,164`); one maximum per 64-key exact block; the port's `exp2`,
+ * F32 accumulators and reduction trees against Triton's. `tests/h3/test_native.cu`
+ * gates the walk against the reference's own rule. */
+int h3d_sol_forward(h3d_context *context, h3d_tensor *output,
+                    const struct h3d_sol_plan *plan, const h3d_tensor *query,
+                    const h3d_tensor *key, const h3d_tensor *value,
+                    uint32_t sequence, uint32_t heads, float scale, char *error,
+                    size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif
