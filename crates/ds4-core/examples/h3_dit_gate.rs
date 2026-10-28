@@ -95,7 +95,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ds4_core::minimax_h3::dit::{self, Dit, LoadMode, LoadOptions, Reduction};
+use ds4_core::minimax_h3::dit::{self, Attention, Dit, LoadMode, LoadOptions, Reduction};
 use ds4_core::minimax_h3::host::{latent_canvas, reuse_schedule, temporal, Rng, Schedule};
 use ds4_core::minimax_h3::sequence::{self, Spec};
 use ds4_core::minimax_h3::text_forward;
@@ -271,6 +271,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             layers: options.layers,
             reduction,
             core_reuse: options.core_reuse,
+            // The goldens below are the reference engine's exact hashes, and
+            // the mma reduction tree cannot reproduce them (`56db38aa`).
+            attention: Attention::Scalar,
         },
     )
     .map_err(|error| error.to_string())?;
