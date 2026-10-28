@@ -31,6 +31,7 @@ pub mod engine;
 pub mod host;
 pub mod layout;
 pub mod local_api;
+pub mod lora;
 pub mod media;
 pub mod multimodal;
 pub mod partition;
