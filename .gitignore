@@ -295,3 +295,13 @@ tests/naive_banks
 
 # Compiler-generated header dependencies.
 *.o.d
+
+# Sol-H3 separate engine (`sol/`): upstream sources, environments, weights and
+# renders stay out of the repository. Only sol/README.md, prepare.sh and run.sh
+# are tracked.
+/sol/upstream/
+/sol/venvs/
+/sol/checkpoints/
+/sol/outputs/
+/sol/paths.json
+/sol/dependencies/
