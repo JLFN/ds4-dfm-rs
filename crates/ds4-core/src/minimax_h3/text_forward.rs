@@ -249,9 +249,36 @@ impl Encoder {
 /// ignores it, so the caller passes the component the catalog resolved either
 /// way.
 pub fn encode_with(encoder: &Encoder, dir: &Path, ids: &[u32]) -> Result<Embedding, ForwardError> {
+    encode_with_layers(encoder, dir, ids, LAYERS)
+}
+
+/// [`encode_with`] over the first `layers` layers, the E4 bisection's entry.
+///
+/// One walk and two stores: the layer count means the same thing on either
+/// side, which is what makes `--layers 1` a localizer for a decode fault.
+pub fn encode_with_layers(
+    encoder: &Encoder,
+    dir: &Path,
+    ids: &[u32],
+    layers: u32,
+) -> Result<Embedding, ForwardError> {
+    require_tokens(ids)?;
+
+    let gpu = Gpu::create().map_err(ForwardError::Gpu)?;
+    let layers = layers.min(LAYERS);
+
     match encoder {
-        Encoder::Bf16 => encode(dir, ids),
-        Encoder::Quantized(file) => encode_quantized(file, ids),
+        Encoder::Bf16 => {
+            let weights = TextWeights::open(dir)?;
+
+            run(&Weights::Bf16(&weights), &gpu, ids, layers, None)
+        }
+        Encoder::Quantized(file) => {
+            let weights =
+                Nvfp4::open(file).map_err(|error| ForwardError::Quantized(error.token()))?;
+
+            run(&Weights::Quantized(&weights), &gpu, ids, layers, None)
+        }
     }
 }
 
@@ -262,39 +289,14 @@ pub fn attention_scale() -> f32 {
 
 /// Encode `ids` with the checkpoint under `dir`.
 pub fn encode(dir: &Path, ids: &[u32]) -> Result<Embedding, ForwardError> {
-    encode_layers(dir, ids, LAYERS)
-}
-
-/// Encode `ids` with the reference's NVFP4-AWQ artifact.
-///
-/// `FL2VA/text_encoder`'s own `config.json` is not read: the geometry is this
-/// crate's constants (`text.rs:39-57`), and the artifact is checked against
-/// them by name, dtype and shape when it opens.
-pub fn encode_quantized(file: &Path, ids: &[u32]) -> Result<Embedding, ForwardError> {
-    require_tokens(ids)?;
-
-    let weights = Nvfp4::open(file).map_err(|error| ForwardError::Quantized(error.token()))?;
-    let gpu = Gpu::create().map_err(ForwardError::Gpu)?;
-
-    run(&Weights::Quantized(&weights), &gpu, ids, LAYERS, None)
+    encode_with(&Encoder::Bf16, dir, ids)
 }
 
 /// Encode `ids` through the first `layers` layers, for the E4 bisection: the
 /// reference exposes the same prefix entry
 /// (`h3_text_encode_multimodal_layers_bf16`, `h3_text_encoder.h:44-52`).
 pub fn encode_layers(dir: &Path, ids: &[u32], layers: u32) -> Result<Embedding, ForwardError> {
-    require_tokens(ids)?;
-
-    let weights = TextWeights::open(dir)?;
-    let gpu = Gpu::create().map_err(ForwardError::Gpu)?;
-
-    run(
-        &Weights::Bf16(&weights),
-        &gpu,
-        ids,
-        layers.min(LAYERS),
-        None,
-    )
+    encode_with_layers(&Encoder::Bf16, dir, ids, layers)
 }
 
 /// Encode a prompt that carries Qwen vision spans

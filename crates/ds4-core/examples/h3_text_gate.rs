@@ -79,8 +79,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     };
 
     let start = Instant::now();
-    let embedding = text_forward::encode_with(&source, std::path::Path::new(encoder), &ids)
-        .map_err(|error| error.token())?;
+    let embedding =
+        text_forward::encode_with_layers(&source, std::path::Path::new(encoder), &ids, layers)
+            .map_err(|error| error.token())?;
     let seconds = start.elapsed().as_secs_f64();
 
     println!(
