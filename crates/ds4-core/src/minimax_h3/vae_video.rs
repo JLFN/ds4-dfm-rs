@@ -474,7 +474,7 @@ impl Decoder {
             HIDDEN as u32,
             EPSILON,
         ))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             &buffers.qkv,
             &buffers.norm,
             &block.qkv_w,
@@ -482,7 +482,6 @@ impl Decoder {
             rows,
             HIDDEN as u32,
             (INNER * 3) as u32,
-            Dtype::F32,
         ))?;
         device(gpu.video_qkv_rope_f32(
             &buffers.query,
@@ -507,7 +506,7 @@ impl Decoder {
             HEAD_DIM,
             1.0f32 / (HEAD_DIM as f32).sqrt(),
         ))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             &buffers.branch,
             &buffers.heads,
             &block.out_w,
@@ -515,7 +514,6 @@ impl Decoder {
             rows,
             INNER as u32,
             HIDDEN as u32,
-            Dtype::F32,
         ))?;
         device(gpu.scale_add_f32(
             hidden,
@@ -534,7 +532,7 @@ impl Decoder {
             HIDDEN as u32,
             EPSILON,
         ))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             &buffers.ff1,
             &buffers.norm,
             &block.w1,
@@ -542,10 +540,9 @@ impl Decoder {
             rows,
             HIDDEN as u32,
             (FFN * 2) as u32,
-            Dtype::F32,
         ))?;
         device(gpu.swiglu_f32(&buffers.activated, &buffers.ff1, rows, FFN as u32))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             &buffers.branch,
             &buffers.activated,
             &block.w2,
@@ -553,7 +550,6 @@ impl Decoder {
             rows,
             FFN as u32,
             HIDDEN as u32,
-            Dtype::F32,
         ))?;
         device(gpu.scale_add_f32(
             hidden,
@@ -580,7 +576,7 @@ impl Decoder {
         let buffers = &scratch.buffers;
         let (post, patch_hidden, zero) = (&scratch.post, &scratch.patch_hidden, &scratch.zero);
 
-        device(gpu.linear(
+        device(gpu.vae_linear(
             post,
             &latent,
             &self.parts.post_w,
@@ -588,9 +584,8 @@ impl Decoder {
             patches as u32,
             LATENT_CHANNELS as u32,
             LATENT_CHANNELS as u32,
-            Dtype::F32,
         ))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             patch_hidden,
             post,
             &self.parts.embed_w,
@@ -598,7 +593,6 @@ impl Decoder {
             patches as u32,
             LATENT_CHANNELS as u32,
             HIDDEN as u32,
-            Dtype::F32,
         ))?;
         device(gpu.copy_f32(&buffers.hidden, 0, patch_hidden, 0, patches * HIDDEN))?;
         device(gpu.copy_f32(
@@ -629,7 +623,7 @@ impl Decoder {
             HIDDEN as u32,
             EPSILON,
         ))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             &buffers.projected,
             &buffers.norm,
             &self.parts.proj_w,
@@ -637,7 +631,6 @@ impl Decoder {
             rows,
             HIDDEN as u32,
             OUTPUT_PATCH as u32,
-            Dtype::F32,
         ))?;
         device(gpu.sync())?;
 

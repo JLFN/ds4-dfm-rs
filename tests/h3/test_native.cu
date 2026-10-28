@@ -318,8 +318,189 @@ static void short_attention_f32_axes(h3d_context *gpu) {
     h3d_free(zero); h3d_free(value); h3d_free(output);
 }
 
-static void text_embedding_rows(h3t_context *gpu, uint32_t rows, uint32_t width) {
+/* Deterministic high-entropy F32 values in [-1, 1): every bit of the mantissa
+ * is used, so a reduced-precision arm has something to round. */
+static void seed_values(std::vector<float> &values, uint32_t seed) {
+    uint32_t state = seed * 2654435761u + 1u;
+    for (auto &item : values) {
+        state = state * 1664525u + 1013904223u;
+        item = (float)(state >> 8) / 8388608.0f - 1.0f;
+    }
+}
+
+/* Every option back to the reference path, so one test cannot leak into the
+ * next: the context is shared by everything below. */
+static void reset_vae_options(h3d_context *gpu) {
+    bool reset = h3d_set_vae_option(gpu, "attention", "scalar") &&
+                 h3d_set_vae_option(gpu, "sdpa_order", "heads") &&
+                 h3d_set_vae_option(gpu, "gemm", "fp32");
+    check(reset, "video VAE options reset to the reference path");
+}
+
+/* The F32 attention's CTA order is a cache experiment, not an arithmetic one:
+ * `grid(query blocks, heads)` must reproduce the reference order bit for bit.
+ * 37 rows is a partial final query block, and 32 heads covers the order swap. */
+static void video_vae_attention_order(h3d_context *gpu) {
     char error[512] = {};
+    constexpr uint32_t rows = 37, heads = 32, width = 64;
+    constexpr size_t elements = (size_t)rows * heads * width;
+    auto *query = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    auto *key = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    auto *value = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    auto *output = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    if (!query || !key || !value || !output) { fprintf(stderr, "%s\n", error); exit(2); }
+    std::vector<float> host(elements), reference(elements), actual(elements);
+    uint32_t seed = 1;
+    bool uploaded = true;
+    for (auto *tensor : {query, key, value}) {
+        seed_values(host, seed++);
+        uploaded = uploaded && h3d_upload(gpu, tensor, host.data(), error, sizeof(error));
+    }
+    if (!uploaded) { fprintf(stderr, "upload: %s\n", error); exit(2); }
+
+    const float scale = 1.0f / (float)std::sqrt((double)width);
+    bool queued = h3d_set_vae_option(gpu, "sdpa_order", "heads") &&
+                  h3d_sdpa_f32(gpu, output, query, key, value, rows, heads, width, scale,
+                               error, sizeof(error)) &&
+                  h3d_sync(gpu, error, sizeof(error)) &&
+                  h3d_read(gpu, reference.data(), output, error, sizeof(error));
+    queued = queued && h3d_set_vae_option(gpu, "sdpa_order", "rows") &&
+             h3d_sdpa_f32(gpu, output, query, key, value, rows, heads, width, scale,
+                          error, sizeof(error)) &&
+             h3d_sync(gpu, error, sizeof(error)) &&
+             h3d_read(gpu, actual.data(), output, error, sizeof(error));
+    if (!queued) { fprintf(stderr, "order arms: %s\n", error); }
+    check(queued && actual == reference,
+          "F32 attention CTA order is bit-identical to the reference order");
+    reset_vae_options(gpu);
+    h3d_free(query); h3d_free(key); h3d_free(value); h3d_free(output);
+}
+
+/* The tensor-core F32 attention is a numerical arm: it must differ from the
+ * scalar kernel (otherwise the switch did nothing), stay finite, and land
+ * inside a structural bound. The bound is loose on purpose — it catches a
+ * mis-staged tile or a swapped axis, which move the output by order 1, not the
+ * BF16 rounding this arm actually carries, which is measured and reported by
+ * `tests/h3/attn_f32_bm --compare`. */
+static void video_vae_attention_mma(h3d_context *gpu) {
+    char error[512] = {};
+    constexpr uint32_t rows = 37, heads = 32, width = 64;
+    constexpr size_t elements = (size_t)rows * heads * width;
+    auto *query = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    auto *key = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    auto *value = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    auto *output = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    if (!query || !key || !value || !output) { fprintf(stderr, "%s\n", error); exit(2); }
+    std::vector<float> host(elements), reference(elements), actual(elements);
+    uint32_t seed = 1;
+    bool uploaded = true;
+    for (auto *tensor : {query, key, value}) {
+        seed_values(host, seed++);
+        uploaded = uploaded && h3d_upload(gpu, tensor, host.data(), error, sizeof(error));
+    }
+    if (!uploaded) { fprintf(stderr, "upload: %s\n", error); exit(2); }
+
+    const float scale = 1.0f / (float)std::sqrt((double)width);
+    bool queued = h3d_set_vae_option(gpu, "attention", "scalar") &&
+                  h3d_sdpa_f32(gpu, output, query, key, value, rows, heads, width, scale,
+                               error, sizeof(error)) &&
+                  h3d_sync(gpu, error, sizeof(error)) &&
+                  h3d_read(gpu, reference.data(), output, error, sizeof(error));
+    queued = queued && h3d_set_vae_option(gpu, "attention", "tensor") &&
+             h3d_sdpa_f32(gpu, output, query, key, value, rows, heads, width, scale,
+                          error, sizeof(error)) &&
+             h3d_sync(gpu, error, sizeof(error)) &&
+             h3d_read(gpu, actual.data(), output, error, sizeof(error));
+    if (!queued) { fprintf(stderr, "attention arms: %s\n", error); }
+
+    float worst = 0.0f, largest = 0.0f;
+    bool finite = true;
+    bool differs = false;
+    for (size_t index = 0; index < elements; index++) {
+        finite = finite && std::isfinite(actual[index]) && std::isfinite(reference[index]);
+        differs = differs || actual[index] != reference[index];
+        worst = std::max(worst, std::fabs(actual[index] - reference[index]));
+        largest = std::max(largest, std::fabs(reference[index]));
+    }
+    check(queued && finite, "tensor-core F32 attention output is finite");
+    check(differs, "tensor-core F32 attention is a distinct arm, not the scalar one");
+    check(worst <= 0.05f * largest,
+          "tensor-core F32 attention stays inside the structural bound");
+    reset_vae_options(gpu);
+    h3d_free(query); h3d_free(key); h3d_free(value); h3d_free(output);
+}
+
+/* The decoder's linear compute modes. The bias still goes through the
+ * reference's separate kernel in every mode, so the check is the matmul: the
+ * default path must equal the plain `h3d_linear` bit for bit, which is what
+ * makes the option free to leave unset, and the reduced modes must stay finite
+ * and inside a structural bound until the reproducer measures their deviation. */
+static void video_vae_linear_options(h3d_context *gpu) {
+    char error[512] = {};
+    constexpr uint32_t rows = 5, input_dim = 11, output_dim = 7;
+    constexpr size_t inputs = (size_t)rows * input_dim;
+    constexpr size_t weights = (size_t)output_dim * input_dim;
+    constexpr size_t outputs = (size_t)rows * output_dim;
+    auto *input = h3d_alloc(gpu, H3D_F32, inputs, error, sizeof(error));
+    auto *weight = h3d_alloc(gpu, H3D_F32, weights, error, sizeof(error));
+    auto *bias = h3d_alloc(gpu, H3D_F32, output_dim, error, sizeof(error));
+    auto *plain = h3d_alloc(gpu, H3D_F32, outputs, error, sizeof(error));
+    auto *option = h3d_alloc(gpu, H3D_F32, outputs, error, sizeof(error));
+    if (!input || !weight || !bias || !plain || !option) {
+        fprintf(stderr, "%s\n", error);
+        exit(2);
+    }
+    std::vector<float> input_host(inputs), weight_host(weights), bias_host(output_dim);
+    seed_values(input_host, 3);
+    seed_values(weight_host, 4);
+    seed_values(bias_host, 5);
+    bool uploaded = h3d_upload(gpu, input, input_host.data(), error, sizeof(error)) &&
+                    h3d_upload(gpu, weight, weight_host.data(), error, sizeof(error)) &&
+                    h3d_upload(gpu, bias, bias_host.data(), error, sizeof(error));
+    if (!uploaded) { fprintf(stderr, "upload: %s\n", error); exit(2); }
+
+    std::vector<float> reference(outputs), actual(outputs);
+    auto run = [&](h3d_tensor *into) {
+        return h3d_vae_linear(gpu, into, input, weight, bias, rows, input_dim,
+                              output_dim, error, sizeof(error)) &&
+               h3d_sync(gpu, error, sizeof(error)) &&
+               h3d_read(gpu, actual.data(), into, error, sizeof(error));
+    };
+
+    /* The default path against the reference's own entry point. */
+    bool queued = h3d_linear(gpu, plain, input, weight, bias, rows, input_dim,
+                             output_dim, H3D_F32, error, sizeof(error)) &&
+                  h3d_sync(gpu, error, sizeof(error)) &&
+                  h3d_read(gpu, reference.data(), plain, error, sizeof(error)) &&
+                  run(option);
+    if (!queued) { fprintf(stderr, "fp32 arms: %s\n", error); }
+    check(queued && actual == reference,
+          "video VAE linear default path is bit-identical to the reference path");
+
+    /* The reduced-precision compute modes: finite, inside the structural bound,
+     * and reported by the reproducer's own deviation readout. */
+    for (const char *mode : {"tf32", "bf16"}) {
+        queued = h3d_set_vae_option(gpu, "gemm", mode) && run(option);
+        if (!queued) { fprintf(stderr, "gemm %s arm: %s\n", mode, error); }
+        float worst = 0.0f, largest = 0.0f;
+        bool finite = true;
+        for (size_t index = 0; index < outputs; index++) {
+            finite = finite && std::isfinite(actual[index]);
+            worst = std::max(worst, std::fabs(actual[index] - reference[index]));
+            largest = std::max(largest, std::fabs(reference[index]));
+        }
+        char name[96];
+        snprintf(name, sizeof(name), "video VAE %s matmul is finite and inside the bound", mode);
+        check(queued && finite && worst <= 0.05f * largest, name);
+        h3d_set_vae_option(gpu, "gemm", "fp32");
+    }
+
+    reset_vae_options(gpu);
+    h3d_free(input); h3d_free(weight); h3d_free(bias);
+    h3d_free(plain); h3d_free(option);
+}
+
+static void text_embedding_rows(h3t_context *gpu, uint32_t rows, uint32_t width) {    char error[512] = {};
     constexpr uint32_t vocab = 3;
     auto *weight = h3t_alloc(gpu, H3T_BF16, (size_t)vocab * width, error, sizeof(error));
     auto *output = h3t_alloc(gpu, H3T_BF16, (size_t)rows * width, error, sizeof(error));
@@ -488,6 +669,9 @@ int main() {
     pad_plane_launch(dit, 3, 2, 129);
     short_attention_axes(dit);
     short_attention_f32_axes(dit);
+    video_vae_attention_order(dit);
+    video_vae_attention_mma(dit);
+    video_vae_linear_options(dit);
     h3v_destroy(vision);
     h3t_destroy(text);
     h3d_destroy(dit);

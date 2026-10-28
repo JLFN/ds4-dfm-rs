@@ -30,6 +30,24 @@ struct h3d_tensor {
     int dtype;
 };
 
+/* The video VAE decoder's bench options. Every field defaults to the path the
+ * H3 campaign measured before, so a job that sets nothing is unchanged, and
+ * each option exists so the arms can be timed on one binary. The decoder's
+ * arithmetic has no reference analogue for these: `/data/h3.c` runs the F32
+ * scalar attention, the reference's CTA order, F32 SIMT matmuls and a separate
+ * bias add, and that is exactly the default here. */
+enum {
+    H3D_VAE_GEMM_FP32 = 0,   /* CUBLAS_COMPUTE_32F, the reference's SIMT F32 */
+    H3D_VAE_GEMM_TF32 = 1,   /* CUBLAS_COMPUTE_32F_FAST_TF32 */
+    H3D_VAE_GEMM_BF16 = 2,   /* CUBLAS_COMPUTE_32F_FAST_16BF */
+};
+
+struct h3d_vae_options {
+    int attention_mma;   /* 1 = tensor-core F32 attention at head_dim 64 */
+    int query_major;     /* 1 = grid(query blocks, heads): the reuse order */
+    int gemm;            /* H3D_VAE_GEMM_* */
+};
+
 struct h3d_context {
     cudaStream_t stream;
     cublasLtHandle_t blas;
@@ -37,6 +55,7 @@ struct h3d_context {
     cudaEvent_t stage_done;
     int stage_pending;    /* a DMA out of `stage` has not been waited for yet */
     int attention_mma;    /* 1 = tensor-core attention (default), 0 = byte-exact scalar */
+    struct h3d_vae_options vae;
 };
 
 /* Whether the byte-exact scalar attention was asked for, from the environment.
@@ -63,6 +82,51 @@ void h3d_set_attention(h3d_context *context, int scalar) {
     if (context) {
         context->attention_mma = !scalar;
     }
+}
+
+/* The video VAE decoder's options, from the environment, read once per
+ * context. Unset means the reference path, so an arm is always a comparison
+ * against the same binary's own default. Each value is matched on its first
+ * letter, which is unambiguous within a name: scalar/tensor, heads/rows,
+ * fp32/tf32/bf16. */
+static struct h3d_vae_options h3d_vae_options_from_env(void) {
+    struct h3d_vae_options options = {0, 0, H3D_VAE_GEMM_FP32};
+    const char *attention = getenv("H3_VAE_ATTENTION");
+    const char *order = getenv("H3_VAE_SDPA_ORDER");
+    const char *gemm = getenv("H3_VAE_GEMM");
+    if (attention) options.attention_mma = attention[0] == 't' || attention[0] == 'T';
+    if (order) options.query_major = order[0] == 'r' || order[0] == 'R';
+    if (gemm && (gemm[0] == 't' || gemm[0] == 'T')) options.gemm = H3D_VAE_GEMM_TF32;
+    if (gemm && (gemm[0] == 'b' || gemm[0] == 'B')) options.gemm = H3D_VAE_GEMM_BF16;
+    return options;
+}
+
+/* Select one video VAE decoder option per run. Names and values: "attention"
+ * (scalar, tensor), "sdpa_order" (heads, rows), "gemm" (fp32, tf32, bf16).
+ * Exact words here, unlike the environment's first-letter rule, because a host
+ * that sets an option wants a typo refused rather than silently read as a
+ * default. Overrides H3_VAE_* for this context. Returns 0 when the name or the
+ * value is not one of those. */
+int h3d_set_vae_option(h3d_context *context, const char *name,
+                       const char *value) {
+    if (!context || !name || !value) return 0;
+    if (strcmp(name, "attention") == 0) {
+        if (strcmp(value, "scalar") == 0) { context->vae.attention_mma = 0; return 1; }
+        if (strcmp(value, "tensor") == 0) { context->vae.attention_mma = 1; return 1; }
+        return 0;
+    }
+    if (strcmp(name, "sdpa_order") == 0) {
+        if (strcmp(value, "heads") == 0) { context->vae.query_major = 0; return 1; }
+        if (strcmp(value, "rows") == 0) { context->vae.query_major = 1; return 1; }
+        return 0;
+    }
+    if (strcmp(name, "gemm") == 0) {
+        if (strcmp(value, "fp32") == 0) { context->vae.gemm = H3D_VAE_GEMM_FP32; return 1; }
+        if (strcmp(value, "tf32") == 0) { context->vae.gemm = H3D_VAE_GEMM_TF32; return 1; }
+        if (strcmp(value, "bf16") == 0) { context->vae.gemm = H3D_VAE_GEMM_BF16; return 1; }
+        return 0;
+    }
+    return 0;
 }
 
 static int h3d_set_error(char *error, size_t error_size, const char *format,
@@ -150,6 +214,7 @@ h3d_context *h3d_create(char *error, size_t error_size) {
      * choose with `h3d_set_attention`; the environment is read once here as the
      * default for callers that never call it, such as the reproducer. */
     context->attention_mma = !h3d_attention_scalar_from_env();
+    context->vae = h3d_vae_options_from_env();
     return context;
 }
 
@@ -298,11 +363,15 @@ int h3d_read(h3d_context *context, void *host, const h3d_tensor *tensor,
 }
 
 /* `h3_linear_lt` (`h3_gpu_cuda.cu:733-779`), byte for byte: row-major
- * layouts, TRANSB, F32 compute, alpha 1 and beta 0. */
-static int h3d_linear_lt(h3d_context *context, void *output, const void *input,
-                         const void *weight, uint32_t rows, uint32_t input_dim,
-                         uint32_t output_dim, cudaDataType_t type,
-                         char *error, size_t error_size) {
+ * layouts, TRANSB, F32 compute, alpha 1 and beta 0. `compute` carries this
+ * port's video VAE decoder compute-mode option; the plain `h3d_linear_lt`
+ * below passes the reference's value, so every other caller is unchanged. */
+static int h3d_linear_lt_compute(h3d_context *context, void *output,
+                                 const void *input, const void *weight,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t output_dim, cudaDataType_t type,
+                                 cublasComputeType_t compute, char *error,
+                                 size_t error_size) {
     cublasLtMatmulDesc_t operation = NULL;
     cublasLtMatrixLayout_t input_layout = NULL;
     cublasLtMatrixLayout_t weight_layout = NULL;
@@ -311,8 +380,8 @@ static int h3d_linear_lt(h3d_context *context, void *output, const void *input,
     cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
     float alpha = 1.0f;
     float beta = 0.0f;
-    cublasStatus_t status = cublasLtMatmulDescCreate(
-        &operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasStatus_t status = cublasLtMatmulDescCreate(&operation, compute,
+                                                     CUDA_R_32F);
     if (status == CUBLAS_STATUS_SUCCESS) {
         status = cublasLtMatmulDescSetAttribute(
             operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
@@ -356,6 +425,16 @@ static int h3d_linear_lt(h3d_context *context, void *output, const void *input,
     if (input_layout) cublasLtMatrixLayoutDestroy(input_layout);
     if (operation) cublasLtMatmulDescDestroy(operation);
     return h3d_blas_ok(status, "cuBLASLt linear", error, error_size);
+}
+
+/* The reference's matmul, unchanged: F32 compute. */
+static int h3d_linear_lt(h3d_context *context, void *output, const void *input,
+                         const void *weight, uint32_t rows, uint32_t input_dim,
+                         uint32_t output_dim, cudaDataType_t type,
+                         char *error, size_t error_size) {
+    return h3d_linear_lt_compute(context, output, input, weight, rows,
+                                 input_dim, output_dim, type, CUBLAS_COMPUTE_32F,
+                                 error, error_size);
 }
 
 /* `h3_linear_bias_kernel` (`:783-791`): the bias is added to the already
@@ -420,6 +499,50 @@ int h3d_linear(h3d_context *context, h3d_tensor *output,
             (const __nv_bfloat16 *)bias->data, outputs, output_dim);
     }
     return h3d_launch_ok("linear bias", error, error_size);
+}
+
+/* The video VAE decoder's F32 linear: the reference's `h3_gpu_linear_f32`
+ * (`:832-870`) with this port's compute-mode option applied. Only the decoder
+ * calls it (`minimax_h3::vae_video`), so `H3_VAE_GEMM` cannot reach the video
+ * VAE encoder or the audio VAE, whose gates compare against the reference bit
+ * for bit. The bias add stays the reference's separate `h3_linear_bias_kernel`
+ * in every mode: cuBLASLt refuses `CUBLASLT_EPILOGUE_BIAS` for this row-major
+ * TRANSB configuration with CUBLAS_STATUS_NOT_SUPPORTED (measured on GB10
+ * sm_121 CUDA 13.0 and on sm_89 CUDA 13.3), so folding the bias into the
+ * epilogue is not available here and the arm was dropped rather than faked. */
+int h3d_vae_linear(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, const h3d_tensor *weight,
+                   const h3d_tensor *bias, uint32_t rows, uint32_t input_dim,
+                   uint32_t output_dim, char *error, size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_F32, inputs) || !h3d_is(weight, H3D_F32, weights) ||
+        !h3d_is(output, H3D_F32, outputs) ||
+        (bias && !h3d_is(bias, H3D_F32, output_dim))) {
+        return h3d_set_error(error, error_size,
+                             "invalid video VAE linear tensors or shape");
+    }
+
+    cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
+    if (context->vae.gemm == H3D_VAE_GEMM_TF32) {
+        compute = CUBLAS_COMPUTE_32F_FAST_TF32;
+    } else if (context->vae.gemm == H3D_VAE_GEMM_BF16) {
+        compute = CUBLAS_COMPUTE_32F_FAST_16BF;
+    }
+    if (!h3d_linear_lt_compute(context, output->data, input->data,
+                               weight->data, rows, input_dim, output_dim,
+                               CUDA_R_32F, compute, error, error_size)) {
+        return 0;
+    }
+    if (!bias) return 1;
+
+    unsigned blocks = (unsigned)((outputs + 255) / 256);
+    h3d_linear_bias_kernel<<<blocks, 256, 0, context->stream>>>(
+        (float *)output->data, (const float *)bias->data, outputs, output_dim);
+    return h3d_launch_ok("video VAE linear bias", error, error_size);
 }
 
 int h3d_patch_linear(h3d_context *context, h3d_tensor *output,
@@ -1981,7 +2104,7 @@ __global__ static void h3d_attention_f32_kernel(
  * H3D_ATTENTION_F32_ROWS rows, served from the same staged rows. Every row runs
  * the reference's arithmetic in the reference's order, so the output stays
  * bit-identical. */
-template <int HEAD_DIM>
+template <int HEAD_DIM, int QUERY_MAJOR>
 __global__ static void h3d_attention_tiled_f32_kernel(
         float *output, const float *query, const float *key,
         const float *value, uint32_t sequence, uint32_t heads, float scale,
@@ -1992,8 +2115,15 @@ __global__ static void h3d_attention_tiled_f32_kernel(
     __shared__ float shared_value[KEYS][HEAD_DIM];
     uint32_t warp = threadIdx.x / 32;
     uint32_t lane = threadIdx.x % 32;
-    uint32_t head = blockIdx.x;
-    uint32_t first_row = blockIdx.y * QUERIES + warp * ROWS;
+    /* `QUERY_MAJOR` is the CTA order only: `grid(query blocks, heads)` keeps
+     * the CTAs resident together on one head, whose staged keys and values are
+     * then read from L2 by the next query block; the reference's
+     * `grid(heads, query blocks)` spreads the resident CTAs over every head.
+     * Neither order changes a single arithmetic operation, so the two are
+     * bit-identical and the option is a cache experiment (`H3_VAE_SDPA_ORDER`). */
+    uint32_t head = QUERY_MAJOR ? blockIdx.y : blockIdx.x;
+    uint32_t first_row =
+            (QUERY_MAJOR ? blockIdx.x : blockIdx.y) * QUERIES + warp * ROWS;
     int active[ROWS];
     float result[ROWS][ITEMS];
     float maximum[ROWS];
@@ -2099,6 +2229,247 @@ __global__ static void h3d_attention_tiled_f32_kernel(
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Tensor-core attention for the video VAE decoder, the arm behind
+ * `H3_VAE_ATTENTION=tensor`.
+ *
+ * Shape: one CTA covers H3D_VFA_ROWS query rows of one head, a warp owns
+ * H3D_VFA_M of them and all H3D_VFA_HD key dimensions, so a row's softmax
+ * statistics never cross a warp and no partial-score exchange is needed: the
+ * same choice this file's BF16 `h3d_attention_mma_kernel` makes, and the
+ * opposite of `cuda/ds41_attn_mma.cuh`, whose 512-dimension head does split K.
+ * The step, the ldmatrix pair and the BF16 pair are mirrored from
+ * `cuda/ds41_attn_mma.cuh:144-157` and the Q fragments, accumulator layout and
+ * P-to-A packing from `:206-277`. The decoder carries F32 tensors, so Q, K and
+ * V round to BF16 as they are staged, which the BF16 kernel gets for free.
+ *
+ * Deviations from the reference, named rather than hidden: Q, K and V round to
+ * BF16 at staging; the scores reduce through `mma` instead of the reference's
+ * four-element lane partial and five-step shuffle; the online softmax takes one
+ * maximum per 64-key tile instead of rescaling on every key row; and P rounds to
+ * BF16 for the second `mma`. Scores, the running maximum and sum and the output
+ * accumulator stay FP32, so the arithmetic is the reference's in kind and
+ * differs only in order.
+ * ------------------------------------------------------------------------- */
+enum {
+    H3D_VFA_HD = 64,                /* the decoder's head_dim, the one shape served */
+    H3D_VFA_KEYS = 64,              /* key rows staged per tile */
+    H3D_VFA_M = 16,                 /* query rows a warp owns */
+    H3D_VFA_WARPS = 4,
+    H3D_VFA_ROWS = H3D_VFA_M * H3D_VFA_WARPS,
+    H3D_VFA_LD = H3D_VFA_HD + 8,    /* +8 bf16 spreads ldmatrix rows across banks */
+    H3D_VFA_DIMS = H3D_VFA_HD / 8,  /* n8 slices of the output */
+    H3D_VFA_KS = H3D_VFA_HD / 16,   /* k16 steps over the head dimension */
+    H3D_VFA_NS = H3D_VFA_KEYS / 8,  /* n8 slices of the scores */
+    H3D_VFA_CHUNKS = H3D_VFA_HD / 8 /* 16-byte copies in one staged row */
+};
+
+/* Eight consecutive F32 values as eight consecutive BF16 halves: one 16-byte
+ * chunk of a staged row. */
+__device__ __forceinline__ static uint4 h3d_mma_bf16_chunk(const float *source) {
+    uint4 packed;
+    packed.x = h3d_mma_pair(source[0], source[1]);
+    packed.y = h3d_mma_pair(source[2], source[3]);
+    packed.z = h3d_mma_pair(source[4], source[5]);
+    packed.w = h3d_mma_pair(source[6], source[7]);
+    return packed;
+}
+
+__global__ static void h3d_attention_mma_f32_kernel(
+        float *output, const float *query, const float *key,
+        const float *value, uint32_t sequence, uint32_t heads, float scale) {
+    __shared__ __align__(16) __nv_bfloat16 shared_key[H3D_VFA_KEYS][H3D_VFA_LD];
+    __shared__ __align__(16) __nv_bfloat16 shared_value[H3D_VFA_KEYS][H3D_VFA_LD];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t quad = lane >> 2u;         /* the accumulator row a lane serves */
+    const uint32_t column = (lane & 3u) * 2u; /* first of its two columns */
+    const uint32_t matrix = lane >> 3u;       /* ldmatrix: which 8x8 quadrant */
+    const uint32_t head = blockIdx.y;
+    const uint32_t first_row = blockIdx.x * H3D_VFA_ROWS + warp * H3D_VFA_M;
+    const uint32_t row0 = first_row + quad, row1 = row0 + 8u;
+    const int live0 = row0 < sequence, live1 = row1 < sequence;
+    /* A row past the end reads the last real row and is never written, which
+     * keeps the CTA's reads in bounds without branching the MMAs. */
+    const uint32_t read0 = live0 ? row0 : sequence - 1u;
+    const uint32_t read1 = live1 ? row1 : sequence - 1u;
+    const float *query0 =
+            query + ((size_t)head * sequence + read0) * H3D_VFA_HD;
+    const float *query1 =
+            query + ((size_t)head * sequence + read1) * H3D_VFA_HD;
+
+    /* Q lives in registers as the four k16 A fragments, built once per CTA. */
+    uint32_t a[H3D_VFA_KS][4];
+#pragma unroll
+    for (uint32_t step = 0; step < H3D_VFA_KS; step++) {
+        const uint32_t dim = step * 16u + column;
+        a[step][0] = h3d_mma_pair(query0[dim], query0[dim + 1u]);
+        a[step][1] = h3d_mma_pair(query1[dim], query1[dim + 1u]);
+        a[step][2] = h3d_mma_pair(query0[dim + 8u], query0[dim + 9u]);
+        a[step][3] = h3d_mma_pair(query1[dim + 8u], query1[dim + 9u]);
+    }
+
+    float maximum0 = -INFINITY, maximum1 = -INFINITY;
+    float denominator0 = 0.0f, denominator1 = 0.0f;
+    float result[H3D_VFA_DIMS][4];
+#pragma unroll
+    for (uint32_t dim = 0; dim < H3D_VFA_DIMS; dim++) {
+        result[dim][0] = result[dim][1] = result[dim][2] = result[dim][3] = 0.0f;
+    }
+
+    for (uint32_t base = 0; base < sequence; base += H3D_VFA_KEYS) {
+        __syncthreads();  /* the previous tile's staged rows are fully consumed */
+        /* Stage K and V: 16-byte copies, one row per eight lanes. A row past
+         * the end is zeroed; its scores are masked below, so it contributes
+         * nothing and the staging stays branch-free. */
+        for (uint32_t index = threadIdx.x;
+             index < H3D_VFA_KEYS * H3D_VFA_CHUNKS;
+             index += H3D_VFA_WARPS * 32u) {
+            const uint32_t row = index / H3D_VFA_CHUNKS;
+            const uint32_t chunk = index % H3D_VFA_CHUNKS;
+            const uint32_t source = base + row;
+            if (source < sequence) {
+                const size_t at =
+                        ((size_t)head * sequence + source) * H3D_VFA_HD +
+                        chunk * 8u;
+                *(uint4 *)&shared_key[row][chunk * 8u] =
+                        h3d_mma_bf16_chunk(key + at);
+                *(uint4 *)&shared_value[row][chunk * 8u] =
+                        h3d_mma_bf16_chunk(value + at);
+            } else {
+                const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+                *(uint4 *)&shared_key[row][chunk * 8u] = zero;
+                *(uint4 *)&shared_value[row][chunk * 8u] = zero;
+            }
+        }
+        __syncthreads();
+
+        /* Scores: S = Q * K^T over all H3D_VFA_KEYS staged keys. */
+        float score[H3D_VFA_NS][4];
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_VFA_NS; slice++) {
+            score[slice][0] = score[slice][1] = 0.0f;
+            score[slice][2] = score[slice][3] = 0.0f;
+        }
+#pragma unroll
+        for (uint32_t step = 0; step < H3D_VFA_KS; step++) {
+#pragma unroll
+            for (uint32_t part = 0; part < H3D_VFA_KEYS / 16; part++) {
+                const uint32_t row = part * 16u + (matrix >> 1u) * 8u + (lane & 7u);
+                const uint32_t col = step * 16u + (matrix & 1u) * 8u;
+                uint32_t b[4];
+                h3d_mma_load(b, &shared_key[row][col]);
+                h3d_mma_step(score[2u * part], a[step], b[0], b[1]);
+                h3d_mma_step(score[2u * part + 1u], a[step], b[2], b[3]);
+            }
+        }
+
+        /* Scale, then mask the tail keys out of the softmax. */
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_VFA_NS; slice++) {
+            const uint32_t first = slice * 8u + column;
+            score[slice][0] *= scale;
+            score[slice][1] *= scale;
+            score[slice][2] *= scale;
+            score[slice][3] *= scale;
+            if (base + first >= sequence) {
+                score[slice][0] = -INFINITY;
+                score[slice][2] = -INFINITY;
+            }
+            if (base + first + 1u >= sequence) {
+                score[slice][1] = -INFINITY;
+                score[slice][3] = -INFINITY;
+            }
+        }
+
+        /* One maximum per tile, reduced across the four lanes of a row. */
+        float tile0 = -INFINITY, tile1 = -INFINITY;
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_VFA_NS; slice++) {
+            tile0 = fmaxf(tile0, fmaxf(score[slice][0], score[slice][1]));
+            tile1 = fmaxf(tile1, fmaxf(score[slice][2], score[slice][3]));
+        }
+        tile0 = fmaxf(tile0, __shfl_xor_sync(0xffffffffu, tile0, 1));
+        tile0 = fmaxf(tile0, __shfl_xor_sync(0xffffffffu, tile0, 2));
+        tile1 = fmaxf(tile1, __shfl_xor_sync(0xffffffffu, tile1, 1));
+        tile1 = fmaxf(tile1, __shfl_xor_sync(0xffffffffu, tile1, 2));
+        const float next0 = fmaxf(maximum0, tile0);
+        const float next1 = fmaxf(maximum1, tile1);
+        const float rescale0 = expf(maximum0 - next0);
+        const float rescale1 = expf(maximum1 - next1);
+
+        float weight[H3D_VFA_NS][4];
+        float part0 = 0.0f, part1 = 0.0f;
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_VFA_NS; slice++) {
+            weight[slice][0] = expf(score[slice][0] - next0);
+            weight[slice][1] = expf(score[slice][1] - next0);
+            weight[slice][2] = expf(score[slice][2] - next1);
+            weight[slice][3] = expf(score[slice][3] - next1);
+            part0 += weight[slice][0] + weight[slice][1];
+            part1 += weight[slice][2] + weight[slice][3];
+        }
+        part0 += __shfl_xor_sync(0xffffffffu, part0, 1);
+        part0 += __shfl_xor_sync(0xffffffffu, part0, 2);
+        part1 += __shfl_xor_sync(0xffffffffu, part1, 1);
+        part1 += __shfl_xor_sync(0xffffffffu, part1, 2);
+        denominator0 = denominator0 * rescale0 + part0;
+        denominator1 = denominator1 * rescale1 + part1;
+        maximum0 = next0;
+        maximum1 = next1;
+#pragma unroll
+        for (uint32_t dim = 0; dim < H3D_VFA_DIMS; dim++) {
+            result[dim][0] *= rescale0;
+            result[dim][1] *= rescale0;
+            result[dim][2] *= rescale1;
+            result[dim][3] *= rescale1;
+        }
+
+        /* O += P * V, P packed from the weights as the A fragments. */
+#pragma unroll
+        for (uint32_t step = 0; step < H3D_VFA_KEYS / 16; step++) {
+            uint32_t p[4];
+            p[0] = h3d_mma_pair(weight[2u * step][0], weight[2u * step][1]);
+            p[1] = h3d_mma_pair(weight[2u * step][2], weight[2u * step][3]);
+            p[2] = h3d_mma_pair(weight[2u * step + 1u][0],
+                                weight[2u * step + 1u][1]);
+            p[3] = h3d_mma_pair(weight[2u * step + 1u][2],
+                                weight[2u * step + 1u][3]);
+#pragma unroll
+            for (uint32_t part = 0; part < H3D_VFA_DIMS / 2; part++) {
+                const uint32_t row =
+                        step * 16u + (matrix & 1u) * 8u + (lane & 7u);
+                const uint32_t col = part * 16u + (matrix >> 1u) * 8u;
+                uint32_t b[4];
+                h3d_mma_load_trans(b, &shared_value[row][col]);
+                h3d_mma_step(result[2u * part], p, b[0], b[1]);
+                h3d_mma_step(result[2u * part + 1u], p, b[2], b[3]);
+            }
+        }
+    }
+
+    __syncthreads();
+    /* The output is row-major in F32, the layout the scalar dispatch writes. */
+    if (live0) {
+#pragma unroll
+        for (uint32_t dim = 0; dim < H3D_VFA_DIMS; dim++) {
+            const size_t at = ((size_t)row0 * heads + head) * H3D_VFA_HD +
+                              dim * 8u + column;
+            output[at] = result[dim][0] / denominator0;
+            output[at + 1u] = result[dim][1] / denominator0;
+        }
+    }
+    if (live1) {
+#pragma unroll
+        for (uint32_t dim = 0; dim < H3D_VFA_DIMS; dim++) {
+            const size_t at = ((size_t)row1 * heads + head) * H3D_VFA_HD +
+                              dim * 8u + column;
+            output[at] = result[dim][2] / denominator1;
+            output[at + 1u] = result[dim][3] / denominator1;
+        }
+    }
+}
+
 int h3d_sdpa_f32(h3d_context *context, h3d_tensor *output,
                  const h3d_tensor *query, const h3d_tensor *key,
                  const h3d_tensor *value, uint32_t sequence, uint32_t heads,
@@ -2115,10 +2486,30 @@ int h3d_sdpa_f32(h3d_context *context, h3d_tensor *output,
                              "invalid attention tensors or shape");
     }
     if (head_dim == 64) {
-        dim3 grid(heads, (sequence + 8 * H3D_ATTENTION_F32_ROWS - 1) /
-                                 (8 * H3D_ATTENTION_F32_ROWS));
-        h3d_attention_tiled_f32_kernel<64><<<grid, 256, 0,
-                                             context->stream>>>(
+        /* The tensor-core arm, off unless the decoder's options ask for it. */
+        if (context->vae.attention_mma) {
+            dim3 mma_grid((sequence + H3D_VFA_ROWS - 1) / H3D_VFA_ROWS, heads);
+            h3d_attention_mma_f32_kernel<<<mma_grid, H3D_VFA_WARPS * 32u, 0,
+                                           context->stream>>>(
+                (float *)output->data, (const float *)query->data,
+                (const float *)key->data, (const float *)value->data, sequence,
+                heads, scale);
+            return h3d_launch_ok("F32 attention (mma)", error, error_size);
+        }
+        const uint32_t row_blocks = (sequence + 8 * H3D_ATTENTION_F32_ROWS - 1) /
+                                    (8 * H3D_ATTENTION_F32_ROWS);
+        if (context->vae.query_major) {
+            dim3 grid(row_blocks, heads);
+            h3d_attention_tiled_f32_kernel<64, 1><<<grid, 256, 0,
+                                                    context->stream>>>(
+                (float *)output->data, (const float *)query->data,
+                (const float *)key->data, (const float *)value->data, sequence,
+                heads, scale, 0);
+            return h3d_launch_ok("F32 attention", error, error_size);
+        }
+        dim3 grid(heads, row_blocks);
+        h3d_attention_tiled_f32_kernel<64, 0><<<grid, 256, 0,
+                                                context->stream>>>(
             (float *)output->data, (const float *)query->data,
             (const float *)key->data, (const float *)value->data, sequence,
             heads, scale, 0);

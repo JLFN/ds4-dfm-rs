@@ -9,7 +9,7 @@
 //! than inventing a friendlier one: a swapped shape argument would still be
 //! accepted by cuBLASLt and would silently change the graph.
 
-use std::ffi::c_char;
+use std::ffi::{c_char, CString};
 use std::os::raw::c_int;
 use std::ptr::NonNull;
 
@@ -76,6 +76,25 @@ unsafe extern "C" {
         dtype: c_int,
         error: *mut c_char,
         error_size: usize,
+    ) -> c_int;
+
+    fn h3d_vae_linear(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_set_vae_option(
+        context: *mut Context,
+        name: *const c_char,
+        value: *const c_char,
     ) -> c_int;
 
     fn h3d_patch_linear(
@@ -797,6 +816,59 @@ impl Gpu {
             },
             "linear",
         )
+    }
+
+    /// The video VAE decoder's F32 linear (`h3d_vae_linear`): `linear` at
+    /// `Dtype::F32` with the decoder's own bench options applied. Only the
+    /// decoder uses it, so those options cannot reach the encoder or the audio
+    /// VAE, whose gates are bit-exact against the reference.
+    pub fn vae_linear(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_vae_linear(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "video VAE linear",
+        )
+    }
+
+    /// Set one video VAE decoder bench option on this context
+    /// (`h3d_set_vae_option`). The native side owns the names and the accepted
+    /// values — "attention" (scalar, tensor), "sdpa_order" (heads, rows),
+    /// "gemm" (fp32, tf32, bf16) — and refuses an unknown pair, so a typo is an
+    /// error rather than a silent default.
+    pub fn set_vae_option(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = CString::new(name).map_err(|_| "option name has a NUL".to_string())?;
+        let value = CString::new(value).map_err(|_| "option value has a NUL".to_string())?;
+        let accepted =
+            unsafe { h3d_set_vae_option(self.raw.as_ptr(), name.as_ptr(), value.as_ptr()) };
+        if accepted == 0 {
+            return Err(format!(
+                "unknown video VAE option {:?} = {:?}",
+                name.to_string_lossy(),
+                value.to_string_lossy()
+            ));
+        }
+        Ok(())
     }
 
     /// `h3_gpu_patch_linear_bf16_offset`: F32 matmul, bias and one BF16 cast.

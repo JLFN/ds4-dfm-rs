@@ -50,6 +50,19 @@ void h3d_destroy(h3d_context *context);
  * tensor-core default. Overrides H3_DIT_ATTENTION and H3_DIT_ATTENTION_MMA. */
 void h3d_set_attention(h3d_context *context, int scalar);
 
+/* One video VAE decoder option per call, for benchmarking an arm on one binary.
+ * Names and values: "attention" (scalar | tensor, the F32 attention kernel),
+ * "sdpa_order" (heads | rows, the F32 attention CTA order), "gemm" (fp32 |
+ * tf32 | bf16, the decoder's F32 matmul compute mode). Every default is the
+ * reference path, so a context that is never set is unchanged, and all three
+ * are read from H3_VAE_ATTENTION, H3_VAE_SDPA_ORDER and H3_VAE_GEMM at create.
+ * Only the decoder's own entry points read them: the video VAE encoder and the
+ * audio VAE keep the reference's F32 matmul and separate bias add, which their
+ * bit-exact gates compare against. Returns 0 for an unknown name or value, so a
+ * typo is refused rather than ignored. */
+int h3d_set_vae_option(h3d_context *context, const char *name,
+                       const char *value);
+
 h3d_tensor *h3d_alloc(h3d_context *context, int dtype, size_t elements,
                       char *error, size_t error_size);
 void h3d_free(h3d_tensor *tensor);
@@ -70,6 +83,15 @@ int h3d_linear(h3d_context *context, h3d_tensor *output,
                const h3d_tensor *input, const h3d_tensor *weight,
                const h3d_tensor *bias, uint32_t rows, uint32_t input_dim,
                uint32_t output_dim, int dtype, char *error, size_t error_size);
+
+/* The video VAE decoder's F32 linear: `h3d_linear` at `H3D_F32` with the
+ * decoder's own options applied (`h3d_set_vae_option`). Separate from
+ * `h3d_linear` on purpose, because the options must not reach the video VAE
+ * encoder or the audio VAE, whose gates are bit-exact against the reference. */
+int h3d_vae_linear(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, const h3d_tensor *weight,
+                   const h3d_tensor *bias, uint32_t rows, uint32_t input_dim,
+                   uint32_t output_dim, char *error, size_t error_size);
 
 /* `h3_gpu_patch_linear_bf16_offset` (`:872-906`) and `h3_patch_convert_kernel`
  * (`:808-829`): an F32 matmul with F32 weights, bias added in F32, one BF16
