@@ -107,6 +107,11 @@ These reports preserve successful gates, rejected experiments and unresolved lim
   binary](benchmarks/h3-jobA-2026-10-27/README.md); [the attention sweep across
   sequence lengths](benchmarks/h3-attention-2026-10-27/README.md); and [why the
   tensor path is the default](minimax-h3/tensor-default-2026-10-27.md).
+  October 28 adds the sparse arm — [the reference's VSA selector](minimax-h3/vsa-policy-2026-10-28.md)
+  and [the DiT's own attention through it](minimax-h3/sol-attention-2026-10-28.md)
+  — and [the FastH3 distilled adapter merged into a derived checkpoint](minimax-h3/lora-merge-2026-10-28.md),
+  which is what makes a four-step render a finished picture and cuts DENOISE
+  5.1x.
 - **MiniMax VQ:** [October 27 prefill/decode campaign](minimax-vq-optimization-2026-10-27.md),
   three adopted rounds each; [fresh 2K–64K DSpark graph](benchmarks/minimax-vq-spark-64k-2026-10-27/README.md),
   raw clocks, exact output checks and observed repeat ranges.
