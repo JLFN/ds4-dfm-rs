@@ -1194,6 +1194,80 @@ static void sol_search_rejects_bad_args(h3d_context *gpu) {
     sol_free(plan);
 }
 
+/* A shape the suite never covered: 70 blocks is three mask words and two query
+ * CTAs (H3D_SOL_QM is 64), and 4,446 tokens leaves the last block 30 rows long,
+ * so the short tail sits inside the tile that also crosses the word boundary.
+ * Both taus are compared against the oracle, and the oracle's row-order form
+ * is what makes the second CTA and the third word independent evidence. */
+static void sol_search_multiword(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 4446, 3, 20261028u);
+    check(data.blocks == 70 && data.words == 3,
+          "the multiword fixture is 70 blocks over three words");
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    for (float tau : {1.0f, 1.5f}) {
+        SolExpect expect;
+        sol_expect(data, scale, tau, 0, 0, expect);
+        SolActual actual;
+        if (!sol_run(gpu, data, scale, tau, 0, 0, actual, error, sizeof(error))) {
+            check(false, "search runs across a second mask word");
+            return;
+        }
+        sol_compare("multiword", data, expect, actual, scale, tau);
+    }
+}
+
+/* The strict `>`. Constant K and Q made every off-band block clear the
+ * threshold by a margin, so no case in this file could tell `>` from `>=`.
+ * Here Q is one-hot on dimension 0 and the block summaries on that dimension
+ * are [1, 0, 3, 0]: the across-block mean is exactly 1.0, so block 0's column
+ * mean is exactly 1.0*log2_scale at tau=0, which is the threshold itself and
+ * must not be routed. Block 2's 3.0 clears it for every query block, so the
+ * expected set is the band plus that one block - arithmetic, not a second
+ * transcription. */
+static void sol_search_equal_threshold(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    data.sequence = 256;
+    data.heads = 1;
+    data.blocks = 4;
+    data.words = 1;
+    const size_t elements = (size_t)data.sequence * H3D_SOL_HEAD_DIM;
+    data.key.assign(elements, sol_bf16(0.0f));
+    data.value.assign(elements, sol_bf16(0.0f));
+    data.query.assign(elements, sol_bf16(0.0f));
+    const float signal[4] = {1.0f, 0.0f, 3.0f, 0.0f};
+    for (uint32_t block = 0; block < data.blocks; ++block) {
+        for (uint32_t row = 0; row < H3D_SOL_BLOCK; ++row) {
+            const size_t at =
+                ((size_t)block * H3D_SOL_BLOCK + row) * H3D_SOL_HEAD_DIM;
+            data.key[at] = sol_bf16(signal[block]);
+        }
+    }
+    for (uint32_t row = 0; row < data.sequence; ++row) {
+        data.query[(size_t)row * H3D_SOL_HEAD_DIM] = sol_bf16(1.0f);
+    }
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolActual actual;
+    if (!sol_run(gpu, data, scale, 0.0f, 0, 0, actual, error, sizeof(error))) {
+        check(false, "search runs with a column mean at the threshold");
+        return;
+    }
+    uint32_t mismatch = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        const uint32_t bits = actual.mask[q_block * data.words];
+        for (uint32_t block = 0; block < data.blocks; ++block) {
+            const uint32_t distance =
+                q_block > block ? q_block - block : block - q_block;
+            const bool want = distance <= 1 || block == 2;
+            mismatch += want != !!(bits & (1u << block));
+        }
+    }
+    check(mismatch == 0,
+          "a column mean equal to the threshold is not routed");
+}
+
 /* Constant K and constant Q: the summaries have no variance, so the threshold
  * is mean + tau*sqrt(1e-6) and no block off the diagonal band can clear it,
  * whatever tau is. The expected set is arithmetic, not a second transcription. */
@@ -1366,6 +1440,8 @@ int main() {
     sol_search_sink(dit);
     sol_search_empty_sink(dit);
     sol_search_rejects_bad_args(dit);
+    sol_search_multiword(dit);
+    sol_search_equal_threshold(dit);
     sol_search_constant(dit);
     sol_search_spike(dit);
     sol_search_tau_monotone(dit);
