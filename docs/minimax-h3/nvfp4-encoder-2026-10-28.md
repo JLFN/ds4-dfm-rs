@@ -152,17 +152,71 @@ verdict.
 
 Two follow-ups, both run after the layer-count fix:
 
-DENSE-RESULT
+### The BF16 path is bit-unchanged
 
-ATTRIBUTION
+The recorded dense-default arm (`lora-merge-2026-10-28.md` runs 3 and 6: the
+derived checkpoint, four steps, default arms, dense attention) reproduces its
+recorded MP4 on this binary:
+`5fe31c57c06bc3848bd210e5709088abd18a84e605b9c1e13675a6dc3edab736`, with
+`DENOISE` 79.403 s against the record's 79.391 and 81.147, and `FRAMES` 198.091 s
+against 200.985 and 202.391. The second store is reached only through the
+switch, and the BF16 path the campaign measured is untouched.
+
+### The localizer
+
+`--layers 1` on either arm, eight lanes, layers 1: the embedding and the first
+block only, so a decode fault is visible at the first output rather than
+accumulated over fifty layers.
+
+| arm | FNV | first eight words | seconds |
+|---|---|---|---:|
+| BF16 | `2b45149d9b286329` | `bdd3.bf12.3dd1.be1c.bd62.3e5e.3dc0.be8c` | 1.504 |
+| NVFP4 | `406663740240f362` | `bde3.bf0b.3dc1.be16.bd7a.3e35.3db4.be8b` | 2.882 |
+
+The two agree to a percent or two on every leading word, so the quantized
+weights decode to the same function and the difference is the 4-bit error, not
+a layout mistake: a wrong scale layout or nibble order produces garbage at the
+first block, not a 1% shift.
+
+The layer-1 pair is also the one place the quantized arm is *slower*, 2.882 s
+against 1.504 s. That is the embedding: 778M `int8` values decoded on the
+calling thread, where the BF16 arm copies a mapped span. It is 1.4 s of every
+quantized encode and it is the one part of the decode the ring's lanes do not
+share. Both arms were measured with the encoder trees out of page cache.
+
+### Where the phase's time goes
+
+The ring's lanes do the decode on the host, so the phase scales with
+`H3_QWEN_PREFETCH` while the decode is the cost and saturates at the device's
+rate when it is not. Fifty layers, one run each, same tree state:
+
+| arm | 1 lane | 4 lanes | 8 lanes | bytes read |
+|---|---:|---:|---:|---:|
+| NVFP4-AWQ | 25.537 s | 10.953 s | 10.781 s | 15.69 GB |
+| BF16 | 28.733 s | - | 53.014 s | 52.4 GB |
+
+The quantized arm is 2.4x slower on one lane, so the decode is real work and the
+ring is what hides it; at four lanes it has saturated at 10.8 s, against a 8.7 s
+floor for 15.69 GB at the disk's measured 1.8 GB/s. The BF16 arm behaves the
+other way round - 28.7 s on one lane against 53.0 s on eight - which is the
+external SSD, not the lanes: eight concurrent shard streams on `/dev/sda` read
+slower than one. That is why the two arms' `TEXT` may only be compared from one
+cache and concurrency regime, and why §3's paired render arms, taken minutes
+apart in one session, are the number to quote and these standalone sweeps are
+the attribution.
+
+Note the spread this puts on the quantized phase: 10.8 s warm and saturated,
+15.5 s in the paired render, both the same binary and artifact. Host cache
+state, not the decoder, is the larger term.
 
 ## 5. What this does not establish
 
-- **The read floor.** The artifact is 15.69 GB and the disk measures 1.8 GB/s,
-  so the read alone is 8.7 s; the phase measures 15.5 s. The difference is the
-  host decode and the 48.8 GB of BF16 it writes into host buffers. §4 attributes
-  it; what removes it (decoding on the device from the packed bytes) is not
-  written.
+- **The read floor.** §4's sweep puts the quantized phase at 10.8 s saturated
+  against a 8.7 s floor for 15.69 GB at the disk's measured 1.8 GB/s, so on four
+  or more lanes the host decode is already hidden by the read and a device-side
+  decoder would recover at most about 2 s. The 1.4 s the embedding costs on the
+  calling thread is the part that is *not* hidden, and it is the cheaper target
+  of the two.
 - **The vision tower and the reference paths.** `--ref-image`, `--ref-video` and
   anchors take `condition::anchor_embedding` and `condition::reference_embedding`,
   which read the BF16 directory and its tower. The switch does not reach them,
