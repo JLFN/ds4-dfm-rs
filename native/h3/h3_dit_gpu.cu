@@ -3693,7 +3693,14 @@ __device__ __forceinline__ static void h3d_sol_stage(
     }
 }
 
-__global__ static void h3d_sol_forward_kernel(
+/* `minBlocksPerMultiprocessor = 3` is load-bearing, not a hint: ptxas then
+ * caps the kernel at 168 registers, which is what fits three CTAs of 128
+ * threads in the 64K register file. At 176 registers it fits two, and on the
+ * Spark's 18,432-token shape the same walk over the same tiles then costs
+ * 1.83x the dense kernel's: the walk is latency-bound, so the third CTA's
+ * eight extra warps per SM are most of the difference. */
+__global__ static void __launch_bounds__(H3D_SOLF_WARPS * 32u, 3)
+h3d_sol_forward_kernel(
         __nv_bfloat16 *output, const __nv_bfloat16 *query,
         const __nv_bfloat16 *key, const __nv_bfloat16 *value,
         const __nv_bfloat16 *kc, const __nv_bfloat16 *vc,
