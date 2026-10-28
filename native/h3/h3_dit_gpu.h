@@ -479,6 +479,37 @@ int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
 /* Number of `mask` words per query block: ceil(ceil(sequence/64) / 32). */
 uint32_t h3d_sol_words(uint32_t sequence);
 
+/* VSA, the reference's own selection rule for the H3 stage, emitting the mask
+ * the sparse forward consumes. Read from the FastVideo module the reference
+ * hashes and refuses to run without
+ * (`fastvideo/attention/backends/video_sparse_attn_h3.py`, sha256
+ * `b7c6d4e4...dc0fab9` = the reference's pinned `VSA_SOURCE_SHA`):
+ *
+ *   tile summary = the tile MEAN of Q and of K, F32               (`:380-383`)
+ *   scores = q_pool @ k_pool^T / sqrt(head_dim)                     (`:629`)
+ *   k_vid  = max(1, min(ceil((1 - sparsity) * video_tiles), video_tiles))
+ *                                            (`video_sparse_attn.py:161-163`)
+ *   the video columns compete for the k_vid largest scores, every prefix
+ *   column is selected, every prefix query row is dense, and a sparsity of 0
+ *   selects everything                                      (`:387-410`)
+ *
+ * `prefix_blocks` is this engine's own text-and-audio span, rounded UP to
+ * whole 64-token blocks: a block that holds a prefix row is treated as prefix,
+ * which is the conservative reading of a span the reference keeps tile-aligned.
+ * The rule is undefined when every block is prefix (its own `topk` would be
+ * asked for more columns than exist), and `prefix_blocks >= blocks` is refused.
+ *
+ * It reuses the tau path's kernels - the block pooling, the kc statistics and
+ * the threshold kernel that produces `query_bar` - so the plan must carry the
+ * same buffers, and the `threshold` it fills is not read by this policy. Only
+ * the selection kernel is new. `h3d_sol_search`'s doc comment applies to every
+ * other deviation this shares with it. */
+int h3d_sol_vsa(h3d_context *context, const struct h3d_sol_plan *plan,
+                const h3d_tensor *query, const h3d_tensor *key,
+                const h3d_tensor *value, uint32_t sequence, uint32_t heads,
+                float scale, double sparsity, uint32_t prefix_blocks,
+                char *error, size_t error_size);
+
 /* The sparse forward the mask was built for: Sol-Attn's attention with the
  * exact/approximated split `h3d_sol_search` routed. One CTA per (query block,
  * head), four warps of 16 query rows each. Per group of 32 KV blocks the

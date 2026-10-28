@@ -1928,6 +1928,364 @@ static void sol_forward_rejects_bad_args(h3d_context *gpu) {
     sol_free(plan);
 }
 
+/* ---------------------------------------------------------------------------
+ * VSA, the rule the reference's H3 stage itself runs (the tau threshold above
+ * is its LTX refiner's). Read from the pinned FastVideo module:
+ *   video_sparse_attn_h3.py:380-383   tile summary = the tile MEAN, F32
+ *   video_sparse_attn_h3.py:629       scores = q_pool @ k_pool^T / sqrt(head_dim)
+ *   video_sparse_attn.py:161-163      k_vid = max(1, min(ceil((1-s)*tiles), tiles))
+ *   video_sparse_attn_h3.py:387-410   video columns compete for the k_vid
+ *                                     largest scores, every prefix column and
+ *                                     every prefix query row is forced, and
+ *                                     s == 0 selects everything
+ *
+ * Deviations, named: `torch.topk`'s tie order is not documented, so this port
+ * breaks ties by ascending column index; the prefix is this engine's own
+ * text-and-audio span rounded up to whole 64-token blocks.
+ * ------------------------------------------------------------------------- */
+
+/* `compute_topk` (`video_sparse_attn.py:161-163`) in the reference's own double
+ * precision, so a sparsity that lands exactly on a boundary keeps the same
+ * count it does there. The sparsity arrives as a double for the same reason:
+ * 0.9 rounded to F32 turns `ceil((1 - s) * 280)` into 29 where the reference's
+ * own double gives 28. */
+static uint32_t sol_vsa_keep(double sparsity, uint32_t tiles) {
+    const double keep = std::ceil((1.0 - sparsity) * (double)tiles);
+    if (keep < 1.0) return 1u;
+    if (keep > (double)tiles) return tiles;
+    return (uint32_t)keep;
+}
+
+/* The kernel's own reduction tree, so the gate compares the rule and not the
+ * F32 order: lane `l` sums the row's dimensions l, l+32, l+64, l+96 in
+ * sequence, then the butterfly adds the offsets 16, 8, 4, 2, 1 and lane 0
+ * stores (`h3d_sol_vsa_kernel`). `fmaf` because nvcc contracts `p += q * k`
+ * by default; the bench reports what the order moves against the reference's
+ * raw-row means. */
+static float sol_vsa_score(const float *query_bar, const float *kc,
+                           float scale) {
+    float part[H3D_SOL_WARP];
+    for (uint32_t lane = 0; lane < H3D_SOL_WARP; ++lane) {
+        float total = 0.0f;
+        for (uint32_t step = 0; step < 4; ++step) {
+            const uint32_t dim = step * H3D_SOL_WARP + lane;
+            total = fmaf(query_bar[dim], kc[dim], total);
+        }
+        part[lane] = total;
+    }
+    for (uint32_t offset = H3D_SOL_WARP / 2; offset > 0; offset >>= 1) {
+        float next[H3D_SOL_WARP];
+        for (uint32_t lane = 0; lane < H3D_SOL_WARP; ++lane) {
+            next[lane] = part[lane] + part[lane ^ offset];
+        }
+        for (uint32_t lane = 0; lane < H3D_SOL_WARP; ++lane) {
+            part[lane] = next[lane];
+        }
+    }
+    return part[0] * scale;
+}
+
+/* The selector alone, applied to the summaries the port's own pooling wrote:
+ * a mask that differs is the selection's fault and not the pooling's, which
+ * the solver's own tests gate separately. */
+static void sol_vsa_expect(const SolData &data, const std::vector<float> &kc,
+                           const std::vector<float> &query_bar, float scale,
+                           double sparsity, uint32_t prefix_blocks,
+                           SolExpect &out) {
+    const uint32_t blocks = data.blocks, heads = data.heads;
+    const uint32_t keep = sol_vsa_keep(sparsity, blocks - prefix_blocks);
+    out.mask.assign((size_t)blocks * heads * data.words, 0u);
+    out.count.assign((size_t)blocks * heads, 0u);
+    for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
+        for (uint32_t head = 0; head < heads; ++head) {
+            const float *row = &query_bar[((size_t)q_block * heads + head) *
+                                          H3D_SOL_HEAD_DIM];
+            std::vector<float> score(blocks, 0.0f);
+            for (uint32_t block = 0; block < blocks; ++block) {
+                score[block] = sol_vsa_score(
+                    row, &kc[((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM],
+                    scale);
+            }
+            uint32_t total = 0;
+            for (uint32_t block = 0; block < blocks; ++block) {
+                /* `:387-410`, exempt mode: a prefix query row is dense, a
+                 * prefix column is always selected, and the video columns
+                 * keep the k_vid largest scores. */
+                bool exact = q_block < prefix_blocks || block < prefix_blocks;
+                if (!exact) {
+                    uint32_t rank = 0;
+                    for (uint32_t other = prefix_blocks; other < blocks; ++other) {
+                        if (score[other] > score[block] ||
+                            (score[other] == score[block] && other < block)) {
+                            rank += 1;
+                        }
+                    }
+                    exact = rank < keep;
+                }
+                if (exact) {
+                    out.mask[((size_t)q_block * heads + head) * data.words +
+                             block / H3D_SOL_GROUP] |= 1u << (block % H3D_SOL_GROUP);
+                    total += 1;
+                }
+            }
+            out.count[(size_t)q_block * heads + head] = total;
+        }
+    }
+}
+
+static bool sol_vsa_run(h3d_context *gpu, const SolData &data, float scale,
+                        double sparsity, uint32_t prefix_blocks, SolActual &out,
+                        char *error, size_t size) {
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, size)) return false;
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    const size_t summary = (size_t)data.heads * data.blocks * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, size);
+    out.kc.assign(summary, 0.0f);
+    out.vc.assign(summary, 0.0f);
+    out.query_bar.assign(summary, 0.0f);
+    out.mask.assign((size_t)data.blocks * data.heads * data.words, 0u);
+    out.count.assign((size_t)data.blocks * data.heads, 0u);
+    out.threshold.assign((size_t)data.blocks * data.heads, 0.0f);
+    bool ok = query && key && value &&
+              h3d_upload(gpu, query, data.query.data(), error, size) &&
+              h3d_upload(gpu, key, data.key.data(), error, size) &&
+              h3d_upload(gpu, value, data.value.data(), error, size) &&
+              h3d_sol_vsa(gpu, &plan.plan, query, key, value, data.sequence,
+                          data.heads, scale, sparsity, prefix_blocks, error,
+                          size) &&
+              h3d_sync(gpu, error, size);
+    std::vector<uint16_t> key_out(summary), value_out(summary);
+    ok = ok && h3d_read(gpu, key_out.data(), plan.kc, error, size) &&
+         h3d_read(gpu, value_out.data(), plan.vc, error, size);
+    if (ok) {
+        for (size_t at = 0; at < summary; ++at) {
+            out.kc[at] = sol_float(key_out[at]);
+            out.vc[at] = sol_float(value_out[at]);
+        }
+    }
+    ok = ok && h3d_read(gpu, out.query_bar.data(), plan.query_bar, error, size) &&
+         h3d_read(gpu, out.mask.data(), plan.mask, error, size) &&
+         h3d_read(gpu, out.count.data(), plan.count, error, size);
+    if (!ok) fprintf(stderr, "VSA selector: %s\n", error);
+    if (query) h3d_free(query);
+    if (key) h3d_free(key);
+    if (value) h3d_free(value);
+    sol_free(plan);
+    return ok;
+}
+
+static void sol_vsa_compare(const char *label, const SolData &data,
+                            const SolExpect &expect, const SolActual &actual,
+                            uint32_t prefix_blocks, double sparsity) {
+    const bool mask = expect.mask == actual.mask;
+    check(mask, "the VSA selector writes the reference's mask");
+    check(expect.count == actual.count, "the VSA selector counts its exact blocks");
+    uint32_t exact = 0;
+    for (uint32_t word : actual.mask) exact += (uint32_t)__builtin_popcount(word);
+    const double share = (double)exact /
+                         ((double)data.blocks * data.heads * data.blocks);
+    printf("  [%s s=%.2f prefix=%u] keep %u of %u video blocks, realized exact "
+           "share %.4f\n",
+           label, sparsity, prefix_blocks,
+           sol_vsa_keep(sparsity, data.blocks - prefix_blocks),
+           data.blocks - prefix_blocks, share);
+    if (!mask) {
+        for (size_t at = 0; at < actual.mask.size(); ++at) {
+            if (expect.mask[at] != actual.mask[at]) {
+                printf("    first mask word %zu: expected %08x, actual %08x\n", at,
+                       expect.mask[at], actual.mask[at]);
+                break;
+            }
+        }
+    }
+}
+
+static void sol_vsa_matches_reference(h3d_context *gpu) {
+    char error[512] = {};
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    const double levels[] = {0.9, 0.75, 0.5, 0.25, 0.0};
+    SolData data;
+    sol_build(data, 1024, 3, 20261028u);
+    for (double sparsity : levels) {
+        const uint32_t prefix = 2;   /* 128 rows of text and audio */
+        SolActual actual;
+        if (!sol_vsa_run(gpu, data, scale, sparsity, prefix, actual, error,
+                         sizeof(error))) {
+            check(false, "the VSA selector runs");
+            return;
+        }
+        SolExpect expect;
+        sol_vsa_expect(data, actual.kc, actual.query_bar, scale, sparsity, prefix,
+                       expect);
+        sol_vsa_compare("random", data, expect, actual, prefix, sparsity);
+    }
+}
+
+/* The reference's own setting on the job's shape: sparsity 0.9 of the video
+ * tiles, prefix exempt. */
+static void sol_vsa_reference_setting(h3d_context *gpu) {
+    char error[512] = {};
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolData data;
+    sol_build(data, 18432, 2, 913u);
+    const uint32_t prefix = 8;     /* 512 rows, text and audio */
+    SolActual actual;
+    if (!sol_vsa_run(gpu, data, scale, 0.9, prefix, actual, error,
+                     sizeof(error))) {
+        check(false, "the VSA selector runs at the job's shape");
+        return;
+    }
+    SolExpect expect;
+    sol_vsa_expect(data, actual.kc, actual.query_bar, scale, 0.9, prefix, expect);
+    sol_vsa_compare("job shape", data, expect, actual, prefix, 0.9);
+    /* 288 blocks, 8 of them prefix: `ceil(0.1 * 280)` = 28 video blocks kept,
+     * plus the 8 prefix columns, on every non-prefix row. */
+    const uint32_t keep = sol_vsa_keep(0.9, data.blocks - prefix);
+    check(keep == 28, "the keep count follows the reference's own formula");
+    bool structural = true;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            const uint32_t want = q_block < prefix ? data.blocks : prefix + keep;
+            structural = structural &&
+                         actual.count[(size_t)q_block * data.heads + head] == want;
+        }
+    }
+    check(structural, "a prefix row is dense and a video row keeps prefix+keep");
+}
+
+/* A keep of exactly one: `ceil((1 - 0.9) * 8)` is 1, the clamp's lower bound. */
+static void sol_vsa_keeps_one(h3d_context *gpu) {
+    char error[512] = {};
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolData data;
+    sol_build(data, 640, 2, 77u);          /* 10 blocks, 8 of them video */
+    const uint32_t prefix = 2;
+    SolActual actual;
+    if (!sol_vsa_run(gpu, data, scale, 0.9, prefix, actual, error,
+                     sizeof(error))) {
+        check(false, "the VSA selector runs with a keep of one");
+        return;
+    }
+    SolExpect expect;
+    sol_vsa_expect(data, actual.kc, actual.query_bar, scale, 0.9, prefix, expect);
+    sol_vsa_compare("keep one", data, expect, actual, prefix, 0.9);
+    bool one = true;
+    for (uint32_t q_block = prefix; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            one = one && actual.count[(size_t)q_block * data.heads + head] ==
+                             prefix + 1;
+        }
+    }
+    check(one, "a keep of one selects one video block per row");
+}
+
+/* Every score equal, which is where the reference leaves the order to
+ * `torch.topk` and this port fixed it: ties go by ascending column index. */
+static void sol_vsa_ties(h3d_context *gpu) {
+    char error[512] = {};
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolData data;
+    sol_build(data, 1024, 2, 5150u);
+    std::fill(data.key.begin(), data.key.end(), sol_bf16(0.0f));
+    std::fill(data.query.begin(), data.query.end(), sol_bf16(1.0f));
+    const uint32_t prefix = 3;
+    SolActual actual;
+    if (!sol_vsa_run(gpu, data, scale, 0.75, prefix, actual, error,
+                     sizeof(error))) {
+        check(false, "the VSA selector survives an all-tie row");
+        return;
+    }
+    SolExpect expect;
+    sol_vsa_expect(data, actual.kc, actual.query_bar, scale, 0.75, prefix, expect);
+    sol_vsa_compare("all ties", data, expect, actual, prefix, 0.75);
+    const uint32_t keep = sol_vsa_keep(0.75, data.blocks - prefix);
+    bool by_index = true;
+    for (uint32_t q_block = prefix; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            const uint32_t word0 =
+                actual.mask[((size_t)q_block * data.heads + head) * data.words];
+            /* The first `prefix + keep` blocks, in index order, and nothing
+             * above them: an idempotent tie rule cannot skip a low index. */
+            const uint32_t want = (1u << (prefix + keep)) - 1u;
+            by_index = by_index && (word0 & 0xffffffffu) == want;
+        }
+    }
+    check(by_index, "ties keep the lowest column indices");
+}
+
+/* The count is monotone in sparsity: lowering it can only add exact blocks. */
+static void sol_vsa_monotone(h3d_context *gpu) {
+    char error[512] = {};
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolData data;
+    sol_build(data, 2048, 2, 31337u);
+    const uint32_t prefix = 1;
+    uint32_t previous = 0;
+    bool monotone = true;
+    for (int step = 10; step >= 0; --step) {
+        const double sparsity = (double)step / 10.0;
+        SolActual actual;
+        if (!sol_vsa_run(gpu, data, scale, sparsity, prefix, actual, error,
+                         sizeof(error))) {
+            check(false, "the VSA selector runs across the sparsity sweep");
+            return;
+        }
+        uint32_t total = 0;
+        for (size_t at = 0; at < actual.count.size(); ++at) total += actual.count[at];
+        monotone = monotone && total >= previous;
+        previous = total;
+    }
+    check(monotone, "a lower sparsity never drops an exact block");
+}
+
+/* The API boundary: the same refusals the search step needs, plus a prefix
+ * that covers the whole sequence, where the reference's own rule has no
+ * video column to select and its `topk` would be asked for more than exist. */
+static void sol_vsa_rejects_bad_args(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 256, 1, 4242u);       /* 4 blocks */
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, sizeof(error))) {
+        check(false, "VSA's rejection cases allocate a plan");
+        return;
+    }
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *wide = h3d_alloc(gpu, H3D_F32, elements, error, sizeof(error));
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    uint32_t refused = 0;
+    refused += !h3d_sol_vsa(gpu, &plan.plan, query, key, value, 0, data.heads,
+                            scale, 0.9, 0, error, sizeof(error));
+    refused += !h3d_sol_vsa(gpu, &plan.plan, query, key, value, data.sequence, 0,
+                            scale, 0.9, 0, error, sizeof(error));
+    refused += !h3d_sol_vsa(gpu, &plan.plan, query, key, wide, data.sequence,
+                            data.heads, scale, 0.9, 0, error, sizeof(error));
+    refused += !h3d_sol_vsa(gpu, &plan.plan, query, key, value, UINT32_MAX,
+                            data.heads, scale, 0.9, 0, error, sizeof(error));
+    refused += !h3d_sol_vsa(gpu, &plan.plan, query, key, value, data.sequence,
+                            data.heads, scale, 0.9, data.blocks, error,
+                            sizeof(error));
+    refused += !h3d_sol_vsa(gpu, &plan.plan, query, key, value, data.sequence,
+                            data.heads, scale, 0.9, data.blocks + 1, error,
+                            sizeof(error));
+    h3d_sol_plan absent = plan.plan;
+    absent.query_bar = nullptr;
+    refused += !h3d_sol_vsa(gpu, &absent, query, key, value, data.sequence,
+                            data.heads, scale, 0.9, 0, error, sizeof(error));
+    check(refused == 7, "the VSA selector refuses a bad shape, prefix or plan");
+    h3d_free(query);
+    h3d_free(key);
+    h3d_free(value);
+    h3d_free(wide);
+    sol_free(plan);
+}
+
 int main() {
     char error[512] = {};
     auto *dit = h3d_create(error, sizeof(error));
@@ -1971,6 +2329,12 @@ int main() {
     sol_forward_multiword(dit);
     sol_forward_mask_is_literal(dit);
     sol_forward_rejects_bad_args(dit);
+    sol_vsa_matches_reference(dit);
+    sol_vsa_reference_setting(dit);
+    sol_vsa_keeps_one(dit);
+    sol_vsa_ties(dit);
+    sol_vsa_monotone(dit);
+    sol_vsa_rejects_bad_args(dit);
     h3v_destroy(vision);
     h3t_destroy(text);
     h3d_destroy(dit);

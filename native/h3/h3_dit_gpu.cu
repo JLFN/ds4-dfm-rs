@@ -3628,6 +3628,172 @@ int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
     return h3d_launch_ok("Sol-Attn route", error, error_size);
 }
 
+/* VSA's selection: the rule the reference's H3 stage runs, against Sol-Attn's
+ * tau threshold above, which is its LTX refiner's. Read from the FastVideo
+ * module the reference hashes and refuses to run without
+ * (`fastvideo/attention/backends/video_sparse_attn_h3.py`, sha256
+ * `b7c6d4e4...dc0fab9` = the pinned `VSA_SOURCE_SHA`):
+ *
+ *   scores = q_pool @ k_pool^T / sqrt(head_dim)                     (`:629`)
+ *   k_vid  = max(1, min(ceil((1 - sparsity) * video_tiles), video_tiles))
+ *                                            (`video_sparse_attn.py:161-163`)
+ *   in `exempt` mode the video columns compete for the k_vid largest scores,
+ *   every prefix column is selected, and every prefix query row is dense; a
+ *   sparsity of 0 selects everything                          (`:387-410`)
+ *
+ * The `[heads][blocks][blocks]` score matrix the reference materialises never
+ * exists here: one CTA per (query block, head) computes each video column's
+ * score from `query_bar` and the `kc` row and keeps it in shared, then ranks
+ * every column against the kept set. Deviations, named: `torch.topk`'s tie
+ * order is undocumented, so ties go to the lower column index; `num_video_tiles`
+ * is this port's count of video blocks, so a short trailing block counts as one
+ * tile where the reference pads; and the rank pass compares all four moments of
+ * the block count where `topk` selects, at the cost measured by
+ * `tests/h3/sol_vsa_bm`. */
+
+enum {
+    /* The score and centroid buffers are dynamic shared, so the sequence bound
+     * is the 48 KiB static limit: (128 + blocks) floats. 12,160 blocks is
+     * 778,240 tokens, well past the largest H3 canvas (32,256 tokens). */
+    H3D_SOL_VSA_MAX_BLOCKS = 12288 - H3D_SOL_HEAD_DIM,
+};
+
+__global__ static void h3d_sol_vsa_kernel(
+        uint32_t *mask, uint32_t *count, const float *query_bar,
+        const __nv_bfloat16 *kc, uint32_t heads, uint32_t blocks,
+        uint32_t words, uint32_t prefix, uint32_t keep, float scale) {
+    extern __shared__ __align__(16) float shared[];
+    float *s_query = shared;                        /* [H3D_SOL_HEAD_DIM] */
+    float *s_score = shared + H3D_SOL_HEAD_DIM;     /* [blocks] */
+    const uint32_t q_block = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+
+    for (uint32_t dim = lane; dim < H3D_SOL_HEAD_DIM; dim += H3D_SOL_WARP) {
+        s_query[dim] =
+            query_bar[((size_t)q_block * heads + head) * H3D_SOL_HEAD_DIM + dim];
+    }
+    __syncwarp();
+
+    /* One `kc` row at a time, the whole warp on it: 128 dimensions over 32
+     * lanes is four values each, and the row is a single 256-byte read. */
+    const __nv_bfloat16 *rows = kc + (size_t)head * blocks * H3D_SOL_HEAD_DIM;
+    for (uint32_t block = 0; block < blocks; ++block) {
+        float part = 0.0f;
+        for (uint32_t dim = lane; dim < H3D_SOL_HEAD_DIM; dim += H3D_SOL_WARP) {
+            part += s_query[dim] *
+                    h3d_value(rows[(size_t)block * H3D_SOL_HEAD_DIM + dim]);
+        }
+        for (int offset = H3D_SOL_WARP / 2; offset > 0; offset >>= 1) {
+            part += __shfl_xor_sync(0xffffffffu, part, offset);
+        }
+        if (lane == 0) s_score[block] = part * scale;
+    }
+    __syncwarp();
+
+    /* A word is 32 consecutive blocks, so a lane owns one column of it and the
+     * ballot is the word: bit set means that block attends exactly, and the
+     * bits past the last block stay clear. */
+    const bool prefix_row = q_block < prefix;
+    uint32_t total = 0;
+    for (uint32_t word = 0; word < words; ++word) {
+        const uint32_t block = word * H3D_SOL_GROUP + lane;
+        bool exact = block < blocks;
+        if (exact && !prefix_row && block >= prefix) {
+            const float mine = s_score[block];
+            uint32_t rank = 0;
+            for (uint32_t other = prefix; other < blocks; ++other) {
+                const float theirs = s_score[other];
+                if (theirs > mine || (theirs == mine && other < block)) {
+                    rank += 1;
+                }
+            }
+            exact = rank < keep;
+        }
+        const uint32_t bits = __ballot_sync(0xffffffffu, exact);
+        if (lane == 0) {
+            mask[((size_t)q_block * heads + head) * words + word] = bits;
+            total += (uint32_t)__popc(bits);
+        }
+    }
+    if (lane == 0) count[(size_t)q_block * heads + head] = total;
+}
+
+/* `compute_topk` (`video_sparse_attn.py:161-163`) in the reference's own double
+ * precision, so a sparsity that lands on a boundary keeps its count. The clamp
+ * is the reference's own: a negative sparsity keeps every tile, one above the
+ * range keeps a single one. */
+static uint32_t h3d_sol_keep(double sparsity, uint32_t tiles) {
+    const double keep = ceil((1.0 - sparsity) * (double)tiles);
+    if (keep < 1.0) return 1u;
+    if (keep > (double)tiles) return tiles;
+    return (uint32_t)keep;
+}
+
+int h3d_sol_vsa(h3d_context *context, const struct h3d_sol_plan *plan,
+                const h3d_tensor *query, const h3d_tensor *key,
+                const h3d_tensor *value, uint32_t sequence, uint32_t heads,
+                float scale, double sparsity, uint32_t prefix_blocks,
+                char *error, size_t error_size) {
+    /* A NaN or infinite sparsity has no keep count in the reference either:
+     * `ceil` propagates it into a `topk` that cannot be asked for. */
+    if (!context || !sequence || !heads || !isfinite(sparsity)) {
+        return h3d_set_error(error, error_size,
+                             "invalid VSA selector arguments");
+    }
+    size_t elements = 0;
+    if (sequence > UINT32_MAX - (H3D_SOL_BLOCK - 1) ||
+        !h3d_mul_size(sequence, heads, &elements) ||
+        !h3d_mul_size(elements, H3D_SOL_HEAD_DIM, &elements)) {
+        return h3d_set_error(error, error_size, "invalid VSA selector shape");
+    }
+    const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    if (blocks > H3D_SOL_VSA_MAX_BLOCKS) {
+        return h3d_set_error(error, error_size,
+                             "VSA selector sequence exceeds its shared budget");
+    }
+    /* `_build_block_mask` (`:387-410`) requires at least one video column: a
+     * sequence that is all prefix asks its `topk` for more columns than exist,
+     * so it is refused rather than answered with a rule the reference lacks. */
+    if (prefix_blocks >= blocks) {
+        return h3d_set_error(error, error_size, "invalid VSA prefix span");
+    }
+    if (!h3d_is(query, H3D_BF16, elements) || !h3d_is(key, H3D_BF16, elements) ||
+        !h3d_is(value, H3D_BF16, elements) ||
+        !h3d_sol_check(plan, sequence, heads, error, error_size)) {
+        return 0;
+    }
+    const uint32_t words = h3d_sol_words(sequence);
+    /* The tau path's kernels, unchanged: the pooling both policies need, the
+     * statistics, and the threshold kernel that also writes the query
+     * centroids this rule scores from. Its `threshold` output is not read
+     * here. */
+    dim3 pool_grid(blocks, heads);
+    h3d_sol_pool_kernel<<<pool_grid, H3D_SOL_THREADS, 0, context->stream>>>(
+        (__nv_bfloat16 *)plan->kc->data, (__nv_bfloat16 *)plan->vc->data,
+        (const __nv_bfloat16 *)key->data,
+        (const __nv_bfloat16 *)value->data, sequence, blocks);
+    if (!h3d_launch_ok("VSA pool", error, error_size)) return 0;
+    h3d_sol_stats_kernel<<<heads, H3D_SOL_THREADS, 0, context->stream>>>(
+        (float *)plan->kc_mean->data, (float *)plan->kc_var->data,
+        (const __nv_bfloat16 *)plan->kc->data, blocks);
+    if (!h3d_launch_ok("VSA statistics", error, error_size)) return 0;
+    h3d_sol_threshold_kernel<<<pool_grid, H3D_SOL_WARP, 0, context->stream>>>(
+        (float *)plan->threshold->data, (float *)plan->query_bar->data,
+        (const float *)plan->kc_mean->data,
+        (const float *)plan->kc_var->data,
+        (const __nv_bfloat16 *)query->data, sequence, heads, scale, 0.0f);
+    if (!h3d_launch_ok("VSA centroids", error, error_size)) return 0;
+    const uint32_t keep = h3d_sol_keep(sparsity, blocks - prefix_blocks);
+    const uint32_t shared = (H3D_SOL_HEAD_DIM + blocks) * sizeof(float);
+    h3d_sol_vsa_kernel<<<pool_grid, H3D_SOL_WARP, shared, context->stream>>>(
+        (uint32_t *)plan->mask->data, (uint32_t *)plan->count->data,
+        (const float *)plan->query_bar->data,
+        (const __nv_bfloat16 *)plan->kc->data, heads, blocks, words,
+        prefix_blocks, keep, scale);
+    return h3d_launch_ok("VSA selection", error, error_size);
+}
+
 /* ---------------------------------------------------------------------------
  * The sparse forward the mask was built for. Structure and order are the
  * reference's (`triton_ref/fwd.py:88-173`):

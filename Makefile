@@ -458,6 +458,11 @@ tests/h3/sol_route_bm: tests/h3/sol_route_bm.cu native/h3/h3_dit_gpu.cu native/h
 tests/h3/sol_forward_bm: tests/h3/sol_forward_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# VSA's selector: the reference's own H3-stage sparsity rule, priced against the
+# tau search step it replaces and against the dense attention it routes.
+tests/h3/sol_vsa_bm: tests/h3/sol_vsa_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # Portable reference tests: host-only, without model weights.
 H3_REFERENCE_TESTS := test_host_portable test_av_mux test_tokenizer_portable
 H3_REFERENCE_SUITE := $(addprefix tests/h3-,$(H3_REFERENCE_TESTS))
