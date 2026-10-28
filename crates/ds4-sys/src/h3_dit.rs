@@ -254,6 +254,40 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    /// `h3d_sol_words`: the mask words one query block carries at this length.
+    fn h3d_sol_words(sequence: u32) -> u32;
+
+    /// VSA's selector: the reference's own sparsity rule for the H3 stage.
+    fn h3d_sol_vsa(
+        context: *mut Context,
+        plan: *const SolPlan,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        sparsity: f64,
+        prefix_blocks: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// The sparse forward the selector's mask was built for.
+    fn h3d_sol_forward(
+        context: *mut Context,
+        output: *mut CTensor,
+        plan: *const SolPlan,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3d_add(
         context: *mut Context,
         output: *mut CTensor,
@@ -665,6 +699,41 @@ impl Tensor {
     fn raw(&self) -> *mut CTensor {
         self.raw.as_ptr()
     }
+}
+
+/// `H3D_SOL_BLOCK`, `H3D_SOL_HEAD_DIM` (`native/h3/h3_dit_gpu.h:45`).
+const SOL_BLOCK: u32 = 64;
+const SOL_HEAD_DIM: usize = 128;
+
+/// `struct h3d_sol_plan` (`native/h3/h3_dit_gpu.h:65-74`), field for field:
+/// the block summaries the search step pools, the routing mask, its count,
+/// the threshold the tau policy writes, the query centroids and the kc
+/// statistics. Field order is the C struct's.
+#[repr(C)]
+pub struct SolPlan {
+    pub kc: *mut CTensor,
+    pub vc: *mut CTensor,
+    pub mask: *mut CTensor,
+    pub count: *mut CTensor,
+    pub threshold: *mut CTensor,
+    pub query_bar: *mut CTensor,
+    pub kc_mean: *mut CTensor,
+    pub kc_var: *mut CTensor,
+}
+
+/// The plan and the buffers it points at: the plan holds raw pointers, so
+/// the tensors must outlive it and cannot be moved out. `Send` is not
+/// claimed, as the tensors are device memory owned by one stream.
+pub struct SolPlanBuffers {
+    plan: SolPlan,
+    _kc: Tensor,
+    _vc: Tensor,
+    _mask: Tensor,
+    _count: Tensor,
+    _threshold: Tensor,
+    _query_bar: Tensor,
+    _kc_mean: Tensor,
+    _kc_var: Tensor,
 }
 
 /// One CUDA stream and one cuBLASLt handle: the reference's `h3_gpu`.
@@ -1248,6 +1317,150 @@ impl Gpu {
                 )
             },
             "attention",
+        )
+    }
+
+    /// The mask words per query block at this sequence length
+    /// (`h3d_sol_words`), for callers sizing anything against the plan.
+    pub fn sol_words(&self, sequence: u32) -> u32 {
+        unsafe { h3d_sol_words(sequence) }
+    }
+
+    /// Allocate the sparse attention's workspace for `sequence x heads`. Every
+    /// shape is the one `h3d_sol_check` validates before a kernel writes: the
+    /// summaries are `[heads][blocks][128]`, the mask is `[blocks][heads]` of
+    /// `words` words, and the rest is per (block, head).
+    pub fn sol_plan(&self, sequence: u32, heads: u32) -> Result<SolPlanBuffers, String> {
+        if sequence == 0 || heads == 0 {
+            return Err("Sol-Attn plan needs a sequence and a head count".into());
+        }
+        let blocks = sequence.div_ceil(SOL_BLOCK);
+        let words = self.sol_words(sequence);
+        let summary = heads as usize * blocks as usize * SOL_HEAD_DIM;
+        let pairs = heads as usize * blocks as usize;
+
+        let kc = self.alloc(Dtype::Bf16, summary)?;
+        let vc = self.alloc(Dtype::Bf16, summary)?;
+        let query_bar = self.alloc(Dtype::F32, summary)?;
+        let mask = self.alloc(Dtype::U32, pairs * words as usize)?;
+        let count = self.alloc(Dtype::U32, pairs)?;
+        let threshold = self.alloc(Dtype::F32, pairs)?;
+        let kc_mean = self.alloc(Dtype::F32, heads as usize * SOL_HEAD_DIM)?;
+        let kc_var = self.alloc(Dtype::F32, heads as usize * SOL_HEAD_DIM)?;
+
+        let plan = SolPlan {
+            kc: kc.raw(),
+            vc: vc.raw(),
+            mask: mask.raw(),
+            count: count.raw(),
+            threshold: threshold.raw(),
+            query_bar: query_bar.raw(),
+            kc_mean: kc_mean.raw(),
+            kc_var: kc_var.raw(),
+        };
+        Ok(SolPlanBuffers {
+            plan,
+            _kc: kc,
+            _vc: vc,
+            _mask: mask,
+            _count: count,
+            _threshold: threshold,
+            _query_bar: query_bar,
+            _kc_mean: kc_mean,
+            _kc_var: kc_var,
+        })
+    }
+
+    /// The exact-block share of the mask the last `sol_vsa` wrote, read back
+    /// from the mask itself. This is the model's own realized sparsity, which
+    /// no fixture can supply, and it costs one synchronised readback, so a
+    /// caller asks for it once rather than per layer.
+    pub fn sol_exact_share(
+        &self,
+        plan: &SolPlanBuffers,
+        sequence: u32,
+        heads: u32,
+    ) -> Result<f64, String> {
+        let blocks = sequence.div_ceil(SOL_BLOCK) as u64;
+        let words = self.sol_words(sequence) as u64;
+        let mut bytes = vec![0u8; (blocks * heads as u64 * words * 4) as usize];
+        self.read(&plan._mask, &mut bytes)?;
+
+        let exact: u64 = bytes
+            .chunks_exact(4)
+            .map(|word| {
+                u32::from_le_bytes([word[0], word[1], word[2], word[3]]).count_ones() as u64
+            })
+            .sum();
+        Ok(exact as f64 / (blocks * blocks * heads as u64) as f64)
+    }
+
+    /// VSA's selector at `sparsity`, exempting the first `prefix_blocks` blocks.    /// `sparsity` is a double because the reference computes its keep count from
+    /// a Python float: 0.9 rounded to F32 asks for a different count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sol_vsa(
+        &self,
+        plan: &SolPlanBuffers,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        sparsity: f64,
+        prefix_blocks: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sol_vsa(
+                    self.raw.as_ptr(),
+                    &plan.plan,
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    scale,
+                    sparsity,
+                    prefix_blocks,
+                    error,
+                    size,
+                )
+            },
+            "VSA selector",
+        )
+    }
+
+    /// The sparse forward over the mask the selector just wrote.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sol_forward(
+        &self,
+        output: &Tensor,
+        plan: &SolPlanBuffers,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sol_forward(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    &plan.plan,
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "sparse attention",
         )
     }
 

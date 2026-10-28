@@ -67,7 +67,7 @@
 use std::fmt;
 use std::path::Path;
 
-use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
+use ds4_sys::h3_dit::{Dtype, Gpu, SolPlanBuffers, Tensor};
 
 use crate::minimax_h3::host::{self, Schedule};
 use crate::minimax_h3::layout::{Config, Role};
@@ -1434,11 +1434,54 @@ impl Geometry {
 
 /// The FL2VA DiT with its weights resident: one device context, the loaded
 /// core, and the per-step tensors the forward indexes.
+/// `H3D_SOL_BLOCK` (`native/h3/h3_dit_gpu.h:45`): the sparse attention's query
+/// and key block, in rows.
+const SOL_BLOCK: u32 = 64;
+
+/// VSA's selector and the sparse forward it feeds, with the workspace they
+/// share across the 50 blocks and every step of one sequence.
+struct SolAttention {
+    plan: SolPlanBuffers,
+    sparsity: f64,
+    /// Whole blocks holding the prefix. `_build_block_mask` requires at least
+    /// one video block, and a block with a prefix row is treated as prefix.
+    prefix_blocks: u32,
+}
+
+/// One line per process with the first sparse call's realized share: the
+/// number no fixture can supply, and the one that decides whether the mask
+/// leaves anything for the fold to carry.
+static SOL_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `H3_DIT_SOL` names the VSA sparsity the DiT's own attention should run at,
+/// or is unset for the dense path. Read once per load, like the native side's
+/// `H3_DIT_ATTENTION`, so one binary serves both arms of an A/B. A value that
+/// is not a finite number is refused: a typo must not quietly serve dense.
+fn sol_from_env() -> Result<Option<f64>, DitError> {
+    let Ok(raw) = std::env::var("H3_DIT_SOL") else {
+        return Ok(None);
+    };
+    let sparsity: f64 = raw.trim().parse().map_err(|_| DitError::Unsupported {
+        detail: format!("H3_DIT_SOL={raw} is not a sparsity"),
+    })?;
+    if !sparsity.is_finite() {
+        return Err(DitError::Unsupported {
+            detail: format!("H3_DIT_SOL={raw} is not a finite sparsity"),
+        });
+    }
+    Ok(Some(sparsity))
+}
+
 pub struct Dit {
     gpu: Gpu,
     config: Config,
     sequence: Sequence,
     schedule: Schedule,
+    /// VSA's sparse attention, present only when `H3_DIT_SOL` asked for it.
+    /// The dense `h3d_sdpa` path is the engine's; this one approximates it by
+    /// folding unselected blocks from their pooled summaries.
+    sol: Option<SolAttention>,
     hidden_width: u32,
     inner: u32,
     video_width: u32,
@@ -1680,9 +1723,35 @@ impl Dit {
             streamer.ensure(&gpu, 0)?;
         }
 
+        // The sparse arm is opt-in and is refused rather than quietly ignored
+        // when the layout it was built for is not the one in use: token pairing
+        // halves the video rows and moves every block boundary, so its block
+        // count and prefix span are not this one's.
+        let sol = match sol_from_env()? {
+            None => None,
+            Some(sparsity) => {
+                if reduction.is_some() {
+                    return Err(DitError::Unsupported {
+                        detail: "H3_DIT_SOL with token pairing: VSA's blocks are \
+                                 the unreduced sequence's"
+                            .into(),
+                    });
+                }
+                let plan = gpu
+                    .sol_plan(rows as u32, config.heads as u32)
+                    .map_err(DitError::Gpu)?;
+                Some(SolAttention {
+                    plan,
+                    sparsity,
+                    prefix_blocks: geometry.video_target_start.div_ceil(SOL_BLOCK),
+                })
+            }
+        };
+
         Ok(Dit {
             gpu,
             config,
+            sol,
             hidden_width,
             inner,
             video_width,
@@ -2421,16 +2490,57 @@ impl Dit {
 
         // `h3_dit.c:1921-1956`: full attention into the qkv buffer (the
         // reference's `attention_heads` alias), then the output projection.
-        device(self.gpu.sdpa(
-            &self.qkv,
-            &self.query,
-            &self.key,
-            &self.value,
-            rows,
-            self.config.heads as u32,
-            self.config.head_dim as u32,
-            1.0 / ((self.config.head_dim as f32).sqrt()),
-        ))?;
+        // The opt-in sparse arm replaces this one call and nothing else: the
+        // same inputs and the same output buffer, routed from this step's own
+        // Q and K. It is skipped on the reduced layout, whose row count is not
+        // the one its plan and prefix span were sized for.
+        let heads = self.config.heads as u32;
+        let scale = 1.0 / ((self.config.head_dim as f32).sqrt());
+        match self.sol.as_ref().filter(|_| rows == self.rows) {
+            Some(sol) => {
+                device(self.gpu.sol_vsa(
+                    &sol.plan,
+                    &self.query,
+                    &self.key,
+                    &self.value,
+                    rows,
+                    heads,
+                    scale,
+                    sol.sparsity,
+                    sol.prefix_blocks,
+                ))?;
+                if !SOL_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    match self.gpu.sol_exact_share(&sol.plan, rows, heads) {
+                        Ok(share) => eprintln!(
+                            "SOL sparsity={:.3} prefix_blocks={} first call: {} rows, \
+                             {} heads, exact share {:.4}",
+                            sol.sparsity, sol.prefix_blocks, rows, heads, share
+                        ),
+                        Err(detail) => eprintln!("SOL sparsity report failed: {detail}"),
+                    }
+                }
+                device(self.gpu.sol_forward(
+                    &self.qkv,
+                    &sol.plan,
+                    &self.query,
+                    &self.key,
+                    &self.value,
+                    rows,
+                    heads,
+                    scale,
+                ))?;
+            }
+            None => device(self.gpu.sdpa(
+                &self.qkv,
+                &self.query,
+                &self.key,
+                &self.value,
+                rows,
+                heads,
+                self.config.head_dim as u32,
+                scale,
+            ))?,
+        }
         device(self.gpu.linear(
             &self.attention_output,
             &self.qkv,
