@@ -111,7 +111,10 @@ These reports preserve successful gates, rejected experiments and unresolved lim
   and [the DiT's own attention through it](minimax-h3/sol-attention-2026-10-28.md)
   — and [the FastH3 distilled adapter merged into a derived checkpoint](minimax-h3/lora-merge-2026-10-28.md),
   which is what makes a four-step render a finished picture and cuts DENOISE
-  5.1x.
+  5.1x. [The reference's NVFP4-AWQ prompt encoder](minimax-h3/nvfp4-encoder-2026-10-28.md)
+  is the same forward reading 15.69 GB instead of 48.8 GiB: TEXT 27.4-28.2 s to
+  15.5 s, the BF16 path bit-unchanged, the render's difference bounded at 7.7%
+  detail energy.
 - **MiniMax VQ:** [October 27 prefill/decode campaign](minimax-vq-optimization-2026-10-27.md),
   three adopted rounds each; [fresh 2K–64K DSpark graph](benchmarks/minimax-vq-spark-64k-2026-10-27/README.md),
   raw clocks, exact output checks and observed repeat ranges.
