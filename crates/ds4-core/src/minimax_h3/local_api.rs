@@ -31,7 +31,7 @@
 
 use serde_json::{Map, Value};
 
-use super::dit::Attention;
+use super::dit::{Attention, VaeAttention, VaeGemm};
 use super::presets::{self, Ratio};
 use super::render::{CANVAS_MULTIPLE, MAX_PIXELS};
 use super::video_api::{
@@ -57,14 +57,19 @@ pub const MAX_CONDITIONS: usize = 2;
 /// The reference's cap on ordered references (`h3.c:588`).
 pub const MAX_REFERENCES: usize = 12;
 
-/// The six fields of the create body, and the only six.
-pub const CREATE_FIELDS: [&str; 6] = [
+/// The eight fields of the create body, and the only eight. The two decoder
+/// switches are the port's own, as `attention` is: they choose kernels on the
+/// context the DiT is loaded with, and every one of them is optional with the
+/// reference's own behaviour as its default.
+pub const CREATE_FIELDS: [&str; 8] = [
     "task",
     "prompt",
     "conditions",
     "target",
     "seed",
     "attention",
+    "vae_attention",
+    "vae_gemm",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +184,11 @@ pub struct CreateBody {
     /// `"attention"`, optional: `tensor` is the default, `scalar` the
     /// byte-exact kernel.
     pub attention: Attention,
+    /// `"vae_attention"`, optional: the decoder's own kernel, whose default is
+    /// the opposite one — `scalar` is the reference path there.
+    pub vae_attention: VaeAttention,
+    /// `"vae_gemm"`, optional: `fp32` is the reference rounding.
+    pub vae_gemm: VaeGemm,
 }
 
 /// The class of one ordered reference (`h3_reference_kind`, `h3.h:30-34`).
@@ -243,6 +253,9 @@ pub struct Plan {
     pub references: Vec<ReferenceMedia>,
     /// Attention path; `Tensor` unless the request asked for `scalar`.
     pub attention: Attention,
+    /// The decoder's own switches, carried through untouched.
+    pub vae_attention: VaeAttention,
+    pub vae_gemm: VaeGemm,
 }
 
 /// Parse and validate a create body.
@@ -358,6 +371,51 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         }
     };
 
+    // The decoder's two switches, optional like `attention` and refused on an
+    // unknown word for the same reason: a typo must not read as the default.
+    let vae_attention = match object.get("vae_attention") {
+        None => VaeAttention::Scalar,
+        Some(Value::String(mode)) => match mode.as_str() {
+            "scalar" => VaeAttention::Scalar,
+            "tensor" => VaeAttention::Tensor,
+            other => {
+                return Err(ApiError::bad_request(
+                    "invalid_vae_attention",
+                    Some("vae_attention"),
+                    format!("vae_attention must be scalar or tensor, not {other}"),
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_vae_attention",
+                Some("vae_attention"),
+                "vae_attention must be the string scalar or tensor",
+            ))
+        }
+    };
+    let vae_gemm = match object.get("vae_gemm") {
+        None => VaeGemm::Fp32,
+        Some(Value::String(mode)) => match mode.as_str() {
+            "fp32" => VaeGemm::Fp32,
+            "bf16" => VaeGemm::Reduced,
+            other => {
+                return Err(ApiError::bad_request(
+                    "invalid_vae_gemm",
+                    Some("vae_gemm"),
+                    format!("vae_gemm must be fp32 or bf16, not {other}"),
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_vae_gemm",
+                Some("vae_gemm"),
+                "vae_gemm must be the string fp32 or bf16",
+            ))
+        }
+    };
+
     Ok(CreateBody {
         task,
         prompt,
@@ -365,6 +423,8 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         target,
         seed,
         attention,
+        vae_attention,
+        vae_gemm,
     })
 }
 
@@ -478,6 +538,8 @@ impl CreateBody {
             last_frame,
             references,
             attention: self.attention,
+            vae_attention: self.vae_attention,
+            vae_gemm: self.vae_gemm,
         })
     }
 
@@ -1234,14 +1296,56 @@ mod tests {
     }
 
     #[test]
-    fn the_six_fields_are_the_contract() {
+    fn the_decoder_options_default_to_the_reference_and_are_opt_in() {
+        // Absent: the decoder's own default, which is the opposite of the
+        // DiT's — `scalar` is the reference path there.
+        let parsed = planned(body("t2va", json!([]), "16:9", 8)).unwrap();
+        assert_eq!(parsed.vae_attention, VaeAttention::Scalar);
+        assert_eq!(parsed.vae_gemm, VaeGemm::Fp32);
+
+        // Asked for: the arm the record measured at 34.7 s against 196.9.
+        let mut fast = body("t2va", json!([]), "16:9", 8);
+        fast["vae_attention"] = json!("tensor");
+        fast["vae_gemm"] = json!("bf16");
+        let plan = planned(fast).unwrap();
+        assert_eq!(plan.vae_attention, VaeAttention::Tensor);
+        assert_eq!(plan.vae_gemm, VaeGemm::Reduced);
+
+        // The spelling is checked rather than guessed, on both fields.
+        let mut bogus = body("t2va", json!([]), "16:9", 8);
+        bogus["vae_attention"] = json!("fast");
+        assert_eq!(
+            parse_create(bogus.to_string().as_bytes()).unwrap_err().code,
+            "invalid_vae_attention"
+        );
+
+        // `tf32` is refused although the native side accepts it: it and `bf16`
+        // are one computation bit for bit, so the contract names one word for
+        // one behaviour (`vae-options-2026-10-28.md`).
+        let mut bogus = body("t2va", json!([]), "16:9", 8);
+        bogus["vae_gemm"] = json!("tf32");
+        assert_eq!(
+            parse_create(bogus.to_string().as_bytes()).unwrap_err().code,
+            "invalid_vae_gemm"
+        );
+
+        let mut wrong_type = body("t2va", json!([]), "16:9", 8);
+        wrong_type["vae_gemm"] = json!(1);
+        assert_eq!(
+            parse_create(wrong_type.to_string().as_bytes()).unwrap_err().code,
+            "invalid_vae_gemm"
+        );
+    }
+
+    #[test]
+    fn the_eight_fields_are_the_contract() {
         let root = body("t2va", json!([]), "16:9", 8);
         let parsed = parse_create(root.to_string().as_bytes()).unwrap();
         assert_eq!(parsed.task, Task::T2va);
         assert_eq!(parsed.seed, 7);
         assert_eq!(parsed.target.short_edge, 768);
 
-        // A seventh field is refused rather than ignored.
+        // A ninth field is refused rather than ignored.
         let mut extra = root.clone();
         extra["model"] = json!("MiniMax-H3");
         let error = parse_create(extra.to_string().as_bytes()).unwrap_err();

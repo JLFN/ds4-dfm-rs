@@ -482,7 +482,7 @@ pub fn unknown_video(id: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minimax_h3::dit::Attention;
+    use crate::minimax_h3::dit::{Attention, VaeAttention, VaeGemm};
     use crate::minimax_h3::local_api::{parse_create, Task};
 
     fn plan() -> Plan {
@@ -497,6 +497,8 @@ mod tests {
             last_frame: None,
             references: Vec::new(),
             attention: Attention::Tensor,
+            vae_attention: VaeAttention::Scalar,
+            vae_gemm: VaeGemm::Fp32,
         }
     }
 

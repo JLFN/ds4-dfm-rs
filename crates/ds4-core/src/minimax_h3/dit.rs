@@ -797,6 +797,28 @@ pub enum Attention {
     Scalar,
 }
 
+/// The video decoder's attention kernel (`H3_VAE_ATTENTION`). A separate choice
+/// from [`Attention`], and with the opposite default: the decoder's `Scalar` is
+/// the reference path and the only arm whose output is reproducible across
+/// architectures, while the DiT's default is its tensor kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaeAttention {
+    #[default]
+    Scalar,
+    Tensor,
+}
+
+/// The decoder's GEMM mode (`H3_VAE_GEMM`). `Fp32` is the reference's rounding;
+/// `Reduced` is one tensor-core computation, 2.75e-05 relative rms from `Fp32`,
+/// four orders below the value scale, and it is what turned the decoder's
+/// matmul share into the 34-36 s arm (`vae-options-2026-10-28.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaeGemm {
+    #[default]
+    Fp32,
+    Reduced,
+}
+
 /// How the core runs: residency, active block count and token pairing
 /// (`h3_dit.c:1601-1665`). The reference takes the same three choices as
 /// separate loader arguments; one struct keeps the call sites readable.
@@ -810,6 +832,11 @@ pub struct LoadOptions {
     pub core_reuse: u32,
     /// Attention path; the tensor-core kernel unless `Scalar` is asked for.
     pub attention: Attention,
+    /// The video decoder's attention kernel, set on the same context as
+    /// [`LoadOptions::attention`] and independent of it.
+    pub vae_attention: VaeAttention,
+    /// The video decoder's GEMM mode, likewise.
+    pub vae_gemm: VaeGemm,
 }
 
 impl LoadOptions {
@@ -821,6 +848,8 @@ impl LoadOptions {
             reduction: Reduction::Environment,
             core_reuse: 1,
             attention: Attention::Tensor,
+            vae_attention: VaeAttention::Scalar,
+            vae_gemm: VaeGemm::Fp32,
         }
     }
 }
@@ -1603,6 +1632,25 @@ impl Dit {
         let config = weights.config().clone();
         let gpu = device(Gpu::create())?;
         gpu.set_attention(matches!(options.attention, Attention::Scalar));
+        // The decoder's two switches, in the native side's own words. A value it
+        // does not know is a bug in this mapping rather than user input: every
+        // string here is one of the three the header documents.
+        gpu.set_vae_option(
+            "attention",
+            match options.vae_attention {
+                VaeAttention::Scalar => "scalar",
+                VaeAttention::Tensor => "tensor",
+            },
+        )
+        .map_err(DitError::Gpu)?;
+        gpu.set_vae_option(
+            "gemm",
+            match options.vae_gemm {
+                VaeGemm::Fp32 => "fp32",
+                VaeGemm::Reduced => "bf16",
+            },
+        )
+        .map_err(DitError::Gpu)?;
 
         let geometry = Geometry::check(&config, &sequence, text.tokens())?;
         let hidden_width = config.hidden as u32;

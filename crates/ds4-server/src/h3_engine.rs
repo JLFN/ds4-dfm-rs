@@ -79,6 +79,8 @@ impl Renderer for EngineRenderer {
             last_frame: last.as_ref().map(|file| file.path().to_path_buf()),
             references,
             attention: spec.attention,
+            vae_attention: spec.vae_attention,
+            vae_gemm: spec.vae_gemm,
             output: output.to_path_buf(),
         };
         let report = self

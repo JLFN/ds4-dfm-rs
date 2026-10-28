@@ -272,8 +272,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             reduction,
             core_reuse: options.core_reuse,
             // The goldens below are the reference engine's exact hashes, and
-            // the mma reduction tree cannot reproduce them (`56db38aa`).
+            // the mma reduction tree cannot reproduce them (`56db38aa`). The
+            // decoder's own switches keep their reference defaults.
             attention: Attention::Scalar,
+            ..LoadOptions::resident()
         },
     )
     .map_err(|error| error.to_string())?;

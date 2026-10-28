@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use super::dit::{Attention, Dit, LoadOptions};
+use super::dit::{Attention, Dit, LoadOptions, VaeAttention, VaeGemm};
 use super::host::{reuse_schedule, temporal, Rng, Schedule};
 use super::media::{self, Fit};
 use super::partition::{Catalog, Partition, TOKENIZER};
@@ -56,6 +56,11 @@ pub struct RenderRequest {
     /// the byte-exact one, which is the only path that reproduces the
     /// reference (`docs/minimax-h3/tensor-default-2026-10-27.md`).
     pub attention: Attention,
+    /// The video decoder's attention kernel, a second and independent choice:
+    /// `Scalar` is the reference path and the default.
+    pub vae_attention: VaeAttention,
+    /// The video decoder's GEMM mode; `Fp32` is the reference rounding.
+    pub vae_gemm: VaeGemm,
     pub output: PathBuf,
 }
 
@@ -123,6 +128,11 @@ struct PreparedKey {
     /// kernel: for `Scalar` that would silently drop the byte-exact promise the
     /// create body makes.
     attention: Attention,
+    /// The decoder's switches belong here for the same reason and not because
+    /// they touch a weight: both are set on the context `Dit::load_with`
+    /// creates, so a request that asks for the other one has to miss.
+    vae_attention: VaeAttention,
+    vae_gemm: VaeGemm,
 }
 
 struct Prepared {
@@ -267,6 +277,8 @@ impl Engine {
             reuse: request.reuse,
             rope: canvas.rope_scale(false).to_bits(),
             attention: request.attention,
+            vae_attention: request.vae_attention,
+            vae_gemm: request.vae_gemm,
         };
 
         // Prepared DiT (`h3.c:168-190`, `h3.c:1505-1516`): a hit skips the
@@ -297,6 +309,8 @@ impl Engine {
                 canvas.rope_scale(false),
                 LoadOptions {
                     attention: request.attention,
+                    vae_attention: request.vae_attention,
+                    vae_gemm: request.vae_gemm,
                     ..LoadOptions::resident()
                 },
             )
@@ -696,6 +710,8 @@ mod tests {
             reuse: 1,
             rope: 16,
             attention: Attention::Tensor,
+            vae_attention: VaeAttention::Scalar,
+            vae_gemm: VaeGemm::Fp32,
         }
     }
 

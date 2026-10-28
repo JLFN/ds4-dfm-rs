@@ -20,7 +20,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ds4_core::minimax_h3::dit::{Attention, Dit, DitError, LoadMode, LoadOptions, Reduction};
+use ds4_core::minimax_h3::dit::{
+    Attention, Dit, DitError, LoadMode, LoadOptions, Reduction, VaeAttention, VaeGemm,
+};
 use ds4_core::minimax_h3::host::{reuse_schedule, temporal, Rng, Schedule};
 use ds4_core::minimax_h3::render::mux_mp4;
 use ds4_core::minimax_h3::render::{check_frames, Canvas, RgbFrames};
@@ -76,6 +78,13 @@ struct Options {
     /// `--attention`: `tensor` is the tensor-core kernel and the default,
     /// `scalar` the byte-exact one.
     attention: Attention,
+    /// `--vae-attention`: the video decoder's own kernel, with the opposite
+    /// default. `scalar` is the reference path and portable; `tensor` is faster
+    /// and not portable across architectures.
+    vae_attention: VaeAttention,
+    /// `--vae-gemm`: `fp32` is the reference rounding, `bf16` the one
+    /// tensor-core computation four orders below the value scale.
+    vae_gemm: VaeGemm,
     /// `--frames-dir` (`main.c:57`, `:339`, `:492`): the decoded frames.
     frames_dir: Option<PathBuf>,
     /// `--preview-dir` (`main.c:58`, `:340`, `:493`).
@@ -230,6 +239,8 @@ fn run() -> Result<ExitCode, String> {
         reduction,
         core_reuse: options.core_reuse,
         attention: options.attention,
+        vae_attention: options.vae_attention,
+        vae_gemm: options.vae_gemm,
     };
 
     let started = Instant::now();
@@ -732,6 +743,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         token_reduction: false,
         core_reuse: 1,
         attention: Attention::Tensor,
+        vae_attention: VaeAttention::Scalar,
+        vae_gemm: VaeGemm::Fp32,
         frames_dir: None,
         preview_dir: None,
         show: false,
@@ -840,6 +853,24 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                     other => {
                         return Err(format!("--attention must be tensor or scalar, not {other}"))
                     }
+                }
+            }
+            "--vae-attention" => {
+                options.vae_attention = match value(&mut argv, &flag)?.as_str() {
+                    "scalar" => VaeAttention::Scalar,
+                    "tensor" => VaeAttention::Tensor,
+                    other => {
+                        return Err(format!(
+                            "--vae-attention must be scalar or tensor, not {other}"
+                        ))
+                    }
+                }
+            }
+            "--vae-gemm" => {
+                options.vae_gemm = match value(&mut argv, &flag)?.as_str() {
+                    "fp32" => VaeGemm::Fp32,
+                    "bf16" => VaeGemm::Reduced,
+                    other => return Err(format!("--vae-gemm must be fp32 or bf16, not {other}")),
                 }
             }
             "--info" => options.info = true,
@@ -954,6 +985,11 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
   --token-reduction         pair video tokens in middle DiT blocks
   --attention tensor|scalar attention kernel; tensor is the default, scalar
                             is byte-exact and slower
+  --vae-attention scalar|tensor  decoder attention kernel; scalar is the
+                            reference path and the default, tensor is faster
+                            and not portable across architectures
+  --vae-gemm fp32|bf16      decoder GEMM; fp32 is the reference rounding, bf16
+                            is one tensor-core computation below its scale
                             (window from H3_TOKEN_REDUCTION_* env)
   --core-reuse N            core refresh: 1 exact, 4 fast, 6 aggressive
   --frames-dir PATH         write one PPM per generated frame
