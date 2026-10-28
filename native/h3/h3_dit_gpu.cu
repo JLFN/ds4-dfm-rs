@@ -3676,9 +3676,29 @@ __global__ static void h3d_sol_vsa_kernel(
     __syncwarp();
 
     /* One `kc` row at a time, the whole warp on it: 128 dimensions over 32
-     * lanes is four values each, and the row is a single 256-byte read. */
+     * lanes is four values each, and the row is a single 256-byte read. Two
+     * columns are in flight, so the reduction of one overlaps the load of the
+     * next; each column's own order is unchanged. */
     const __nv_bfloat16 *rows = kc + (size_t)head * blocks * H3D_SOL_HEAD_DIM;
-    for (uint32_t block = 0; block < blocks; ++block) {
+    for (uint32_t block = 0; block + 1 < blocks; block += 2) {
+        float part[2] = {0.0f, 0.0f};
+        for (uint32_t dim = lane; dim < H3D_SOL_HEAD_DIM; dim += H3D_SOL_WARP) {
+            part[0] += s_query[dim] *
+                       h3d_value(rows[(size_t)block * H3D_SOL_HEAD_DIM + dim]);
+            part[1] += s_query[dim] *
+                       h3d_value(rows[(size_t)(block + 1) * H3D_SOL_HEAD_DIM + dim]);
+        }
+        for (int offset = H3D_SOL_WARP / 2; offset > 0; offset >>= 1) {
+            part[0] += __shfl_xor_sync(0xffffffffu, part[0], offset);
+            part[1] += __shfl_xor_sync(0xffffffffu, part[1], offset);
+        }
+        if (lane == 0) {
+            s_score[block] = part[0] * scale;
+            s_score[block + 1] = part[1] * scale;
+        }
+    }
+    if (blocks & 1u) {
+        const uint32_t block = blocks - 1;
         float part = 0.0f;
         for (uint32_t dim = lane; dim < H3D_SOL_HEAD_DIM; dim += H3D_SOL_WARP) {
             part += s_query[dim] *
@@ -3693,7 +3713,8 @@ __global__ static void h3d_sol_vsa_kernel(
 
     /* A word is 32 consecutive blocks, so a lane owns one column of it and the
      * ballot is the word: bit set means that block attends exactly, and the
-     * bits past the last block stay clear. */
+     * bits past the last block stay clear. The rank is a sum of four
+     * independent counts, so the chain of adds is not what the lane waits on. */
     const bool prefix_row = q_block < prefix;
     uint32_t total = 0;
     for (uint32_t word = 0; word < words; ++word) {
@@ -3701,14 +3722,24 @@ __global__ static void h3d_sol_vsa_kernel(
         bool exact = block < blocks;
         if (exact && !prefix_row && block >= prefix) {
             const float mine = s_score[block];
-            uint32_t rank = 0;
-            for (uint32_t other = prefix; other < blocks; ++other) {
-                const float theirs = s_score[other];
-                if (theirs > mine || (theirs == mine && other < block)) {
-                    rank += 1;
-                }
+            uint32_t rank[4] = {0u, 0u, 0u, 0u};
+            uint32_t other = prefix;
+            for (; other + 4 <= blocks; other += 4) {
+                const float s0 = s_score[other];
+                const float s1 = s_score[other + 1];
+                const float s2 = s_score[other + 2];
+                const float s3 = s_score[other + 3];
+                rank[0] += s0 > mine || (s0 == mine && other < block);
+                rank[1] += s1 > mine || (s1 == mine && other + 1 < block);
+                rank[2] += s2 > mine || (s2 == mine && other + 2 < block);
+                rank[3] += s3 > mine || (s3 == mine && other + 3 < block);
             }
-            exact = rank < keep;
+            for (; other < blocks; ++other) {
+                const float theirs = s_score[other];
+                rank[0] += theirs > mine || (theirs == mine && other < block);
+            }
+            const uint32_t summed = (rank[0] + rank[1]) + (rank[2] + rank[3]);
+            exact = summed < keep;
         }
         const uint32_t bits = __ballot_sync(0xffffffffu, exact);
         if (lane == 0) {
