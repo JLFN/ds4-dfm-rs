@@ -187,6 +187,57 @@ int main(int argc, char **argv) {
     printf("the forward alone is %.2fx the dense %.3f ms\n",
            dense_ms / forward_ms, dense_ms);
 
+    /* The control: a mask that marks every block exact, so the sparse walk
+     * does the dense kernel's own work - the same 288 sequential tiles, the
+     * same MMAs, the same staging, the same two barriers each - and the folded
+     * pass never runs. Dense and control are interleaved, so run order cannot
+     * explain the difference between them; the tau arms above rode the same
+     * binary and the same clocks. */
+    std::vector<uint32_t> all_exact((size_t)blocks * heads * words, 0u);
+    for (uint32_t word = 0; word < words; ++word) {
+        const uint32_t first = word * H3D_SOL_GROUP;
+        const uint32_t rest = blocks - first;
+        const uint32_t bits = rest >= H3D_SOL_GROUP ? ~0u : (1u << rest) - 1u;
+        for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
+            for (uint32_t head = 0; head < heads; ++head) {
+                all_exact[((size_t)q_block * heads + head) * words + word] = bits;
+            }
+        }
+    }
+    if (!h3d_upload(gpu, mask, all_exact.data(), error, sizeof(error))) {
+        fail("upload", error);
+    }
+    printf("control, every block exact:\n");
+    const double dense_a = time_calls("dense attention", dense);
+    const double full_ms = time_calls("sparse forward, all exact", forward);
+    const double dense_b = time_calls("dense attention", dense);
+    const double dense_mid = 0.5 * (dense_a + dense_b);
+    printf("  the sparse walk at 100%% exact is %.2fx the dense %.3f ms at the "
+           "same work\n",
+           full_ms / dense_mid, dense_mid);
+
+    /* The second control: each query block's exact set moved to a contiguous
+     * window of the same size, starting at that block and wrapping. The tile
+     * count per CTA and the whole-kernel tile count are unchanged, the MMAs
+     * and barriers are unchanged, so what is left between this arm and the
+     * router's own mask is where the blocks sit in K and V. */
+    std::vector<uint32_t> windowed((size_t)blocks * heads * words, 0u);
+    for (uint32_t head = 0; head < heads; ++head) {
+        for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
+            const uint32_t count_here = host_count[(size_t)q_block * heads + head];
+            for (uint32_t step = 0; step < count_here; ++step) {
+                const uint32_t block = (q_block + step) % blocks;
+                windowed[((size_t)q_block * heads + head) * words + block / H3D_SOL_GROUP] |=
+                    1u << (block % H3D_SOL_GROUP);
+            }
+        }
+    }
+    if (!h3d_upload(gpu, mask, windowed.data(), error, sizeof(error))) {
+        fail("upload", error);
+    }
+    printf("control, the same count as a contiguous window per query block:\n");
+    const double window_ms = time_calls("sparse forward, windowed", forward);
+
     h3d_free(query); h3d_free(key); h3d_free(value); h3d_free(output);
     h3d_free(kc); h3d_free(vc); h3d_free(mask); h3d_free(count);
     h3d_free(threshold); h3d_free(query_bar); h3d_free(kc_mean); h3d_free(kc_var);
