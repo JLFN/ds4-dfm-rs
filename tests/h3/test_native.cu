@@ -824,9 +824,13 @@ static void sol_expect(const SolData &data, float scale, float tau,
     }
     out.mask.assign((size_t)blocks * heads * data.words, 0u);
     out.count.assign((size_t)blocks * heads, 0u);
-    const uint32_t sink_first = sink_start / H3D_SOL_BLOCK;
+    /* `_sink_block_range` (`interface.py:134-142`): a zero sink is the empty
+     * range, so no block is forced exact. */
+    const uint32_t sink_first =
+        sink_tokens ? sink_start / H3D_SOL_BLOCK : blocks;
     const uint32_t sink_last =
-        (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+        sink_tokens ? (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK
+                    : blocks;
     for (uint32_t q_block = 0; q_block < blocks; ++q_block) {
         for (uint32_t head = 0; head < heads; ++head) {
             uint32_t total = 0;
@@ -1095,6 +1099,101 @@ static void sol_search_sink(h3d_context *gpu) {
     check(missed == 0, "search routes every sink block exactly");
 }
 
+/* The empty sink range. `_sink_block_range` (`interface.py:134-142`) returns
+ * `[blocks, blocks)` whenever `sink_tokens` is zero, so no block is forced
+ * exact. Rounding the token range up without that case gives `[0, 1)` for any
+ * `sink_start` below one block, which forces block 0 for every query block -
+ * a decision the reference never makes.
+ *
+ * Constant summaries make the expected set arithmetic instead of a second
+ * transcription: every kc is 1.0, so every column mean is 128*log2_scale and
+ * the threshold is 128*log2_scale + tau*sqrt(1e-6), which no off-band block
+ * clears. Block 0 appearing more than one block away from the diagonal is
+ * therefore the rounding bug, not the rule. */
+static void sol_search_empty_sink(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    data.sequence = 512;
+    data.heads = 2;
+    data.blocks = 8;
+    data.words = 1;
+    const size_t elements = (size_t)data.sequence * data.heads * H3D_SOL_HEAD_DIM;
+    data.key.assign(elements, sol_bf16(1.0f));
+    data.value.assign(elements, sol_bf16(0.5f));
+    data.query.assign(elements, sol_bf16(1.0f));
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    SolActual actual;
+    if (!sol_run(gpu, data, scale, 1.5f, 1, 0, actual, error, sizeof(error))) {
+        check(false, "search runs on an empty sink range");
+        return;
+    }
+    uint32_t mismatch = 0;
+    for (uint32_t q_block = 0; q_block < data.blocks; ++q_block) {
+        for (uint32_t head = 0; head < data.heads; ++head) {
+            const uint32_t bits =
+                actual.mask[((size_t)q_block * data.heads + head) * data.words];
+            uint32_t set = 0;
+            for (uint32_t block = 0; block < data.blocks; ++block) {
+                const uint32_t distance =
+                    q_block > block ? q_block - block : block - q_block;
+                mismatch += (distance <= 1) != !!(bits & (1u << block));
+                set += !!(bits & (1u << block));
+            }
+            mismatch += set != actual.count[(size_t)q_block * data.heads + head];
+        }
+    }
+    check(mismatch == 0,
+          "an empty sink range forces no block: the band is the whole route");
+
+    /* The same call with no sink at all must give the identical mask: the
+     * token range is empty either way. */
+    SolActual plain;
+    if (!sol_run(gpu, data, scale, 1.5f, 0, 0, plain, error, sizeof(error))) {
+        check(false, "search runs with no sink at all");
+        return;
+    }
+    check(plain.mask == actual.mask,
+          "an empty sink range routes exactly as no sink at all");
+}
+
+/* The API boundary. The sink range lives inside the sequence
+ * (`interface.py:134-142`), and the block count rounds `sequence` up by
+ * `BLOCK - 1`, so a wrapping range or an overflowing shape must be refused
+ * before a launch rather than reaching a kernel. The first case is the sum
+ * `sink_start + sink_tokens` wrapping to a small number that would otherwise
+ * pass an unchecked comparison. */
+static void sol_search_rejects_bad_args(h3d_context *gpu) {
+    char error[512] = {};
+    SolData data;
+    sol_build(data, 256, 1, 4242u);
+    SolPlan plan;
+    if (!sol_alloc(gpu, data, plan, error, sizeof(error))) {
+        check(false, "the rejection cases allocate a plan");
+        return;
+    }
+    const uint32_t sequence = data.sequence, heads = data.heads;
+    const size_t elements = (size_t)sequence * heads * H3D_SOL_HEAD_DIM;
+    auto *query = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *key = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    auto *value = h3d_alloc(gpu, H3D_BF16, elements, error, sizeof(error));
+    const float scale = 1.0f / sqrtf((float)H3D_SOL_HEAD_DIM);
+    uint32_t refused = 0;
+    refused += !h3d_sol_search(gpu, &plan.plan, query, key, value, sequence,
+                               heads, scale, 1.0f, UINT32_MAX - 1, 4, error,
+                               sizeof(error));
+    refused += !h3d_sol_search(gpu, &plan.plan, query, key, value, sequence,
+                               heads, scale, 1.0f, 0, sequence + 1, error,
+                               sizeof(error));
+    refused += !h3d_sol_search(gpu, &plan.plan, query, key, value, UINT32_MAX,
+                               heads, scale, 1.0f, 0, 0, error,
+                               sizeof(error));
+    check(refused == 3, "the search step refuses a wrapping sink or shape");
+    h3d_free(query);
+    h3d_free(key);
+    h3d_free(value);
+    sol_free(plan);
+}
+
 /* Constant K and constant Q: the summaries have no variance, so the threshold
  * is mean + tau*sqrt(1e-6) and no block off the diagonal band can clear it,
  * whatever tau is. The expected set is arithmetic, not a second transcription. */
@@ -1265,6 +1364,8 @@ int main() {
     video_vae_linear_options(dit);
     sol_search_matches_reference(dit);
     sol_search_sink(dit);
+    sol_search_empty_sink(dit);
+    sol_search_rejects_bad_args(dit);
     sol_search_constant(dit);
     sol_search_spike(dit);
     sol_search_tau_monotone(dit);

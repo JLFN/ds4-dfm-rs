@@ -3536,9 +3536,16 @@ static int h3d_sol_check(const struct h3d_sol_plan *plan, uint32_t sequence,
                          uint32_t heads, char *error, size_t error_size) {
     const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
     const uint32_t words = h3d_sol_words(sequence);
-    const size_t summary = (size_t)blocks * heads * H3D_SOL_HEAD_DIM;
-    const size_t threshold = (size_t)blocks * heads;
-    const size_t words_ = (size_t)blocks * heads * words;
+    /* Reachable only after `h3d_sol_search` has bounded `sequence x heads`, but
+     * the products are checked here too so the function stands on its own. */
+    size_t summary = 0, threshold = 0, words_ = 0;
+    if (!h3d_mul_size(blocks, heads, &summary) ||
+        !h3d_mul_size(summary, H3D_SOL_HEAD_DIM, &summary) ||
+        !h3d_mul_size(blocks, heads, &threshold) ||
+        !h3d_mul_size(threshold, words, &words_)) {
+        return h3d_set_error(error, error_size,
+                             "invalid Sol-Attn search tensors or shape");
+    }
     if (!plan || !h3d_is(plan->kc, H3D_BF16, summary) ||
         !h3d_is(plan->vc, H3D_BF16, summary) ||
         !h3d_is(plan->mask, H3D_U32, words_) ||
@@ -3559,12 +3566,24 @@ int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
                    const h3d_tensor *value, uint32_t sequence, uint32_t heads,
                    float scale, float tau, uint32_t sink_start,
                    uint32_t sink_tokens, char *error, size_t error_size) {
+    /* The reference builds `[sink_start, sink_start + sink_tokens)` inside the
+     * sequence and rejects nothing (`interface.py:134-142`), so an out-of-range
+     * pair is refused here. The bound is written as a difference: the sum wraps
+     * for a near-UINT32_MAX start (the idiom at `:556-560`). */
     if (!context || !sequence || !heads || sink_tokens > sequence ||
-        sink_start + sink_tokens > sequence) {
+        sink_start > sequence - sink_tokens) {
         return h3d_set_error(error, error_size,
                              "invalid Sol-Attn search arguments");
     }
-    const size_t elements = (size_t)sequence * heads * H3D_SOL_HEAD_DIM;
+    /* `sequence + BLOCK - 1` wraps above UINT32_MAX - 63, and the element count
+     * overflows size_t for large arguments; both are refused before a launch
+     * (`h3d_mul_size`, `:716-720`). */
+    size_t elements = 0;
+    if (sequence > UINT32_MAX - (H3D_SOL_BLOCK - 1) ||
+        !h3d_mul_size(sequence, heads, &elements) ||
+        !h3d_mul_size(elements, H3D_SOL_HEAD_DIM, &elements)) {
+        return h3d_set_error(error, error_size, "invalid Sol-Attn search shape");
+    }
     if (!h3d_is(query, H3D_BF16, elements) || !h3d_is(key, H3D_BF16, elements) ||
         !h3d_is(value, H3D_BF16, elements) ||
         !h3d_sol_check(plan, sequence, heads, error, error_size)) {
@@ -3590,13 +3609,21 @@ int h3d_sol_search(h3d_context *context, const struct h3d_sol_plan *plan,
         (const float *)plan->kc_var->data,
         (const __nv_bfloat16 *)query->data, sequence, heads, scale, tau);
     if (!h3d_launch_ok("Sol-Attn threshold", error, error_size)) return 0;
+    /* `_sink_block_range` (`interface.py:134-142`) returns an empty range when
+     * `sink_tokens` is zero: `[blocks, blocks)`, so no block is forced exact.
+     * Rounding the token range up without that case gives `[0, 1)` for any
+     * `sink_start` below one block, which forces block 0 for every query
+     * block - a decision the reference never makes. */
+    const uint32_t sink_first = sink_tokens ? sink_start / H3D_SOL_BLOCK : blocks;
+    const uint32_t sink_last = sink_tokens
+        ? (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK
+        : blocks;
     dim3 route_grid((blocks + H3D_SOL_QM - 1) / H3D_SOL_QM, heads);
     h3d_sol_route_kernel<<<route_grid, H3D_SOL_WARP, 0, context->stream>>>(
         (uint32_t *)plan->mask->data, (uint32_t *)plan->count->data,
         (const __nv_bfloat16 *)plan->kc->data,
         (const float *)plan->query_bar->data,
         (const float *)plan->threshold->data, heads, blocks, words,
-        scale, sink_start / H3D_SOL_BLOCK,
-        (sink_start + sink_tokens + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK);
+        scale, sink_first, sink_last);
     return h3d_launch_ok("Sol-Attn route", error, error_size);
 }
