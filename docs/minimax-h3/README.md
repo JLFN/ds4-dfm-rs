@@ -99,6 +99,7 @@ The model's license is included in the downloaded repository.
 - [Reference probes and media comparison](../../tools/minimax_h3/README.md)
 - [GB10 maintainer validation, 2026-10-26](validation-2026-10-26.md)
 - [Speed baseline against h3.c, 2026-10-27](speed-2026-10-27.md)
+- [The server's steady state, 2026-10-28](steady-state-2026-10-28.md)
 - [The video VAE decoder's bench options, 2026-10-28](vae-options-2026-10-28.md)
 - [The reference's NVFP4-AWQ prompt encoder, 2026-10-28](nvfp4-encoder-2026-10-28.md)
 - [Sol-H3-Spark recon, 2026-10-28](sol-h3-spark-recon-2026-10-28.md)
