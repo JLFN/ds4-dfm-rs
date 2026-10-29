@@ -181,8 +181,11 @@ def main() -> int:
         upscaled = upscaler(network_input, scale=2.0, target_size=upscaled_shape[2:],
                             enable_chunking=True)
         upscaled = upscaled * std + mean
+    # The node chunks at T > 32 with overlap 5 (its own `chunk` and the kernel
+    # size), which the release's T of 37 does engage and smaller geometries do not.
+    chunked = "chunked" if h3_shape[1] > 32 else "single segment"
     print(f"upscale in {time.time() - started:.1f}s -> {tuple(upscaled.shape)} "
-          f"(chunked: T={h3_shape[1]})")
+          f"(T={h3_shape[1]}, {chunked})")
 
     print("=== adapter ===")
     started = time.time()
