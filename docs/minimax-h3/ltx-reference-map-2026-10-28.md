@@ -28,6 +28,10 @@ of a guessed one. Nothing here was built or run on a GPU; the Spark is idle.
   equal `configs/checkpoints.json`'s `bytes` fields exactly
   (`checkpoints.json:76-117`), so this is the release's own weight set.
 - The release page, re-fetched: `nvlabs.github.io/Sana/Sol-Engine/Sol-H3-Spark`.
+- The author's upscaler node, cloned to `/data/h3-upscaler-node` at the pinned
+  `d7c01b90` (`--filter=blob:none`, so `/data/Sol-h3-Spark` stays untouched).
+- The two bridge artifacts' safetensors headers, read in place over the Spark's
+  gvfs mount: the upscaler (322 tensors) and the adapter (228 tensors).
 
 ## 2. The bridge, exactly
 
@@ -82,10 +86,44 @@ temporal), the whole route is exact and needs no interpolation:
 So the release's "2 -> 0 inter-stage VAE" claim is mechanically this: the H3 VAE
 decoder and the LTX VAE encoder are both replaced by one small learned Conv3D
 whose input is an H3 latent and whose output is an LTX latent. The upscale half
-is the author's own ComfyUI node (`LBH-123-AI/Minimax_h3_latent_Upscaler`, the
-`normalization`, `LatentResizer3D` and `zero_module` symbols `h3_upscale.py:22`
-expects), applied as `D(model(N(x)))` on the normalized H3 latent, taking
-24 -> 24 channels in place and doubling H and W.
+is the author's own ComfyUI node (`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler`
+at the pinned `d7c01b90`, whose `nodes/minimax_h3_latent_upscaler_3d.py` sha256
+is `744063b4…89e2`, verified locally), applied as `D(model(N(x)))` on the
+normalized H3 latent.
+
+### The upscale half, exactly
+
+`LatentResizer3D` has **no learnable upsampling**: the 2x is
+`F.interpolate(..., mode="trilinear", align_corners=False)` applied after
+`conv_in` and the in-blocks and before the out-blocks
+(`minimax_h3_latent_upscaler_3d.py:327`). Its config comes from
+`_detect_arch` (`:379-411`), which the profile runs on the loaded state dict
+(`h3_upscale.py:78`), and the header confirms it: 322 BF16 tensors,
+345,280,216 parameters, a count the block arithmetic below reproduces exactly.
+
+    channels 512, in/out 24, embed 1 -> 64 -> 64, GroupNorm(32), attn False
+    per side: 12 ResBlockEmb3D + 6 TemporalConv, order R T R R T R R T R R T R R T R R T R
+              (temporal_every 2, temporal_kernel 5), then norm_out -> SiLU -> conv_out
+
+- `ResBlockEmb3D` (`:160-189`): `GN(32) -> SiLU -> Conv3d(3, pad 1)`, then
+  `emb = SiLU -> Linear(64 -> 1024)`, `scale, shift = chunk(emb, 2)`,
+  `h = out_norm(h) * (1 + scale) + shift`, `SiLU -> zero-init Conv3d -> add x`.
+- `TemporalConv` (`:191-213`): `GN(32) -> SiLU -> depthwise Conv3d((5,1,1),
+  pad (2,0,0)) -> zero-init 1x1 Conv3d -> add x`.
+- The rescale embedding is `scale - 1`, i.e. `1.0` for a 2.0 upscale
+  (`_forward_seg`, `:314-317`).
+- The profile calls it with `target_size = H3_UPSCALED[2:]` = `(37,48,84)` and
+  `enable_chunking=True` (`h3_upscale.py:124`), so the release runs the chunked
+  path: chunk 32, overlap = the temporal kernel = 5, linear ramp weights and a
+  weighted average (`:246-311`). Our T of 37 exceeds 32, so it chunks: a port
+  that computes one segment will not match, because every chunk is convolved and
+  resized over its own replicate-padded extent and only then blended.
+- The 24-channel `LATENTS_MEAN`/`LATENTS_STD` literals live in the node source
+  (`:83-99`) and the profile extracts them by AST, asserting length 24
+  (`h3_upscale.py:48-58`); both are BF16 on the device. They equal the adapter's
+  own `H3_LATENTS_MEAN`/`_STD` (`h3_ltx_adapter/constants.py`) to within
+  5.6e-17, so the two independent artifacts agree on the same released
+  statistics - a free cross-check that the bridge's seams are consistent.
 
 ## 3. The LTX-2.5 model maps
 
@@ -260,6 +298,10 @@ projection GEMM, `qkv_rope`, `adaln`).
   architecture `sm121-triton`. One dense call and 47 Sol calls per update is
   precisely the contract's "layer 0 dense, layers 1-47 strict Sol-Attn"; a port
   that deviates produces 140 or 142 and fails this check.
+- The plan's "only source we still need from outside" is fetched: the author's
+  node is at `/data/h3-upscaler-node` at `d7c01b90`, and its
+  `nodes/minimax_h3_latent_upscaler_3d.py` sha256 is the `744063b4…` the
+  profile pins. Nothing external is needed for the bridge any more.
 - The three-update schedule is a literal constant, not a scheduler:
   `STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]`
   (`ltx-pipelines/utils/constants.py:19`), four endpoints giving three Euler
@@ -360,7 +402,9 @@ Ordered by what the plan's phases need, with the file that defines each:
    modality, learnable registers, `PER_TOKEN_RMS` feature extractor
    (`feature_extractor.py:100-129`). Only needed offline, once.
 5. **The adapter and upscaler** (`stage2_ops/h3_ltx_adapter/`,
-   `stage2_ops/h3_upscale.py`): pure Conv3D, shape-checked at every seam.
+   `stage2_ops/h3_upscale.py` and the node at `/data/h3-upscaler-node`): pure
+   Conv3D, shape-checked at every seam, with the upscaler's trilinear 2x, its
+   `scale - 1` embedding and its 32/5 chunked blend as pinned above.
 6. **The Conv VAE decoder** with the profile's tiles, emitting NHWC directly
    (`stage2_ops/conv_direct_nhwc.py`), then the mux at CRF 19
    `veryfast` (`stage2.py:124-126`).
