@@ -113,11 +113,14 @@ same thing:
 | 4070 | planar | f32 | 7.264 | 0.443 | 2.962e-6 | 6.064e-6 | 6.139e-6 |
 
 The two paths agree with the reference to the same order in every arm; the
-differences between them are the bf16 arm's own noise. The f32 adapter is the
-one regression (0.774 -> 1.006 s on the Spark): at that size and dtype the
-planar build's three copies and the nine passes over the f32 accumulator cost
-more than the im2col they replace. Production is bf16, where the adapter is
-faster both times (0.254 -> 0.210 on the Spark).
+differences between them are the bf16 arm's own noise. Re-measured on the
+committed state (`5b778519`), which is what a fresh session should reproduce:
+planar 2.219 / 2.237 s and adapter 0.210 / 0.210 s, classic 3.886 / 3.898 and
+0.252 / 0.253. The f32 adapter is the one regression (0.774 -> 1.006 s on the
+Spark): at that size and dtype the planar build's three copies and the nine
+passes over the f32 accumulator cost more than the im2col they replace.
+Production is bf16, where the adapter is faster both times (0.254 -> 0.210 on
+the Spark).
 
 ## What the planar path now spends
 
