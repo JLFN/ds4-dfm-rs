@@ -69,7 +69,8 @@ That is the handle for gating our port on hardware without the extension.
 - **Rotation matrix** (`tensor/int8_utils.py:11-45`): a normalized *regular*
   Hadamard, base `h4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]`, Kronecker
   powered until `size` (must be a power of 4), then divided by `sqrt(size)`.
-  For group size 256 that is four Kronecker steps and a divide by 16.
+  For group size 256 that is three Kronecker steps (4 -> 16 -> 64 -> 256) and a
+  divide by 16.
 - **Activation rotation** (`tensor/int8_utils.py:55-70`): reshape the last dim
   into groups of `group_size`, multiply each group by `H`. Weights are rotated
   offline by `H^T` (`:44-52`), and `h4` is symmetric, so the two agree.
