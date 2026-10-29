@@ -14,6 +14,13 @@
  * means the two arms cannot be A/B'd against each other and only the pair
  * (F32, FAST) is a real comparison.
  *
+ * It then prices the one candidate the attribution leaves: the same four
+ * matmuls with BF16 operands and an F32 output, which is what a BF16 kernel
+ * would run against the TF32-class kernel cuBLASLt picks for `FAST_16BF`. That
+ * arm is not in the port (`h3d_vae_linear` has three modes); the figure is the
+ * GEMM's own ceiling, without the per-call activation rounding an adopted arm
+ * would also pay.
+ *
  * Build: `make tests/h3/vae_gemm_bm`.
  */
 #include "../../native/h3/h3_dit_gpu.cu"
@@ -65,9 +72,81 @@ struct Matmul {
     h3d_tensor *output;
 };
 
+/* Candidate probe, NOT a port path: the port's matmul with BF16 operands, so
+ * the four block shapes can be priced under a BF16 kernel instead of the
+ * TF32-class one cuBLASLt picks for `CUBLAS_COMPUTE_32F_FAST_16BF` (the class
+ * the 2026-10-29 attribution found: `cutlass_..._s1688gemm_*` at 36 TFLOPS).
+ * It mirrors `h3d_linear_lt_compute`'s layouts, TRANSB, row-major order, alpha
+ * 1 and beta 0, and changes the operand types and optionally the output type.
+ * `CUDA_R_32F` output is refused on the workstation's sm_89 with
+ * CUBLAS_STATUS_INTERNAL_ERROR; `CUDA_R_16BF` output is the DiT's own path. */
+static int bf16_matmul(h3d_context *context, void *output,
+                       cudaDataType_t output_type, const void *input,
+                       const void *weight, uint32_t rows, uint32_t input_dim,
+                       uint32_t output_dim, char *error, size_t error_size) {
+    cublasLtMatmulDesc_t operation = NULL;
+    cublasLtMatrixLayout_t input_layout = NULL;
+    cublasLtMatrixLayout_t weight_layout = NULL;
+    cublasLtMatrixLayout_t output_layout = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t status =
+            cublasLtMatmulDescCreate(&operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+                operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
+                sizeof(transpose));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&input_layout, CUDA_R_16BF, rows,
+                                            input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&weight_layout, CUDA_R_16BF,
+                                            output_dim, input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&output_layout, output_type, rows,
+                                            output_dim, output_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+                input_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+                sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+                weight_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+                sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+                output_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+                sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmul(context->blas, operation, &alpha, input,
+                                input_layout, weight, weight_layout, &beta,
+                                output, output_layout, output, output_layout,
+                                NULL, NULL, 0, context->stream);
+    }
+    if (output_layout) cublasLtMatrixLayoutDestroy(output_layout);
+    if (weight_layout) cublasLtMatrixLayoutDestroy(weight_layout);
+    if (input_layout) cublasLtMatrixLayoutDestroy(input_layout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return h3d_blas_ok(status, "cuBLASLt BF16 linear", error, error_size);
+}
+
 int main(int argc, char **argv) {
     const uint32_t rows = argc > 1 ? (uint32_t)std::atoi(argv[1]) : 2532;
     const int calls = argc > 2 ? std::atoi(argv[2]) : 2;
+    bool f32_output = false;
+    for (int index = 1; index < argc; index++) {
+        if (std::strcmp(argv[index], "--f32out") == 0) {
+            f32_output = true;
+        }
+    }
     char error[512] = {};
     h3d_context *gpu = h3d_create(error, sizeof(error));
     if (!gpu) {
@@ -167,6 +246,127 @@ int main(int argc, char **argv) {
     compare("bf16 vs fp32", 2, 0);
     compare("bf16 vs tf32", 2, 1);
 
+    /* The candidate probe: the same four shapes with BF16 operands. The inputs
+     * are the same values rounded once on the host, so the figure is the GEMM's
+     * own ceiling; rounding an activation per call would add a 20.7 MB read and
+     * a 10.4 MB write, 0.13 ms at this host's 250 GB/s, and is not in it. */
+    std::vector<h3d_tensor *> rounded_input(4), rounded_weight(4), narrowed(4);
+    for (int index = 0; index < 4; index++) {
+        const uint32_t input_dim = shapes[index][0], output_dim = shapes[index][1];
+        std::vector<float> host;
+        host.resize((size_t)rows * input_dim);
+        fill(host, 10u + index * 3u);
+        std::vector<__nv_bfloat16> narrow(host.size());
+        for (size_t item = 0; item < host.size(); item++) {
+            narrow[item] = __float2bfloat16(host[item]);
+        }
+        rounded_input[index] = h3d_alloc(gpu, H3D_BF16, host.size(), error, sizeof(error));
+        if (!rounded_input[index] ||
+            !h3d_upload(gpu, rounded_input[index], narrow.data(), error, sizeof(error))) {
+            fail("bf16 input", error);
+        }
+        host.resize((size_t)output_dim * input_dim);
+        fill(host, 11u + index * 3u);
+        narrow.resize(host.size());
+        for (size_t item = 0; item < host.size(); item++) {
+            narrow[item] = __float2bfloat16(host[item]);
+        }
+        rounded_weight[index] = h3d_alloc(gpu, H3D_BF16, host.size(), error, sizeof(error));
+        if (!rounded_weight[index] ||
+            !h3d_upload(gpu, rounded_weight[index], narrow.data(), error, sizeof(error))) {
+            fail("bf16 weight", error);
+        }
+        narrowed[index] = h3d_alloc(gpu, H3D_BF16, (size_t)rows * output_dim, error,
+                                    sizeof(error));
+        if (!narrowed[index]) {
+            fail("bf16 output", error);
+        }
+    }
+    if (!h3d_sync(gpu, error, sizeof(error))) {
+        fail("bf16 sync", error);
+    }
+
+    /* The F32-output variant is opt-in: sm_89 refuses it with
+     * CUBLAS_STATUS_INTERNAL_ERROR and leaves the context unusable, so a normal
+     * run must not touch it. `--f32out` attempts it once and reports. */
+    if (f32_output) {
+        error[0] = 0;
+        const bool ok = bf16_matmul(gpu, matmuls[0].output, CUDA_R_32F,
+                                    rounded_input[0], rounded_weight[0], rows,
+                                    matmuls[0].input_dim, matmuls[0].output_dim,
+                                    error, sizeof(error));
+        std::printf("bf16 operands, F32 output: %s (%s)\n", ok ? "accepted" : "refused",
+                    ok ? "no error" : error);
+        if (!ok || !h3d_sync(gpu, error, sizeof(error))) {
+            std::printf("bf16 operands, F32 output: the context is unusable after it\n");
+            return 3;
+        }
+    }
+
+    /* cuBLASLt pays a one-time cost on the first BF16 call (algorithm selection
+     * and, on sm_89, a JIT); it lands in the mean if the first call is kept, so
+     * it is discarded and each call is printed. */
+    double rounded_ms = 0.0;
+    for (int call = 0; call <= calls; call++) {
+        auto start = std::chrono::steady_clock::now();
+        for (int index = 0; index < 4; index++) {
+            if (!bf16_matmul(gpu, narrowed[index]->data, CUDA_R_16BF,
+                             rounded_input[index]->data, rounded_weight[index]->data,
+                             rows, matmuls[index].input_dim,
+                             matmuls[index].output_dim, error, sizeof(error))) {
+                std::fprintf(stderr, "bf16 matmul %s: %s\n", matmuls[index].name, error);
+                std::exit(2);
+            }
+        }
+        if (!h3d_sync(gpu, error, sizeof(error))) {
+            fail("sync", error);
+        }
+        auto finish = std::chrono::steady_clock::now();
+        const double this_call =
+                std::chrono::duration<double, std::milli>(finish - start).count();
+        std::printf("  bf16i call %d: %.3f ms%s\n", call, this_call,
+                    call == 0 ? " (discarded)" : "");
+        if (call > 0) {
+            rounded_ms += this_call;
+        }
+    }
+    rounded_ms /= (double)calls;
+    std::printf("rows=%u mode=%-4s ms_per_block=%.3f (BF16 operands, probe)\n", rows,
+                "bf16i", rounded_ms);
+    std::vector<float> probe;
+    for (int index = 0; index < 4; index++) {
+        std::vector<__nv_bfloat16> narrow((size_t)rows * matmuls[index].output_dim);
+        if (!h3d_read(gpu, narrow.data(), narrowed[index], error, sizeof(error))) {
+            fail("read", error);
+        }
+        for (__nv_bfloat16 value : narrow) {
+            probe.push_back(__bfloat162float(value));
+        }
+    }
+
+    double worst = 0.0, square = 0.0, scale = 0.0;
+    size_t differing = 0, elements = 0;
+    size_t at = 0;
+    for (size_t piece = 0; piece < results[0].size(); piece++) {
+        for (float reference : results[0][piece]) {
+            const double delta = (double)probe[at++] - (double)reference;
+            if (probe[at - 1] != reference) differing++;
+            worst = std::fmax(worst, std::fabs(delta));
+            scale = std::fmax(scale, std::fabs((double)reference));
+            square += delta * delta;
+            elements++;
+        }
+    }
+    const double rms = std::sqrt(square / (double)elements);
+    std::printf("%-14s max_abs=%.6g rms=%.6g rel_rms=%.3g differing=%.2f%%\n",
+                "bf16i vs fp32", worst, rms, scale > 0.0 ? rms / scale : 0.0,
+                100.0 * (double)differing / (double)elements);
+
+    for (int index = 0; index < 4; index++) {
+        h3d_free(narrowed[index]);
+        h3d_free(rounded_weight[index]);
+        h3d_free(rounded_input[index]);
+    }
     for (Matmul &matmul : matmuls) {
         h3d_free(matmul.output);
         h3d_free(matmul.bias);
