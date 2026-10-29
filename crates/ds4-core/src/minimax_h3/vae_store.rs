@@ -152,14 +152,21 @@ const NARROW_THREADS: usize = 16;
 /// `minimax_vq::release`'s worker count, without the atomic queue a pure
 /// elementwise map does not need.
 fn narrow_bytes(bytes: &[u8]) -> Vec<u8> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get())
+        .min(NARROW_THREADS);
+
+    narrow_bytes_with(bytes, workers)
+}
+
+/// The same map over `workers` contiguous ranges, one range a serial pass. Only
+/// the thread count is a parameter, so a test can hold it fixed and show that
+/// the split cannot move a bit.
+fn narrow_bytes_with(bytes: &[u8], workers: usize) -> Vec<u8> {
     let values = bytes.as_chunks::<4>().0;
     let mut narrowed = vec![0u8; values.len() * 2];
     let words = narrowed.as_chunks_mut::<2>().0;
-
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |cores| cores.get())
-        .min(NARROW_THREADS)
-        .min(values.len());
+    let workers = workers.min(values.len());
     if workers < 2 {
         narrow_into(values, words);
         return narrowed;
@@ -302,5 +309,22 @@ mod tests {
             kept,
             [0x3F80, 0x3F80, 0x3F80, 0x3F81, 0x3F82, 0x3F81, 0x4000, 0xBF80, 0x0000, 0x7F80]
         );
+    }
+
+    /// The load's rounding is split over the machine's cores, so the property
+    /// that has to hold is that the split moves nothing: an odd chunk that does
+    /// not divide the values, a range per value, and one range, all equal.
+    #[test]
+    fn narrowing_is_bit_identical_across_ranges() {
+        let bytes: Vec<u8> = (0..(1usize << 18))
+            .map(|index| (index as u32 ^ (index as u32).rotate_left(7)) as u8)
+            .collect();
+        let serial = narrow_bytes_with(&bytes, 1);
+        assert_eq!(serial.len(), bytes.len() / 2);
+
+        for workers in [2, 3, 8, 64, 1 << 16] {
+            assert_eq!(narrow_bytes_with(&bytes, workers), serial, "{workers} ranges");
+        }
+        assert!(narrow_bytes_with(&[], 8).is_empty());
     }
 }
