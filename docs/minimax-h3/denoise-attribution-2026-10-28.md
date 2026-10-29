@@ -62,11 +62,24 @@ for four. The table sums to 12,345.9 ms per evaluation against those 12.33-12.64
   is 1.6 ms. Both sit at about a sixth of their bandwidth floors.
 - **The sparse attention path: 1,719 ms, 13.9%.** `sol_forward` runs the
   selected blocks; `sol_vsa`, `sol_pool`, `sol_threshold` and `sol_stats` are
-  the fold. Dense attention at this shape would be 10.13 TFLOP per evaluation
-  (2 x 2 x R^2 x 7168), and the log reports the realized share as 0.1370, so
-  `sol_forward` does about 1.39 TFLOP in 1.311 s: 1.06 TFLOPS, about 1% of the
-  tensor peak. The selection did its job — the exact share is 13.7% of the
-  dense blocks — but what remains runs far below what the hardware can do.
+  the fold. Dense attention at this shape is 10.13 TFLOP per call
+  (2 x 2 x R^2 x heads x head_dim), so 507 TFLOP per evaluation over 50 calls;
+  the log reports the realized share as 0.1370, and `sol_forward` therefore
+  does about 69 TFLOP per evaluation in 1.311 s: 53.2 TFLOPS, 49% of the
+  108 TFLOPS `mma.sync` peak. The selection did its job - the exact share is
+  13.7% of the dense blocks, a 7.3x FLOP ratio - and the kernel converts it:
+  26.07 ms per call against the dense kernel's 173-174 and its own all-exact
+  control's 150.3 (`sol-forward-2026-10-28.md`, same host), i.e. 58.6 and
+  67.4 TFLOPS for those two. 79% of the all-exact arm's rate on 13.7% of its
+  work.
+
+  *Corrected 2026-10-29*: this bullet's first version divided a per-call FLOP
+  count (1.39 TFLOP) by a per-evaluation time (1.311 s) and reported
+  1.06 TFLOPS "about 1% of the tensor peak". That is 50x off, and it is the
+  reason the sparse path was ranked as the second lever in section 3 below.
+  The per-call and per-evaluation figures are above; the remaining headroom
+  in this path is the fold's own constant (about 5.6 ms of a 26.1 ms call)
+  and the selector's 410 ms of the evaluation.
 - **The rest: 674 ms, 5.4%.** `swiglu` 383.9 ms moves 1.28 GB, 5.1 ms at
   250 GB/s against 7.7 measured, so it is near its floor and not a target;
   `gate` 289.2 ms and the small VSA helpers are the remainder.
@@ -85,9 +98,10 @@ kind of work it is:
 2. `qkv_rope` and `adaln`, 2.044 s. At their floors they would be about
    0.2 s. Neither is a numerical change: same arithmetic, better access pattern
    and fewer passes.
-3. The sparse path, 1.719 s, of which `sol_forward` is 1.311 s at about 1% of
-   the tensor peak. This is the one term whose exact work is variable, so its
-   target is an investigation of its own.
+3. The sparse path, 1.719 s, of which `sol_forward` is 1.311 s. It is not at
+   1% of the peak - see the correction above: it is at 53 TFLOPS, 79% of the
+   rate its own all-exact control reaches. What is left here is the fold's
+   constant and the selector, together under 0.7 s of the evaluation.
 4. Everything else, 0.674 s, with `swiglu` already near its floor.
 
 Cold-read work (Phase C's FP8 checkpoint) still halves `LOAD` 66 GiB to 33 GiB,
