@@ -43,8 +43,9 @@ extern "C" {
 enum h3d_dtype { H3D_BF16 = 0, H3D_F32 = 1, H3D_U32 = 2, H3D_FP8 = 3 };
 
 /* Sol-Attn's fixed shapes (`techniques/sparse_backends/sol_attn/preprocess.py`
- * `:11-13` in NVIDIA's Sana `sol-engine` tree: BLOCK_SIZE 64, HEAD_DIM 128;
- * `triton_ref/fwd.py:23` GROUP 32, the KV blocks one route mask word covers). */
+ * `:10-12` in NVIDIA's Sana `sol-engine` tree: BLOCK_SIZE 64, HEAD_DIM 128;
+ * `triton_ref/fwd.py:20-21` GROUP 32, the KV blocks one route mask word
+ * covers). */
 enum { H3D_SOL_BLOCK = 64, H3D_SOL_HEAD_DIM = 128, H3D_SOL_GROUP = 32 };
 
 typedef struct h3d_context h3d_context;
@@ -521,8 +522,10 @@ int h3d_sdpa_causal_f32(h3d_context *context, h3d_tensor *output,
 
 /* -------------------------------------------------------------------------
  * Sol-Attn's search step: which KV blocks attend exactly and which are
- * approximated from their summaries. Not on any production path yet; the
- * consumer is the sparse forward this port has not built.
+ * approximated from their summaries. Stage 1 runs the VSA policy
+ * (`h3d_sol_vsa` below, `H3_DIT_SOL`); this tau policy is the one the release
+ * applies to the joint refiner, and its consumer is the sparse forward
+ * `h3d_sol_forward`, which is built and live on the stage-1 path.
  *
  * Ported from NVIDIA Sana `sol-engine` @ `6e4a440`, `sol_attn/`:
  *   preprocess.py:280-322   kc = block mean of K, vc = block sum of V (BF16)
@@ -608,7 +611,7 @@ int h3d_sol_vsa(h3d_context *context, const struct h3d_sol_plan *plan,
  * and `mask` and nothing else. Call `h3d_sol_search` for the same plan first.
  *
  * Deviations, named: BF16 `P` for both products, as the reference casts too
- * (`fwd.py:129,164`); one maximum per 64-key exact block; the port's `exp2`,
+ * (`fwd.py:122,166`); one maximum per 64-key exact block; the port's `exp2`,
  * F32 accumulators and reduction trees against Triton's. `tests/h3/test_native.cu`
  * gates the walk against the reference's own rule. */
 int h3d_sol_forward(h3d_context *context, h3d_tensor *output,
