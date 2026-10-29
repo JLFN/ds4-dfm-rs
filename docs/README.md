@@ -114,7 +114,11 @@ These reports preserve successful gates, rejected experiments and unresolved lim
   5.1x. [The reference's NVFP4-AWQ prompt encoder](minimax-h3/nvfp4-encoder-2026-10-28.md)
   is the same forward reading 15.69 GB instead of 48.8 GiB: TEXT 27.4-28.2 s to
   15.5 s, the BF16 path bit-unchanged, the render's difference bounded at 7.7%
-  detail energy.
+  detail energy. Toward the Sol-H3-Spark port: [the server's steady state](minimax-h3/steady-state-2026-10-28.md)
+  (88.99 s hot, MP4-identical to the CLI); [where a DiT evaluation goes](minimax-h3/denoise-attribution-2026-10-28.md)
+  (per-kernel, projections 64% of it at 61-68% of the sm_121 peak); [the pipeline plan](minimax-h3/ltx-sol-pipeline-plan-2026-10-28.md)
+  and [the LTX-2.5 reference map](minimax-h3/ltx-reference-map-2026-10-28.md),
+  the bridge, the weights and the stage-2 cost model.
 - **MiniMax VQ:** [October 27 prefill/decode campaign](minimax-vq-optimization-2026-10-27.md),
   three adopted rounds each; [fresh 2K–64K DSpark graph](benchmarks/minimax-vq-spark-64k-2026-10-27/README.md),
   raw clocks, exact output checks and observed repeat ranges.
