@@ -115,6 +115,11 @@ int main(int argc, char **argv) {
     if (!gpu) fail("create", error);
     const uint32_t rows = argc > 1 ? (uint32_t)std::atoi(argv[1]) : 18799;
     const int calls = argc > 2 ? std::atoi(argv[2]) : 3;
+    /* Elements to shift the operands by, to price what a misaligned slice
+     * costs: cuBLASLt's tensor-core kernels assume 16-byte (align8 in the
+     * kernel names) operands, and the model's tensors are views into larger
+     * allocations. */
+    const uint32_t drop = argc > 3 ? (uint32_t)std::atoi(argv[3]) : 0;
 
     /* One allocation per tensor, sized for the largest shape (fc2's K). */
     size_t input_bytes = (size_t)rows * SHAPES[0].input_dim * 2;
@@ -127,16 +132,19 @@ int main(int argc, char **argv) {
     }
     std::vector<uint8_t> host_a(input_bytes, 0x38), host_b(weight_bytes, 0x38);
     void *a = NULL, *b = NULL, *c = NULL;
-    if (cudaMalloc((void **)&a, input_bytes) != cudaSuccess ||
-        cudaMalloc((void **)&b, weight_bytes) != cudaSuccess ||
-        cudaMalloc((void **)&c, output_bytes) != cudaSuccess) {
+    if (cudaMalloc((void **)&a, input_bytes + 32) != cudaSuccess ||
+        cudaMalloc((void **)&b, weight_bytes + 32) != cudaSuccess ||
+        cudaMalloc((void **)&c, output_bytes + 32) != cudaSuccess) {
         fail("cudaMalloc", "out of device memory for the bench tensors");
     }
+    a = (char *)a + 2 * drop;
+    b = (char *)b + 2 * drop;
     cudaMemcpy(a, host_a.data(), host_a.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(b, host_b.data(), host_b.size(), cudaMemcpyHostToDevice);
 
-    printf("rows %u, %d calls per arm; FP32 accumulate, BF16 output, "
-           "alpha 1 (unscaled)\n", rows, calls);
+    printf("rows %u, %d calls per arm, operands shifted %u element(s) "
+           "(%u bytes); FP32 accumulate, BF16 output, alpha 1 (unscaled)\n",
+           rows, calls, drop, 2 * drop);
     printf("%-4s %8s %8s %10s %10s %12s %10s\n", "gemm", "K", "N", "TFLOP",
            "bf16 ms", "bf16 TFLOPS", "fp8 ms");
 
