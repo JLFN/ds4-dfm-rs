@@ -56,22 +56,36 @@ temporal), the whole route is exact and needs no interpolation:
   the release's `H3_INPUT`, from the same 16x/4x VAE.
 - The H3 latent of 384x672 is 24x42. At the LTX 32x factor on the 1344x768
   canvas the LTX latent is also 24x42. The H3 upscale to 48x84 followed by a
-  fixed 2x pixel-unshuffle (`geometry.py:104-115`, `scale_h == scale_w == 2`
-  is asserted) is what converts one grid into the other, and it multiplies the
-  channels by 4: 24 -> 96, then `cat((linear, packed))` along channels, then
-  96 x 4 = 384 = the adapter's `in_channels`.
+  fixed 2x pixel-unshuffle (`geometry.py:102-112`, `scale_h == scale_w == 2`
+  is asserted at `:105`) is what converts one grid into the other, and it
+  multiplies the channels by 4: `cat((linear, packed))` along channels
+  (`geometry.py:99-101`) gives 24 + 24x3 = 96, and 96 x 4 = 384 = the adapter's
+  `in_channels`.
 - Temporal alignment is `temporal_resample` (linear interpolation between the
   37 H3 positions and the LTX positions of the padded 129 frames,
   `geometry.py:39-53`) concatenated with `temporal_nearest_pack` into 3 slots
   (`geometry.py:56-79`), giving the 17 LTX latent frames that are cropped to 16.
 - The adapter itself is a plain Conv3D resnet stack
-  (`h3_ltx_adapter/model.py:26-42`): 1x1 skip, 3x3x3 stem, N factorized
-  residual blocks (GroupNorm SiLU, 1x3x3 spatial, depthwise 3x1x1 temporal,
-  gated 1x1 MLP), 1x1 head.
+  (`h3_ltx_adapter/model.py:27-42`) and is now fully specified by its own
+  `config.json` next to its header: `in_channels 384`, `out_channels 128`,
+  `width 752`, `num_blocks 22`, `expansion 2`, `groups 16`, `model_type tiny`,
+  194,759,504 BF16 parameters in 228 tensors, `format
+  h3_ltx_adapter_safetensors_v1`. Its map, confirmed against the header: a 1x1
+  `skip (128,384,1,1,1)`, a 3x3x3 `stem (752,384,3,3,3)`, 22
+  `FactorizedResidualBlock`s of 10 tensors each, then `final_norm` (GroupNorm
+  16), SiLU and a 1x1 `head (128,752,1,1,1)`; each block is `GroupNorm(16) ->
+  SiLU -> spatial (752,752,1,3,3) -> depthwise temporal (752,1,3,1,1) -> SiLU ->
+  1x1 up to 3008 -> chunk(value,gate) -> value*SiLU(gate) -> 1x1 back to 752`,
+  added to its input. `build_model` (`model.py:45-55`) rejects any checkpoint
+  that enables the unsupported training variants, all zero here.
 
-So the release's "2 -> 0 inter-stage VAE" claim is mec hanically this: the H3 VAE
+So the release's "2 -> 0 inter-stage VAE" claim is mechanically this: the H3 VAE
 decoder and the LTX VAE encoder are both replaced by one small learned Conv3D
-whose input is an H3 latent and whose output is an LTX latent.
+whose input is an H3 latent and whose output is an LTX latent. The upscale half
+is the author's own ComfyUI node (`LBH-123-AI/Minimax_h3_latent_Upscaler`, the
+`normalization`, `LatentResizer3D` and `zero_module` symbols `h3_upscale.py:22`
+expects), applied as `D(model(N(x)))` on the normalized H3 latent, taking
+24 -> 24 channels in place and doubling H and W.
 
 ## 3. The LTX-2.5 model maps
 
@@ -262,39 +276,57 @@ projection GEMM, `qkv_rope`, `adaln`).
 
 ## 6. Artifacts
 
-Present, byte-exact against `configs/checkpoints.json`: the transformer (42.0
-GB), the distilled LoRA 450 (8.9 GB), the video Conv VAE (1.45 GB), the audio
-VAE (365 MB).
+All checks below are of the Spark's own store, read over the gvfs mount at
+`/mnt/h3-artifacts` (the workstation's `/mnt/h3-artifacts` is empty; the store
+is on the measurement host).
 
-Missing, with the exact repo, revision and byte count read from
-`configs/checkpoints.json` and confirmed live against the Hugging Face
-model/tree API at those revisions:
+**Present**, sha256 matched against `configs/checkpoints.json`'s pinned values
+where it carries one:
+
+| artifact | bytes | sha256 |
+|---|---:|---|
+| LTX-2.5 22B dev transformer bf16 | 42,018,190,584 | — (byte count matched) |
+| LTX-2.5 distilled LoRA 450 bf16 | 8,899,889,568 | — (byte count matched) |
+| LTX-2.5 video Conv VAE bf16 | 1,452,269,922 | — (byte count matched) |
+| LTX-2.5 audio VAE bf16 | 364,866,540 | — (byte count matched) |
+| H3 latent upscaler `..._3d_bf16.safetensors` | 690,592,992 | `4f57821f…46a5e6` verified |
+| H3-to-LTX adapter `model.safetensors` + `config.json` | 389,541,112 | `170199a3…0724ac` verified |
+
+Both verified sha256 values equal the release's own: the upscaler's is the
+constant in `stage2_ops/h3_upscale.py:20-21`, and the adapter's is both
+`checkpoints.json`'s and the one its own `config.json` declares under
+`model_sha256`. The adapter's declared parameter count also reproduces exactly
+from its header (194,759,504 BF16 in 228 tensors).
+
+**Missing**, with the exact repo, revision and byte count from
+`checkpoints.json`, confirmed live against the Hugging Face model/tree API:
 
 | artifact | repo @ revision | bytes | gating |
 |---|---|---:|---|
-| `minimax_h3_latent_upscaler_3d_bf16.safetensors` | `LBH-123-AI/Minimax_h3_latent_Upscaler` @ `13ccf95d` | 690,592,992 | ungated |
-| H3-to-LTX adapter `model.safetensors` + `config.json` | `Efficient-Large-Model/H3-to-LTX-Latent-Adapter` @ `cfcd8a7c` | 389,541,112 | ungated |
-| `text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` | `Lightricks/LTX-2.5` @ `5e6e7101` | 15,372,969,374 | `gated: auto` |
 | `diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors` | `Lightricks/LTX-2.5` @ `5e6e7101` | 21,504,034,224 | `gated: auto` |
-| the fixed-prompt cache itself | derived | < 64 MiB | built once from the row above, or reused |
+| `text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors` | `Lightricks/LTX-2.5` @ `5e6e7101` | 15,372,969,374 | `gated: auto` |
+| the fixed-prompt cache itself | derived | < 64 MiB | built once from the row above |
 | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors` (alternative) | `Lightricks/LTX-2.5` @ `5e6e7101` | 26,263,858,182 | `gated: auto` |
 | an FP8 H3 DiT checkpoint (stage 1) | not in this set | ~15.5 GB | — |
 
-Two facts narrow the gate considerably. First, the upscaler file exists under
-that name only at the pinned revision - the current default branch shows it
-moved to `minimax_h3_latent_upscaler_3d_conv_v1/` as
-`..._3d_conv_v1_bf16.safetensors` - so the pinned revision is the one to fetch,
-not `main`. Second, `Lightricks/LTX-2.5` is gated for *download* but not for
-metadata, and the operator's four present files come from that same repo at
-that same revision, so access is proven rather than merely possible.
+The store shows the operator already staging the gap: `LTX-2.5/diffusion_models/`
+and `LTX-2.5/latent_upscale_models/` exist and are empty, so the connector and
+the official LTX upscalers are anticipated, while `text_encoders/` has not been
+created. Two further facts narrow the gate. The upscaler file exists under that
+name only at the pinned revision - the current default branch shows it moved to
+`minimax_h3_latent_upscaler_3d_conv_v1/` as `..._3d_conv_v1_bf16.safetensors` -
+so the pinned revision is the one to fetch, not `main`. And `Lightricks/LTX-2.5`
+is gated for *download* but not for *metadata*: its tree listing is public, and
+the operator's four present files come from that same repo at that same
+revision, so access is proven rather than merely possible.
 
-The prompt cache is the only real gate, and it gates conditioning alone. The
-adapter's shape is fixed and its recipe is fixed: `validate_payload`
+The prompt cache is the only real gate, and it gates conditioning alone. Its
+shape is fixed and so is its recipe: `validate_payload`
 (`prompt_cache.py:39-62`) rejects any payload whose `recipe` dict differs from
 the module's `RECIPE` at all, so a cache built from the BF16 Gemma (26.3 GB)
-would be refused by the release loader unless its recipe is rewritten - a
-named deviation whose numeric effect (int8-convrot contexts vs BF16 contexts)
-would have to be measured against the release's own cache. The int8 pair is the
+would be refused by the release loader unless the recipe is rewritten - a named
+deviation whose numeric effect (int8-convrot contexts vs BF16 contexts) would
+have to be measured against the release's own cache. The int8 pair is the
 faithful route and lives behind the licence the operator already accepted.
 
 ## 7. What the port must mirror
