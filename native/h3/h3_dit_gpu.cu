@@ -5224,9 +5224,10 @@ int h3b_weight_pack(h3d_context *context, h3d_tensor *output,
 
 int h3b_matmul_planar(h3d_context *context, h3d_tensor *output,
                       const h3d_tensor *a, size_t a_offset,
-                      const h3d_tensor *b, size_t b_offset, uint32_t rows,
-                      uint32_t input_dim, uint32_t output_dim, int accumulate,
-                      int dtype, char *error, size_t error_size) {
+                      const h3d_tensor *b, size_t b_offset, size_t c_offset,
+                      uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                      int accumulate, int dtype, char *error,
+                      size_t error_size) {
     cudaDataType_t type = CUDA_R_32F;
     size_t ae = 0, be = 0, ce = 0;
     if (!context || !rows || !input_dim || !output_dim ||
@@ -5235,10 +5236,10 @@ int h3b_matmul_planar(h3d_context *context, h3d_tensor *output,
         !h3d_mul_size(output_dim, input_dim, &be) ||
         !h3d_mul_size(rows, output_dim, &ce) ||
         !h3d_is(a, dtype, a_offset + ae) || !h3d_is(b, dtype, b_offset + be) ||
-        !h3d_is(output, H3D_F32, ce)) {
+        !h3d_is(output, H3D_F32, c_offset + ce)) {
         return h3d_set_error(error, error_size, "invalid latent planar matmul shape");
     }
-    return h3b_gemm_planar(context, (float *)output->data,
+    return h3b_gemm_planar(context, (float *)output->data + c_offset,
                            (const char *)a->data +
                                a_offset * h3d_dtype_size(dtype),
                            (const char *)b->data +

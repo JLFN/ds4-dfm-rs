@@ -128,8 +128,15 @@ pub const UPSCALER_EMBED_DIM: usize = 64;
 pub const UPSCALER_GROUPS: usize = 32;
 pub const UPSCALER_EPSILON: f32 = 1e-5;
 
-/// `LatentResizer3D.forward` (`:268-269`): `chunk = 32`, `overlap = tk`, the
+/// `LatentResizer3D.forward` (`:264-268`): `chunk = 32`, `overlap = tk`, the
 /// depthwise temporal kernel width.
+///
+/// The chunk is *not* a VRAM-only knob, whatever its tooltip says: the model's
+/// temporal blocks downsample and upsample in time, so the segment's frame
+/// count decides the intermediate grid, and a single 37-frame segment lands a
+/// different latent (`docs/minimax-h3/planar-conv-2026-10-29.md`: 3.8e-1
+/// relative against the reference, both arms, both convolution paths). It is
+/// part of the arithmetic and the port keeps the node's value.
 pub const UPSCALER_CHUNK: usize = 32;
 
 /// `model.py:28-42` and `config.json`: in 384 (24 linear + 24x3 packed, x4
@@ -853,6 +860,12 @@ fn conv_path() -> ConvPath {
 /// reads is `kd` images of `kh + out_height` rows of `kw*channels` halfwords,
 /// which is small enough that the taps' nine passes over it are served by L2
 /// rather than by DRAM. The materialized im2col moved 104 GiB per conversion.
+///
+/// What is *not* worth doing is blocking the frame's rows so the accumulator
+/// fits L2 by itself: at 1,024 rows the call has 32 CTAs on a 48-SM part, and
+/// the measured cost of losing the waves is larger than the accumulator's DRAM
+/// walk (2,283 -> 3,158 us on the workstation, 2026-10-29). The taps stay whole
+/// plane, which is 2.6 waves at the widest convolution.
 fn convolve_planar(
     gpu: &Gpu,
     arm: Arm,
@@ -929,6 +942,7 @@ fn convolve_planar(
                     offset,
                     &conv.packed,
                     pass * conv.output_channels as usize * columns,
+                    0,
                     out_plane as u32,
                     columns as u32,
                     conv.output_channels,

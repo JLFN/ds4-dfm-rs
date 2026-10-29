@@ -578,9 +578,10 @@ int h3b_im2col(h3d_context *context, h3d_tensor *output,
  * weights in the pass decomposition's own order, and `h3b_matmul_planar` runs
  * one tap as a dense matmul whose A operand is a window of the planar buffer —
  * leading dimension `input_dim`, the window at `a_offset` elements into
- * `planar` — accumulating into the same f32 `output` when `accumulate` is set.
- * The A view is only valid for a same-shape kernel, which `h3b_planar` checks:
- * `out_width + kw - 1` must equal the padded width. */
+ * `planar`, the result at `c_offset` elements into `output` — accumulating into
+ * the same f32 `output` when `accumulate` is set. The A view is only valid for a
+ * same-shape kernel, which `h3b_planar` checks: `out_width + kw - 1` must equal
+ * the padded width. */
 int h3b_planar(h3d_context *context, h3d_tensor *output,
                const h3d_tensor *input, int dtype, uint32_t channels,
                uint32_t depth, uint32_t height, uint32_t width, uint32_t kw,
@@ -594,9 +595,10 @@ int h3b_weight_pack(h3d_context *context, h3d_tensor *output,
 
 int h3b_matmul_planar(h3d_context *context, h3d_tensor *output,
                       const h3d_tensor *planar, size_t a_offset,
-                      const h3d_tensor *weight, size_t b_offset, uint32_t rows,
-                      uint32_t input_dim, uint32_t output_dim, int accumulate,
-                      int dtype, char *error, size_t error_size);
+                      const h3d_tensor *weight, size_t b_offset,
+                      size_t c_offset, uint32_t rows, uint32_t input_dim,
+                      uint32_t output_dim, int accumulate, int dtype,
+                      char *error, size_t error_size);
 
 /* The two matmuls, both into an f32 accumulator: `h3b_matmul` for the im2col
  * form (`left` is `rows x input_dim`, `right` is `output_dim x input_dim`,

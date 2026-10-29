@@ -102,6 +102,7 @@ The model's license is included in the downloaded repository.
 - [The Sol-H3-Spark pipeline: what it takes to run it here, 2026-10-28](ltx-sol-pipeline-plan-2026-10-28.md)
 - [The LTX-2.5 reference, its latent path and its cost model, 2026-10-28](ltx-reference-map-2026-10-28.md)
 - [The latent path, ported and gated, 2026-10-29](latent-path-2026-10-29.md)
+- [The im2col-free convolution: 1.73x on the latent path, 2026-10-29](planar-conv-2026-10-29.md)
 - [Where a DiT evaluation goes: the per-kernel table, 2026-10-28](denoise-attribution-2026-10-28.md)
 - [The server's steady state, 2026-10-28](steady-state-2026-10-28.md)
 - [The video VAE decoder's bench options, 2026-10-28](vae-options-2026-10-28.md)

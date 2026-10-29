@@ -725,6 +725,7 @@ unsafe extern "C" {
         a_offset: usize,
         weight: *const CTensor,
         b_offset: usize,
+        c_offset: usize,
         rows: u32,
         input_dim: u32,
         output_dim: u32,
@@ -2764,8 +2765,9 @@ impl Gpu {
     /// `h3b_matmul_planar`: one tap of the convolution as a dense matmul.
     /// `planar`'s window starts at `a_offset` elements and is `rows` by
     /// `input_dim` with leading dimension `input_dim`; `weight`'s window starts
-    /// at `b_offset` and is `output_dim` by `input_dim` row-major; `output` is
-    /// f32 and, with `accumulate`, receives `alpha*AB + output`.
+    /// at `b_offset` and is `output_dim` by `input_dim` row-major; the result
+    /// lands at `c_offset` elements into the f32 `output` and, with
+    /// `accumulate`, receives `alpha*AB + output`.
     #[allow(clippy::too_many_arguments)]
     pub fn latent_matmul_planar(
         &self,
@@ -2774,6 +2776,7 @@ impl Gpu {
         a_offset: usize,
         weight: &Tensor,
         b_offset: usize,
+        c_offset: usize,
         rows: u32,
         input_dim: u32,
         output_dim: u32,
@@ -2789,6 +2792,7 @@ impl Gpu {
                     a_offset,
                     weight.raw(),
                     b_offset,
+                    c_offset,
                     rows,
                     input_dim,
                     output_dim,
