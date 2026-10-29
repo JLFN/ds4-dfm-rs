@@ -1062,6 +1062,94 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> c_int;
+
+    // ---- the Gemma4 encoder's INT8 convrot route (`native/h3/h3_dit_gpu.h`).
+    // The reference is comfy-kitchen 0.2.26, called by the release from
+    // `runtime/cache_ops/int8_policy.py`; `h3d_int8_plan` is the chain's
+    // workspace and must outlive the call.
+
+    fn h3d_int8_hadamard(
+        context: *mut Context,
+        words: *mut CTensor,
+        group_size: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_int8_rotate(
+        context: *mut Context,
+        output: *mut CTensor,
+        words: *const CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        group_size: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_int8_scale_rows(
+        context: *mut Context,
+        scales: *mut CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_int8_quantize_rows(
+        context: *mut Context,
+        output: *mut CTensor,
+        scales: *const CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_linear_int8_raw(
+        context: *mut Context,
+        accumulator: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_int8_scale_epilogue(
+        context: *mut Context,
+        output: *mut CTensor,
+        accumulator: *const CTensor,
+        row_scale: *const CTensor,
+        column_scale: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_linear_int8_convrot(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        weight_scale: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        group_size: u32,
+        plan: *const Int8Plan,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_int8_pad_rows(rows: u32) -> u32;
 }
 
 /// `h3d_dtype`.
@@ -1072,6 +1160,10 @@ pub enum Dtype {
     U32,
     /// E4M3, one byte per element: the FP8 projection route's operand type.
     Fp8,
+    /// The INT8 convrot route's quantized weights and activations.
+    I8,
+    /// Its int32 accumulator.
+    I32,
 }
 
 impl Dtype {
@@ -1081,6 +1173,8 @@ impl Dtype {
             Dtype::F32 => 1,
             Dtype::U32 => 2,
             Dtype::Fp8 => 3,
+            Dtype::I8 => 4,
+            Dtype::I32 => 5,
         }
     }
 
@@ -1088,8 +1182,8 @@ impl Dtype {
     pub fn size(self) -> usize {
         match self {
             Dtype::Bf16 => 2,
-            Dtype::F32 | Dtype::U32 => 4,
-            Dtype::Fp8 => 1,
+            Dtype::F32 | Dtype::U32 | Dtype::I32 => 4,
+            Dtype::Fp8 | Dtype::I8 => 1,
         }
     }
 }
@@ -1153,6 +1247,31 @@ pub struct SolPlanBuffers {
     _query_bar: Tensor,
     _kc_mean: Tensor,
     _kc_var: Tensor,
+}
+
+/// `struct h3d_int8_plan` (`native/h3/h3_dit_gpu.h`), field for field: the
+/// INT8 convrot chain's workspace. `quantized` and `accumulator` are sized to
+/// `h3d_int8_pad_rows(rows)`, the reference's own M padding; the two padded
+/// rows past the real ones are written and never read.
+#[repr(C)]
+struct Int8Plan {
+    words: *mut CTensor,
+    rotated: *mut CTensor,
+    quantized: *mut CTensor,
+    row_scales: *mut CTensor,
+    accumulator: *mut CTensor,
+}
+
+/// The plan and the tensors it points at, for the same reason
+/// [`SolPlanBuffers`] exists: the C struct holds raw pointers, so the tensors
+/// must outlive it and cannot move.
+pub struct Int8PlanBuffers {
+    plan: Int8Plan,
+    _words: Tensor,
+    _rotated: Tensor,
+    _quantized: Tensor,
+    _row_scales: Tensor,
+    _accumulator: Tensor,
 }
 
 /// One CUDA stream and one cuBLASLt handle: the reference's `h3_gpu`.
@@ -1521,6 +1640,250 @@ impl Gpu {
             },
             "fp8 scale epilogue",
         )
+    }
+
+    // ---- the Gemma4 encoder's INT8 convrot route. The reference is
+    // comfy-kitchen 0.2.26's eager backend, cited in the native file; the
+    // release drives it from `runtime/cache_ops/int8_policy.py`.
+
+    /// How many rows the int8 chain pads to: `max(rows, 32)` rounded up to 32,
+    /// the reference's own M padding. A plan built for `rows` must size
+    /// `quantized`, `row_scales` and `accumulator` for the padded count.
+    pub fn int8_pad_rows(rows: u32) -> u32 {
+        unsafe { h3d_int8_pad_rows(rows) }
+    }
+
+    /// Build the grouped-Hadamard sign matrix for `group_size` (a power of 4,
+    /// at most 1024) into `words`, a `Dtype::U32` tensor of
+    /// `group_size * ceil(group_size / 32)` elements.
+    pub fn int8_hadamard(&self, words: &Tensor, group_size: u32) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_int8_hadamard(self.raw.as_ptr(), words.raw(), group_size, error, size)
+            },
+            "int8 hadamard",
+        )
+    }
+
+    /// The grouped rotation on its own (`h3d_int8_rotate`), for a bisect.
+    pub fn int8_rotate(
+        &self,
+        output: &Tensor,
+        words: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+        group_size: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_int8_rotate(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    words.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    group_size,
+                    error,
+                    size,
+                )
+            },
+            "int8 rotate",
+        )
+    }
+
+    /// The row absmax and scale on their own (`h3d_int8_scale_rows`).
+    pub fn int8_scale_rows(
+        &self,
+        scales: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_int8_scale_rows(
+                    self.raw.as_ptr(),
+                    scales.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "int8 row scale",
+        )
+    }
+
+    /// The row-wise quantization on its own (`h3d_int8_quantize_rows`).
+    pub fn int8_quantize_rows(
+        &self,
+        output: &Tensor,
+        scales: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_int8_quantize_rows(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    scales.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "int8 row quantize",
+        )
+    }
+
+    /// The int8 x int8 -> int32 matmul (`h3d_linear_int8_raw`), row-major with
+    /// the weight transposed, as the BF16 and FP8 routes are laid out.
+    pub fn linear_int8_raw(
+        &self,
+        accumulator: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_linear_int8_raw(
+                    self.raw.as_ptr(),
+                    accumulator.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "int8 linear raw",
+        )
+    }
+
+    /// The F32 scale epilogue (`h3d_int8_scale_epilogue`):
+    /// `bf16(acc * (row_scale * column_scale))`, the reference's own
+    /// association. The bias, when there is one, is `linear`'s separate add.
+    pub fn int8_scale_epilogue(
+        &self,
+        output: &Tensor,
+        accumulator: &Tensor,
+        row_scale: &Tensor,
+        column_scale: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_int8_scale_epilogue(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    accumulator.raw(),
+                    row_scale.raw(),
+                    column_scale.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "int8 scale epilogue",
+        )
+    }
+
+    /// The whole INT8 convrot linear (`h3d_linear_int8_convrot`):
+    /// `DevInt8ConvRotLinear.forward` end to end. `weight` is `Dtype::I8` at
+    /// `[output_dim, input_dim]` and `weight_scale` `Dtype::F32` at
+    /// `[output_dim]`, both as the checkpoint carries them - the weight is
+    /// already rotated, so nothing here rotates a weight.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_int8_convrot(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        weight_scale: &Tensor,
+        bias: Option<&Tensor>,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        group_size: u32,
+        plan: &Int8PlanBuffers,
+    ) -> Result<(), String> {
+        let bias_raw = bias.map_or(std::ptr::null_mut(), |tensor| tensor.raw());
+        self.call(
+            |error, size| unsafe {
+                h3d_linear_int8_convrot(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    weight_scale.raw(),
+                    bias_raw,
+                    rows,
+                    input_dim,
+                    output_dim,
+                    group_size,
+                    &plan.plan,
+                    error,
+                    size,
+                )
+            },
+            "int8 linear convrot",
+        )
+    }
+
+    /// Allocate the chain's workspace for one `[rows, input_dim]` activation
+    /// and one `[output_dim, input_dim]` weight, the way
+    /// `h3d_int8_plan`'s comments describe it. One plan serves every layer of
+    /// one shape.
+    pub fn int8_plan(
+        &self,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        group_size: u32,
+    ) -> Result<Int8PlanBuffers, String> {
+        let padded = Self::int8_pad_rows(rows) as usize;
+        let input_dim = input_dim as usize;
+        let output_dim = output_dim as usize;
+        let group_size = group_size as usize;
+        let per_row = group_size.div_ceil(32);
+
+        let words = self.alloc(Dtype::U32, group_size * per_row)?;
+        let rotated = self.alloc(Dtype::Bf16, rows as usize * input_dim)?;
+        let quantized = self.alloc(Dtype::I8, padded * input_dim)?;
+        let row_scales = self.alloc(Dtype::F32, padded)?;
+        let accumulator = self.alloc(Dtype::I32, padded * output_dim)?;
+        self.int8_hadamard(&words, group_size as u32)?;
+
+        let plan = Int8Plan {
+            words: words.raw(),
+            rotated: rotated.raw(),
+            quantized: quantized.raw(),
+            row_scales: row_scales.raw(),
+            accumulator: accumulator.raw(),
+        };
+
+        Ok(Int8PlanBuffers {
+            plan,
+            _words: words,
+            _rotated: rotated,
+            _quantized: quantized,
+            _row_scales: row_scales,
+            _accumulator: accumulator,
+        })
     }
 
     /// The video VAE decoder's F32 linear (`h3d_vae_linear`): `linear` at
