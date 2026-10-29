@@ -125,6 +125,12 @@ normalized H3 latent.
   weighted average (`:246-311`). Our T of 37 exceeds 32, so it chunks: a port
   that computes one segment will not match, because every chunk is convolved and
   resized over its own replicate-padded extent and only then blended.
+- The adapter is then handed that **upscaled** grid together with the **doubled**
+  canvas - `pixel_frames=124, pixel_height=768, pixel_width=1344`
+  (`stage2.py:69-70`) - because its `expected_shapes` (`adapter.py:16-24`)
+  measures the H3 latent at 16x of the canvas it is given. Handing it the draft
+  canvas (384x672) would ask for a 24x42 H3 latent: it raises rather than
+  silently mis-shaping, which is how this was found.
 - The 24-channel `LATENTS_MEAN`/`LATENTS_STD` literals live in the node source
   (`:83-99`) and the profile extracts them by AST, asserting length 24
   (`h3_upscale.py:48-58`); both are BF16 on the device. They equal the adapter's
@@ -420,3 +426,40 @@ The stage-1 side needs no reference reading: the four-step H3 draft at 672x384
 is our own DiT at a token count we have already measured, with FP8 weights and
 the FastH3 VSA LoRA, and the three stage-1 levers already queued in the
 attribution record are the same 1.27x.
+
+## 8. The oracle for the port
+
+Both halves of the bridge run locally on the workstation - no Spark GPU and no
+environment install. The profile's own `h3_ltx_adapter` package and the node's
+ast-extracted `LatentResizer3D` execute against the real checkpoints read over
+the gvfs mount, in a venv that reuses the workstation's torch
+(`python3 -m venv --system-site-packages`, then einops; torch 2.13.0+cu130,
+safetensors 0.8.0, einops 0.8.2). The probe is
+`tools/minimax_h3/ltx/bridge_oracle.py`; it writes the four tensors and a
+manifest that pins the node's sha256 and both checkpoints'. Verified runs:
+
+- Tiny (`--frames 17 --draft-height 64 --draft-width 64`), 22 s: `[24,2,4,4]` ->
+  upscaled `[1,24,2,8,8]` -> `[1,128,3,2,2]`. Single-segment, no chunking.
+- **The release's own geometry** (`--frames 124 --draft-height 384
+  --draft-width 672`), 154 s including both checkpoint hashes: `h3_input`
+  `[1,24,37,24,42]`, `h3_upscaled` `[1,24,37,48,84]`, `adapter_output`
+  `[1,128,17,24,42]`, `refiner_input` `[1,128,16,24,42]` - the profile's four
+  constants `H3_INPUT`, `H3_UPSCALED`, `ADAPTER_OUTPUT`, `REFINER_INPUT` exactly,
+  with `aligned_h3` at `[384,17,24,42]` on the way. The upscale ran the chunked
+  path (T=37 > 32). This is the P2 gate's golden.
+- The upscaler's own detector agrees with the map derived from the header:
+  `_detect_arch` on the real checkpoint returns 24/12/12/512, `temporal_every 2`,
+  `temporal_kernel 5`, `attn` false, both ModuleLists 18 long with composition
+  `RTRRTRRTRRTRRTRRTR`.
+
+One measured trap decides the gate's design. torch's CPU **bf16** conv3d has no
+fast path: the same tiny upscaler forward took **483.5 s** at bf16
+(single-threaded, ~1.5 GFLOP/s over 696 GFLOP of convs) and **0.5 s** at float32
+across 20 threads (~1.4 TFLOP/s), a ~970x difference. So run the oracle in
+float32 on all cores, or on a GPU, and never bf16 on CPU - at the release's
+geometry the upscaler is ~64 TFLOP of convs (the 512-wide 3x3x3 pair of each of
+the 12 in-blocks at 37x24x42 and 12 out-blocks at 37x48x84 dominates), which is
+about a minute at the measured float32 rate and about 12 hours at bf16.
+
+Seed the oracle's inputs. An unseeded run is not a reference, which is why the
+first two exploratory runs recorded here differ in their sums.
