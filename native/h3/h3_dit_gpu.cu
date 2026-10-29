@@ -666,17 +666,38 @@ int h3d_patch_linear_map(h3d_context *context, h3d_tensor *output,
     return ok;
 }
 
+/* `H3_DIT_ELEMENTWISE` selects the spelling of the two elementwise kernels.
+ * Unset means the staged pair below; `reference` restores the port's first
+ * spelling, which is the reference's own (`h3_gpu_cuda.cu:2656`, `:3079`), for
+ * an A/B in one binary. Read once per process. */
+static int h3d_elementwise_reference(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("H3_DIT_ELEMENTWISE");
+        cached = value && strcmp(value, "reference") == 0;
+    }
+    return cached;
+}
+
+/* Shared-memory row the staged AdaLN kernel walks, the elements one vector
+ * read covers, and the head dimension the staged QKV/RoPE kernel stages. 8,192
+ * bf16 is 16 KiB, which still admits six blocks per SM beside the
+ * 1,536-thread limit. */
+#define H3D_ADALN_STAGED_WIDTH 8192
+#define H3D_QKV_STAGED_DIM 256
+#define H3D_ELEMENTWISE_VECTOR 8
+
 /* `h3_adaln_kernel` (`:2656-2687`): thread 0 owns the RMS sum, one block per
- * row, and the modulation row is selected per row through `row_map`. */
-__global__ static void h3d_adaln_kernel(__nv_bfloat16 *output,
-                                        const __nv_bfloat16 *input,
-                                        const __nv_bfloat16 *weight,
-                                        const __nv_bfloat16 *modulation,
-                                        const uint32_t *row_map, uint32_t rows,
-                                        uint32_t width, uint32_t slots,
-                                        uint32_t shift_slot,
-                                        uint32_t scale_slot, float epsilon,
-                                        size_t input_offset) {
+ * row, and the modulation row is selected per row through `row_map`. The chain
+ * is one lane's serial accumulation, so it is kept as the reference spelling
+ * and not as the default: a lane's 2-byte loads leave the other 255 threads
+ * parked and expose the whole row's latency. */
+__global__ static void h3d_adaln_reference_kernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *input,
+        const __nv_bfloat16 *weight, const __nv_bfloat16 *modulation,
+        const uint32_t *row_map, uint32_t rows, uint32_t width, uint32_t slots,
+        uint32_t shift_slot, uint32_t scale_slot, float epsilon,
+        size_t input_offset) {
     __shared__ float inverse;
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -704,6 +725,64 @@ __global__ static void h3d_adaln_kernel(__nv_bfloat16 *output,
     }
 }
 
+/* The same arithmetic with the row staged in shared memory once: the block
+ * copies it with its 256 threads (coalesced, so the reads are in flight
+ * together), one lane walks the copy in the same index order, and the
+ * elementwise pass reads it there instead of a second global pass. The
+ * accumulation order and every rounding is the reference's, so this kernel is
+ * bit-identical to `h3d_adaln_reference_kernel`; only the traffic changes. */
+__global__ static void h3d_adaln_kernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *input,
+        const __nv_bfloat16 *weight, const __nv_bfloat16 *modulation,
+        const uint32_t *row_map, uint32_t rows, uint32_t width, uint32_t slots,
+        uint32_t shift_slot, uint32_t scale_slot, float epsilon,
+        size_t input_offset) {
+    __shared__ __align__(16) __nv_bfloat16 staged[H3D_ADALN_STAGED_WIDTH];
+    __shared__ float inverse;
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const __nv_bfloat16 *source = input + input_offset + (size_t)row * width;
+
+    /* The block copies the row in 16-byte units when the row's start and the
+     * width allow it, which is the model's case; the scalar copy is the
+     * fallback, and the only difference is the instruction count. */
+    const int vector = (((uintptr_t)source & 15u) == 0) &&
+                       (width % H3D_ELEMENTWISE_VECTOR == 0);
+    if (vector) {
+        for (uint32_t k = threadIdx.x * H3D_ELEMENTWISE_VECTOR; k < width;
+             k += blockDim.x * H3D_ELEMENTWISE_VECTOR) {
+            *(uint4 *)(staged + k) = *(const uint4 *)(source + k);
+        }
+    } else {
+        for (uint32_t k = threadIdx.x; k < width; k += blockDim.x) {
+            staged[k] = source[k];
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float square_sum = 0.0f;
+        for (uint32_t k = 0; k < width; ++k) {
+            float value = h3d_value(staged[k]);
+            square_sum = fmaf(value, value, square_sum);
+        }
+        inverse = rsqrtf(square_sum / (float)width + epsilon);
+    }
+    __syncthreads();
+    size_t base = (size_t)row_map[row] * slots * width;
+    for (uint32_t column = threadIdx.x; column < width;
+         column += blockDim.x) {
+        float normalized = h3d_value(staged[column]) * inverse *
+                           h3d_value(weight[column]);
+        float shift =
+            h3d_value(modulation[base + (size_t)shift_slot * width + column]);
+        float scale =
+            h3d_value(modulation[base + (size_t)scale_slot * width + column]);
+        output[(size_t)row * width + column] =
+            h3d_store(normalized * (1.0f + scale) + shift);
+    }
+}
+
 int h3d_adaln(h3d_context *context, h3d_tensor *output,
               const h3d_tensor *input, size_t input_element,
               const h3d_tensor *norm_weight, const h3d_tensor *modulation,
@@ -721,12 +800,21 @@ int h3d_adaln(h3d_context *context, h3d_tensor *output,
         !h3d_is(row_map, H3D_U32, rows)) {
         return h3d_set_error(error, error_size, "invalid AdaLN arguments");
     }
-    h3d_adaln_kernel<<<rows, 256, 0, context->stream>>>(
-        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
-        (const __nv_bfloat16 *)norm_weight->data,
-        (const __nv_bfloat16 *)modulation->data,
-        (const uint32_t *)row_map->data, rows, width, slots, shift_slot,
-        scale_slot, epsilon, input_element);
+    if (h3d_elementwise_reference() || width > H3D_ADALN_STAGED_WIDTH) {
+        h3d_adaln_reference_kernel<<<rows, 256, 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+            (const __nv_bfloat16 *)norm_weight->data,
+            (const __nv_bfloat16 *)modulation->data,
+            (const uint32_t *)row_map->data, rows, width, slots, shift_slot,
+            scale_slot, epsilon, input_element);
+    } else {
+        h3d_adaln_kernel<<<rows, 256, 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+            (const __nv_bfloat16 *)norm_weight->data,
+            (const __nv_bfloat16 *)modulation->data,
+            (const uint32_t *)row_map->data, rows, width, slots, shift_slot,
+            scale_slot, epsilon, input_element);
+    }
     return h3d_launch_ok("BF16 AdaLN", error, error_size);
 }
 
@@ -988,8 +1076,11 @@ int h3d_swiglu(h3d_context *context, h3d_tensor *output,
 
 /* `h3_qkv_rope_kernel` (`:3079-3136`) with `grouped = 1`, `normalize = 1`,
  * `weighted = 1`: the checkpoint's [head][q,k,v][dim] rows, Q/K RMS over the
- * head, then the pair rotation on the first `2 * rope_half` dimensions. */
-__global__ static void h3d_qkv_rope_kernel(
+ * head, then the pair rotation on the first `2 * rope_half` dimensions. Kept
+ * as the reference spelling: every one of the block's 128 threads walks the
+ * whole 128-element Q and K vectors for the two sums, so the block issues 512
+ * broadcasts of the same 512 bytes. */
+__global__ static void h3d_qkv_rope_reference_kernel(
         __nv_bfloat16 *query, __nv_bfloat16 *key, __nv_bfloat16 *value,
         const __nv_bfloat16 *qkv, const __nv_bfloat16 *q_weight,
         const __nv_bfloat16 *k_weight, const __nv_bfloat16 *rope_cos,
@@ -1043,6 +1134,105 @@ __global__ static void h3d_qkv_rope_kernel(
     value[output_index] = qkv[v_base + dimension];
 }
 
+/* The same arithmetic with the head staged in shared memory once: the block
+ * copies its Q and K with 128 coalesced reads, writes V on the way (it is a
+ * copy of `qkv`'s third block, untouched by the rotation), one lane walks the
+ * copy in the same index order for both sums, and the epilogue reads it there
+ * - the second read of Q and K was already in the block's L1. Bit-identical to
+ * `h3d_qkv_rope_reference_kernel`; only the traffic changes. */
+__global__ static void h3d_qkv_rope_kernel(
+        __nv_bfloat16 *query, __nv_bfloat16 *key, __nv_bfloat16 *value,
+        const __nv_bfloat16 *qkv, const __nv_bfloat16 *q_weight,
+        const __nv_bfloat16 *k_weight, const __nv_bfloat16 *rope_cos,
+        const __nv_bfloat16 *rope_sin, uint32_t sequence, uint32_t heads,
+        uint32_t head_dim, uint32_t rope_half, float epsilon) {
+    __shared__ __align__(16) __nv_bfloat16 staged[2 * H3D_QKV_STAGED_DIM];
+    __shared__ float inverse[2];
+    uint32_t head = blockIdx.y;
+    uint32_t row = blockIdx.x;
+    size_t inner = (size_t)heads * head_dim;
+    size_t row_base = (size_t)row * inner * 3;
+    size_t q_base = row_base + (size_t)head * head_dim * 3;
+    size_t k_base = q_base + head_dim;
+    size_t v_base = k_base + head_dim;
+
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        staged[d] = qkv[q_base + d];
+        staged[head_dim + d] = qkv[k_base + d];
+        value[((size_t)head * sequence + row) * head_dim + d] = qkv[v_base + d];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float q_sum = 0.0f, k_sum = 0.0f;
+        const uint32_t bulk = head_dim - (head_dim % H3D_ELEMENTWISE_VECTOR);
+        for (uint32_t d = 0; d < bulk; d += H3D_ELEMENTWISE_VECTOR) {
+            uint4 q_word = *(const uint4 *)(staged + d);
+            uint4 k_word = *(const uint4 *)(staged + head_dim + d);
+            uint32_t q_parts[4] = {q_word.x, q_word.y, q_word.z, q_word.w};
+            uint32_t k_parts[4] = {k_word.x, k_word.y, k_word.z, k_word.w};
+            #pragma unroll
+            for (uint32_t part = 0; part < 4; ++part) {
+                float q_low = h3d_value(
+                    __ushort_as_bfloat16((unsigned short)q_parts[part]));
+                float k_low = h3d_value(
+                    __ushort_as_bfloat16((unsigned short)k_parts[part]));
+                float q_high = h3d_value(
+                    __ushort_as_bfloat16((unsigned short)(q_parts[part] >> 16)));
+                float k_high = h3d_value(
+                    __ushort_as_bfloat16((unsigned short)(k_parts[part] >> 16)));
+                q_sum = fmaf(q_low, q_low, q_sum);
+                k_sum = fmaf(k_low, k_low, k_sum);
+                q_sum = fmaf(q_high, q_high, q_sum);
+                k_sum = fmaf(k_high, k_high, k_sum);
+            }
+        }
+        for (uint32_t d = bulk; d < head_dim; d++) {
+            float q = h3d_value(staged[d]);
+            float k = h3d_value(staged[head_dim + d]);
+            q_sum = fmaf(q, q, q_sum);
+            k_sum = fmaf(k, k, k_sum);
+        }
+        inverse[0] = rsqrtf(q_sum / (float)head_dim + epsilon);
+        inverse[1] = rsqrtf(k_sum / (float)head_dim + epsilon);
+    }
+    __syncthreads();
+    float q_inverse = inverse[0];
+    float k_inverse = inverse[1];
+
+    for (uint32_t dimension = threadIdx.x; dimension < head_dim;
+         dimension += blockDim.x) {
+        float qw = h3d_value(q_weight[dimension]);
+        float kw = h3d_value(k_weight[dimension]);
+        float q0 = h3d_value(staged[dimension]) * q_inverse * qw;
+        float k0 = h3d_value(staged[head_dim + dimension]) * k_inverse * kw;
+        if (dimension < rope_half * 2) {
+            uint32_t rope_index = dimension % rope_half;
+            uint32_t pair = dimension < rope_half ? dimension + rope_half :
+                                                     dimension - rope_half;
+            float q1 = h3d_value(staged[pair]) * q_inverse *
+                       h3d_value(q_weight[pair]);
+            float k1 = h3d_value(staged[head_dim + pair]) * k_inverse *
+                       h3d_value(k_weight[pair]);
+            float c =
+                h3d_value(rope_cos[(size_t)row * rope_half + rope_index]);
+            float s =
+                h3d_value(rope_sin[(size_t)row * rope_half + rope_index]);
+            if (dimension < rope_half) {
+                q0 = q0 * c - q1 * s;
+                k0 = k0 * c - k1 * s;
+            } else {
+                q0 = q0 * c + q1 * s;
+                k0 = k0 * c + k1 * s;
+            }
+        }
+        size_t output_index =
+            ((size_t)head * sequence + row) * head_dim + dimension;
+        query[output_index] = h3d_store(q0);
+        key[output_index] = h3d_store(k0);
+    }
+}
+
 int h3d_qkv_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
                  h3d_tensor *value, const h3d_tensor *qkv,
                  const h3d_tensor *q_norm, const h3d_tensor *k_norm,
@@ -1064,15 +1254,29 @@ int h3d_qkv_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
         !h3d_is(rope_sin, H3D_BF16, (size_t)sequence * rope_half)) {
         return h3d_set_error(error, error_size, "invalid QKV/RoPE tensors");
     }
-    dim3 grid(sequence, heads, (head_dim + 127) / 128);
-    h3d_qkv_rope_kernel<<<grid, 128, 0, context->stream>>>(
-        (__nv_bfloat16 *)query->data, (__nv_bfloat16 *)key->data,
-        (__nv_bfloat16 *)value->data, (const __nv_bfloat16 *)qkv->data,
-        (const __nv_bfloat16 *)q_norm->data,
-        (const __nv_bfloat16 *)k_norm->data,
-        (const __nv_bfloat16 *)rope_cos->data,
-        (const __nv_bfloat16 *)rope_sin->data, sequence, heads, head_dim,
-        rope_half, epsilon);
+    if (h3d_elementwise_reference() || head_dim > H3D_QKV_STAGED_DIM) {
+        dim3 grid(sequence, heads, (head_dim + 127) / 128);
+        h3d_qkv_rope_reference_kernel<<<grid, 128, 0, context->stream>>>(
+            (__nv_bfloat16 *)query->data, (__nv_bfloat16 *)key->data,
+            (__nv_bfloat16 *)value->data, (const __nv_bfloat16 *)qkv->data,
+            (const __nv_bfloat16 *)q_norm->data,
+            (const __nv_bfloat16 *)k_norm->data,
+            (const __nv_bfloat16 *)rope_cos->data,
+            (const __nv_bfloat16 *)rope_sin->data, sequence, heads, head_dim,
+            rope_half, epsilon);
+    } else {
+        /* One block owns a whole head: it stages every dimension, so the
+         * dimension axis is not a grid axis here. */
+        dim3 grid(sequence, heads);
+        h3d_qkv_rope_kernel<<<grid, 128, 0, context->stream>>>(
+            (__nv_bfloat16 *)query->data, (__nv_bfloat16 *)key->data,
+            (__nv_bfloat16 *)value->data, (const __nv_bfloat16 *)qkv->data,
+            (const __nv_bfloat16 *)q_norm->data,
+            (const __nv_bfloat16 *)k_norm->data,
+            (const __nv_bfloat16 *)rope_cos->data,
+            (const __nv_bfloat16 *)rope_sin->data, sequence, heads, head_dim,
+            rope_half, epsilon);
+    }
     return h3d_launch_ok("BF16 grouped QKV RoPE", error, error_size);
 }
 
