@@ -85,10 +85,17 @@ temporal), the whole route is exact and needs no interpolation:
 
 So the release's "2 -> 0 inter-stage VAE" claim is mechanically this: the H3 VAE
 decoder and the LTX VAE encoder are both replaced by one small learned Conv3D
-whose input is an H3 latent and whose output is an LTX latent. The upscale half
-is the author's own ComfyUI node (`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler`
-at the pinned `d7c01b90`, whose `nodes/minimax_h3_latent_upscaler_3d.py` sha256
-is `744063b4…89e2`, verified locally), applied as `D(model(N(x)))` on the
+whose input is an H3 latent and whose output is an LTX latent. Nothing is
+normalized twice: the adapter's `convert` takes the input as already-normalized
+H3 unless told `input_normalization="raw"`, which the profile never asks for
+(`adapter.py:69-87`, `stage2.py:69-70`), so the node's N/D round trip and the
+adapter's expectation agree at the seam, and the adapter's output is a
+normalized LTX latent the refiner consumes directly (`adapter.py:28`).
+`expected_shapes` (`adapter.py:16-24`) pins the three seam shapes and requires
+the pixel geometry to be divisible by 32. The upscale half is the author's own
+ComfyUI node (`LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler` at the pinned
+`d7c01b90`, whose `nodes/minimax_h3_latent_upscaler_3d.py` sha256 is
+`744063b4…89e2`, verified locally), applied as `D(model(N(x)))` on the
 normalized H3 latent.
 
 ### The upscale half, exactly
