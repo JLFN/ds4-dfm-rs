@@ -118,7 +118,9 @@ These reports preserve successful gates, rejected experiments and unresolved lim
   (88.99 s hot, MP4-identical to the CLI); [where a DiT evaluation goes](minimax-h3/denoise-attribution-2026-10-28.md)
   (per-kernel, projections 64% of it at 61-68% of the sm_121 peak); [the pipeline plan](minimax-h3/ltx-sol-pipeline-plan-2026-10-28.md)
   and [the LTX-2.5 reference map](minimax-h3/ltx-reference-map-2026-10-28.md),
-  the bridge, the weights and the stage-2 cost model.
+  the latent path, the weights and the stage-2 cost model, with [the path itself
+  ported and gated](minimax-h3/latent-path-2026-10-29.md) at 4.15 s against the
+  release's 2.13 s.
 - **MiniMax VQ:** [October 27 prefill/decode campaign](minimax-vq-optimization-2026-10-27.md),
   three adopted rounds each; [fresh 2K–64K DSpark graph](benchmarks/minimax-vq-spark-64k-2026-10-27/README.md),
   raw clocks, exact output checks and observed repeat ranges.
