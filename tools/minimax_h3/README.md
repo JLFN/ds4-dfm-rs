@@ -15,12 +15,12 @@ They are not linked into production hosts.
 | `ppm_diff.c` | Pixel differences, PSNR and spatial attribution |
 | `standin-renderer.sh` | Model-free HTTP plumbing, not model qualification |
 
-The H3-to-LTX bridge has no C reference: its authority is the Sol-H3-Spark
+The H3-to-LTX latent path has no C reference: its authority is the Sol-H3-Spark
 profile's Python plus the author's ComfyUI node, so its probe is Python.
 
 | Tool | Purpose |
 |---|---|
-| `ltx/bridge_oracle.py` | Golden tensors for the latent upscale, the adapter and the crop to 16 frames, run against the real checkpoints and pinned by sha256 in its manifest |
+| `ltx/latent_oracle.py` | Golden tensors for the latent upscale, the adapter and the crop to 16 frames, run against the real checkpoints and pinned by sha256 in its manifest |
 
 Build probes against a reference checkout supplied by the operator. For
 example, after building its `libh3.a`:
