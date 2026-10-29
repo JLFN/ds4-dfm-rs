@@ -1,4 +1,4 @@
-# P0: the LTX-2.5 reference, its exact bridge, and the cost model
+# P0: the LTX-2.5 reference, its exact latent path, and the cost model
 
 P0 of [the pipeline plan](ltx-sol-pipeline-plan-2026-10-28.md): read the LTX-2.5
 sources first-hand, write the weights map, and check a cost model against the
@@ -30,10 +30,10 @@ of a guessed one. Nothing here was built or run on a GPU; the Spark is idle.
 - The release page, re-fetched: `nvlabs.github.io/Sana/Sol-Engine/Sol-H3-Spark`.
 - The author's upscaler node, cloned to `/data/h3-upscaler-node` at the pinned
   `d7c01b90` (`--filter=blob:none`, so `/data/Sol-h3-Spark` stays untouched).
-- The two bridge artifacts' safetensors headers, read in place over the Spark's
+- The two latent-path artifacts' safetensors headers, read in place over the Spark's
   gvfs mount: the upscaler (322 tensors) and the adapter (228 tensors).
 
-## 2. The bridge, exactly
+## 2. The latent path, exactly
 
 The Spark route is not the public LTX two-stage pipeline; it replaces the
 official latent upsampler. `configs/default.json:15-21` declares
@@ -136,7 +136,7 @@ normalized H3 latent.
   (`h3_upscale.py:48-58`); both are BF16 on the device. They equal the adapter's
   own `H3_LATENTS_MEAN`/`_STD` (`h3_ltx_adapter/constants.py`) to within
   5.6e-17, so the two independent artifacts agree on the same released
-  statistics - a free cross-check that the bridge's seams are consistent.
+  statistics - a free cross-check that the latent path's seams are consistent.
 
 ## 3. The LTX-2.5 model maps
 
@@ -314,7 +314,7 @@ projection GEMM, `qkv_rope`, `adaln`).
 - The plan's "only source we still need from outside" is fetched: the author's
   node is at `/data/h3-upscaler-node` at `d7c01b90`, and its
   `nodes/minimax_h3_latent_upscaler_3d.py` sha256 is the `744063b4…` the
-  profile pins. Nothing external is needed for the bridge any more.
+  profile pins. Nothing external is needed for the latent path any more.
 - The three-update schedule is a literal constant, not a scheduler:
   `STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]`
   (`ltx-pipelines/utils/constants.py:19`), four endpoints giving three Euler
@@ -429,13 +429,13 @@ attribution record are the same 1.27x.
 
 ## 8. The oracle for the port
 
-Both halves of the bridge run locally on the workstation - no Spark GPU and no
+Both halves of the latent path run locally on the workstation - no Spark GPU and no
 environment install. The profile's own `h3_ltx_adapter` package and the node's
 ast-extracted `LatentResizer3D` execute against the real checkpoints read over
 the gvfs mount, in a venv that reuses the workstation's torch
 (`python3 -m venv --system-site-packages`, then einops; torch 2.13.0+cu130,
 safetensors 0.8.0, einops 0.8.2). The probe is
-`tools/minimax_h3/ltx/bridge_oracle.py`; it writes the four tensors and a
+`tools/minimax_h3/ltx/latent_oracle.py`; it writes the four tensors and a
 manifest that pins the node's sha256 and both checkpoints'. Verified runs:
 
 - Tiny (`--frames 17 --draft-height 64 --draft-width 64`), 22 s: `[24,2,4,4]` ->
