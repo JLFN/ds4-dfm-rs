@@ -101,6 +101,7 @@ The model's license is included in the downloaded repository.
 - [Speed baseline against h3.c, 2026-10-27](speed-2026-10-27.md)
 - [The Sol-H3-Spark pipeline: what it takes to run it here, 2026-10-28](ltx-sol-pipeline-plan-2026-10-28.md)
 - [The LTX-2.5 reference, its latent path and its cost model, 2026-10-28](ltx-reference-map-2026-10-28.md)
+- [The Gemma4 encoder and the AV connector: port map and numeric reference, 2026-10-29](gemma-connector-port-plan-2026-10-29.md)
 - [The LTX-2.5 refiner read at the pin the release runs, 2026-10-29](ltx-refiner-2026-10-29.md)
 - [The refiner's sparse attention: Sol-Attn, read at its source, 2026-10-29](ltx-sol-attn-2026-10-29.md)
 - [The latent path, ported and gated, 2026-10-29](latent-path-2026-10-29.md)
