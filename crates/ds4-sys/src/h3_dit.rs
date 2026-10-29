@@ -647,6 +647,270 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> c_int;
+
+    // The H3-to-LTX latent path (`native/h3/h3_dit_gpu.h`, the `h3b_*`
+    // section). Same context and tensor type as the rest of the family: the
+    // ops are additive, not a second device.
+    fn h3b_pad3d(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        pad_t: u32,
+        pad_h: u32,
+        pad_w: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_im2col(
+        context: *mut Context,
+        output: *mut CTensor,
+        padded: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        pad_depth: u32,
+        pad_height: u32,
+        pad_width: u32,
+        kd: u32,
+        kh: u32,
+        kw: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        t_begin: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_matmul(
+        context: *mut Context,
+        output: *mut CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        dtype: c_int,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_matmul_channels(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        spatial: u32,
+        input_dim: u32,
+        output_dim: u32,
+        dtype: c_int,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_epilogue(
+        context: *mut Context,
+        output: *mut CTensor,
+        matrix: *const CTensor,
+        bias: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        spatial: u32,
+        row_stride: usize,
+        row_offset: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_norm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        embedding: *const CTensor,
+        partial: *mut CTensor,
+        mean: *mut CTensor,
+        rstd: *mut CTensor,
+        dtype: c_int,
+        channels: u32,
+        groups: u32,
+        rows: u32,
+        spatial: u32,
+        epsilon: f32,
+        silu: c_int,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_silu(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_add(
+        context: *mut Context,
+        output: *mut CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        dtype: c_int,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_depthwise_temporal(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        rows: u32,
+        spatial: u32,
+        kernel: u32,
+        pad: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_resize3d(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        rows: u32,
+        height: u32,
+        width: u32,
+        out_rows: u32,
+        out_height: u32,
+        out_width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_time_gather(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        index: *const CTensor,
+        dtype: c_int,
+        in_channels: u32,
+        source_frames: u32,
+        target_frames: u32,
+        spatial: u32,
+        slots: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_time_lerp(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        weight: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        source_frames: u32,
+        target_frames: u32,
+        spatial: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_unshuffle2(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        in_channels: u32,
+        rows: u32,
+        height: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_accumulate(
+        context: *mut Context,
+        accumulator: *mut CTensor,
+        segment: *const CTensor,
+        weight: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        frames: u32,
+        segment_frames: u32,
+        spatial: u32,
+        in_frames: u32,
+        in_begin: u32,
+        out_begin: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_blend_finish(
+        context: *mut Context,
+        output: *mut CTensor,
+        accumulator: *const CTensor,
+        weight: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        frames: u32,
+        spatial: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_gate_mul(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        half: u32,
+        plane: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_scale(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        center: *const CTensor,
+        scale: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        plane: usize,
+        denormalize: c_int,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_copy_offset(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        out_offset: usize,
+        in_offset: usize,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
 }
 
 /// `h3d_dtype`.
@@ -2260,6 +2524,616 @@ impl Gpu {
         }
 
         Err(format!("{label}: {}", message(&error)))
+    }
+
+    // ---- the H3-to-LTX latent path (`minimax_h3::ltx_adapter`). Every
+    // wrapper mirrors the native argument order; `bias` and `embedding` are
+    // optional and pass NULL when absent.
+
+    /// `h3b_pad3d`: zero padding on the temporal and spatial axes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_pad3d(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        pad_t: u32,
+        pad_h: u32,
+        pad_w: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_pad3d(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    channels,
+                    depth,
+                    height,
+                    width,
+                    pad_t,
+                    pad_h,
+                    pad_w,
+                    error,
+                    size,
+                )
+            },
+            "latent_pad3d",
+        )
+    }
+
+    /// `h3b_im2col`: the padded tensor's interior grid as a
+    /// `depth*height*width` by `channels*kd*kh*kw` matrix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_im2col(
+        &self,
+        output: &Tensor,
+        padded: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        pad: [u32; 3],
+        kernel: [u32; 3],
+        size: [u32; 3],
+        t_begin: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, error_size| unsafe {
+                h3b_im2col(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    padded.raw(),
+                    dtype.code(),
+                    channels,
+                    pad[0],
+                    pad[1],
+                    pad[2],
+                    kernel[0],
+                    kernel[1],
+                    kernel[2],
+                    size[0],
+                    size[1],
+                    size[2],
+                    t_begin,
+                    error,
+                    error_size,
+                )
+            },
+            "latent_im2col",
+        )
+    }
+
+    /// `h3b_matmul`: `left (rows, input_dim)` by `right (output_dim,
+    /// input_dim)`, both dtype, into an f32 `output (rows, output_dim)`.
+    pub fn latent_matmul(
+        &self,
+        output: &Tensor,
+        left: &Tensor,
+        right: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        dtype: Dtype,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_matmul(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    left.raw(),
+                    right.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    dtype.code(),
+                    error,
+                    size,
+                )
+            },
+            "latent_matmul",
+        )
+    }
+
+    /// `h3b_matmul_channels`: a 1x1 convolution over channel-major activations
+    /// with no copy, into an f32 `output (spatial, output_dim)`.
+    pub fn latent_matmul_channels(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        spatial: u32,
+        input_dim: u32,
+        output_dim: u32,
+        dtype: Dtype,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_matmul_channels(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    spatial,
+                    input_dim,
+                    output_dim,
+                    dtype.code(),
+                    error,
+                    size,
+                )
+            },
+            "latent_matmul_channels",
+        )
+    }
+
+    /// `h3b_epilogue`: `(spatial, channels)` f32 to channel-major dtype, bias
+    /// in f32, one rounding, at `row_offset` inside a `row_stride` tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_epilogue(
+        &self,
+        output: &Tensor,
+        matrix: &Tensor,
+        bias: Option<&Tensor>,
+        dtype: Dtype,
+        channels: u32,
+        spatial: u32,
+        row_stride: usize,
+        row_offset: usize,
+    ) -> Result<(), String> {
+        let bias_raw: *const CTensor = match bias {
+            Some(tensor) => tensor.raw(),
+            None => std::ptr::null(),
+        };
+        self.call(
+            |error, size| unsafe {
+                h3b_epilogue(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    matrix.raw(),
+                    bias_raw,
+                    dtype.code(),
+                    channels,
+                    spatial,
+                    row_stride,
+                    row_offset,
+                    error,
+                    size,
+                )
+            },
+            "latent_epilogue",
+        )
+    }
+
+    /// `h3b_norm`: volume GroupNorm with the ResBlock epilogues folded in.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        embedding: Option<&Tensor>,
+        partial: &Tensor,
+        mean: &Tensor,
+        rstd: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        groups: u32,
+        rows: u32,
+        spatial: u32,
+        epsilon: f32,
+        silu: bool,
+    ) -> Result<(), String> {
+        let embedding_raw: *const CTensor = match embedding {
+            Some(tensor) => tensor.raw(),
+            None => std::ptr::null(),
+        };
+        self.call(
+            |error, size| unsafe {
+                h3b_norm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    embedding_raw,
+                    partial.raw(),
+                    mean.raw(),
+                    rstd.raw(),
+                    dtype.code(),
+                    channels,
+                    groups,
+                    rows,
+                    spatial,
+                    epsilon,
+                    silu as c_int,
+                    error,
+                    size,
+                )
+            },
+            "latent_norm",
+        )
+    }
+
+    pub fn latent_silu(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_silu(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "latent_silu",
+        )
+    }
+
+    pub fn latent_add(
+        &self,
+        output: &Tensor,
+        left: &Tensor,
+        right: &Tensor,
+        dtype: Dtype,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_add(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    left.raw(),
+                    right.raw(),
+                    dtype.code(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "latent_add",
+        )
+    }
+
+    /// `h3b_depthwise_temporal`: `(kernel, 1, 1)`, `groups == channels`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_depthwise_temporal(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        rows: u32,
+        spatial: u32,
+        kernel: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_depthwise_temporal(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    dtype.code(),
+                    channels,
+                    rows,
+                    spatial,
+                    kernel,
+                    kernel / 2,
+                    error,
+                    size,
+                )
+            },
+            "latent_depthwise_temporal",
+        )
+    }
+
+    /// `h3b_resize3d`: trilinear, `align_corners=False`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_resize3d(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        size: [u32; 3],
+        target: [u32; 3],
+    ) -> Result<(), String> {
+        self.call(
+            |error, error_size| unsafe {
+                h3b_resize3d(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    channels,
+                    size[0],
+                    size[1],
+                    size[2],
+                    target[0],
+                    target[1],
+                    target[2],
+                    error,
+                    error_size,
+                )
+            },
+            "latent_resize3d",
+        )
+    }
+
+    /// `h3b_time_gather`: one source frame per target (or zero for
+    /// `u32::MAX` in `index`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_time_gather(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        index: &Tensor,
+        dtype: Dtype,
+        in_channels: u32,
+        source_frames: u32,
+        target_frames: u32,
+        spatial: u32,
+        slots: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_time_gather(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    index.raw(),
+                    dtype.code(),
+                    in_channels,
+                    source_frames,
+                    target_frames,
+                    spatial,
+                    slots,
+                    error,
+                    size,
+                )
+            },
+            "latent_time_gather",
+        )
+    }
+
+    /// `h3b_time_lerp`: `a + w * (b - a)` between two source frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_time_lerp(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        left: &Tensor,
+        right: &Tensor,
+        weight: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        source_frames: u32,
+        target_frames: u32,
+        spatial: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_time_lerp(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    left.raw(),
+                    right.raw(),
+                    weight.raw(),
+                    dtype.code(),
+                    channels,
+                    source_frames,
+                    target_frames,
+                    spatial,
+                    error,
+                    size,
+                )
+            },
+            "latent_time_lerp",
+        )
+    }
+
+    /// `h3b_unshuffle2`: `F.pixel_unshuffle` at factor 2.
+    pub fn latent_unshuffle2(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        in_channels: u32,
+        rows: u32,
+        height: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_unshuffle2(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    in_channels,
+                    rows,
+                    height,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "latent_unshuffle2",
+        )
+    }
+
+    /// `h3b_accumulate`: the chunked upscaler's weighted segment sum, reading
+    /// the segment's own output at `in_begin` and writing at `out_begin`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_accumulate(
+        &self,
+        accumulator: &Tensor,
+        segment: &Tensor,
+        weight: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        frames: u32,
+        segment_frames: u32,
+        spatial: u32,
+        in_frames: u32,
+        in_begin: u32,
+        out_begin: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_accumulate(
+                    self.raw.as_ptr(),
+                    accumulator.raw(),
+                    segment.raw(),
+                    weight.raw(),
+                    dtype.code(),
+                    channels,
+                    frames,
+                    segment_frames,
+                    spatial,
+                    in_frames,
+                    in_begin,
+                    out_begin,
+                    error,
+                    size,
+                )
+            },
+            "latent_accumulate",
+        )
+    }
+
+    /// `h3b_blend_finish`: the weighted average that closes the chunk loop.
+    pub fn latent_blend_finish(
+        &self,
+        output: &Tensor,
+        accumulator: &Tensor,
+        weight: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        frames: u32,
+        spatial: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_blend_finish(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    accumulator.raw(),
+                    weight.raw(),
+                    dtype.code(),
+                    channels,
+                    frames,
+                    spatial,
+                    error,
+                    size,
+                )
+            },
+            "latent_blend_finish",
+        )
+    }
+
+    /// `h3b_gate_mul`: `value * silu(gate)` over a `2*half` channel tensor.
+    pub fn latent_gate_mul(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        half: u32,
+        plane: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_gate_mul(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    half,
+                    plane,
+                    error,
+                    size,
+                )
+            },
+            "latent_gate_mul",
+        )
+    }
+
+    /// `h3b_scale`: the node's `N` (`denormalize` false) and `D` (true).
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_scale(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        center: &Tensor,
+        scale: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        plane: usize,
+        denormalize: bool,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_scale(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    center.raw(),
+                    scale.raw(),
+                    dtype.code(),
+                    channels,
+                    plane,
+                    denormalize as c_int,
+                    error,
+                    size,
+                )
+            },
+            "latent_scale",
+        )
+    }
+
+    /// `h3b_copy_offset`: a plain copy into `output` at `out_offset` elements.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_copy_offset(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        out_offset: usize,
+        in_offset: usize,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3b_copy_offset(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    out_offset,
+                    in_offset,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "latent_copy_offset",
+        )
     }
 }
 

@@ -541,6 +541,156 @@ int h3d_sol_forward(h3d_context *context, h3d_tensor *output,
                     uint32_t sequence, uint32_t heads, float scale, char *error,
                     size_t error_size);
 
+/* ------------------------------------------------------------------------
+ * h3b_* — the H3-to-LTX latent path (`minimax_h3::ltx_adapter`).
+ *
+ * The profile's `stage2_ops/h3_upscale.py` (the pinned author node's
+ * `LatentResizer3D` wrapped in its own N/D) and `stage2_ops/h3_ltx_adapter/`
+ * (the alignment and the 22-block factorized Conv3D adapter), ported. These
+ * models have no C reference: the authority is that Python, read at
+ * `/data/Sol-h3-Spark` and at the node's own pin `d7c01b90`.
+ *
+ * Every op takes `dtype` (`H3D_BF16` or `H3D_F32`). The reference runs both
+ * models in bf16; the f32 arm exists so the port can be gated tightly against
+ * an f32 reference vector. Activations are channel-major
+ * `[channel][time][height][width]` and weights are PyTorch's own
+ * `[out][in][kd][kh][kw]`, so no weight is ever transformed.
+ * ------------------------------------------------------------------------ */
+
+/* Zero-pad the temporal and spatial axes (`Conv3d(padding=...)`). */
+int h3b_pad3d(h3d_context *context, h3d_tensor *output,
+              const h3d_tensor *input, int dtype, uint32_t channels,
+              uint32_t depth, uint32_t height, uint32_t width, uint32_t pad_t,
+              uint32_t pad_h, uint32_t pad_w, char *error, size_t error_size);
+
+/* The convolution's im2col: `(depth, height, width)` interior positions of the
+ * padded tensor, starting at `t_begin`, into a `depth*height*width` by
+ * `channels*kd*kh*kw` matrix. */
+int h3b_im2col(h3d_context *context, h3d_tensor *output,
+               const h3d_tensor *padded, int dtype, uint32_t channels,
+               uint32_t pad_depth, uint32_t pad_height, uint32_t pad_width,
+               uint32_t kd, uint32_t kh, uint32_t kw, uint32_t depth,
+               uint32_t height, uint32_t width, uint32_t t_begin, char *error,
+               size_t error_size);
+
+/* The two matmuls, both into an f32 accumulator: `h3b_matmul` for the im2col
+ * form (`left` is `rows x input_dim`, `right` is `output_dim x input_dim`,
+ * both row-major) and `h3b_matmul_channels` for a 1x1 convolution with no
+ * copy at all (`input` is `input_dim x spatial` channel-major, `weight` is
+ * `output_dim x input_dim`). */
+int h3b_matmul(h3d_context *context, h3d_tensor *output,
+               const h3d_tensor *left, const h3d_tensor *right, uint32_t rows,
+               uint32_t input_dim, uint32_t output_dim, int dtype, char *error,
+               size_t error_size);
+
+int h3b_matmul_channels(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t spatial, uint32_t input_dim,
+                        uint32_t output_dim, int dtype, char *error,
+                        size_t error_size);
+
+/* The convolution's tail: `(spatial, channels)` f32 into channel-major `T`,
+ * bias added in f32, one rounding. `row_stride` and `row_offset` place the
+ * tile inside a larger channel-major tensor, which is how the convolution
+ * runs in temporal slabs. */
+int h3b_epilogue(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *matrix, const h3d_tensor *bias, int dtype,
+                 uint32_t channels, uint32_t spatial, size_t row_stride,
+                 size_t row_offset, char *error, size_t error_size);
+
+/* `nn.GroupNorm`, which for a 5-D input reduces over the whole
+ * `(channels/groups, time, height, width)` volume per group, with the
+ * ResBlock epilogues folded in: `embedding` non-NULL applies
+ * `norm * (1 + scale) + shift` from its two halves, `silu` applies SiLU after.
+ * `partial`, `mean` and `rstd` are f32 scratch the caller sizes: `partial`
+ * needs `groups * (channels/groups) * ceil(rows*spatial/8192) * 2` elements and
+ * `mean`/`rstd` need `groups` each. */
+int h3b_norm(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+             const h3d_tensor *weight, const h3d_tensor *bias,
+             const h3d_tensor *embedding, h3d_tensor *partial,
+             h3d_tensor *mean, h3d_tensor *rstd, int dtype, uint32_t channels,
+             uint32_t groups, uint32_t rows, uint32_t spatial, float epsilon,
+             int silu, char *error, size_t error_size);
+
+int h3b_silu(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+             int dtype, size_t elements, char *error, size_t error_size);
+
+int h3b_add(h3d_context *context, h3d_tensor *output, const h3d_tensor *left,
+            const h3d_tensor *right, int dtype, size_t elements, char *error,
+            size_t error_size);
+
+/* A depthwise `(kernel, 1, 1)` convolution with `groups == channels` and
+ * symmetric temporal padding. */
+int h3b_depthwise_temporal(h3d_context *context, h3d_tensor *output,
+                           const h3d_tensor *input, const h3d_tensor *weight,
+                           const h3d_tensor *bias, int dtype, uint32_t channels,
+                           uint32_t rows, uint32_t spatial, uint32_t kernel,
+                           uint32_t pad, char *error, size_t error_size);
+
+/* `F.interpolate(..., mode="trilinear", align_corners=False)`. */
+int h3b_resize3d(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, int dtype, uint32_t channels,
+                 uint32_t rows, uint32_t height, uint32_t width,
+                 uint32_t out_rows, uint32_t out_height, uint32_t out_width,
+                 char *error, size_t error_size);
+
+/* Take target frame `index[target*slots + slot]` of the source
+ * (`0xffffffff` writes zero): the nearest pack and the replicate padding. */
+int h3b_time_gather(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *index, int dtype,
+                    uint32_t in_channels, uint32_t source_frames,
+                    uint32_t target_frames, uint32_t spatial, uint32_t slots,
+                    char *error, size_t error_size);
+
+/* `a + w * (b - a)` between two source frames. */
+int h3b_time_lerp(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *input, const h3d_tensor *left,
+                  const h3d_tensor *right, const h3d_tensor *weight, int dtype,
+                  uint32_t channels, uint32_t source_frames,
+                  uint32_t target_frames, uint32_t spatial, char *error,
+                  size_t error_size);
+
+/* `F.pixel_unshuffle(x, 2)` over `(height, width)`, giving four times the
+ * channels. */
+int h3b_unshuffle2(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, int dtype, uint32_t in_channels,
+                   uint32_t rows, uint32_t height, uint32_t width, char *error,
+                   size_t error_size);
+
+/* The chunked upscaler's `out_full += segment * weight` and its
+ * `out_full / weight_full.clamp(min=1e-8)`; the accumulator is f32 and holds
+ * every output frame. */
+int h3b_accumulate(h3d_context *context, h3d_tensor *accumulator,
+                   const h3d_tensor *segment, const h3d_tensor *weight,
+                   int dtype, uint32_t channels, uint32_t frames,
+                   uint32_t segment_frames, uint32_t spatial, uint32_t in_frames,
+                   uint32_t in_begin, uint32_t out_begin, char *error,
+                   size_t error_size);
+
+int h3b_blend_finish(h3d_context *context, h3d_tensor *output,
+                     const h3d_tensor *accumulator, const h3d_tensor *weight,
+                     int dtype, uint32_t channels, uint32_t frames,
+                     uint32_t spatial, char *error, size_t error_size);
+
+/* `value * silu(gate)` over the two halves of a `2*half` channel tensor. */
+int h3b_gate_mul(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, int dtype, uint32_t half,
+                 size_t plane, char *error, size_t error_size);
+
+/* The node's `N` and `D`: `(x - center) / scale` and `x * scale + center`,
+ * applied per channel. */
+int h3b_scale(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+              const h3d_tensor *center, const h3d_tensor *scale, int dtype,
+              uint32_t channels, size_t plane, int denormalize, char *error,
+              size_t error_size);
+
+/* A plain copy into `output` at `out_offset` elements from `input` at
+ * `in_offset`: `torch.cat` over the channel axis. */
+int h3b_copy_offset(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, int dtype, size_t out_offset,
+                    size_t in_offset, size_t elements, char *error,
+                    size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

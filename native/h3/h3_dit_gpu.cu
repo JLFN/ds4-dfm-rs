@@ -4253,3 +4253,1212 @@ int h3d_sol_forward(h3d_context *context, h3d_tensor *output,
         h3d_sol_words(sequence), scale);
     return h3d_launch_ok("Sol-Attn forward", error, error_size);
 }
+
+/* ==========================================================================
+ * h3b_* — the H3-to-LTX latent path's device ops.
+ *
+ * Source of truth: `runtime/stage2_ops/h3_upscale.py` (the pinned author node
+ * wrapped) and `runtime/stage2_ops/h3_ltx_adapter/{constants,geometry,model}.
+ * py`, against the architecture the node itself declares
+ * (`nodes/minimax_h3_latent_upscaler_3d.py` at `d7c01b90`). Both models run
+ * here; nothing in this section evaluates Python or calls out of process.
+ *
+ * Every kernel is templated on the element type, so one binary carries the
+ * bf16 path the reference runs (`h3_upscale.py:82`, the adapter's own
+ * `dtype=torch.bfloat16` default) and an f32 path that exists to be gated
+ * tightly against an f32 reference vector. Both accumulate in f32 and round
+ * once, which is what torch's own bf16 kernels do.
+ *
+ * Layouts are the H3 family's: channel-major `[channel][time][height][width]`,
+ * weights as PyTorch stores them (`[out][in][kd][kh][kw]`).
+ * ========================================================================== */
+
+/* Element-type traits: `to` widens for the arithmetic, `from` rounds back. */
+template <typename T> struct h3b_element;
+
+template <> struct h3b_element<float> {
+    static __device__ __forceinline__ float to(float value) { return value; }
+    static __device__ __forceinline__ float from(float value) { return value; }
+};
+
+template <> struct h3b_element<__nv_bfloat16> {
+    static __device__ __forceinline__ float to(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    static __device__ __forceinline__ __nv_bfloat16 from(float value) {
+        return __float2bfloat16(value);
+    }
+};
+
+/* `h3b_time_pack`'s "write zero" entry, `geometry.py:72-78`'s `occupied`. */
+#define H3B_UNOCCUPIED 0xffffffffu
+
+#define H3B_BLOCK 256u
+
+/* A block-wide (sum, sum of squares) reduction through shared memory. */
+__device__ static void h3b_block_sum2(float *sum, float *squares) {
+    __shared__ float partial_sum[32];
+    __shared__ float partial_squares[32];
+    unsigned mask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        *sum += __shfl_down_sync(mask, *sum, offset);
+        *squares += __shfl_down_sync(mask, *squares, offset);
+    }
+    unsigned lane = threadIdx.x & 31u;
+    unsigned warp = threadIdx.x >> 5u;
+    if (lane == 0u) {
+        partial_sum[warp] = *sum;
+        partial_squares[warp] = *squares;
+    }
+    __syncthreads();
+    unsigned warps = (blockDim.x + 31u) >> 5u;
+    if (warp == 0u) {
+        *sum = lane < warps ? partial_sum[lane] : 0.0f;
+        *squares = lane < warps ? partial_squares[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            *sum += __shfl_down_sync(mask, *sum, offset);
+            *squares += __shfl_down_sync(mask, *squares, offset);
+        }
+    } else {
+        *sum = 0.0f;
+        *squares = 0.0f;
+    }
+}
+
+/* `F.pad`'s zero halo (`minimax_h3_latent_upscaler_3d.py:221-223`'s Conv3d
+ * padding, applied once instead of per convolution). */
+template <typename T>
+__global__ static void h3b_pad3d_kernel(T *out, const T *in, uint32_t channels,
+                                        uint32_t depth, uint32_t height,
+                                        uint32_t width, uint32_t pad_t,
+                                        uint32_t pad_h, uint32_t pad_w,
+                                        size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t stride_w = width + 2 * pad_w;
+    uint32_t stride_h = height + 2 * pad_h;
+    uint32_t stride_t = depth + 2 * pad_t;
+    uint32_t x = (uint32_t)(index % stride_w);
+    size_t rest = index / stride_w;
+    uint32_t y = (uint32_t)(rest % stride_h);
+    rest /= stride_h;
+    uint32_t t = (uint32_t)(rest % stride_t);
+    uint32_t channel = (uint32_t)(rest / stride_t);
+    if (t >= pad_t && y >= pad_h && x >= pad_w && t - pad_t < depth &&
+        y - pad_h < height && x - pad_w < width) {
+        out[index] = in[(((size_t)channel * depth + (t - pad_t)) * height +
+                         (y - pad_h)) * width + (x - pad_w)];
+        return;
+    }
+    out[index] = h3b_element<T>::from(0.0f);
+}
+
+/* The convolution's im2col: row `(t, y, x)` of the interior grid, column
+ * `((channel * kd + kt) * kh + ky) * kw + kx`. The row-major weight is then
+ * PyTorch's own `[out][in][kd][kh][kw]` flattened, so no weight transform
+ * exists anywhere in this path. */
+template <typename T>
+__global__ static void h3b_im2col_kernel(T *out, const T *padded,
+                                         uint32_t channels, uint32_t pad_depth,
+                                         uint32_t pad_height, uint32_t pad_width,
+                                         uint32_t kd, uint32_t kh, uint32_t kw,
+                                         uint32_t depth, uint32_t height,
+                                         uint32_t width, uint32_t t_begin,
+                                         size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    size_t columns = (size_t)channels * kd * kh * kw;
+    size_t row = index / columns;
+    uint32_t column = (uint32_t)(index % columns);
+    uint32_t kx = column % kw;
+    uint32_t ky = (column / kw) % kh;
+    uint32_t kt = (column / (kw * kh)) % kd;
+    uint32_t channel = column / (kw * kh * kd);
+    size_t plane = (size_t)height * width;
+    uint32_t t = t_begin + (uint32_t)(row / plane);
+    uint32_t spatial = (uint32_t)(row % plane);
+    uint32_t x = spatial % width;
+    uint32_t y = spatial / width;
+    out[index] =
+        padded[(((size_t)channel * pad_depth + (t + kt)) * pad_height +
+                (y + ky)) * pad_width + (x + kx)];
+}
+
+/* `[channel][spatial]` -> `[spatial][channel]` with the bias added in f32 and
+ * one rounding: the convolution's epilogue, a tiled transpose (both the f32
+ * read and the `T` write stay coalesced, the tile is transposed in shared
+ * memory with a one-element pad so neither pass conflicts on a bank).
+ *
+ * `row_stride` and `row_offset` place the tile inside a larger channel-major
+ * tensor, which is how the convolution runs in temporal slabs without ever
+ * materializing its whole im2col. */
+#define H3B_TILE 32u
+
+template <typename T>
+__global__ static void h3b_epilogue_kernel(T *out, const float *temp,
+                                           const T *bias, uint32_t spatial,
+                                           uint32_t channels, size_t row_stride,
+                                           size_t row_offset, int has_bias) {
+    __shared__ float tile[H3B_TILE][H3B_TILE + 1];
+    // Load: threadIdx.x walks the matrix's fast axis, which is the channel.
+    uint32_t in_channel = blockIdx.x * H3B_TILE + threadIdx.x;
+    uint32_t in_point = blockIdx.y * H3B_TILE + threadIdx.y;
+    if (in_channel < channels && in_point < spatial) {
+        tile[threadIdx.y][threadIdx.x] = temp[(size_t)in_point * channels + in_channel];
+    }
+    __syncthreads();
+    // Store: the tile is read transposed, so threadIdx.x now walks the
+    // destination's fast axis — the spatial index — and stays coalesced.
+    uint32_t out_point = blockIdx.y * H3B_TILE + threadIdx.x;
+    uint32_t out_channel = blockIdx.x * H3B_TILE + threadIdx.y;
+    if (out_point < spatial && out_channel < channels) {
+        float value = tile[threadIdx.x][threadIdx.y];
+        if (has_bias) value += h3b_element<T>::to(bias[out_channel]);
+        out[(size_t)out_channel * row_stride + row_offset + out_point] =
+            h3b_element<T>::from(value);
+    }
+}
+
+/* GroupNorm's first pass: one block per (group, group-local channel, chunk of
+ * that channel's plane), writing an f32 (sum, sum of squares) pair. The
+ * reduction is over the whole `(channels/groups, time, height, width)` volume,
+ * which is what `nn.GroupNorm` normalizes over for a 5-D input. */
+template <typename T>
+__global__ static void h3b_norm_partial_kernel(float *partial, const T *in,
+                                               uint32_t group_channels,
+                                               size_t plane, uint32_t chunk,
+                                               uint32_t chunks) {
+    uint32_t group = blockIdx.z;
+    uint32_t local = blockIdx.y;
+    uint32_t index = blockIdx.x;
+    size_t base = ((size_t)group * group_channels + local) * plane;
+    size_t begin = (size_t)index * chunk;
+    size_t count = plane - begin < chunk ? plane - begin : chunk;
+    float sum = 0.0f;
+    float squares = 0.0f;
+    for (size_t offset = threadIdx.x; offset < count; offset += blockDim.x) {
+        float value = h3b_element<T>::to(in[base + begin + offset]);
+        sum += value;
+        squares += value * value;
+    }
+    h3b_block_sum2(&sum, &squares);
+    if (threadIdx.x == 0u) {
+        size_t slot = ((size_t)group * group_channels + local) * chunks + index;
+        partial[slot * 2] = sum;
+        partial[slot * 2 + 1] = squares;
+    }
+}
+
+/* GroupNorm's second pass: one block per group, mean and rstd in f32. */
+__global__ static void h3b_norm_stats_kernel(float *mean, float *rstd,
+                                             const float *partial,
+                                             uint32_t group_channels,
+                                             uint32_t chunks, float count,
+                                             float epsilon) {
+    size_t entries = (size_t)group_channels * chunks;
+    float sum = 0.0f;
+    float squares = 0.0f;
+    for (size_t index = threadIdx.x; index < entries; index += blockDim.x) {
+        size_t slot = (size_t)blockIdx.x * entries + index;
+        sum += partial[slot * 2];
+        squares += partial[slot * 2 + 1];
+    }
+    h3b_block_sum2(&sum, &squares);
+    if (threadIdx.x == 0u) {
+        float average = sum / count;
+        float variance = squares / count - average * average;
+        if (variance < 0.0f) variance = 0.0f;
+        mean[blockIdx.x] = average;
+        rstd[blockIdx.x] = rsqrtf(variance + epsilon);
+    }
+}
+
+/* GroupNorm's third pass, with the ResBlock's two epilogues folded in:
+ * `h = out_norm(h) * (1 + scale) + shift` (`:185`, scale and shift are the
+ * halves of the embedding projection) and, where the graph has it, the SiLU
+ * inside `in_layers`/`out_layers` (`:165`, `:171`). */
+template <typename T>
+__global__ static void h3b_norm_apply_kernel(
+    T *out, const T *in, const T *weight, const T *bias, const T *emb,
+    const float *mean, const float *rstd, uint32_t channels,
+    uint32_t group_channels, size_t plane, int silu, int has_emb,
+    size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t channel = (uint32_t)(index / plane);
+    uint32_t group = channel / group_channels;
+    float value = (h3b_element<T>::to(in[index]) - mean[group]) *
+                      rstd[group] * h3b_element<T>::to(weight[channel]) +
+                  h3b_element<T>::to(bias[channel]);
+    if (has_emb) {
+        value = value * (1.0f + h3b_element<T>::to(emb[channel])) +
+                h3b_element<T>::to(emb[channels + channel]);
+    }
+    if (silu) value = value / (1.0f + expf(-value));
+    out[index] = h3b_element<T>::from(value);
+}
+
+template <typename T>
+__global__ static void h3b_silu_kernel(T *out, const T *in, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float value = h3b_element<T>::to(in[index]);
+    out[index] = h3b_element<T>::from(value / (1.0f + expf(-value)));
+}
+
+/* `inputs + out_proj(...)` (`model.py:22`) and `self.skip(x) + h`
+ * (`:189`): one rounding, as torch's own bf16 add. */
+template <typename T>
+__global__ static void h3b_add_kernel(T *out, const T *left, const T *right,
+                                      size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    out[index] = h3b_element<T>::from(h3b_element<T>::to(left[index]) +
+                                      h3b_element<T>::to(right[index]));
+}
+
+/* The depthwise temporal convolution both models carry: kernel
+ * `(kernel, 1, 1)`, `groups = channels`, symmetric padding, out-of-range
+ * frames contributing nothing (`TemporalConv`, `:191-213`; the adapter's
+ * `temporal`, `model.py:15`). */
+template <typename T>
+__global__ static void h3b_depthwise_temporal_kernel(
+    T *out, const T *in, const T *weight, const T *bias, uint32_t rows,
+    uint32_t spatial, uint32_t kernel, uint32_t pad, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t point = (uint32_t)(index % spatial);
+    size_t rest = index / spatial;
+    uint32_t row = (uint32_t)(rest % rows);
+    uint32_t channel = (uint32_t)(rest / rows);
+    float sum = h3b_element<T>::to(bias[channel]);
+    for (uint32_t tap = 0; tap < kernel; tap++) {
+        int source = (int)row + (int)tap - (int)pad;
+        if (source < 0 || source >= (int)rows) continue;
+        sum += h3b_element<T>::to(
+                   in[((size_t)channel * rows + source) * spatial + point]) *
+               h3b_element<T>::to(weight[(size_t)channel * kernel + tap]);
+    }
+    out[index] = h3b_element<T>::from(sum);
+}
+
+/* `F.interpolate(..., mode="trilinear", align_corners=False)` (`:327`):
+ * `src = scale * (dst + 0.5) - 0.5` clamped at zero, the two taps per axis,
+ * f32 weights and one rounding at the end. */
+template <typename T>
+__global__ static void h3b_resize3d_kernel(
+    T *out, const T *in, uint32_t channels, uint32_t rows, uint32_t height,
+    uint32_t width, uint32_t out_rows, uint32_t out_height, uint32_t out_width,
+    size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t x = (uint32_t)(index % out_width);
+    size_t rest = index / out_width;
+    uint32_t y = (uint32_t)(rest % out_height);
+    rest /= out_height;
+    uint32_t row = (uint32_t)(rest % out_rows);
+    uint32_t channel = (uint32_t)(rest / out_rows);
+
+    float row_scale = (float)rows / (float)out_rows;
+    float height_scale = (float)height / (float)out_height;
+    float width_scale = (float)width / (float)out_width;
+
+    float source_t = row_scale * ((float)row + 0.5f) - 0.5f;
+    float source_y = height_scale * ((float)y + 0.5f) - 0.5f;
+    float source_x = width_scale * ((float)x + 0.5f) - 0.5f;
+    if (source_t < 0.0f) source_t = 0.0f;
+    if (source_y < 0.0f) source_y = 0.0f;
+    if (source_x < 0.0f) source_x = 0.0f;
+
+    uint32_t t0 = (uint32_t)source_t;
+    uint32_t y0 = (uint32_t)source_y;
+    uint32_t x0 = (uint32_t)source_x;
+    if (t0 > rows - 1) t0 = rows - 1;
+    if (y0 > height - 1) y0 = height - 1;
+    if (x0 > width - 1) x0 = width - 1;
+    uint32_t t1 = t0 + 1 < rows ? t0 + 1 : t0;
+    uint32_t y1 = y0 + 1 < height ? y0 + 1 : y0;
+    uint32_t x1 = x0 + 1 < width ? x0 + 1 : x0;
+
+    float frac_t = source_t - (float)t0;
+    float frac_y = source_y - (float)y0;
+    float frac_x = source_x - (float)x0;
+
+    const T *plane = in + (size_t)channel * rows * height * width;
+    float value = 0.0f;
+    for (uint32_t ti = 0; ti < 2; ti++) {
+        uint32_t t = ti ? t1 : t0;
+        float weight_t = ti ? frac_t : 1.0f - frac_t;
+        for (uint32_t yi = 0; yi < 2; yi++) {
+            uint32_t row_index = yi ? y1 : y0;
+            float weight_y = yi ? frac_y : 1.0f - frac_y;
+            const T *line = plane + ((size_t)t * height + row_index) * width;
+            for (uint32_t xi = 0; xi < 2; xi++) {
+                float weight_x = xi ? frac_x : 1.0f - frac_x;
+                value += weight_t * weight_y * weight_x *
+                         h3b_element<T>::to(line[xi ? x1 : x0]);
+            }
+        }
+    }
+    out[index] = h3b_element<T>::from(value);
+}
+
+/* One frame per target from a source frame, with `H3B_UNOCCUPIED` writing
+ * zero: `geometry.py:60-79`'s nearest pack (`slots` source frames per target)
+ * and the replicate padding the chunked upscaler reads (`:271`). */
+template <typename T>
+__global__ static void h3b_time_gather_kernel(
+    T *out, const T *in, const uint32_t *index, uint32_t in_channels,
+    uint32_t source_frames, uint32_t target_frames, uint32_t spatial,
+    uint32_t slots, size_t elements) {
+    size_t element = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (element >= elements) return;
+    uint32_t point = (uint32_t)(element % spatial);
+    size_t rest = element / spatial;
+    uint32_t frame = (uint32_t)(rest % target_frames);
+    uint32_t out_channel = (uint32_t)(rest / target_frames);
+    uint32_t slot = out_channel / in_channels;
+    uint32_t channel = out_channel % in_channels;
+    uint32_t source = index[(size_t)frame * slots + slot];
+    if (source == H3B_UNOCCUPIED) {
+        out[element] = h3b_element<T>::from(0.0f);
+        return;
+    }
+    out[element] =
+        in[((size_t)channel * source_frames + source) * spatial + point];
+}
+
+/* `geometry.py:44-51`'s `temporal_resample`: `a + w * (b - a)` in f32. */
+template <typename T>
+__global__ static void h3b_time_lerp_kernel(
+    T *out, const T *in, const uint32_t *left, const uint32_t *right,
+    const float *weight, uint32_t channels, uint32_t source_frames,
+    uint32_t target_frames, uint32_t spatial, size_t elements) {
+    size_t element = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (element >= elements) return;
+    uint32_t point = (uint32_t)(element % spatial);
+    size_t rest = element / spatial;
+    uint32_t frame = (uint32_t)(rest % target_frames);
+    uint32_t channel = (uint32_t)(rest / target_frames);
+    float near = h3b_element<T>::to(
+        in[((size_t)channel * source_frames + left[frame]) * spatial + point]);
+    float far = h3b_element<T>::to(
+        in[((size_t)channel * source_frames + right[frame]) * spatial + point]);
+    out[element] = h3b_element<T>::from(near + weight[frame] * (far - near));
+}
+
+/* `geometry.py:105-112`: `F.pixel_unshuffle(..., 2)` over each latent frame's
+ * `(height, width)`, giving the adapter its 384 channels. */
+template <typename T>
+__global__ static void h3b_unshuffle2_kernel(T *out, const T *in,
+                                             uint32_t rows, uint32_t height,
+                                             uint32_t width, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t out_width = width / 2;
+    uint32_t out_height = height / 2;
+    uint32_t x = (uint32_t)(index % out_width);
+    size_t rest = index / out_width;
+    uint32_t y = (uint32_t)(rest % out_height);
+    rest /= out_height;
+    uint32_t row = (uint32_t)(rest % rows);
+    uint32_t out_channel = (uint32_t)(rest / rows);
+    uint32_t channel = out_channel / 4;
+    uint32_t sub = out_channel % 4;
+    out[index] = in[(((size_t)channel * rows + row) * height +
+                     (2u * y + sub / 2u)) * width + (2u * x + sub % 2u)];
+}
+
+/* `forward` (`:302-310`)'s weighted accumulation and its weighted average. */
+template <typename T>
+__global__ static void h3b_accumulate_kernel(
+    float *accumulator, const T *segment, const float *weight, uint32_t frames,
+    uint32_t segment_frames, uint32_t spatial, uint32_t in_frames,
+    uint32_t in_begin, uint32_t out_begin, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t point = (uint32_t)(index % spatial);
+    size_t rest = index / spatial;
+    uint32_t frame = (uint32_t)(rest % segment_frames);
+    uint32_t channel = (uint32_t)(rest / segment_frames);
+    size_t source =
+        ((size_t)channel * in_frames + (in_begin + frame)) * spatial + point;
+    accumulator[((size_t)channel * frames + (out_begin + frame)) * spatial +
+                point] += h3b_element<T>::to(segment[source]) * weight[frame];
+}
+
+template <typename T>
+__global__ static void h3b_blend_finish_kernel(T *out,
+                                               const float *accumulator,
+                                               const float *weight_total,
+                                               uint32_t frames, uint32_t spatial,
+                                               size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t frame = (uint32_t)((index / spatial) % frames);
+    float total = weight_total[frame];
+    if (total < 1e-8f) total = 1e-8f;
+    out[index] = h3b_element<T>::from(accumulator[index] / total);
+}
+
+/* `model.py:21`'s `value * self.activation(gate)` over the `in_proj` halves,
+ * which `chunk(2, dim=1)` splits at `gate_offset` elements. */
+template <typename T>
+__global__ static void h3b_gate_mul_kernel(T *out, const T *in,
+                                           size_t gate_offset,
+                                           size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float gate = h3b_element<T>::to(in[gate_offset + index]);
+    gate = gate / (1.0f + expf(-gate));
+    out[index] = h3b_element<T>::from(h3b_element<T>::to(in[index]) * gate);
+}
+
+/* The node's `N` and `D` (`:586-592`): `(x - mean) / std` and `x * std + mean`,
+ * with the statistics in the same dtype the reference keeps them in. */
+template <typename T>
+__global__ static void h3b_scale_kernel(T *out, const T *in, const T *mean,
+                                        const T *scale, uint32_t channels,
+                                        size_t plane, int denormalize,
+                                        size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t channel = (uint32_t)(index / plane);
+    float value = h3b_element<T>::to(in[index]);
+    float center = h3b_element<T>::to(mean[channel]);
+    float factor = h3b_element<T>::to(scale[channel]);
+    // `(x - mean) / std` and `x * std + mean`, the node's own two expressions
+    // (`minimax_h3_latent_upscaler_3d.py:586,592`): a division one way, a
+    // multiplication the other, each rounding once.
+    out[index] = h3b_element<T>::from(
+        denormalize ? value * factor + center : (value - center) / factor);
+}
+
+/* --- the host entry points, one per op -------------------------------- */
+
+static int h3b_type(cudaDataType_t *type, int dtype) {
+    if (dtype == H3D_BF16) {
+        *type = CUDA_R_16BF;
+        return 1;
+    }
+    if (dtype == H3D_F32) {
+        *type = CUDA_R_32F;
+        return 1;
+    }
+    return 0;
+}
+
+static unsigned h3b_blocks(size_t elements) {
+    return (unsigned)((elements + H3B_BLOCK - 1) / H3B_BLOCK);
+}
+
+/* The convolution's two halves, as cuBLASLt calls them. `h3b_gemm_rows` is the
+ * im2col form: A `(rows, k)` and B `(out, k)` both row-major — B is PyTorch's
+ * weight untouched — into an f32 C, one accumulation, no intermediate
+ * rounding. `h3b_gemm_channels` is the 1x1 form: A is the channel-major
+ * activation `(k, spatial)` read column-major and B the weight `(out, k)` read
+ * column-major, so a 1x1 convolution copies nothing at all. */
+static int h3b_gemm_rows(h3d_context *context, float *out, const void *a,
+                         const void *b, uint32_t rows, uint32_t input_dim,
+                         uint32_t output_dim, cudaDataType_t type, char *error,
+                         size_t error_size) {
+    cublasLtMatmulDesc_t operation = NULL;
+    cublasLtMatrixLayout_t a_layout = NULL;
+    cublasLtMatrixLayout_t b_layout = NULL;
+    cublasLtMatrixLayout_t c_layout = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasStatus_t status =
+        cublasLtMatmulDescCreate(&operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
+            sizeof(transpose));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&a_layout, type, rows, input_dim,
+                                            input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&b_layout, type, output_dim,
+                                            input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&c_layout, CUDA_R_32F, rows,
+                                            output_dim, output_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            a_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            b_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            c_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmul(context->blas, operation, &alpha, a, a_layout,
+                                b, b_layout, &beta, out, c_layout, out,
+                                c_layout, NULL, NULL, 0, context->stream);
+    }
+    if (c_layout) cublasLtMatrixLayoutDestroy(c_layout);
+    if (b_layout) cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) cublasLtMatrixLayoutDestroy(a_layout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return h3d_blas_ok(status, "cuBLASLt latent matmul", error, error_size);
+}
+
+static int h3b_gemm_channels(h3d_context *context, float *out,
+                             const void *input, const void *weight,
+                             uint32_t spatial, uint32_t input_dim,
+                             uint32_t output_dim, cudaDataType_t type,
+                             char *error, size_t error_size) {
+    cublasLtMatmulDesc_t operation = NULL;
+    cublasLtMatrixLayout_t a_layout = NULL;
+    cublasLtMatrixLayout_t b_layout = NULL;
+    cublasLtMatrixLayout_t c_layout = NULL;
+    cublasLtOrder_t column_major = CUBLASLT_ORDER_COL;
+    cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasStatus_t status =
+        cublasLtMatmulDescCreate(&operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&a_layout, type, spatial, input_dim,
+                                            spatial);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&b_layout, type, input_dim,
+                                            output_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&c_layout, CUDA_R_32F, spatial,
+                                            output_dim, output_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            a_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &column_major,
+            sizeof(column_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            b_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &column_major,
+            sizeof(column_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            c_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmul(context->blas, operation, &alpha, input,
+                                a_layout, weight, b_layout, &beta, out,
+                                c_layout, out, c_layout, NULL, NULL, 0,
+                                context->stream);
+    }
+    if (c_layout) cublasLtMatrixLayoutDestroy(c_layout);
+    if (b_layout) cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) cublasLtMatrixLayoutDestroy(a_layout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return h3d_blas_ok(status, "cuBLASLt latent channel matmul", error,
+                       error_size);
+}
+
+int h3b_pad3d(h3d_context *context, h3d_tensor *output,
+              const h3d_tensor *input, int dtype, uint32_t channels,
+              uint32_t depth, uint32_t height, uint32_t width, uint32_t pad_t,
+              uint32_t pad_h, uint32_t pad_w, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t inputs = 0, outputs = 0;
+    if (!context || !channels || !depth || !height || !width ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * depth * height, width, &inputs) ||
+        !h3d_mul_size((size_t)channels * (depth + 2 * pad_t) *
+                          (height + 2 * pad_h),
+                      width + 2 * pad_w, &outputs) ||
+        !h3d_is(input, dtype, inputs) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size, "invalid latent pad tensors");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_pad3d_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                  context->stream>>>(
+            (float *)output->data, (const float *)input->data, channels, depth,
+            height, width, pad_t, pad_h, pad_w, outputs);
+    } else {
+        h3b_pad3d_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                          context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, channels, depth, height,
+            width, pad_t, pad_h, pad_w, outputs);
+    }
+    return h3d_launch_ok("latent pad", error, error_size);
+}
+
+int h3b_im2col(h3d_context *context, h3d_tensor *output,
+               const h3d_tensor *padded, int dtype, uint32_t channels,
+               uint32_t pad_depth, uint32_t pad_height, uint32_t pad_width,
+               uint32_t kd, uint32_t kh, uint32_t kw, uint32_t depth,
+               uint32_t height, uint32_t width, uint32_t t_begin, char *error,
+               size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t sources = 0, outputs = 0;
+    if (!context || !channels || !kd || !kh || !kw || !depth || !height ||
+        !width || t_begin + depth > pad_depth || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * pad_depth * pad_height, pad_width,
+                      &sources) ||
+        !h3d_mul_size((size_t)depth * height * width,
+                      (size_t)channels * kd * kh * kw, &outputs) ||
+        !h3d_is(padded, dtype, sources) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size, "invalid latent im2col shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_im2col_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                   context->stream>>>(
+            (float *)output->data, (const float *)padded->data, channels,
+            pad_depth, pad_height, pad_width, kd, kh, kw, depth, height, width,
+            t_begin, outputs);
+    } else {
+        h3b_im2col_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                           context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)padded->data, channels, pad_depth,
+            pad_height, pad_width, kd, kh, kw, depth, height, width, t_begin,
+            outputs);
+    }
+    return h3d_launch_ok("latent im2col", error, error_size);
+}
+
+int h3b_matmul(h3d_context *context, h3d_tensor *output,
+               const h3d_tensor *left, const h3d_tensor *right, uint32_t rows,
+               uint32_t input_dim, uint32_t output_dim, int dtype, char *error,
+               size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t lefts = 0, rights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size(rows, input_dim, &lefts) ||
+        !h3d_mul_size(output_dim, input_dim, &rights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(left, dtype, lefts) || !h3d_is(right, dtype, rights) ||
+        !h3d_is(output, H3D_F32, outputs)) {
+        return h3d_set_error(error, error_size, "invalid latent matmul shape");
+    }
+    return h3b_gemm_rows(context, (float *)output->data, left->data,
+                         right->data, rows, input_dim, output_dim, type, error,
+                         error_size);
+}
+
+int h3b_matmul_channels(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t spatial, uint32_t input_dim,
+                        uint32_t output_dim, int dtype, char *error,
+                        size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !spatial || !input_dim || !output_dim ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size(input_dim, spatial, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(spatial, output_dim, &outputs) ||
+        !h3d_is(input, dtype, inputs) || !h3d_is(weight, dtype, weights) ||
+        !h3d_is(output, H3D_F32, outputs)) {
+        return h3d_set_error(error, error_size, "invalid latent 1x1 shape");
+    }
+    return h3b_gemm_channels(context, (float *)output->data, input->data,
+                             weight->data, spatial, input_dim, output_dim, type,
+                             error, error_size);
+}
+
+int h3b_epilogue(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *matrix, const h3d_tensor *bias, int dtype,
+                 uint32_t channels, uint32_t spatial, size_t row_stride,
+                 size_t row_offset, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t matrices = 0, needed = 0;
+    if (!context || !channels || !spatial || !h3b_type(&type, dtype) ||
+        !h3d_mul_size(spatial, channels, &matrices) ||
+        !h3d_mul_size((size_t)channels - 1, row_stride, &needed) ||
+        needed > SIZE_MAX - row_offset - spatial ||
+        !h3d_is(matrix, H3D_F32, matrices) ||
+        !h3d_is(output, dtype, needed + row_offset + spatial) ||
+        (bias && !h3d_is(bias, dtype, channels))) {
+        return h3d_set_error(error, error_size, "invalid latent epilogue shape");
+    }
+    dim3 grid((channels + H3B_TILE - 1) / H3B_TILE,
+              (spatial + H3B_TILE - 1) / H3B_TILE);
+    dim3 block(H3B_TILE, H3B_TILE);
+    if (dtype == H3D_F32) {
+        h3b_epilogue_kernel<float><<<grid, block, 0, context->stream>>>(
+            (float *)output->data, (const float *)matrix->data,
+            bias ? (const float *)bias->data : (const float *)matrix->data,
+            spatial, channels, row_stride, row_offset, bias != NULL);
+    } else {
+        h3b_epilogue_kernel<__nv_bfloat16><<<grid, block, 0,
+                                             context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const float *)matrix->data,
+            bias ? (const __nv_bfloat16 *)bias->data
+                 : (const __nv_bfloat16 *)matrix->data,
+            spatial, channels, row_stride, row_offset, bias != NULL);
+    }
+    return h3d_launch_ok("latent epilogue", error, error_size);
+}
+
+/* Elements per partial-sum block: 8,192 gives the released shapes 19 blocks per
+ * channel on the upscaler and 3 on the adapter, which is enough to fill the
+ * device without making the second pass long. */
+#define H3B_NORM_CHUNK 8192u
+
+int h3b_norm(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+             const h3d_tensor *weight, const h3d_tensor *bias,
+             const h3d_tensor *embedding, h3d_tensor *partial,
+             h3d_tensor *mean, h3d_tensor *rstd, int dtype, uint32_t channels,
+             uint32_t groups, uint32_t rows, uint32_t spatial, float epsilon,
+             int silu, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0, plane = 0, partials = 0;
+    uint32_t group_channels = channels / groups;
+    uint32_t chunks = 0;
+    if (!context || !channels || !groups || !rows || !spatial ||
+        channels % groups || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * rows, spatial, &elements) ||
+        !h3d_mul_size(rows, spatial, &plane) ||
+        !h3d_is(input, dtype, elements) || !h3d_is(output, dtype, elements) ||
+        !h3d_is(weight, dtype, channels) || !h3d_is(bias, dtype, channels) ||
+        (embedding && !h3d_is(embedding, dtype, 2 * (size_t)channels)) ||
+        !h3d_is(mean, H3D_F32, groups) || !h3d_is(rstd, H3D_F32, groups)) {
+        return h3d_set_error(error, error_size, "invalid latent norm shape");
+    }
+    chunks = (uint32_t)((plane + H3B_NORM_CHUNK - 1) / H3B_NORM_CHUNK);
+    if (!h3d_mul_size((size_t)groups * group_channels * chunks, 2, &partials) ||
+        !h3d_is(partial, H3D_F32, partials)) {
+        return h3d_set_error(error, error_size,
+                             "latent norm scratch is undersized");
+    }
+    if (group_channels > 65535 || groups > 65535) {
+        return h3d_set_error(error, error_size, "latent norm grid too wide");
+    }
+
+    dim3 grid(chunks, group_channels, groups);
+    if (dtype == H3D_F32) {
+        h3b_norm_partial_kernel<float><<<grid, H3B_BLOCK, 0,
+                                         context->stream>>>(
+            (float *)partial->data, (const float *)input->data,
+            group_channels, plane, H3B_NORM_CHUNK, chunks);
+    } else {
+        h3b_norm_partial_kernel<__nv_bfloat16><<<grid, H3B_BLOCK, 0,
+                                                 context->stream>>>(
+            (float *)partial->data, (const __nv_bfloat16 *)input->data,
+            group_channels, plane, H3B_NORM_CHUNK, chunks);
+    }
+    if (!h3d_launch_ok("latent norm partial", error, error_size)) return 0;
+
+    h3b_norm_stats_kernel<<<groups, H3B_BLOCK, 0, context->stream>>>(
+        (float *)mean->data, (float *)rstd->data, (const float *)partial->data,
+        group_channels, chunks, (float)(plane * group_channels), epsilon);
+    if (!h3d_launch_ok("latent norm statistics", error, error_size)) return 0;
+
+    if (dtype == H3D_F32) {
+        h3b_norm_apply_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                       context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const float *)weight->data, (const float *)bias->data,
+            embedding ? (const float *)embedding->data
+                      : (const float *)weight->data,
+            (const float *)mean->data, (const float *)rstd->data, channels,
+            group_channels, plane, silu, embedding != NULL, elements);
+    } else {
+        h3b_norm_apply_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK,
+                                               0, context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+            (const __nv_bfloat16 *)weight->data,
+            (const __nv_bfloat16 *)bias->data,
+            embedding ? (const __nv_bfloat16 *)embedding->data
+                      : (const __nv_bfloat16 *)weight->data,
+            (const float *)mean->data, (const float *)rstd->data, channels,
+            group_channels, plane, silu, embedding != NULL, elements);
+    }
+    return h3d_launch_ok("latent norm apply", error, error_size);
+}
+
+int h3b_silu(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+             int dtype, size_t elements, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    if (!context || !h3b_type(&type, dtype) || !h3d_is(input, dtype, elements) ||
+        !h3d_is(output, dtype, elements)) {
+        return h3d_set_error(error, error_size, "invalid latent SiLU shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_silu_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                 context->stream>>>(
+            (float *)output->data, (const float *)input->data, elements);
+    } else {
+        h3b_silu_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                         context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, elements);
+    }
+    return h3d_launch_ok("latent SiLU", error, error_size);
+}
+
+int h3b_add(h3d_context *context, h3d_tensor *output, const h3d_tensor *left,
+            const h3d_tensor *right, int dtype, size_t elements, char *error,
+            size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    if (!context || !h3b_type(&type, dtype) || !h3d_is(left, dtype, elements) ||
+        !h3d_is(right, dtype, elements) || !h3d_is(output, dtype, elements)) {
+        return h3d_set_error(error, error_size, "invalid latent add shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_add_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                context->stream>>>(
+            (float *)output->data, (const float *)left->data,
+            (const float *)right->data, elements);
+    } else {
+        h3b_add_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                        context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)left->data,
+            (const __nv_bfloat16 *)right->data, elements);
+    }
+    return h3d_launch_ok("latent add", error, error_size);
+}
+
+int h3b_depthwise_temporal(h3d_context *context, h3d_tensor *output,
+                           const h3d_tensor *input, const h3d_tensor *weight,
+                           const h3d_tensor *bias, int dtype, uint32_t channels,
+                           uint32_t rows, uint32_t spatial, uint32_t kernel,
+                           uint32_t pad, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0;
+    if (!context || !channels || !rows || !spatial || !kernel ||
+        kernel % 2 == 0 || pad != kernel / 2 || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * rows, spatial, &elements) ||
+        !h3d_is(input, dtype, elements) || !h3d_is(output, dtype, elements) ||
+        !h3d_is(weight, dtype, (size_t)channels * kernel) ||
+        !h3d_is(bias, dtype, channels)) {
+        return h3d_set_error(error, error_size,
+                             "invalid latent depthwise shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_depthwise_temporal_kernel<float><<<h3b_blocks(elements), H3B_BLOCK,
+                                               0, context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const float *)weight->data, (const float *)bias->data, rows,
+            spatial, kernel, pad, elements);
+    } else {
+        h3b_depthwise_temporal_kernel<__nv_bfloat16>
+            <<<h3b_blocks(elements), H3B_BLOCK, 0, context->stream>>>(
+                (__nv_bfloat16 *)output->data,
+                (const __nv_bfloat16 *)input->data,
+                (const __nv_bfloat16 *)weight->data,
+                (const __nv_bfloat16 *)bias->data, rows, spatial, kernel, pad,
+                elements);
+    }
+    return h3d_launch_ok("latent depthwise temporal", error, error_size);
+}
+
+int h3b_resize3d(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, int dtype, uint32_t channels,
+                 uint32_t rows, uint32_t height, uint32_t width,
+                 uint32_t out_rows, uint32_t out_height, uint32_t out_width,
+                 char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t inputs = 0, outputs = 0;
+    if (!context || !channels || !rows || !height || !width || !out_rows ||
+        !out_height || !out_width || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * rows * height, width, &inputs) ||
+        !h3d_mul_size((size_t)channels * out_rows * out_height, out_width,
+                      &outputs) ||
+        !h3d_is(input, dtype, inputs) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size, "invalid latent resize shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_resize3d_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                     context->stream>>>(
+            (float *)output->data, (const float *)input->data, channels, rows,
+            height, width, out_rows, out_height, out_width, outputs);
+    } else {
+        h3b_resize3d_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                             context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, channels, rows, height, width,
+            out_rows, out_height, out_width, outputs);
+    }
+    return h3d_launch_ok("latent trilinear resize", error, error_size);
+}
+
+int h3b_time_gather(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *index, int dtype,
+                    uint32_t in_channels, uint32_t source_frames,
+                    uint32_t target_frames, uint32_t spatial, uint32_t slots,
+                    char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t inputs = 0, outputs = 0;
+    if (!context || !in_channels || !source_frames || !target_frames ||
+        !spatial || !slots || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)in_channels * source_frames, spatial, &inputs) ||
+        !h3d_mul_size((size_t)slots * in_channels * target_frames, spatial,
+                      &outputs) ||
+        !h3d_is(input, dtype, inputs) || !h3d_is(output, dtype, outputs) ||
+        !h3d_is(index, H3D_U32, (size_t)target_frames * slots)) {
+        return h3d_set_error(error, error_size, "invalid latent gather shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_time_gather_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                        context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const uint32_t *)index->data, in_channels, source_frames,
+            target_frames, spatial, slots, outputs);
+    } else {
+        h3b_time_gather_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK,
+                                                0, context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data,
+            (const uint32_t *)index->data, in_channels, source_frames,
+            target_frames, spatial, slots, outputs);
+    }
+    return h3d_launch_ok("latent time gather", error, error_size);
+}
+
+int h3b_time_lerp(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *input, const h3d_tensor *left,
+                  const h3d_tensor *right, const h3d_tensor *weight, int dtype,
+                  uint32_t channels, uint32_t source_frames,
+                  uint32_t target_frames, uint32_t spatial, char *error,
+                  size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t inputs = 0, outputs = 0;
+    if (!context || !channels || !source_frames || !target_frames || !spatial ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * source_frames, spatial, &inputs) ||
+        !h3d_mul_size((size_t)channels * target_frames, spatial, &outputs) ||
+        !h3d_is(input, dtype, inputs) || !h3d_is(output, dtype, outputs) ||
+        !h3d_is(left, H3D_U32, target_frames) ||
+        !h3d_is(right, H3D_U32, target_frames) ||
+        !h3d_is(weight, H3D_F32, target_frames)) {
+        return h3d_set_error(error, error_size, "invalid latent lerp shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_time_lerp_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                      context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const uint32_t *)left->data, (const uint32_t *)right->data,
+            (const float *)weight->data, channels, source_frames,
+            target_frames, spatial, outputs);
+    } else {
+        h3b_time_lerp_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                              context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data,
+            (const uint32_t *)left->data, (const uint32_t *)right->data,
+            (const float *)weight->data, channels, source_frames,
+            target_frames, spatial, outputs);
+    }
+    return h3d_launch_ok("latent time lerp", error, error_size);
+}
+
+int h3b_unshuffle2(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, int dtype, uint32_t in_channels,
+                   uint32_t rows, uint32_t height, uint32_t width, char *error,
+                   size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t inputs = 0, outputs = 0;
+    if (!context || !in_channels || !rows || !height || !width ||
+        height % 2 || width % 2 || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)in_channels * rows * height, width, &inputs) ||
+        !h3d_mul_size((size_t)in_channels * 4 * rows * (height / 2), width / 2,
+                      &outputs) ||
+        !h3d_is(input, dtype, inputs) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size,
+                             "invalid latent unshuffle shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_unshuffle2_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                       context->stream>>>(
+            (float *)output->data, (const float *)input->data, rows, height,
+            width, outputs);
+    } else {
+        h3b_unshuffle2_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK,
+                                               0, context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, rows, height, width, outputs);
+    }
+    return h3d_launch_ok("latent unshuffle", error, error_size);
+}
+
+int h3b_accumulate(h3d_context *context, h3d_tensor *accumulator,
+                   const h3d_tensor *segment, const h3d_tensor *weight,
+                   int dtype, uint32_t channels, uint32_t frames,
+                   uint32_t segment_frames, uint32_t spatial, uint32_t in_frames,
+                   uint32_t in_begin, uint32_t out_begin, char *error,
+                   size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t segments = 0, totals = 0;
+    if (!context || !channels || !frames || !segment_frames || !spatial ||
+        !in_frames || out_begin + segment_frames > frames ||
+        in_begin + segment_frames > in_frames || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * in_frames, spatial, &segments) ||
+        !h3d_mul_size((size_t)channels * frames, spatial, &totals) ||
+        !h3d_is(segment, dtype, segments) ||
+        !h3d_is(accumulator, H3D_F32, totals) ||
+        !h3d_is(weight, H3D_F32, segment_frames)) {
+        return h3d_set_error(error, error_size,
+                             "invalid latent accumulate shape");
+    }
+    if (segment_frames == 0) return 1;
+    size_t written = (size_t)channels * segment_frames * spatial;
+    if (dtype == H3D_F32) {
+        h3b_accumulate_kernel<float><<<h3b_blocks(written), H3B_BLOCK, 0,
+                                       context->stream>>>(
+            (float *)accumulator->data, (const float *)segment->data,
+            (const float *)weight->data, frames, segment_frames, spatial,
+            in_frames, in_begin, out_begin, written);
+    } else {
+        h3b_accumulate_kernel<__nv_bfloat16><<<h3b_blocks(written), H3B_BLOCK,
+                                               0, context->stream>>>(
+            (float *)accumulator->data,
+            (const __nv_bfloat16 *)segment->data,
+            (const float *)weight->data, frames, segment_frames, spatial,
+            in_frames, in_begin, out_begin, written);
+    }
+    return h3d_launch_ok("latent accumulate", error, error_size);
+}
+
+int h3b_blend_finish(h3d_context *context, h3d_tensor *output,
+                     const h3d_tensor *accumulator, const h3d_tensor *weight,
+                     int dtype, uint32_t channels, uint32_t frames,
+                     uint32_t spatial, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t totals = 0;
+    if (!context || !channels || !frames || !spatial ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * frames, spatial, &totals) ||
+        !h3d_is(accumulator, H3D_F32, totals) ||
+        !h3d_is(output, dtype, totals) || !h3d_is(weight, H3D_F32, frames)) {
+        return h3d_set_error(error, error_size, "invalid latent blend shape");
+    }
+    if (totals == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_blend_finish_kernel<float><<<h3b_blocks(totals), H3B_BLOCK, 0,
+                                         context->stream>>>(
+            (float *)output->data, (const float *)accumulator->data,
+            (const float *)weight->data, frames, spatial, totals);
+    } else {
+        h3b_blend_finish_kernel<__nv_bfloat16><<<h3b_blocks(totals), H3B_BLOCK,
+                                                 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const float *)accumulator->data, (const float *)weight->data,
+            frames, spatial, totals);
+    }
+    return h3d_launch_ok("latent blend", error, error_size);
+}
+
+int h3b_gate_mul(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, int dtype, uint32_t half,
+                 size_t plane, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0, expected = 0;
+    if (!context || !half || !plane || !h3b_type(&type, dtype) ||
+        !h3d_mul_size(half, plane, &elements) ||
+        !h3d_mul_size(2 * half, plane, &expected) ||
+        !h3d_is(input, dtype, expected) || !h3d_is(output, dtype, elements)) {
+        return h3d_set_error(error, error_size, "invalid latent gate shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_gate_mul_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                     context->stream>>>(
+            (float *)output->data, (const float *)input->data, elements,
+            elements);
+    } else {
+        h3b_gate_mul_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                             context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, elements, elements);
+    }
+    return h3d_launch_ok("latent gate multiply", error, error_size);
+}
+
+int h3b_scale(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+              const h3d_tensor *center, const h3d_tensor *scale, int dtype,
+              uint32_t channels, size_t plane, int denormalize, char *error,
+              size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0;
+    if (!context || !channels || !plane || !h3b_type(&type, dtype) ||
+        !h3d_mul_size(channels, plane, &elements) ||
+        !h3d_is(input, dtype, elements) || !h3d_is(output, dtype, elements) ||
+        !h3d_is(center, dtype, channels) || !h3d_is(scale, dtype, channels)) {
+        return h3d_set_error(error, error_size, "invalid latent scale shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_scale_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                  context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const float *)center->data, (const float *)scale->data, channels,
+            plane, denormalize, elements);
+    } else {
+        h3b_scale_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                          context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data,
+            (const __nv_bfloat16 *)center->data,
+            (const __nv_bfloat16 *)scale->data, channels, plane, denormalize,
+            elements);
+    }
+    return h3d_launch_ok("latent scale", error, error_size);
+}
+
+/* `geometry.py:101`'s `torch.cat((linear, packed), dim=1)`: a plain copy into
+ * an offset, the only piece of the alignment that needs one. */
+template <typename T>
+__global__ static void h3b_copy_offset_kernel(T *out, const T *in,
+                                              size_t in_offset,
+                                              size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    out[index] = in[in_offset + index];
+}
+
+int h3b_copy_offset(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, int dtype, size_t out_offset,
+                    size_t in_offset, size_t elements, char *error,
+                    size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    if (!context || !h3b_type(&type, dtype) ||
+        !h3d_is(input, dtype, in_offset + elements) ||
+        !h3d_is(output, dtype, out_offset + elements)) {
+        return h3d_set_error(error, error_size, "invalid latent copy shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_copy_offset_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                        context->stream>>>(
+            (float *)output->data + out_offset, (const float *)input->data,
+            in_offset, elements);
+    } else {
+        h3b_copy_offset_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK,
+                                                0, context->stream>>>(
+            (__nv_bfloat16 *)output->data + out_offset,
+            (const __nv_bfloat16 *)input->data, in_offset, elements);
+    }
+    return h3d_launch_ok("latent copy", error, error_size);
+}
