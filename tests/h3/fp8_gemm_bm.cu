@@ -7,8 +7,12 @@
  *   tests/h3/fp8_gemm_bm [rows] [k] [n] [mode]
  *
  * `mode` 0 runs the whole route, 1 stops after the quantization (the bisect
- * between the two kernels and the matmul). The default is 18,799 x 5,376 x
- * 21,504, the DiT's QKV projection at job A's row count.
+ * between the two kernels and the matmul), and 11 runs the reference's
+ * per-row `granularity="channel"` arm, which cannot go through cuBLASLt's own
+ * scale vectors (modes 4-8) and is therefore assembled from
+ * `h3d_fp8_scale_rows`, `h3d_fp8_quantize_rows`, `h3d_linear_e4m3_raw` and
+ * `h3d_fp8_scale_epilogue`. The default is 18,799 x 5,376 x 21,504, the DiT's
+ * QKV projection at job A's row count.
  *
  * Build: `make CUDA_ARCH=<arch> tests/h3/fp8_gemm_bm`.
  */
@@ -95,6 +99,44 @@ static size_t check_quantized(const char *name, const std::vector<float> &values
                 "bytes off by more than half an ulp: %zu (worst %.3g)\n",
                 name, values.size(), (double)scale, (double)want_scale, scale_error,
                 wrong, worst);
+    return wrong;
+}
+
+/* One tensor's per-row quantization against the host arithmetic: `scales` is
+ * the device's own vector, so the reduction is checked as well as the
+ * rounding. Returns the number of bytes that disagree with the host quotient
+ * by more than half an E4M3 ulp, and reports the worst scale's own error. */
+static size_t check_quantized_rows(const char *name,
+                                   const std::vector<float> &values,
+                                   const std::vector<uint8_t> &stored,
+                                   const std::vector<float> &scales,
+                                   size_t columns) {
+    if (stored.size() < values.size()) fail(name, "short device copy");
+    size_t wrong = 0;
+    double worst = 0.0, worst_scale = 0.0;
+    for (size_t row = 0; row < scales.size(); ++row) {
+        double amax = 0.0;
+        for (size_t index = 0; index < columns; ++index) {
+            amax = fmax(amax, fabs((double)values[row * columns + index]));
+        }
+        float want_scale =
+            (float)fmax(amax / H3D_FP8_MAX, (double)H3D_FP8_MIN_SCALE);
+        worst_scale = fmax(worst_scale, fabs((double)scales[row] - (double)want_scale) /
+                                            (double)want_scale);
+        for (size_t index = 0; index < columns; ++index) {
+            size_t at = row * columns + index;
+            double got = e4m3_decode(stored[at]);
+            double want = expected_quantized(values[at], want_scale);
+            double over = fabs(got - want) - 0.5 * e4m3_ulp(want);
+            if (over > 1e-9) {
+                ++wrong;
+                worst = fmax(worst, over);
+            }
+        }
+    }
+    std::printf("%-6s %zu rows x %zu, worst scale rel error %.2g, "
+                "bytes off by more than half an ulp: %zu (worst %.3g)\n",
+                name, scales.size(), columns, worst_scale, wrong, worst);
     return wrong;
 }
 
@@ -331,11 +373,35 @@ int main(int argc, char **argv) {
         std::sort(samples.begin(), samples.end());
         return samples[samples.size() / 2];
     };
+    /* Four repetitions, the first discarded, median of the rest: the kernels'
+     * own setup is what the first one pays and the shapes here are large
+     * enough that a single run is not a sample. `timed_ok` carries a failure
+     * out of the closure, because a `fail` inside it would leave the stream
+     * unsynchronized. */
+    bool timed_ok = true;
+    auto timed = [&](auto &&body) {
+        std::vector<double> samples;
+        for (int repeat = 0; repeat < 4; ++repeat) {
+            auto t0 = std::chrono::steady_clock::now();
+            if (!body()) {
+                timed_ok = false;
+                return 0.0;
+            }
+            cudaStreamSynchronize(gpu->stream);
+            auto t1 = std::chrono::steady_clock::now();
+            if (repeat) {
+                samples.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+        }
+        return median(samples);
+    };
     /* Modes 2..5 run the local variants, one per invocation, so a variant that
      * crashes or hangs takes only its own process with it. Modes 6..8 are the
      * outer-vector probe: 6 all-ones scales, 7 a power-of-two pattern, 8 the
      * same pattern with a device workspace; 9 times the no-scale GEMM alone,
      * and 10 runs the same outer-vector mode on BF16 operands instead of E4M3.
+     * Mode 11 is the per-row arm the port ships when the probe fails.
      */
     if (mode == 9) {
         /* The no-scale E4M3 GEMM on its own: the floor a per-row arm that
@@ -402,7 +468,207 @@ int main(int argc, char **argv) {
                         mode - 2, error, sizeof(error))) {
             fail("local gemm", error);
         }
-    } else if (mode >= 6) {
+    } else if (mode == 13) {
+        /* The three ways one projection's call can run, in one process on the
+         * same operands: the release's scaled matmul with its BF16 output, the
+         * raw matmul the per-row arm needs, and that matmul plus the epilogue.
+         * The two arms' nsys tables are differenced captures from different
+         * sessions, so this is the same-process check of the GEMM's own part
+         * of the row arm's price. Values do not matter to any of the three
+         * timings; the vectors are ones. */
+        h3d_tensor *accumulator =
+            h3d_alloc(gpu, H3D_F32, (size_t)rows * n, error, sizeof(error));
+        if (!accumulator) fail("alloc accumulator", error);
+        std::vector<float> ones_row(rows, 1.0f), ones_col(n, 1.0f);
+        if (!h3d_upload(gpu, row_scale, ones_row.data(), error, sizeof(error)) ||
+            !h3d_upload(gpu, col_scale, ones_col.data(), error, sizeof(error))) {
+            fail("upload ones", error);
+        }
+        const double scaled_ms = timed([&] {
+            return h3d_linear_e4m3(gpu, out_control, a_fp8, a_scale, w_fp8, w_scale, rows,
+                                   k, n, error, sizeof(error));
+        });
+        const double raw_ms = timed([&] {
+            return h3d_linear_e4m3_raw(gpu, accumulator, a_fp8, w_fp8, rows, k, n, error,
+                                       sizeof(error));
+        });
+        const double both_ms = timed([&] {
+            return h3d_linear_e4m3_raw(gpu, accumulator, a_fp8, w_fp8, rows, k, n, error,
+                                       sizeof(error)) &&
+                   h3d_fp8_scale_epilogue(gpu, out_fp8, accumulator, row_scale, col_scale,
+                                          rows, n, error, sizeof(error));
+        });
+        if (!timed_ok) fail("gemm trio", error);
+        std::printf("per call %u x %u x %u: scaled BF16-out %.3f ms, raw F32-out %.3f "
+                    "ms, raw + epilogue %.3f ms\n",
+                    rows, k, n, scaled_ms, raw_ms, both_ms);
+        std::printf("GEMM-TRIO-DONE\n");
+        h3d_destroy(gpu);
+        return 0;
+    } else if (mode == 12) {
+        /* The two reductions and the two quantizations on the same tensor in
+         * one process. The differenced nsys tables of the two arms disagree by
+         * 2.2x on the reduction (611 ms per evaluation for 200 calls against
+         * 281) although both read the same bytes, and those captures are from
+         * different sessions; this is the same-process check of whether the
+         * disagreement is the grid. `h3d_fp8_scale`'s grid is capped at
+         * `H3D_FP8_MAX_BLOCKS` (1024) for any length, while the per-row one
+         * gives every row its own block. */
+        const double tensorwise_scale_ms = timed([&] {
+            return h3d_fp8_scale(gpu, a_scale, a_bf16, error, sizeof(error));
+        });
+        const double row_scale_ms = timed([&] {
+            return h3d_fp8_scale_rows(gpu, row_scale, a_bf16, rows, k, error, sizeof(error));
+        });
+        const double tensorwise_quantize_ms = timed([&] {
+            return h3d_fp8_quantize(gpu, a_fp8, a_scale, a_bf16, values_a.size(), error,
+                                    sizeof(error));
+        });
+        const double row_quantize_ms = timed([&] {
+            return h3d_fp8_quantize_rows(gpu, a_fp8, row_scale, a_bf16, rows, k, error,
+                                         sizeof(error));
+        });
+        if (!timed_ok) fail("amax pair", error);
+        const double bytes = (double)values_a.size() * 2.0;
+        std::printf("per call on %zu x %u BF16 (%.1f MB read):\n", (size_t)rows, k,
+                    bytes / 1e6);
+        std::printf("  amax+scale   tensorwise %.3f ms (%.0f GB/s), per-row %.3f ms "
+                    "(%.0f GB/s)\n",
+                    tensorwise_scale_ms, bytes / tensorwise_scale_ms / 1e6, row_scale_ms,
+                    bytes / row_scale_ms / 1e6);
+        std::printf("  quantize     tensorwise %.3f ms, per-row %.3f ms\n",
+                    tensorwise_quantize_ms, row_quantize_ms);
+        std::printf("AMAX-PAIR-DONE\n");
+        h3d_destroy(gpu);
+        return 0;
+    } else if (mode == 11) {
+        /* The per-row arm end to end: the reference's `granularity="channel"`
+         * route, which cuBLASLt will not run itself. Four pieces, each checked
+         * on its own - the two per-row quantizations against the host
+         * arithmetic, the unscaled matmul, and the epilogue, which is exact
+         * and is therefore compared bit for bit against the accumulator it
+         * reads. */
+        std::vector<float> row_host(rows, 0.0f), col_host(n, 0.0f);
+        if (!h3d_fp8_scale_rows(gpu, row_scale, a_bf16, rows, k, error, sizeof(error)) ||
+            !h3d_fp8_scale_rows(gpu, col_scale, w_bf16, n, k, error, sizeof(error))) {
+            fail("row scale", error);
+        }
+        if (!h3d_read(gpu, row_host.data(), row_scale, error, sizeof(error)) ||
+            !h3d_read(gpu, col_host.data(), col_scale, error, sizeof(error))) {
+            fail("read row scales", error);
+        }
+        if (!h3d_fp8_quantize_rows(gpu, a_fp8, row_scale, a_bf16, rows, k, error, sizeof(error)) ||
+            !h3d_fp8_quantize_rows(gpu, w_fp8, col_scale, w_bf16, n, k, error, sizeof(error))) {
+            fail("row quantize", error);
+        }
+        {
+            std::vector<uint8_t> got_a(values_a.size()), got_w(values_w.size());
+            if (!h3d_read(gpu, got_a.data(), a_fp8, error, sizeof(error)) ||
+                !h3d_read(gpu, got_w.data(), w_fp8, error, sizeof(error))) {
+                fail("read row quantized", error);
+            }
+            check_quantized_rows("A", values_a, got_a, row_host, k);
+            check_quantized_rows("W", values_w, got_w, col_host, k);
+        }
+
+        /* The F32 accumulator the reference's own scaling reads. */
+        h3d_tensor *accumulator =
+            h3d_alloc(gpu, H3D_F32, (size_t)rows * n, error, sizeof(error));
+        if (!accumulator) fail("alloc accumulator", error);
+        const double quantize_rows_ms = timed([&] {
+            return h3d_fp8_scale_rows(gpu, row_scale, a_bf16, rows, k, error, sizeof(error)) &&
+                   h3d_fp8_quantize_rows(gpu, a_fp8, row_scale, a_bf16, rows, k, error,
+                                         sizeof(error)) &&
+                   h3d_fp8_scale_rows(gpu, col_scale, w_bf16, n, k, error, sizeof(error)) &&
+                   h3d_fp8_quantize_rows(gpu, w_fp8, col_scale, w_bf16, n, k, error,
+                                         sizeof(error));
+        });
+        const double raw_ms = timed([&] {
+            return h3d_linear_e4m3_raw(gpu, accumulator, a_fp8, w_fp8, rows, k, n, error,
+                                       sizeof(error));
+        });
+        /* The epilogue's own two tensors, so its cost is not the matmul's. */
+        const double epilogue_ms = timed([&] {
+            return h3d_fp8_scale_epilogue(gpu, out_fp8, accumulator, row_scale, col_scale,
+                                          rows, n, error, sizeof(error));
+        });
+        if (!timed_ok) fail("row arm", error);
+
+        std::vector<float> accum((size_t)rows * n);
+        std::vector<uint16_t> arm((size_t)rows * n), base((size_t)rows * n);
+        if (!h3d_read(gpu, accum.data(), accumulator, error, sizeof(error)) ||
+            !h3d_read(gpu, arm.data(), out_fp8, error, sizeof(error)) ||
+            !h3d_read(gpu, base.data(), out_bf16, error, sizeof(error))) {
+            fail("read arm", error);
+        }
+        size_t epilogue_off = 0;
+        double epilogue_worst = 0.0, sum = 0.0, sum_diff = 0.0, worst = 0.0;
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t column = 0; column < n; ++column) {
+                size_t index = row * n + column;
+                const float reference = __bfloat162float(*(__nv_bfloat16 *)&base[index]);
+                const float got = __bfloat162float(*(__nv_bfloat16 *)&arm[index]);
+                /* The port's expression, in the port's own arithmetic: two F32
+                 * multiplies then one BF16 rounding. `fmaf(x, y, 0)` is the
+                 * host's way of writing a single rounded multiply, so the
+                 * compiler cannot contract or reassociate either one. */
+                const float want = __bfloat162float(__float2bfloat16(fmaf(
+                    fmaf(accum[index], row_host[row], 0.0f), col_host[column], 0.0f)));
+                if (got != want) {
+                    ++epilogue_off;
+                    epilogue_worst =
+                        fmax(epilogue_worst, fabs((double)got - (double)want));
+                }
+                double delta = fabs((double)got - (double)reference);
+                sum += (double)reference * reference;
+                sum_diff += delta * delta;
+                worst = fmax(worst, delta);
+            }
+        }
+        std::printf("epilogue against the accumulator: %zu elements, %zu differ "
+                    "(worst %.3g)\n",
+                    arm.size(), epilogue_off, epilogue_worst);
+        std::printf("fp8-row vs bf16 over %zu elements: RMS %.6g against %.6g "
+                    "(rel %.3g), worst abs %.6g\n",
+                    arm.size(), sqrt(sum_diff / arm.size()), sqrt(sum / arm.size()),
+                    sqrt(sum_diff / sum), worst);
+
+        /* The identity the two arms share: all-ones vectors turn the unscaled
+         * matmul plus its epilogue into the scaled one. */
+        float one = 1.0f;
+        std::vector<float> ones_row(rows, 1.0f), ones_col(n, 1.0f);
+        if (!h3d_upload(gpu, row_scale, ones_row.data(), error, sizeof(error)) ||
+            !h3d_upload(gpu, col_scale, ones_col.data(), error, sizeof(error)) ||
+            !h3d_upload(gpu, a_scale, &one, error, sizeof(error)) ||
+            !h3d_upload(gpu, w_scale, &one, error, sizeof(error)) ||
+            !h3d_linear_e4m3(gpu, out_control, a_fp8, a_scale, w_fp8, w_scale, rows, k, n,
+                             error, sizeof(error)) ||
+            !h3d_linear_e4m3_raw(gpu, accumulator, a_fp8, w_fp8, rows, k, n, error,
+                                 sizeof(error)) ||
+            !h3d_fp8_scale_epilogue(gpu, out_fp8, accumulator, row_scale, col_scale, rows,
+                                    n, error, sizeof(error))) {
+            fail("ones arm", error);
+        }
+        std::vector<uint16_t> scaled_ones((size_t)rows * n), raw_ones((size_t)rows * n);
+        if (!h3d_read(gpu, scaled_ones.data(), out_control, error, sizeof(error)) ||
+            !h3d_read(gpu, raw_ones.data(), out_fp8, error, sizeof(error))) {
+            fail("read ones", error);
+        }
+        size_t ones_off = 0;
+        for (size_t index = 0; index < scaled_ones.size(); ++index) {
+            if (scaled_ones[index] != raw_ones[index]) ++ones_off;
+        }
+        std::printf("all-ones identity: %zu of %zu elements differ from the scaled "
+                    "matmul\n",
+                    ones_off, scaled_ones.size());
+        std::printf("per call: quantize rows %.3f ms, raw F32 matmul %.3f ms, "
+                    "epilogue %.3f ms\n",
+                    quantize_rows_ms, raw_ms, epilogue_ms);
+        std::printf("%s\n", (epilogue_off == 0 && ones_off == 0) ? "FP8-ROW-OK"
+                                                                 : "FP8-ROW-OFF");
+        h3d_destroy(gpu);
+        return 0;
+    } else if (mode >= 6 && mode <= 8) {
         /* Whether cuBLASLt will express the reference's `granularity="channel"`
          * at all, and what it costs. A's scale is one F32 per row and B's one
          * per output channel (`cublasLt.h`: in the outer-vector mode the

@@ -632,40 +632,166 @@ int h3d_fp8_quantize(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("FP8 quantize", error, error_size);
 }
 
-/* `torch._scaled_mm(x_fp8, w_fp8.t(), scale_a=x_scale, scale_b=w_scale,
- * out_dtype=torch.bfloat16)`: the row-major TRANSB configuration
- * `h3d_linear_lt` builds, with E4M3 operands, a BF16 output and the two
- * tensorwise scales as `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` /
- * `_B_SCALE_POINTER` - the attributes' documented type is the compute type,
- * F32 here. alpha stays 1 and beta 0: the scales are the kernel's, not the
- * caller's, so no projection needs a host round trip. */
-int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
-                    const h3d_tensor *input, const h3d_tensor *input_scale,
-                    const h3d_tensor *weight, const h3d_tensor *weight_scale,
-                    uint32_t rows, uint32_t input_dim, uint32_t output_dim,
-                    char *error, size_t error_size) {
-    size_t inputs = 0, weights = 0, outputs = 0;
-    if (!context || !rows || !input_dim || !output_dim ||
-        !h3d_mul_size(rows, input_dim, &inputs) ||
-        !h3d_mul_size(output_dim, input_dim, &weights) ||
-        !h3d_mul_size(rows, output_dim, &outputs) ||
-        !h3d_is(input, H3D_FP8, inputs) ||
-        !h3d_is(weight, H3D_FP8, weights) ||
-        !h3d_is(output, H3D_BF16, outputs) ||
-        !h3d_is(input_scale, H3D_F32, 1) ||
-        !h3d_is(weight_scale, H3D_F32, 1)) {
-        return h3d_set_error(error, error_size,
-                             "invalid FP8 linear tensors or shape");
+/* ---- the same route at the reference's per-row granularity ----
+ *
+ * `fp8_config.py`'s `granularity="channel"` branch takes the activation's amax
+ * per row of `[rows, k]` (`:63-68`, `abs().amax(dim=-1, keepdim=True)`) and the
+ * weight's the same way (`convert_model_to_fp8`, `:226`, `abs().amax(dim=1)`
+ * over an `[n, k]` weight, so a row of a weight is one output channel); its own
+ * summary is "higher accuracy but slower `_scaled_mm`". One block per row: the
+ * row is the reduction's unit, so no atomics and no cross-block fold, and no
+ * zeroing pass either - every row writes its own element. */
+__global__ static void h3d_fp8_amax_rows_kernel(const __nv_bfloat16 *input,
+                                                float *rows, size_t columns) {
+    const __nv_bfloat16 *row = input + (size_t)blockIdx.x * columns;
+    float local = 0.0f;
+    for (size_t index = threadIdx.x; index < columns; index += blockDim.x) {
+        local = fmaxf(local, fabsf(__bfloat162float(row[index])));
     }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local = fmaxf(local, __shfl_down_sync(0xffffffffu, local, offset));
+    }
+    __shared__ float partial[H3D_FP8_THREADS / 32];
+    if ((threadIdx.x & 31u) == 0) {
+        partial[threadIdx.x >> 5] = local;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    float block = 0.0f;
+    for (unsigned lane = 0; lane < H3D_FP8_THREADS / 32; ++lane) {
+        block = fmaxf(block, partial[lane]);
+    }
+    rows[blockIdx.x] = block;
+}
 
+/* `(x_absmax / FP8_MAX).clamp(min=1 / (448 * 512))`, one element per row. */
+__global__ static void h3d_fp8_scale_rows_kernel(float *scales, size_t rows) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= rows) return;
+    scales[index] = fmaxf(scales[index] / H3D_FP8_MAX, H3D_FP8_MIN_SCALE);
+}
+
+/* The tensorwise kernel's own rounding, with the divisor taken from the
+ * element's row: `(x_2d / x_scale.to(x.dtype)).clamp(-448, 448).to(fp8)`. */
+__global__ static void h3d_fp8_quantize_rows_kernel(
+    __nv_fp8_storage_t *output, const __nv_bfloat16 *input, const float *scales,
+    size_t columns) {
+    const float divisor = __bfloat162float(__float2bfloat16(scales[blockIdx.x]));
+    const __nv_bfloat16 *row = input + (size_t)blockIdx.x * columns;
+    __nv_fp8_storage_t *out = output + (size_t)blockIdx.x * columns;
+    for (size_t index = threadIdx.x; index < columns; index += blockDim.x) {
+        float value = __bfloat162float(row[index]) / divisor;
+        value = __bfloat162float(__float2bfloat16(value));
+        value = fminf(fmaxf(value, -H3D_FP8_MAX), H3D_FP8_MAX);
+        out[index] = __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+/* The two vectors `torch._scaled_mm` would apply, applied here instead:
+ * `out[i][j] = bf16(acc[i][j] * row[i] * col[j])`, the reference's own
+ * `(A @ W^T) * scale_a * scale_b` order, both multiplies in F32 because its
+ * matmul scales the F32 accumulator before the BF16 cast. */
+__global__ static void h3d_fp8_scale_epilogue_kernel(
+    __nv_bfloat16 *output, const float *accumulator, const float *row_scale,
+    const float *column_scale, size_t columns) {
+    const size_t row = blockIdx.x;
+    const float row_factor = row_scale[row];
+    const float *in = accumulator + row * columns;
+    __nv_bfloat16 *out = output + row * columns;
+    for (size_t index = threadIdx.x; index < columns; index += blockDim.x) {
+        out[index] =
+            __float2bfloat16(in[index] * row_factor * column_scale[index]);
+    }
+}
+
+/* The per-row pair of launches, as `h3d_fp8_scale` runs its tensorwise pair.
+ * `rows` and `columns` are the row-major shape, so the caller names the same
+ * numbers the matmul takes. */
+int h3d_fp8_scale_rows(h3d_context *context, h3d_tensor *scales,
+                       const h3d_tensor *input, uint32_t rows,
+                       uint32_t columns, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !columns ||
+        !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_is(scales, H3D_F32, rows) || !h3d_is(input, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid FP8 row scale tensors");
+    }
+    h3d_fp8_amax_rows_kernel<<<rows, H3D_FP8_THREADS, 0, context->stream>>>(
+        (const __nv_bfloat16 *)input->data, (float *)scales->data, columns);
+    if (!h3d_launch_ok("FP8 row amax", error, error_size)) return 0;
+    h3d_fp8_scale_rows_kernel<<<h3d_fp8_blocks(rows), H3D_FP8_THREADS, 0,
+                                context->stream>>>((float *)scales->data,
+                                                   rows);
+    return h3d_launch_ok("FP8 row scale", error, error_size);
+}
+
+int h3d_fp8_quantize_rows(h3d_context *context, h3d_tensor *output,
+                          const h3d_tensor *scales, const h3d_tensor *input,
+                          uint32_t rows, uint32_t columns, char *error,
+                          size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !columns ||
+        !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_is(scales, H3D_F32, rows) || !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_FP8, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid FP8 row quantize tensors");
+    }
+    h3d_fp8_quantize_rows_kernel<<<rows, H3D_FP8_THREADS, 0,
+                                   context->stream>>>(
+        (__nv_fp8_storage_t *)output->data,
+        (const __nv_bfloat16 *)input->data, (const float *)scales->data,
+        columns);
+    return h3d_launch_ok("FP8 row quantize", error, error_size);
+}
+
+int h3d_fp8_scale_epilogue(h3d_context *context, h3d_tensor *output,
+                           const h3d_tensor *accumulator,
+                           const h3d_tensor *row_scale,
+                           const h3d_tensor *column_scale, uint32_t rows,
+                           uint32_t columns, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !columns ||
+        !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(accumulator, H3D_F32, elements) ||
+        !h3d_is(row_scale, H3D_F32, rows) ||
+        !h3d_is(column_scale, H3D_F32, columns)) {
+        return h3d_set_error(error, error_size,
+                             "invalid FP8 scale epilogue tensors");
+    }
+    h3d_fp8_scale_epilogue_kernel<<<rows, H3D_FP8_THREADS, 0,
+                                    context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const float *)accumulator->data,
+        (const float *)row_scale->data, (const float *)column_scale->data,
+        columns);
+    return h3d_launch_ok("FP8 scale epilogue", error, error_size);
+}
+
+/* `torch._scaled_mm`: the row-major TRANSB configuration `h3d_linear_lt`
+ * builds, with E4M3 operands. The output type is the caller's - BF16 for the
+ * scaled matmul, F32 for the one whose scales an epilogue applies after it -
+ * and `a_scale` / `b_scale` are the release's two tensorwise scales as
+ * `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` / `_B_SCALE_POINTER` (the attributes'
+ * documented type is the compute type, F32 here), or NULL when the caller
+ * applies them itself. alpha stays 1 and beta 0: the scales are the kernel's,
+ * not the caller's, so no projection needs a host round trip. The attributes
+ * are not merely a hint - setting them selects a different kernel, and the
+ * unscaled call is the faster of the two on this architecture. */
+static int h3d_linear_e4m3_compute(h3d_context *context, void *output,
+                                   cudaDataType_t output_type,
+                                   const void *input, const void *weight,
+                                   const void *a_scale, const void *b_scale,
+                                   uint32_t rows, uint32_t input_dim,
+                                   uint32_t output_dim, char *error,
+                                   size_t error_size) {
     cublasLtMatmulDesc_t operation = NULL;
     cublasLtMatrixLayout_t input_layout = NULL;
     cublasLtMatrixLayout_t weight_layout = NULL;
     cublasLtMatrixLayout_t output_layout = NULL;
     cublasOperation_t transpose = CUBLAS_OP_T;
     cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
-    const void *a_scale = input_scale->data;
-    const void *b_scale = weight_scale->data;
     float alpha = 1.0f;
     float beta = 0.0f;
     cublasStatus_t status = cublasLtMatmulDescCreate(&operation,
@@ -676,12 +802,12 @@ int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
             operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
             sizeof(transpose));
     }
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    if (status == CUBLAS_STATUS_SUCCESS && a_scale) {
         status = cublasLtMatmulDescSetAttribute(
             operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale,
             sizeof(a_scale));
     }
-    if (status == CUBLAS_STATUS_SUCCESS) {
+    if (status == CUBLAS_STATUS_SUCCESS && b_scale) {
         status = cublasLtMatmulDescSetAttribute(
             operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale,
             sizeof(b_scale));
@@ -695,7 +821,7 @@ int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
                                             output_dim, input_dim, input_dim);
     }
     if (status == CUBLAS_STATUS_SUCCESS) {
-        status = cublasLtMatrixLayoutCreate(&output_layout, CUDA_R_16BF, rows,
+        status = cublasLtMatrixLayoutCreate(&output_layout, output_type, rows,
                                             output_dim, output_dim);
     }
     if (status == CUBLAS_STATUS_SUCCESS) {
@@ -715,15 +841,64 @@ int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
     }
     if (status == CUBLAS_STATUS_SUCCESS) {
         status = cublasLtMatmul(
-            context->blas, operation, &alpha, input->data, input_layout,
-            weight->data, weight_layout, &beta, output->data, output_layout,
-            output->data, output_layout, NULL, NULL, 0, context->stream);
+            context->blas, operation, &alpha, input, input_layout, weight,
+            weight_layout, &beta, output, output_layout, output, output_layout,
+            NULL, NULL, 0, context->stream);
     }
     if (output_layout) cublasLtMatrixLayoutDestroy(output_layout);
     if (weight_layout) cublasLtMatrixLayoutDestroy(weight_layout);
     if (input_layout) cublasLtMatrixLayoutDestroy(input_layout);
     if (operation) cublasLtMatmulDescDestroy(operation);
     return h3d_blas_ok(status, "cuBLASLt FP8 linear", error, error_size);
+}
+
+/* `torch._scaled_mm(x_fp8, w_fp8.t(), scale_a=x_scale, scale_b=w_scale,
+ * out_dtype=torch.bfloat16)`: the two tensorwise scales are the kernel's. */
+int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *input_scale,
+                    const h3d_tensor *weight, const h3d_tensor *weight_scale,
+                    uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                    char *error, size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_FP8, inputs) ||
+        !h3d_is(weight, H3D_FP8, weights) ||
+        !h3d_is(output, H3D_BF16, outputs) ||
+        !h3d_is(input_scale, H3D_F32, 1) ||
+        !h3d_is(weight_scale, H3D_F32, 1)) {
+        return h3d_set_error(error, error_size,
+                             "invalid FP8 linear tensors or shape");
+    }
+    return h3d_linear_e4m3_compute(context, output->data, CUDA_R_16BF,
+                                   input->data, weight->data, input_scale->data,
+                                   weight_scale->data, rows, input_dim,
+                                   output_dim, error, error_size);
+}
+
+/* The same matmul with no scales at all and an F32 output, for the per-row arm:
+ * `h3d_fp8_scale_epilogue` applies the two vectors afterwards, which needs the
+ * accumulator the reference's own scaling reads. */
+int h3d_linear_e4m3_raw(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                        char *error, size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_FP8, inputs) ||
+        !h3d_is(weight, H3D_FP8, weights) ||
+        !h3d_is(output, H3D_F32, outputs)) {
+        return h3d_set_error(error, error_size,
+                             "invalid raw FP8 linear tensors or shape");
+    }
+    return h3d_linear_e4m3_compute(context, output->data, CUDA_R_32F,
+                                   input->data, weight->data, NULL, NULL, rows,
+                                   input_dim, output_dim, error, error_size);
 }
 
 /* The video VAE decoder's F32 linear: the reference's `h3_gpu_linear_f32`

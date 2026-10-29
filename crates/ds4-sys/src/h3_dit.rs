@@ -123,6 +123,51 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3d_fp8_scale_rows(
+        context: *mut Context,
+        scales: *mut CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_quantize_rows(
+        context: *mut Context,
+        output: *mut CTensor,
+        scales: *const CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_linear_e4m3_raw(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_scale_epilogue(
+        context: *mut Context,
+        output: *mut CTensor,
+        accumulator: *const CTensor,
+        row_scale: *const CTensor,
+        column_scale: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3d_set_vae_option(
         context: *mut Context,
         name: *const c_char,
@@ -1313,6 +1358,121 @@ impl Gpu {
                 )
             },
             "fp8 linear",
+        )
+    }
+
+    /// `h3d_fp8_scale_rows`: one element of `scale` per row of a row-major
+    /// `[rows, columns]` BF16 tensor, the reference's `_quantize_rowwise`
+    /// (`fp8_config.py:63-68`) and, for a `[n, k]` weight, its `abs().amax(dim=1)`
+    /// (`:226`) whose rows are output channels.
+    pub fn fp8_scale_rows(
+        &self,
+        scales: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_scale_rows(
+                    self.raw.as_ptr(),
+                    scales.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "fp8 row scale",
+        )
+    }
+
+    /// `h3d_fp8_quantize_rows`: `input` rounded to E4M3 through the scale of
+    /// its own row.
+    pub fn fp8_quantize_rows(
+        &self,
+        output: &Tensor,
+        scales: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_quantize_rows(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    scales.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "fp8 row quantize",
+        )
+    }
+
+    /// `h3d_linear_e4m3_raw`: the same E4M3 matmul with no scales at all and
+    /// an F32 output, the accumulator `fp8_scale_epilogue` scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_e4m3_raw(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_linear_e4m3_raw(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "raw fp8 linear",
+        )
+    }
+
+    /// `h3d_fp8_scale_epilogue`: `out[i][j] = bf16(acc[i][j] * row[i] *
+    /// col[j])`, the reference's `(A @ W^T) * scale_a * scale_b` applied to
+    /// the accumulator `_scaled_mm` would have scaled itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_scale_epilogue(
+        &self,
+        output: &Tensor,
+        accumulator: &Tensor,
+        row_scale: &Tensor,
+        column_scale: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_scale_epilogue(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    accumulator.raw(),
+                    row_scale.raw(),
+                    column_scale.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "fp8 scale epilogue",
         )
     }
 

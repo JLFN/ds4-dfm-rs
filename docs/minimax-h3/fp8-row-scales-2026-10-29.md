@@ -178,6 +178,16 @@ That is the next unit: the per-row kernels, the epilogue, and
 `H3_DIT_GEMM=bf16|fp8|fp8-row`, with the three-arm table the port record asks
 for (ms per evaluation against detail energy and the render digest).
 
+*Corrected 2026-10-29*: the epilogue paragraph above is 50x low - it summed
+the four output matrices once, when an evaluation runs each of them once **per
+block**, 50 times. The measured epilogue is **1,648 ms per evaluation** (32.96
+ms per block-set, 206 GB/s, at the streaming rate), plus 231 ms for the F32
+output the raw matmul must leave instead of BF16. Built and priced in
+[`fp8-row-arm-2026-10-29.md`](fp8-row-arm-2026-10-29.md): the arm is exact but
+costs 1,728 ms more per evaluation than the tensorwise arm, and the identity
+this section claimed - "the scale vectors cost nothing in the GEMM" - does not
+survive the F32 output, which more than eats the unscaled kernel's own gain.
+
 ## 7. What this unit does not establish
 
 - **No logit- or latent-level quality comparison**, and no NLL over many

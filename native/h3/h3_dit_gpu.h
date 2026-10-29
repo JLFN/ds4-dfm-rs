@@ -139,6 +139,32 @@ int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
                     uint32_t rows, uint32_t input_dim, uint32_t output_dim,
                     char *error, size_t error_size);
 
+/* The same route at the reference's `granularity="channel"`: one scale per row
+ * of a row-major `[rows, columns]` BF16 tensor, so a weight's rows are its
+ * output channels and an activation's are its tokens (`fp8_config.py:63-68`,
+ * `:225-229`). cuBLASLt will not take the two vectors - the outer-vector scale
+ * mode is `NOT_SUPPORTED` for E4M3 on this architecture and CUDA version
+ * (`tests/h3/fp8_gemm_bm` modes 4-8) - so the matmul runs unscaled
+ * (`h3d_linear_e4m3_raw`, F32 output) and `h3d_fp8_scale_epilogue` applies
+ * both: `out[i][j] = bf16(acc[i][j] * row[i] * col[j])`, the reference's own
+ * `(A @ W^T) * scale_a * scale_b` order on the F32 accumulator. */
+int h3d_fp8_scale_rows(h3d_context *context, h3d_tensor *scales,
+                       const h3d_tensor *input, uint32_t rows,
+                       uint32_t columns, char *error, size_t error_size);
+int h3d_fp8_quantize_rows(h3d_context *context, h3d_tensor *output,
+                          const h3d_tensor *scales, const h3d_tensor *input,
+                          uint32_t rows, uint32_t columns, char *error,
+                          size_t error_size);
+int h3d_linear_e4m3_raw(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                        char *error, size_t error_size);
+int h3d_fp8_scale_epilogue(h3d_context *context, h3d_tensor *output,
+                           const h3d_tensor *accumulator,
+                           const h3d_tensor *row_scale,
+                           const h3d_tensor *column_scale, uint32_t rows,
+                           uint32_t columns, char *error, size_t error_size);
+
 /* The video VAE decoder's F32 linear: `h3d_linear` at `H3D_F32` with the
  * decoder's own options applied (`h3d_set_vae_option`). Separate from
  * `h3d_linear` on purpose, because the options must not reach the video VAE
