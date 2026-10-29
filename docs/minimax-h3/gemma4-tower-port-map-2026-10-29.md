@@ -153,9 +153,37 @@ JSON rather than assumed: the model is a byte-level BPE with a 262144 vocabulary
 and the `tokenizer_config.json` sidecar carries the normalization and the added
 tokens the wrapper relies on.
 
-## 6. What this changes in the port plan
+## 6. The two ATen formulas, read at the pinned torch
 
-- The plan's unit 2 line says "48 layers, three norms per layer": it is **four**
+Two expressions in section 3 belong to PyTorch, not to the model file, so they
+were read from torch 2.13.0's own sources (`requirements/stage2-observed.txt:7`
+pins `torch==2.13.0+cu132`), fetched read-only into
+`/data/refs/torch-2.13.0-aten`:
+
+- **`pow(mean + eps, -0.5)` is `rsqrtf`.** `Gemma4RMSNorm._norm` calls
+  `torch.pow(mean_squared, -0.5)` and its own comment says `pow` was chosen over
+  `sqrt`/`rsqrt`; `aten/src/ATen/native/cuda/PowKernel.cu:170-179` shows why that
+  does not matter, `pow_tensor_scalar_kernel` dispatches the exponent `-0.5` to
+  `rsqrt_kernel_cuda`, which is `c10::cuda::compat::rsqrt` =
+  `::rsqrtf` for a float (`aten/src/ATen/native/cuda/UnaryOpsKernel.cu:96`,
+  `c10/cuda/CUDAMathCompat.h:122-123`). The port's own
+  `h3d_rms_norm_kernel` therefore already uses the reference's primitive, and
+  the two differ only in the *reduction order* of `mean(x^2)` - torch's own
+  tree against the port's - which is a last-bit difference to name and measure,
+  not to chase. The one real gap is the shape of the call:
+  `h3d_rms_norm` requires a weight, and Gemma's `v_norm` is built
+  `with_scale=False` (`modeling_gemma4.py:1220`), so the tower needs the weight
+  to be optional.
+- **`gelu_pytorch_tanh`** is `GeluCUDAKernelImpl` with `GeluType::Tanh`
+  (`aten/src/ATen/native/cuda/ActivationGeluKernel.cu:21-31`), in the operand's
+  opmath type (float for BF16):
+  `kBeta = M_SQRT2 * M_2_SQRTPI * 0.5`, `kKappa = 0.044715`,
+  `x_cube = x * x * x`, `inner = kBeta * (x + kKappa * x_cube)`,
+  `y = 0.5 * x * (1 + tanhf(inner))`, one cast back to BF16. The constants are
+  that expression, compiled the same way - not `0.7978845608028654` written out
+  by hand.
+
+## 7. What this changes in the port plan- The plan's unit 2 line says "48 layers, three norms per layer": it is **four**
   (section 2).
 - The plan's unit 3 line says "per-token weights, not a plain id list": the
   second element is the attention mask (section 5), which is a simpler contract -
