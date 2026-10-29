@@ -1150,6 +1150,102 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn h3d_int8_pad_rows(rows: u32) -> u32;
+
+    // The Gemma4 text tower's own primitives (`native/h3/h3_dit_gpu.h`), the
+    // forward of HuggingFace's `gemma4` at the release's pin. BF16 in and out
+    // with an F32 intermediate, one reference expression each.
+    fn h3d_embedding(
+        context: *mut Context,
+        output: *mut CTensor,
+        table: *const CTensor,
+        ids: *const CTensor,
+        rows: u32,
+        width: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_gelu_tanh(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_mul(
+        context: *mut Context,
+        output: *mut CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_scale_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        scalar: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_gemma_rope(
+        context: *mut Context,
+        query: *mut CTensor,
+        key: *mut CTensor,
+        cos: *const CTensor,
+        sin: *const CTensor,
+        rows: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_gemma_rope_table(
+        context: *mut Context,
+        cos: *mut CTensor,
+        sin: *mut CTensor,
+        rows: u32,
+        dim: u32,
+        angles: u32,
+        base: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_gemma_mask(
+        context: *mut Context,
+        output: *mut CTensor,
+        rows: u32,
+        window: u32,
+        padding: *const CTensor,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_gemma_attention(
+        context: *mut Context,
+        output: *mut CTensor,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        mask: *const CTensor,
+        rows: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
 }
 
 /// `h3d_dtype`.
@@ -1886,6 +1982,242 @@ impl Gpu {
         })
     }
 
+    /// The Gemma4 text tower's own primitives, the forward of HuggingFace's
+    /// `gemma4` at the release's pin. Each takes BF16 and returns BF16 with an
+    /// F32 intermediate, and each is one reference expression.
+
+    /// `embed_tokens(ids) * embed_scale` (`modeling_gemma4.py:1476-1477`), the
+    /// scale already carrying the reference's own BF16 cast. `ids` is
+    /// `Dtype::U32` `[rows]`, `table` BF16 `[vocabulary, width]`.
+    pub fn embedding(
+        &self,
+        output: &Tensor,
+        table: &Tensor,
+        ids: &Tensor,
+        rows: u32,
+        width: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_embedding(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    table.raw(),
+                    ids.raw(),
+                    rows,
+                    width,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "gemma embedding",
+        )
+    }
+
+    /// `gelu_pytorch_tanh`, ATen's tanh gelu
+    /// (`ActivationGeluKernel.cu:21-31`).
+    pub fn gelu_tanh(&self, output: &Tensor, input: &Tensor) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_gelu_tanh(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "gemma tanh gelu",
+        )
+    }
+
+    /// The MLP's `act_fn(gate_proj(x)) * up_proj(x)` (`:1089`).
+    pub fn mul(&self, output: &Tensor, left: &Tensor, right: &Tensor) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_mul(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    left.raw(),
+                    right.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 multiply",
+        )
+    }
+
+    /// `hidden_states *= self.layer_scalar` (`:1462`): `scalar` is a BF16
+    /// `[1]`.
+    pub fn scale_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        scalar: &Tensor,
+    ) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_scale_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    scalar.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 scale",
+        )
+    }
+
+    /// `apply_rotary_pos_emb` (`:793-811`) with `rotate_half` (`:786-791`),
+    /// in place on head-major query and key. `cos` and `sin` are
+    /// [`Self::gemma_rope_table`]'s pair tables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_rope(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rows: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_gemma_rope(
+                    self.raw.as_ptr(),
+                    query.raw(),
+                    key.raw(),
+                    cos.raw(),
+                    sin.raw(),
+                    rows,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    error,
+                    size,
+                )
+            },
+            "gemma rope",
+        )
+    }
+
+    /// The RoPE pair tables (`Gemma4TextRotaryEmbedding.forward`,
+    /// `:1164-1181`): `Dtype::Bf16` `[rows, dim]` each. `angles` counts the
+    /// live frequencies; the rest are the identity pair (`dim / 2` for the
+    /// sliding layers' default table, `dim / 4` for the full ones'
+    /// proportional table).
+    pub fn gemma_rope_table(
+        &self,
+        cos: &Tensor,
+        sin: &Tensor,
+        rows: u32,
+        dim: u32,
+        angles: u32,
+        base: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_gemma_rope_table(
+                    self.raw.as_ptr(),
+                    cos.raw(),
+                    sin.raw(),
+                    rows,
+                    dim,
+                    angles,
+                    base,
+                    error,
+                    size,
+                )
+            },
+            "gemma rope table",
+        )
+    }
+
+    /// The additive attention mask (`masking_utils.py:608-610`): BF16
+    /// `[rows, rows]`, 0 where a key is attended and `finfo(bfloat16).min`
+    /// where it is not. `window` of 0 is the full layer type; `padding` is
+    /// `Dtype::U32` `[rows]` over the keys, or `None`.
+    pub fn gemma_mask(
+        &self,
+        output: &Tensor,
+        rows: u32,
+        window: u32,
+        padding: Option<&Tensor>,
+    ) -> Result<(), String> {
+        let padding = padding.map_or(std::ptr::null(), |padding| padding.raw());
+
+        self.call(
+            |error, size| unsafe {
+                h3d_gemma_mask(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    rows,
+                    window,
+                    padding,
+                    error,
+                    size,
+                )
+            },
+            "gemma mask",
+        )
+    }
+
+    /// `eager_attention_forward` (`:824-858`) at `scaling = 1.0`, head-major
+    /// Q/K/V and output, with `mask` the [`Self::gemma_mask`] tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_attention(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        mask: Option<&Tensor>,
+        rows: u32,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        let mask = mask.map_or(std::ptr::null(), |mask| mask.raw());
+
+        self.call(
+            |error, size| unsafe {
+                h3d_gemma_attention(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    mask,
+                    rows,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "gemma attention",
+        )
+    }
+
     /// The video VAE decoder's F32 linear (`h3d_vae_linear`): `linear` at
     /// `Dtype::F32` with the decoder's own bench options applied. Only the
     /// decoder uses it, so those options cannot reach the encoder or the audio
@@ -2231,22 +2563,30 @@ impl Gpu {
     }
 
     /// `h3_gpu_rms_norm_bf16`.
+    /// The BF16 RMS norm (`h3d_rms_norm`) with the reference's reduction tree.
+    /// `weight` is optional because Gemma's `v_norm` is built with
+    /// `with_scale=False` and has none.
     pub fn rms_norm(
         &self,
         output: &Tensor,
         input: &Tensor,
-        weight: &Tensor,
+        weight: Option<&Tensor>,
         rows: u32,
         width: u32,
         epsilon: f32,
     ) -> Result<(), String> {
+        let weight = match weight {
+            Some(weight) => weight.raw(),
+            None => std::ptr::null(),
+        };
+
         self.call(
             |error, size| unsafe {
                 h3d_rms_norm(
                     self.raw.as_ptr(),
                     output.raw(),
                     input.raw(),
-                    weight.raw(),
+                    weight,
                     rows,
                     width,
                     epsilon,

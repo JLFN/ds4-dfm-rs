@@ -113,9 +113,17 @@ From `modeling_gemma4.py`:
 - Masks: `create_causal_mask` for the full layers and
   `create_sliding_window_causal_mask` for the sliding ones (`:1694-1708`).
   Their function is `kv_idx <= q_idx` (`masking_utils.py:76-80`) AND, for sliding,
-  `kv_idx > q_idx - sliding_window` (`:92-100`), AND the padding mask, then
-  `where(keep, 0.0, finfo(float32).min)` (`:605-610`) - an **F32** additive mask
-  added to BF16 scores.
+  `kv_idx > q_idx - sliding_window` (`:92-100`), AND the padding mask on the key
+  axis (`:168-179`), then `where(keep, 0.0, finfo(dtype).min)` (`:608-610`) -
+  and that `dtype` is `inputs_embeds.dtype`, BF16
+  (`masking_utils.py:942` builds it from `inputs_embeds`, and `:990` passes it
+  to the mask interface). So the fill is `finfo(bfloat16).min`
+  (-3.3895313892515355e+38), a **finite** value, added to the BF16 scores in
+  BF16: an earlier version of this line called it an F32 `-inf` mask and that
+  was wrong. Two consequences the port depends on: the add rounds to BF16 once
+  (torch computes it in float and stores BF16), and a fully masked row - every
+  left-padding row - softmaxes to uniform rather than to NaN, because
+  `x - max` is `fill - fill = 0` for every entry.
 - The tower must return the **49** hidden states the extractor stacks:
   `FeatureExtractorV2.forward` (`feature_extractor.py:115-129`) takes
   `torch.stack(hidden_states, dim=-1)` and its aggregate embeds are

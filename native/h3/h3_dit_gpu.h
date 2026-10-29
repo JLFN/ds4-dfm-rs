@@ -257,6 +257,134 @@ int h3d_linear_int8_convrot(h3d_context *context, h3d_tensor *output,
                             const struct h3d_int8_plan *plan, char *error,
                             size_t error_size);
 
+/* ---- the Gemma4 text tower's own primitives ----
+ *
+ * The tower is the other consumer of the INT8 route above: it feeds it BF16
+ * activations and gets BF16 rows back, and everything between the calls is the
+ * forward of HuggingFace's `gemma4` at the release's pin (transformers 5.14.1,
+ * `requirements/stage2-observed.txt:7`), read at
+ * `/data/refs/transformers-5.14.1/transformers/models/gemma4/
+ * modeling_gemma4.py`.
+ * The path is BF16 in and out with an F32 intermediate - `inputs_embeds` fixes
+ * the dtype (`:1679`) and every elementwise op below computes in float and
+ * rounds once, which is what torch's half-precision kernels do - so each
+ * kernel here is one reference expression with its own rounding structure, and
+ * the port's fixed reduction orders are the deviations to measure.
+ *
+ * Two of those expressions are PyTorch's, not the model file's, and were read
+ * at the pinned torch (`/data/refs/torch-2.13.0-aten`): `pow(mean + eps, -0.5)`
+ * on CUDA IS `rsqrtf` (`PowKernel.cu:170-179` -> `UnaryOpsKernel.cu:96` ->
+ * `CUDAMathCompat.h:122`), which `h3d_rms_norm_kernel` already issues, so its
+ * `weight` becomes optional here rather than gaining a second norm kernel; and
+ * `gelu_pytorch_tanh` is ATen's tanh gelu, cited at `h3d_gelu_tanh`. */
+
+/* `Gemma4TextScaledWordEmbedding.forward` (`:1476-1477`):
+ * `embed_tokens(ids) * embed_scale.to(weight.dtype)`, the scale fixed at
+ * `hidden_size ** 0.5` (`:1608-1610`, the reference's own comment recording
+ * that the cast is deliberate). `ids` is U32 `[rows]`; `scale` arrives already
+ * carrying that BF16 cast. */
+int h3d_embedding(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *table, const h3d_tensor *ids,
+                  uint32_t rows, uint32_t width, float scale, char *error,
+                  size_t error_size);
+
+/* `h3d_rms_norm` gains the weightless form Gemma's `v_norm` needs: built
+ * `with_scale=False` (`:1220`), so `forward` skips the multiply (`:210-214`)
+ * and the kernel takes `weight == NULL`. */
+int h3d_rms_norm(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, const h3d_tensor *weight,
+                 uint32_t rows, uint32_t width, float epsilon, char *error,
+                 size_t error_size);
+
+/* `Gemma4TextMLP.forward` (`:1088-1090`) with `hidden_activation`
+ * `gelu_pytorch_tanh`: `0.5 * x * (1 + tanhf(kBeta * (x + 0.044715 x^3)))`,
+ * `kBeta = M_SQRT2 * M_2_SQRTPI * 0.5`, in float with one rounding
+ * (`aten/src/ATen/native/cuda/ActivationGeluKernel.cu:21-31`, whose constants
+ * are that product and not a decimal literal). */
+int h3d_gelu_tanh(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *input, size_t elements, char *error,
+                  size_t error_size);
+
+/* The MLP's `act_fn(gate_proj(x)) * up_proj(x)` (`:1089`): one BF16 product in
+ * float with one rounding. The LTX path's `h3b_gate_mul` carries a SiLU gate,
+ * so this is its own op. */
+int h3d_mul(h3d_context *context, h3d_tensor *output, const h3d_tensor *left,
+            const h3d_tensor *right, size_t elements, char *error,
+            size_t error_size);
+
+/* `hidden_states *= self.layer_scalar` (`:1462`): a BF16 `[1]` buffer (ones in
+ * this checkpoint, kept so a checkpoint that carries a non-one scalar stays
+ * coherent), broadcast over the row and rounded once. */
+int h3d_scale_bf16(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, const h3d_tensor *scalar,
+                   size_t elements, char *error, size_t error_size);
+
+/* `apply_rotary_pos_emb` (`:793-811`) with `rotate_half` (`:786-791`) over the
+ * pair table `Gemma4TextRotaryEmbedding.forward` builds (`:1164-1181`):
+ * `x * cos + rotate_half(x) * sin`, the two products and the sum each rounded
+ * to the operand dtype, as torch's elementwise ops do. `cos`/`sin` are BF16
+ * `[rows, head_dim]` and already carry the reference's own cast; `query` is
+ * BF16 `[rows, heads, head_dim]` and `key` BF16 `[rows, kv_heads, head_dim]`,
+ * both rotated in place. The two layer types differ only in the table's width
+ * and the frequencies behind it (`:1106-1122`), so one kernel serves both. */
+int h3d_gemma_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
+                   const h3d_tensor *cos, const h3d_tensor *sin, uint32_t rows,
+                   uint32_t heads, uint32_t kv_heads, uint32_t head_dim,
+                   char *error, size_t error_size);
+
+/* The pair tables the call above consumes, `Gemma4TextRotaryEmbedding.forward`
+ * (`:1164-1181`): `inv_freq` is `1 / base ** (arange(0, dim, 2) / dim)`
+ * (`:1157-1161`), the angles are `inv_freq @ positions` in F32, `emb` is
+ * `cat(freqs, freqs)` and the tables are that elementwise, cast to BF16. A
+ * proportional table (`:1106-1122`, the full layers' `partial_rotary_factor`
+ * 0.25) keeps the first `angles` frequencies and zeroes the rest
+ * (`modeling_rope_utils.py:236-250`), which is what leaves those dimensions
+ * unrotated - so `angles` counts live frequencies and the rest are the identity
+ * pair (cos 1, sin 0). `base` is `rope_theta` (1e4 sliding, 1e6 full),
+ * `dim` the per-head width (256 sliding, 512 full) and `positions` are
+ * `arange(rows)` (`:1689-1691`; the tokenizer's left padding does not shift
+ * them). `cos` and `sin` are BF16 `[rows, dim]`. */
+int h3d_gemma_rope_table(h3d_context *context, h3d_tensor *cos,
+                         h3d_tensor *sin, uint32_t rows, uint32_t dim,
+                         uint32_t angles, float base, char *error,
+                         size_t error_size);
+
+/* `create_causal_mask` / `create_sliding_window_causal_mask` (`:1701-1708`) as
+ * `eager_mask` materialises them (`masking_utils.py:545-611`): keep is
+ * `kv <= q` and, on a sliding layer, `kv > q - window`
+ * (`masking_utils.py:76-80,92-100`), intersected with the 2-D padding mask
+ * (`:168-179`), then `where(keep, 0.0, finfo(dtype).min)`. The `dtype` is the
+ * embedding's (`:942,990`), BF16 here, so the fill is `finfo(bfloat16).min`
+ * (-3.3895313892515355e+38, finite) - which is why a fully masked row softmaxes
+ * to uniform rather than to NaN. `window` of 0 is the full layer type;
+ * `padding` is the tokenizer's attention mask, U32 `[rows]` over keys, or NULL.
+ * `output` is the BF16 additive mask `[rows, rows]`. */
+int h3d_gemma_mask(h3d_context *context, h3d_tensor *output, uint32_t rows,
+                   uint32_t window, const h3d_tensor *padding, char *error,
+                   size_t error_size);
+
+/* `eager_attention_forward` (`:824-858`) at `scaling = 1.0` (`:1200`, passed
+ * explicitly, so the eager default never applies): `q @ repeat_kv(k)^T * 1.0`,
+ * `+ mask`, an F32 softmax cast back to the query dtype, then `@ repeat_kv(v)`,
+ * with `repeat_kv` (`:815-822`) the `heads / kv_heads` repeat. Q/K/V and the
+ * output are head-major, the port's layout for every H3 attention primitive;
+ * `mask` is BF16 `[rows, rows]` or NULL. The port's reduction order and its
+ * single BF16 rounding per product are the named deviations.
+ *
+ * Limits, checked and refused: `head_dim` at most `H3D_GEMMA_HEAD_DIM_MAX` and
+ * `rows` at most `H3D_GEMMA_ROWS_MAX`, because one row's score vector is staged
+ * in shared memory; the release's tokenizer truncates to 1024, so the encoder
+ * never asks for more. `head_dim` must be a multiple of 256 (8 warps x 32
+ * lanes) so every lane owns whole elements. */
+enum { H3D_GEMMA_HEAD_DIM_MAX = 512, H3D_GEMMA_ROWS_MAX = 4096 };
+
+int h3d_gemma_attention(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *query, const h3d_tensor *key,
+                        const h3d_tensor *value, const h3d_tensor *mask,
+                        uint32_t rows, uint32_t heads, uint32_t kv_heads,
+                        uint32_t head_dim, float scale, char *error,
+                        size_t error_size);
+
 /* The video VAE decoder's F32 linear: `h3d_linear` at `H3D_F32` with the
  * decoder's own options applied (`h3d_set_vae_option`). Separate from
  * `h3d_linear` on purpose, because the options must not reach the video VAE

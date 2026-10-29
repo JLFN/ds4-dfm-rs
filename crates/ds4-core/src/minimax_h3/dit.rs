@@ -2941,7 +2941,7 @@ fn refine_text(
     // `h3_dit.c:763-801` `run_refiner_block`: no AdaLN, no RoPE (the call
     // passes `rope_half = 0`), residuals in BF16.
     for block in [&block0, &block1] {
-        device(gpu.rms_norm(&norm, &refined, &block.norm1, rows, hidden, EPSILON))?;
+        device(gpu.rms_norm(&norm, &refined, Some(&block.norm1), rows, hidden, EPSILON))?;
         device(gpu.linear(
             &qkv,
             &norm,
@@ -2989,7 +2989,7 @@ fn refine_text(
         ))?;
         device(gpu.add(&refined, &refined, &branch))?;
 
-        device(gpu.rms_norm(&norm, &refined, &block.norm2, rows, hidden, EPSILON))?;
+        device(gpu.rms_norm(&norm, &refined, Some(&block.norm2), rows, hidden, EPSILON))?;
         device(gpu.linear(
             &fc1,
             &norm,
@@ -3015,7 +3015,7 @@ fn refine_text(
     }
 
     // `h3_dit.c:866-869`: in place, as the reference writes it.
-    device(gpu.rms_norm(&refined, &refined, &final_norm, rows, hidden, EPSILON))?;
+    device(gpu.rms_norm(&refined, &refined, Some(&final_norm), rows, hidden, EPSILON))?;
 
     Ok(refined)
 }

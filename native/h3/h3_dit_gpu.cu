@@ -1402,6 +1402,428 @@ int h3d_linear_int8_convrot(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("INT8 convrot bias", error, error_size);
 }
 
+/* ---- the Gemma4 text tower's own primitives ----
+ *
+ * Source: `/data/refs/transformers-5.14.1/transformers/models/gemma4/
+ * modeling_gemma4.py` (`Gemma4TextModel.forward` `:1650-1740` carries the
+ * graph) plus the two PyTorch expressions the tower's numerics rest on, read at
+ * `/data/refs/torch-2.13.0-aten`. Every kernel below is BF16 in and out with an
+ * F32 intermediate, one reference expression each, with the reference's own
+ * rounding structure: torch's elementwise ops on a half type compute in float
+ * and round once, so a chain of two multiplies and an add rounds three times
+ * and the port reproduces that rather than keeping one wide accumulator.
+ *
+ * The reduction orders are this port's, and they are the deviation the tower's
+ * gate measures - no reference tree is reproducible here. */
+
+/* `finfo(bfloat16).min`, the fill `eager_mask` writes for a masked position
+ * (`masking_utils.py:608-610` with `dtype = inputs_embeds.dtype`, BF16). Finite
+ * by construction, which is what makes a fully masked row softmax to uniform
+ * rather than to NaN. */
+#define H3D_GEMMA_MASK_FILL (-3.3895313892515355e+38f)
+enum { H3D_GEMMA_WARPS = 8, H3D_GEMMA_THREADS = H3D_GEMMA_WARPS * 32 };
+
+/* `embed_tokens(input_ids) * embed_scale.to(weight.dtype)`
+ * (`modeling_gemma4.py:1476-1477`): one row gather, one BF16 product in float,
+ * one rounding. `scale` is the caller's already-rounded BF16 value widened. */
+__global__ static void h3d_embedding_kernel(__nv_bfloat16 *output,
+                                            const __nv_bfloat16 *table,
+                                            const uint32_t *ids, uint32_t width,
+                                            float scale) {
+    const uint32_t row = blockIdx.x;
+    const __nv_bfloat16 *source = table + (size_t)ids[row] * width;
+    __nv_bfloat16 *destination = output + (size_t)row * width;
+    for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        destination[column] = __float2bfloat16(
+            __bfloat162float(source[column]) * scale);
+    }
+}
+
+/* ATen's tanh gelu (`ActivationGeluKernel.cu:21-31`), the constants as its own
+ * `constexpr` product so the compiler folds the same value, and `tanhf` for
+ * `c10::cuda::compat::tanh` (`CUDAMathCompat.h:136-137`). `gpu_kernel`'s
+ * functor returns a `scalar_t`, so the expression rounds once, at the end. */
+__global__ static void h3d_gelu_tanh_kernel(__nv_bfloat16 *output,
+                                            const __nv_bfloat16 *input,
+                                            size_t elements) {
+    constexpr float beta = 1.41421356237309504880f * 1.12837916709551257390f *
+                           0.5f;
+    constexpr float kappa = 0.044715f;
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    const float x = __bfloat162float(input[index]);
+    const float cube = x * x * x;
+    const float inner = beta * (x + kappa * cube);
+    output[index] = __float2bfloat16(0.5f * x * (1.0f + tanhf(inner)));
+}
+
+/* `act_fn(gate_proj(x)) * up_proj(x)` (`modeling_gemma4.py:1089`). */
+__global__ static void h3d_mul_kernel(__nv_bfloat16 *output,
+                                      const __nv_bfloat16 *left,
+                                      const __nv_bfloat16 *right,
+                                      size_t elements) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = __float2bfloat16(__bfloat162float(left[index]) *
+                                     __bfloat162float(right[index]));
+}
+
+/* `hidden_states *= self.layer_scalar` (`:1462`), the scalar a BF16 `[1]`. */
+__global__ static void h3d_scale_bf16_kernel(__nv_bfloat16 *output,
+                                             const __nv_bfloat16 *input,
+                                             const __nv_bfloat16 *scalar,
+                                             size_t elements) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = __float2bfloat16(__bfloat162float(input[index]) *
+                                     __bfloat162float(*scalar));
+}
+
+/* `x * cos + rotate_half(x) * sin` (`:793-811`): `rotate_half` (`:786-791`)
+ * pairs an index with its half-shifted partner and negates the first half's
+ * partner, and the two products and the sum each round to BF16 as torch's
+ * elementwise ops do. The row is snapshotted in shared memory first because
+ * the partner of dimension d is written by the same block: without the
+ * snapshot, thread d's write races thread d +/- half's read, and the rotation
+ * reads a half-updated row. One thread per output dimension; the launch is
+ * exactly `head_dim` threads, so no thread is inactive across the barrier. */
+__global__ static void h3d_gemma_rope_kernel(__nv_bfloat16 *x,
+                                             const __nv_bfloat16 *cos,
+                                             const __nv_bfloat16 *sin,
+                                             uint32_t rows, uint32_t heads,
+                                             uint32_t head_dim) {
+    __shared__ float staged[H3D_GEMMA_HEAD_DIM_MAX];
+    const uint32_t row = blockIdx.x, head = blockIdx.y;
+    const uint32_t dimension = threadIdx.x;
+    const size_t base = ((size_t)row * heads + head) * head_dim;
+    staged[dimension] = __bfloat162float(x[base + dimension]);
+    __syncthreads();
+    const uint32_t half = head_dim / 2;
+    const uint32_t partner =
+        dimension < half ? dimension + half : dimension - half;
+    const float rotated =
+        dimension < half ? -staged[partner] : staged[partner];
+    const size_t table = (size_t)row * head_dim + dimension;
+    const float turned = __bfloat162float(
+        __float2bfloat16(staged[dimension] * __bfloat162float(cos[table])));
+    const float spin = __bfloat162float(
+        __float2bfloat16(rotated * __bfloat162float(sin[table])));
+    x[base + dimension] = __float2bfloat16(turned + spin);
+}
+
+/* `eager_mask`'s keep rule (`masking_utils.py:608-610`), the sliding overlay
+ * included (`:92-100`), and the padding mask (`:168-179`) which intersects on
+ * the KEY index only. */
+__global__ static void h3d_gemma_mask_kernel(__nv_bfloat16 *output,
+                                             const uint32_t *padding,
+                                             uint32_t rows, uint32_t window) {
+    const uint32_t query_index = blockIdx.x;
+    for (uint32_t key_index = threadIdx.x; key_index < rows;
+         key_index += blockDim.x) {
+        int keep = key_index <= query_index;
+        if (keep && window) {
+            keep = (int64_t)key_index > (int64_t)query_index - (int64_t)window;
+        }
+        if (keep && padding) keep = padding[key_index] != 0;
+        output[(size_t)query_index * rows + key_index] =
+            keep ? __float2bfloat16(0.0f)
+                 : __float2bfloat16(H3D_GEMMA_MASK_FILL);
+    }
+}
+
+/* `eager_attention_forward` (`modeling_gemma4.py:824-858`) at `scaling = 1.0`.
+ * One block per (query row, head); eight warps.
+ *
+ *   scores: one warp per key stride, the 32 lanes covering the head and one
+ *           shuffle tree per key; the dot rounds to BF16 before the mask is
+ *           added, and the sum rounds again - torch's elementwise add.
+ *   softmax: F32 over the BF16-rounded scores, the max and the sum each a
+ *           block reduction with this port's tree.
+ *   output: all eight warps walk the keys, one 1/8 of the head per warp, the
+ *           normalised weight rounded to BF16 before each product, and one
+ *           rounding at the end.
+ *
+ * The layouts are the port's: Q and the output `[rows][heads][head_dim]`, K and
+ * V `[rows][kv_heads][head_dim]`. */
+__global__ static void h3d_gemma_attention_kernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *query,
+        const __nv_bfloat16 *key, const __nv_bfloat16 *value,
+        const __nv_bfloat16 *mask, uint32_t rows, uint32_t heads,
+        uint32_t kv_heads, uint32_t head_dim, float scale) {
+    __shared__ float qv[H3D_GEMMA_HEAD_DIM_MAX];
+    __shared__ float score[H3D_GEMMA_ROWS_MAX];
+    __shared__ float partial[H3D_GEMMA_THREADS];
+
+    const uint32_t row = blockIdx.x, head = blockIdx.y;
+    const uint32_t source = head / (heads / kv_heads);
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const __nv_bfloat16 *q_row =
+        query + ((size_t)row * heads + head) * head_dim;
+
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        qv[i] = __bfloat162float(q_row[i]);
+    }
+    __syncthreads();
+
+    for (uint32_t k = warp; k < rows; k += H3D_GEMMA_WARPS) {
+        const __nv_bfloat16 *k_row =
+            key + ((size_t)k * kv_heads + source) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t i = lane; i < head_dim; i += 32) {
+            dot = fmaf(qv[i], __bfloat162float(k_row[i]), dot);
+        }
+        for (uint32_t offset = 16; offset; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, offset);
+        }
+        if (lane == 0) {
+            float weighted = __bfloat162float(__float2bfloat16(dot * scale));
+            if (mask) {
+                weighted = __bfloat162float(__float2bfloat16(
+                    weighted + __bfloat162float(mask[(size_t)row * rows + k])));
+            }
+            score[k] = weighted;
+        }
+    }
+    __syncthreads();
+
+    float maximum = -INFINITY;
+    for (uint32_t k = threadIdx.x; k < rows; k += blockDim.x) {
+        maximum = fmaxf(maximum, score[k]);
+    }
+    partial[threadIdx.x] = maximum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    maximum = partial[0];
+
+    float total = 0.0f;
+    for (uint32_t k = threadIdx.x; k < rows; k += blockDim.x) {
+        const float weight = expf(score[k] - maximum);
+        score[k] = weight;
+        total += weight;
+    }
+    partial[threadIdx.x] = total;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inverse = 1.0f / partial[0];
+
+    const uint32_t per_lane = head_dim / H3D_GEMMA_THREADS;
+    const uint32_t begin =
+        warp * (head_dim / H3D_GEMMA_WARPS) + lane * per_lane;
+    float accumulator[2] = {0.0f, 0.0f};
+    for (uint32_t k = 0; k < rows; ++k) {
+        const float weight =
+            __bfloat162float(__float2bfloat16(score[k] * inverse));
+        const __nv_bfloat16 *v_row =
+            value + ((size_t)k * kv_heads + source) * head_dim;
+        for (uint32_t e = 0; e < per_lane; ++e) {
+            accumulator[e] =
+                fmaf(weight, __bfloat162float(v_row[begin + e]),
+                     accumulator[e]);
+        }
+    }
+
+    __nv_bfloat16 *out_row = output + ((size_t)row * heads + head) * head_dim;
+    for (uint32_t e = 0; e < per_lane; ++e) {
+        out_row[begin + e] = __float2bfloat16(accumulator[e]);
+    }
+}
+
+int h3d_embedding(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *table, const h3d_tensor *ids,
+                  uint32_t rows, uint32_t width, float scale, char *error,
+                  size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width || !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(ids, H3D_U32, rows) || !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(table, H3D_BF16, table->elements) ||
+        table->elements % width != 0) {
+        return h3d_set_error(error, error_size,
+                             "invalid Gemma embedding tensors or shape");
+    }
+    h3d_embedding_kernel<<<rows, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)table->data,
+        (const uint32_t *)ids->data, width, scale);
+    return h3d_launch_ok("Gemma embedding", error, error_size);
+}
+
+int h3d_gelu_tanh(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *input, size_t elements, char *error,
+                  size_t error_size) {
+    if (!context || !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(input, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size, "invalid Gemma GELU tensors");
+    }
+    if (!elements) return 1;
+    h3d_gelu_tanh_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                           context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        elements);
+    return h3d_launch_ok("Gemma tanh GELU", error, error_size);
+}
+
+int h3d_mul(h3d_context *context, h3d_tensor *output, const h3d_tensor *left,
+            const h3d_tensor *right, size_t elements, char *error,
+            size_t error_size) {
+    if (!context || !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(left, H3D_BF16, elements) ||
+        !h3d_is(right, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 multiply tensors");
+    }
+    if (!elements) return 1;
+    h3d_mul_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                     context->stream>>>((__nv_bfloat16 *)output->data,
+                                        (const __nv_bfloat16 *)left->data,
+                                        (const __nv_bfloat16 *)right->data,
+                                        elements);
+    return h3d_launch_ok("BF16 multiply", error, error_size);
+}
+
+int h3d_scale_bf16(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, const h3d_tensor *scalar,
+                   size_t elements, char *error, size_t error_size) {
+    if (!context || !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(input, H3D_BF16, elements) || !h3d_is(scalar, H3D_BF16, 1)) {
+        return h3d_set_error(error, error_size, "invalid BF16 scale tensors");
+    }
+    if (!elements) return 1;
+    h3d_scale_bf16_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                            context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        (const __nv_bfloat16 *)scalar->data, elements);
+    return h3d_launch_ok("BF16 scale", error, error_size);
+}
+
+int h3d_gemma_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
+                   const h3d_tensor *cos, const h3d_tensor *sin, uint32_t rows,
+                   uint32_t heads, uint32_t kv_heads, uint32_t head_dim,
+                   char *error, size_t error_size) {
+    size_t query_elements = 0, key_elements = 0, table_elements = 0;
+    if (!context || !rows || !heads || !kv_heads || !head_dim ||
+        head_dim > H3D_GEMMA_HEAD_DIM_MAX || (head_dim % 2) ||
+        !h3d_mul_size((size_t)rows * heads, head_dim, &query_elements) ||
+        !h3d_mul_size((size_t)rows * kv_heads, head_dim, &key_elements) ||
+        !h3d_mul_size(rows, head_dim, &table_elements) ||
+        !h3d_is(query, H3D_BF16, query_elements) ||
+        !h3d_is(key, H3D_BF16, key_elements) ||
+        !h3d_is(cos, H3D_BF16, table_elements) ||
+        !h3d_is(sin, H3D_BF16, table_elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid Gemma RoPE tensors or shape");
+    }
+    dim3 query_grid(rows, heads), key_grid(rows, kv_heads);
+    h3d_gemma_rope_kernel<<<query_grid, head_dim, 0, context->stream>>>(
+        (__nv_bfloat16 *)query->data, (const __nv_bfloat16 *)cos->data,
+        (const __nv_bfloat16 *)sin->data, rows, heads, head_dim);
+    if (!h3d_launch_ok("Gemma RoPE query", error, error_size)) return 0;
+    h3d_gemma_rope_kernel<<<key_grid, head_dim, 0, context->stream>>>(
+        (__nv_bfloat16 *)key->data, (const __nv_bfloat16 *)cos->data,
+        (const __nv_bfloat16 *)sin->data, rows, kv_heads, head_dim);
+    return h3d_launch_ok("Gemma RoPE key", error, error_size);
+}
+
+/* `Gemma4TextRotaryEmbedding.forward` (`modeling_gemma4.py:1164-1181`): one
+ * thread per (position, dimension) of the `[rows, dim]` pair tables. The
+ * exponent is `2 * angle / dim` (`:1159`, `arange(0, dim, 2) / dim`), the
+ * frequency `1 / base ** exponent`, the angle its product with the position,
+ * and `cat(freqs, freqs)` is the `dimension % (dim / 2)` fold. Frequencies past
+ * `angles` are zero, which is the identity pair. */
+__global__ static void h3d_gemma_rope_table_kernel(__nv_bfloat16 *cos,
+                                                   __nv_bfloat16 *sin,
+                                                   uint32_t rows, uint32_t dim,
+                                                   uint32_t angles,
+                                                   float base) {
+    const uint32_t position = blockIdx.y;
+    const uint32_t dimension = blockIdx.x * blockDim.x + threadIdx.x;
+    if (position >= rows || dimension >= dim) return;
+    const uint32_t angle =
+        dimension < dim / 2 ? dimension : dimension - dim / 2;
+    float frequency = 0.0f;
+    if (angle < angles) {
+        frequency = 1.0f / powf(base, 2.0f * (float)angle / (float)dim);
+    }
+    const float value = frequency * (float)position;
+    const size_t at = (size_t)position * dim + dimension;
+    cos[at] = __float2bfloat16(cosf(value));
+    sin[at] = __float2bfloat16(sinf(value));
+}
+
+int h3d_gemma_rope_table(h3d_context *context, h3d_tensor *cos,
+                         h3d_tensor *sin, uint32_t rows, uint32_t dim,
+                         uint32_t angles, float base, char *error,
+                         size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !dim || !h3d_mul_size(rows, dim, &elements) ||
+        angles > dim / 2 || !(base > 0.0f) ||
+        !h3d_is(cos, H3D_BF16, elements) ||
+        !h3d_is(sin, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid Gemma RoPE table arguments");
+    }
+    dim3 grid((dim + 255) / 256, rows);
+    h3d_gemma_rope_table_kernel<<<grid, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)cos->data, (__nv_bfloat16 *)sin->data, rows, dim,
+        angles, base);
+    return h3d_launch_ok("Gemma RoPE table", error, error_size);
+}
+
+int h3d_gemma_mask(h3d_context *context, h3d_tensor *output, uint32_t rows,
+                   uint32_t window, const h3d_tensor *padding, char *error,
+                   size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !h3d_mul_size(rows, rows, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        (padding && !h3d_is(padding, H3D_U32, rows))) {
+        return h3d_set_error(error, error_size, "invalid Gemma mask tensors");
+    }
+    h3d_gemma_mask_kernel<<<rows, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data,
+        padding ? (const uint32_t *)padding->data : NULL, rows, window);
+    return h3d_launch_ok("Gemma mask", error, error_size);
+}
+
+int h3d_gemma_attention(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *query, const h3d_tensor *key,
+                        const h3d_tensor *value, const h3d_tensor *mask,
+                        uint32_t rows, uint32_t heads, uint32_t kv_heads,
+                        uint32_t head_dim, float scale, char *error,
+                        size_t error_size) {
+    size_t query_elements = 0, key_elements = 0, mask_elements = 0;
+    if (!context || !rows || !heads || !kv_heads || !head_dim ||
+        rows > H3D_GEMMA_ROWS_MAX || head_dim > H3D_GEMMA_HEAD_DIM_MAX ||
+        heads % kv_heads || head_dim % H3D_GEMMA_THREADS ||
+        !h3d_mul_size((size_t)rows * heads, head_dim, &query_elements) ||
+        !h3d_mul_size((size_t)rows * kv_heads, head_dim, &key_elements) ||
+        !h3d_mul_size(rows, rows, &mask_elements) ||
+        !h3d_is(query, H3D_BF16, query_elements) ||
+        !h3d_is(key, H3D_BF16, key_elements) ||
+        !h3d_is(value, H3D_BF16, key_elements) ||
+        !h3d_is(output, H3D_BF16, query_elements) ||
+        (mask && !h3d_is(mask, H3D_BF16, mask_elements))) {
+        return h3d_set_error(error, error_size,
+                             "invalid Gemma attention tensors or shape");
+    }
+    dim3 grid(rows, heads);
+    h3d_gemma_attention_kernel<<<grid, H3D_GEMMA_THREADS, 0,
+                                 context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)query->data,
+        (const __nv_bfloat16 *)key->data, (const __nv_bfloat16 *)value->data,
+        mask ? (const __nv_bfloat16 *)mask->data : NULL, rows, heads, kv_heads,
+        head_dim, scale);
+    return h3d_launch_ok("Gemma attention", error, error_size);
+}
+
 /* The video VAE decoder's F32 linear: the reference's `h3_gpu_linear_f32`
  * (`:832-870`) with this port's compute-mode option applied. Only the decoder
  * calls it (`minimax_h3::vae_video`), so `H3_VAE_GEMM` cannot reach the video
@@ -1936,7 +2358,9 @@ int h3d_token_expand(h3d_context *context, h3d_tensor *output,
 }
 
 /* `h3_rms_norm_bf16_kernel` (`:2462-2489`): 256 threads, a strided fmaf sum,
- * a shared-memory tree, then `value * inverse * weight`. */
+ * a shared-memory tree, then `value * inverse * weight`. The DiT always passes
+ * a weight; Gemma's `v_norm` is built `with_scale=False` and passes NULL, which
+ * is the reference's own missing `* weight` branch. */
 __global__ static void h3d_rms_norm_kernel(__nv_bfloat16 *output,
                                            const __nv_bfloat16 *input,
                                            const __nv_bfloat16 *weight,
@@ -1959,8 +2383,8 @@ __global__ static void h3d_rms_norm_kernel(__nv_bfloat16 *output,
     float inverse = rsqrtf(sums[0] / (float)width + epsilon);
     for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
         size_t index = (size_t)row * width + column;
-        float value = __bfloat162float(input[index]) * inverse *
-                      __bfloat162float(weight[column]);
+        float value = __bfloat162float(input[index]) * inverse;
+        if (weight) value *= __bfloat162float(weight[column]);
         output[index] = __float2bfloat16(value);
     }
 }
@@ -1973,12 +2397,13 @@ int h3d_rms_norm(h3d_context *context, h3d_tensor *output,
     if (!context || !h3d_mul_size(rows, width, &elements) || epsilon < 0.0f ||
         !h3d_is(output, H3D_BF16, elements) ||
         !h3d_is(input, H3D_BF16, elements) ||
-        !h3d_is(weight, H3D_BF16, width)) {
+        (weight && !h3d_is(weight, H3D_BF16, width))) {
         return h3d_set_error(error, error_size, "invalid RMS norm arguments");
     }
     h3d_rms_norm_kernel<<<rows, 256, 0, context->stream>>>(
         (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
-        (const __nv_bfloat16 *)weight->data, rows, width, epsilon);
+        weight ? (const __nv_bfloat16 *)weight->data : NULL, rows, width,
+        epsilon);
     return h3d_launch_ok("BF16 RMS norm", error, error_size);
 }
 

@@ -487,6 +487,12 @@ tests/h3/elementwise_bm: tests/h3/elementwise_bm.cu native/h3/h3_dit_gpu.cu nati
 tests/h3/int8_convrot_bm: tests/h3/int8_convrot_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# The Gemma4 text tower's primitives (embedding, RMS norm, tanh GELU, the
+# elementwise ops, both RoPE conventions, the additive mask, attention), each
+# against a host transcription of the HuggingFace forward that uses it.
+tests/h3/gemma_tower_bm: tests/h3/gemma_tower_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # Portable reference tests: host-only, without model weights.
 H3_REFERENCE_TESTS := test_host_portable test_av_mux test_tokenizer_portable test_int8_convrot
 H3_REFERENCE_SUITE := $(addprefix tests/h3-,$(H3_REFERENCE_TESTS))

@@ -292,6 +292,7 @@ tests/naive_banks
 /tests/h3/linear_fp8_bm
 /tests/h3/fp8_gemm_bm
 /tests/h3/int8_convrot_bm
+/tests/h3/gemma_tower_bm
 
 # h3 host binaries (`make h3-rs`, `make h3-server-rs`)
 /h3-rs
