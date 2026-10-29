@@ -93,6 +93,12 @@ two real bugs the gate caught both showed rel RMS above 0.35.
 At `rows = 128` the same 22 checks pass with the embeddings, products and masks
 exact and 1, 0, 2 and 0 differing values in the four transcendental rows.
 
+The Spark's GB10 reproduces every count above exactly, including the 191 at
+`row 334 head 4` of the full layer's 1024-row attention; that run's dump also
+reports `3 rows differ, 0 of them fully masked`, which is what rules the masked
+padding rows out as the cause and leaves the host's and the device's `expf` as
+the only remaining difference there.
+
 ## 4. The three bugs the gate caught
 
 Worth recording, because two were the same mistake, and the third only a second
