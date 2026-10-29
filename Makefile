@@ -468,6 +468,12 @@ tests/h3/sol_vsa_bm: tests/h3/sol_vsa_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3
 tests/h3/linear_fp8_bm: tests/h3/linear_fp8_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# The release's own FP8 projection route in isolation: the two quantization
+# steps checked element by element against their host arithmetic, and the E4M3
+# matmul against the BF16 path it replaces.
+tests/h3/fp8_gemm_bm: tests/h3/fp8_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # The DiT's two elementwise kernels at the denoise shape: AdaLN's row chain and
 # the QKV/RoPE boundary, each timed against the reduction-free control and the
 # candidate designs, with every arm's output hashed.

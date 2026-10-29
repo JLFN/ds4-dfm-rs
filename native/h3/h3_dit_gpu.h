@@ -37,7 +37,10 @@
 extern "C" {
 #endif
 
-enum h3d_dtype { H3D_BF16 = 0, H3D_F32 = 1, H3D_U32 = 2 };
+/* `H3D_FP8` is E4M3, one byte per element, and exists only for the FP8
+ * projection route below. `h3d_is` still matches a dtype exactly, so no
+ * existing op can be handed one by accident. */
+enum h3d_dtype { H3D_BF16 = 0, H3D_F32 = 1, H3D_U32 = 2, H3D_FP8 = 3 };
 
 /* Sol-Attn's fixed shapes (`techniques/sparse_backends/sol_attn/preprocess.py`
  * `:11-13` in NVIDIA's Sana `sol-engine` tree: BLOCK_SIZE 64, HEAD_DIM 128;
@@ -114,6 +117,27 @@ int h3d_linear(h3d_context *context, h3d_tensor *output,
                const h3d_tensor *input, const h3d_tensor *weight,
                const h3d_tensor *bias, uint32_t rows, uint32_t input_dim,
                uint32_t output_dim, int dtype, char *error, size_t error_size);
+
+/* The release's own route for the DiT's projection linears, W8A8 tensorwise
+ * E4M3. `runtime/stage1.py:126-134` tags the layer names
+ * `runtime/stage1_ops/lookup.py:15-16` selects and calls
+ * `convert_model_to_fp8`; the arithmetic here is FastVideo's
+ * `fastvideo/layers/quantization/fp8_config.py` at the revision
+ * `configs/dependencies.json` pins (`3d8ac9d1`). `h3d_fp8_scale` writes a
+ * one-element F32 scale for a BF16 tensor, `h3d_fp8_quantize` rounds a BF16
+ * tensor to E4M3 through it, and `h3d_linear_e4m3` is the matmul
+ * `torch._scaled_mm` reaches: E4M3 x E4M3, F32 accumulate, BF16 output, with
+ * the two tensorwise scales folded into the matmul's alpha on the device. */
+int h3d_fp8_scale(h3d_context *context, h3d_tensor *scale,
+                  const h3d_tensor *input, char *error, size_t error_size);
+int h3d_fp8_quantize(h3d_context *context, h3d_tensor *output,
+                     const h3d_tensor *scale, const h3d_tensor *input,
+                     size_t elements, char *error, size_t error_size);
+int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *input_scale,
+                    const h3d_tensor *weight, const h3d_tensor *weight_scale,
+                    uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                    char *error, size_t error_size);
 
 /* The video VAE decoder's F32 linear: `h3d_linear` at `H3D_F32` with the
  * decoder's own options applied (`h3d_set_vae_option`). Separate from

@@ -17,6 +17,7 @@
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdarg>
@@ -165,6 +166,7 @@ static size_t h3d_dtype_size(int dtype) {
     switch (dtype) {
         case H3D_F32:
         case H3D_U32: return sizeof(uint32_t);
+        case H3D_FP8: return 1;
         default: return sizeof(__nv_bfloat16);
     }
 }
@@ -230,7 +232,7 @@ void h3d_destroy(h3d_context *context) {
 h3d_tensor *h3d_alloc(h3d_context *context, int dtype, size_t elements,
                       char *error, size_t error_size) {
     if (!context || (dtype != H3D_BF16 && dtype != H3D_F32 &&
-                     dtype != H3D_U32)) {
+                     dtype != H3D_U32 && dtype != H3D_FP8)) {
         h3d_set_error(error, error_size, "unknown DiT dtype %d", dtype);
         return NULL;
     }
@@ -499,6 +501,229 @@ int h3d_linear(h3d_context *context, h3d_tensor *output,
             (const __nv_bfloat16 *)bias->data, outputs, output_dim);
     }
     return h3d_launch_ok("linear bias", error, error_size);
+}
+
+/* ---- the DiT's FP8 projections: the release's own W8A8 route ----
+ *
+ * `runtime/stage1.py:126-134` gives the projection linears
+ * `runtime/stage1_ops/lookup.py:15-16` names (`.to_q`, `.to_k`, `.to_v`,
+ * `.to_out`, `.ff.fc_in`, `.ff.fc_out`) an `FP8Config()` with
+ * `FP8QuantizeMethod("tensor")` and converts the model in place, so the arm
+ * below ports the release's route instead of inventing a scheme. Its
+ * arithmetic is FastVideo's `fastvideo/layers/quantization/fp8_config.py` at
+ * the revision `configs/dependencies.json` pins (`3d8ac9d1`), cited step by
+ * step. The reference drops the BF16 weight it converted
+ * (`mod._parameters.pop("weight")`), so an FP8 model is smaller than its BF16
+ * source, and `torch._scaled_mm` receives the two per-tensor scales as F32
+ * device tensors. */
+#define H3D_FP8_MAX 448.0f
+#define H3D_FP8_MIN_SCALE (1.0f / (H3D_FP8_MAX * 512.0f))
+#define H3D_FP8_THREADS 256
+#define H3D_FP8_MAX_BLOCKS 1024
+
+static unsigned h3d_fp8_blocks(size_t elements) {
+    size_t blocks = (elements + H3D_FP8_THREADS - 1) / H3D_FP8_THREADS;
+    if (!blocks) return 1;
+    if (blocks > H3D_FP8_MAX_BLOCKS) return H3D_FP8_MAX_BLOCKS;
+    return (unsigned)blocks;
+}
+
+/* `x_2d.abs().amax()` (`weight_local.detach().abs().amax().nan_to_num()` for a
+ * weight): one maximum over the whole tensor, into the one-element F32
+ * accumulator the caller has zeroed. `fmaxf` drops a NaN operand, which is
+ * what `nan_to_num` does to an all-NaN amax; no real weight or activation
+ * reaches that. */
+__global__ static void h3d_fp8_amax_kernel(const __nv_bfloat16 *input,
+                                           float *result, size_t elements) {
+    float local = 0.0f;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += stride) {
+        local = fmaxf(local, fabsf(__bfloat162float(input[index])));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local = fmaxf(local, __shfl_down_sync(0xffffffffu, local, offset));
+    }
+    __shared__ float partial[H3D_FP8_THREADS / 32];
+    if ((threadIdx.x & 31u) == 0) {
+        partial[threadIdx.x >> 5] = local;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    float block = 0.0f;
+    for (unsigned lane = 0; lane < H3D_FP8_THREADS / 32; ++lane) {
+        block = fmaxf(block, partial[lane]);
+    }
+    /* A maximum of absolute values is a maximum of non-negative floats, and
+     * those order as their bit patterns do: an integer maximum is the same
+     * answer, and a zero block cannot raise it. */
+    if (block > 0.0f) {
+        atomicMax((int *)result, __float_as_int(block));
+    }
+}
+
+/* `(x_absmax / FP8_MAX).clamp(min=1 / (448 * 512))`, in place on the
+ * accumulator: the reference computes this in float and hands the float to
+ * `_scaled_mm`. */
+__global__ static void h3d_fp8_scale_kernel(float *scale) {
+    scale[0] = fmaxf(scale[0] / H3D_FP8_MAX, H3D_FP8_MIN_SCALE);
+}
+
+/* `(x_2d / x_scale.to(x_2d.dtype)).clamp(-448, 448).to(torch.float8_e4m3fn)`.
+ * The divisor is the scale rounded to the operand's own dtype, because the
+ * reference divides a BF16 tensor by a BF16 scale, and the quotient is rounded
+ * to BF16 for the same reason, before the clamp and the cast. The cast rounds
+ * to nearest even, as torch's `.to(float8_e4m3fn)` does. */
+__global__ static void h3d_fp8_quantize_kernel(__nv_fp8_storage_t *output,
+                                               const __nv_bfloat16 *input,
+                                               const float *scale,
+                                               size_t elements) {
+    const float divisor = __bfloat162float(__float2bfloat16(scale[0]));
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += stride) {
+        float value = __bfloat162float(input[index]) / divisor;
+        value = __bfloat162float(__float2bfloat16(value));
+        value = fminf(fmaxf(value, -H3D_FP8_MAX), H3D_FP8_MAX);
+        output[index] = __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+/* Two launches, as the reference's own two steps: the amax reduction, then the
+ * scale. The zeroing is part of the reduction's contract rather than a third
+ * step of its own. */
+int h3d_fp8_scale(h3d_context *context, h3d_tensor *scale,
+                  const h3d_tensor *input, char *error, size_t error_size) {
+    if (!context || !h3d_is(scale, H3D_F32, 1) ||
+        !h3d_is(input, H3D_BF16, 1)) {
+        return h3d_set_error(error, error_size, "invalid FP8 scale tensors");
+    }
+    if (!h3d_cuda_ok(cudaMemsetAsync(scale->data, 0, sizeof(float),
+                                     context->stream),
+                     "FP8 amax zero", error, error_size)) {
+        return 0;
+    }
+    h3d_fp8_amax_kernel<<<h3d_fp8_blocks(input->elements), H3D_FP8_THREADS, 0,
+                          context->stream>>>((const __nv_bfloat16 *)input->data,
+                                             (float *)scale->data,
+                                             input->elements);
+    if (!h3d_launch_ok("FP8 amax", error, error_size)) return 0;
+    h3d_fp8_scale_kernel<<<1, 1, 0, context->stream>>>((float *)scale->data);
+    return h3d_launch_ok("FP8 scale", error, error_size);
+}
+
+/* `elements` is the length of the activation being quantized, and `output` may
+ * be a scratch larger than it: the FP8 route reuses one buffer for all four
+ * projections, so the caller names the range the way `h3d_copy` does. */
+int h3d_fp8_quantize(h3d_context *context, h3d_tensor *output,
+                     const h3d_tensor *scale, const h3d_tensor *input,
+                     size_t elements, char *error, size_t error_size) {
+    if (!context || !h3d_is(scale, H3D_F32, 1) ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_FP8, elements)) {
+        return h3d_set_error(error, error_size, "invalid FP8 quantize tensors");
+    }
+    if (!elements) return 1;
+    h3d_fp8_quantize_kernel<<<h3d_fp8_blocks(elements), H3D_FP8_THREADS, 0,
+                              context->stream>>>(
+        (__nv_fp8_storage_t *)output->data,
+        (const __nv_bfloat16 *)input->data, (const float *)scale->data,
+        elements);
+    return h3d_launch_ok("FP8 quantize", error, error_size);
+}
+
+/* `torch._scaled_mm(x_fp8, w_fp8.t(), scale_a=x_scale, scale_b=w_scale,
+ * out_dtype=torch.bfloat16)`: the row-major TRANSB configuration
+ * `h3d_linear_lt` builds, with E4M3 operands, a BF16 output and the two
+ * tensorwise scales as `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` /
+ * `_B_SCALE_POINTER` - the attributes' documented type is the compute type,
+ * F32 here. alpha stays 1 and beta 0: the scales are the kernel's, not the
+ * caller's, so no projection needs a host round trip. */
+int h3d_linear_e4m3(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *input_scale,
+                    const h3d_tensor *weight, const h3d_tensor *weight_scale,
+                    uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                    char *error, size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_FP8, inputs) ||
+        !h3d_is(weight, H3D_FP8, weights) ||
+        !h3d_is(output, H3D_BF16, outputs) ||
+        !h3d_is(input_scale, H3D_F32, 1) ||
+        !h3d_is(weight_scale, H3D_F32, 1)) {
+        return h3d_set_error(error, error_size,
+                             "invalid FP8 linear tensors or shape");
+    }
+
+    cublasLtMatmulDesc_t operation = NULL;
+    cublasLtMatrixLayout_t input_layout = NULL;
+    cublasLtMatrixLayout_t weight_layout = NULL;
+    cublasLtMatrixLayout_t output_layout = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    const void *a_scale = input_scale->data;
+    const void *b_scale = weight_scale->data;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cublasStatus_t status = cublasLtMatmulDescCreate(&operation,
+                                                     CUBLAS_COMPUTE_32F,
+                                                     CUDA_R_32F);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
+            sizeof(transpose));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale,
+            sizeof(a_scale));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale,
+            sizeof(b_scale));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&input_layout, CUDA_R_8F_E4M3,
+                                            rows, input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&weight_layout, CUDA_R_8F_E4M3,
+                                            output_dim, input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&output_layout, CUDA_R_16BF, rows,
+                                            output_dim, output_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            input_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            weight_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            output_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmul(
+            context->blas, operation, &alpha, input->data, input_layout,
+            weight->data, weight_layout, &beta, output->data, output_layout,
+            output->data, output_layout, NULL, NULL, 0, context->stream);
+    }
+    if (output_layout) cublasLtMatrixLayoutDestroy(output_layout);
+    if (weight_layout) cublasLtMatrixLayoutDestroy(weight_layout);
+    if (input_layout) cublasLtMatrixLayoutDestroy(input_layout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return h3d_blas_ok(status, "cuBLASLt FP8 linear", error, error_size);
 }
 
 /* The video VAE decoder's F32 linear: the reference's `h3_gpu_linear_f32`

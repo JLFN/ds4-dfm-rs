@@ -144,8 +144,20 @@ struct Block {
 }
 
 /// The four matrices that stream from the checkpoint, one slot per block
-/// (`h3_dit.c:600-621`, `:2223-2240`).
+/// (`h3_dit.c:600-621`, `:2223-2240`). Under `H3_DIT_GEMM=fp8` the four hold
+/// E4M3 and `scales` carries each one's tensorwise scale; the BF16 tensor they
+/// were converted from is dropped, as the release drops the parameter it
+/// converted.
 struct BlockMatrices {
+    qkv: Tensor,
+    out: Tensor,
+    fc1: Tensor,
+    fc2: Tensor,
+    scales: Option<BlockScales>,
+}
+
+/// One F32 tensorwise scale per matrix: FastVideo's `_fp8_weight_scale`.
+struct BlockScales {
     qkv: Tensor,
     out: Tensor,
     fc1: Tensor,
@@ -253,6 +265,7 @@ impl Streamer {
                 out: gpu_alloc(gpu, Dtype::Bf16, hidden * inner)?,
                 fc1: gpu_alloc(gpu, Dtype::Bf16, 2 * ffn * hidden)?,
                 fc2: gpu_alloc(gpu, Dtype::Bf16, hidden * ffn)?,
+                scales: None,
             })
         };
         let slots = [slot()?, slot()?];
@@ -1502,6 +1515,26 @@ fn sol_from_env() -> Result<Option<f64>, DitError> {
     Ok(Some(sparsity))
 }
 
+/// `H3_DIT_GEMM=fp8` runs the DiT's four projection linears through the
+/// release's own W8A8 route (`runtime/stage1.py:126-134`; the arithmetic is
+/// `fastvideo/layers/quantization/fp8_config.py` at the revision
+/// `configs/dependencies.json` pins); unset or `bf16` keeps the BF16 path.
+/// Read once per load, like `H3_DIT_SOL`, so one binary serves both arms of an
+/// A/B. A value that is neither is refused: a typo must not quietly serve
+/// BF16.
+fn gemm_fp8_from_env() -> Result<bool, DitError> {
+    let Ok(raw) = std::env::var("H3_DIT_GEMM") else {
+        return Ok(false);
+    };
+    match raw.trim() {
+        "bf16" => Ok(false),
+        "fp8" => Ok(true),
+        other => Err(DitError::Unsupported {
+            detail: format!("H3_DIT_GEMM={other} is not bf16 or fp8"),
+        }),
+    }
+}
+
 pub struct Dit {
     gpu: Gpu,
     config: Config,
@@ -1561,6 +1594,11 @@ pub struct Dit {
 
     hidden: Tensor,
     mod_attention: Tensor,
+    /// The FP8 route's per-call activation scratch, reused by all four
+    /// projections: one E4M3 buffer and the one-element F32 scale its amax
+    /// pass writes. Present only when `H3_DIT_GEMM=fp8` asked for them.
+    activation_fp8: Option<Tensor>,
+    activation_scale: Option<Tensor>,
     qkv: Tensor,
     query: Tensor,
     key: Tensor,
@@ -1576,6 +1614,60 @@ pub struct Dit {
 }
 
 impl Dit {
+    /// One of the four projection linears. Without `H3_DIT_GEMM=fp8` this is
+    /// the engine's `h3_gpu_linear_bf16`; with it, the release's three steps on
+    /// this call's activation: its tensorwise amax and scale, its E4M3 copy,
+    /// then the matmul whose scales the kernel applies. `scale` is `None`
+    /// exactly when the weight is the BF16 one.
+    fn projection(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        scale: Option<&Tensor>,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), DitError> {
+        let Some(weight_scale) = scale else {
+            return device(self.gpu.linear(
+                output,
+                input,
+                weight,
+                None,
+                rows,
+                input_dim,
+                output_dim,
+                Dtype::Bf16,
+            ));
+        };
+        // Both exist whenever an FP8 weight does; the load builds them first.
+        let (Some(activation), Some(activation_scale)) =
+            (self.activation_fp8.as_ref(), self.activation_scale.as_ref())
+        else {
+            return Err(DitError::Gpu(
+                "FP8 projection without its activation scratch".into(),
+            ));
+        };
+        device(self.gpu.fp8_scale(activation_scale, input))?;
+        device(self.gpu.fp8_quantize(
+            activation,
+            activation_scale,
+            input,
+            rows as usize * input_dim as usize,
+        ))?;
+        device(self.gpu.linear_e4m3(
+            output,
+            activation,
+            activation_scale,
+            weight,
+            weight_scale,
+            rows,
+            input_dim,
+            output_dim,
+        ))
+    }
+
     /// Load and prepare every tensor `h3_dit.c:1559-1700` prepares, in the
     /// reference's order.
     ///
@@ -1628,6 +1720,17 @@ impl Dit {
         }
         let mode = options.mode;
         let reduction = options.reduction;
+        let fp8 = gemm_fp8_from_env()?;
+        // The streaming ring's slots are BF16 and are refilled per block, so an
+        // FP8 arm has nothing to convert into; the resident layout is the one
+        // the FP8 route was ported for.
+        if fp8 && mode == LoadMode::Stream {
+            return Err(DitError::Unsupported {
+                detail: "H3_DIT_GEMM=fp8 with the streaming ring: the ring's \
+                         slots are BF16"
+                    .into(),
+            });
+        }
         let weights = Weights::open(dir).map_err(|error| DitError::Weights(error.to_string()))?;
         let config = weights.config().clone();
         let gpu = device(Gpu::create())?;
@@ -1676,7 +1779,7 @@ impl Dit {
             modulation_maps(&gpu, &tree, &sequence, text_tags)?;
 
         // `h3_dit.c:1685-1688`: the core, then the activation arena.
-        let blocks = load_blocks(&gpu, &weights, &config, mode)?;
+        let blocks = load_blocks(&gpu, &weights, &config, mode, fp8)?;
         let mut streamer = match mode {
             LoadMode::Resident => None,
             LoadMode::Stream => Some(Streamer::new(&gpu, &weights, &config)?),
@@ -1747,6 +1850,16 @@ impl Dit {
         let attention_output = bf16(rows * hidden_width as usize)?;
         let fc1 = bf16(rows * config.ffn as usize * 2)?;
         let activated = bf16(rows * config.ffn as usize)?;
+        // The FP8 route quantizes one activation at a time through one scratch
+        // pair, sized for the widest of the four (the MLP's `activated`).
+        let (activation_fp8, activation_scale) = if fp8 {
+            (
+                Some(gpu_alloc(&gpu, Dtype::Fp8, rows * config.ffn as usize)?),
+                Some(f32t(1)?),
+            )
+        } else {
+            (None, None)
+        };
         // `h3_dit.c:1534-1543`: the cached core delta needs its own input copy.
         let (core_input, core_residual) = if options.core_reuse > 1 {
             (
@@ -1800,6 +1913,8 @@ impl Dit {
             gpu,
             config,
             sol,
+            activation_fp8,
+            activation_scale,
             hidden_width,
             inner,
             video_width,
@@ -2488,6 +2603,8 @@ impl Dit {
                 .as_ref()
                 .ok_or_else(|| DitError::Gpu("resident block without matrices".into()))?,
         };
+        // The FP8 route's four scales, present together with its weights.
+        let matrix_scales = matrices.scales.as_ref();
         let attention_adaln_ready = *carried;
         *carried = false;
 
@@ -2510,16 +2627,15 @@ impl Dit {
 
         // `h3_dit.c:1902-1919`: grouped QKV projection, then the Q/K norm and
         // RoPE boundary.
-        device(self.gpu.linear(
+        self.projection(
             &self.qkv,
             &self.mod_attention,
             &matrices.qkv,
-            None,
+            matrix_scales.map(|scales| &scales.qkv),
             rows,
             hidden,
             inner * 3,
-            Dtype::Bf16,
-        ))?;
+        )?;
         device(self.gpu.qkv_rope(
             &self.query,
             &self.key,
@@ -2589,16 +2705,15 @@ impl Dit {
                 scale,
             ))?,
         }
-        device(self.gpu.linear(
+        self.projection(
             &self.attention_output,
             &self.qkv,
             &matrices.out,
-            None,
+            matrix_scales.map(|scales| &scales.out),
             rows,
             inner,
             hidden,
-            Dtype::Bf16,
-        ))?;
+        )?;
 
         // `h3_dit.c:1958-1982`: the attention gate, then the MLP AdaLN, which
         // reuses the qkv buffer as `mod_mlp`.
@@ -2629,30 +2744,28 @@ impl Dit {
         ))?;
 
         // `h3_dit.c:1984-2013`: `h3_gpu_mlp_bf16` is linear, SwiGLU, linear.
-        device(self.gpu.linear(
+        self.projection(
             &self.fc1,
             &self.qkv,
             &matrices.fc1,
-            None,
+            matrix_scales.map(|scales| &scales.fc1),
             rows,
             hidden,
             self.config.ffn as u32 * 2,
-            Dtype::Bf16,
-        ))?;
+        )?;
         device(
             self.gpu
                 .swiglu(&self.activated, &self.fc1, rows, self.config.ffn as u32),
         )?;
-        device(self.gpu.linear(
+        self.projection(
             &self.attention_output,
             &self.activated,
             &matrices.fc2,
-            None,
+            matrix_scales.map(|scales| &scales.fc2),
             rows,
             self.config.ffn as u32,
             hidden,
-            Dtype::Bf16,
-        ))?;
+        )?;
 
         // `h3_dit.c:2015-2046`: the MLP gate, and, when another block follows,
         // the next block's attention AdaLN in the same step.
@@ -3089,10 +3202,11 @@ fn load_blocks(
     weights: &Weights,
     config: &Config,
     mode: LoadMode,
+    fp8: bool,
 ) -> Result<Vec<CoreBlock>, DitError> {
     let mut blocks = Vec::with_capacity(config.layers as usize);
     for layer in 0..config.layers {
-        blocks.push(load_block(gpu, weights, layer, mode)?);
+        blocks.push(load_block(gpu, weights, layer, mode, fp8)?);
     }
     Ok(blocks)
 }
@@ -3104,6 +3218,7 @@ fn load_block(
     weights: &Weights,
     layer: u32,
     mode: LoadMode,
+    fp8: bool,
 ) -> Result<CoreBlock, DitError> {
     let norms = BlockNorms {
         norm1: tensor_from_role(gpu, weights, Role::BlockNorm1(layer), Dtype::Bf16)?,
@@ -3112,7 +3227,7 @@ fn load_block(
         k_norm: tensor_from_role(gpu, weights, Role::BlockKNorm(layer), Dtype::Bf16)?,
     };
     let matrices = match mode {
-        LoadMode::Resident => Some(load_block_matrices(gpu, weights, layer)?),
+        LoadMode::Resident => Some(load_block_matrices(gpu, weights, layer, fp8)?),
         LoadMode::Stream => None,
     };
     Ok(CoreBlock { norms, matrices })
@@ -3122,13 +3237,52 @@ fn load_block_matrices(
     gpu: &Gpu,
     weights: &Weights,
     layer: u32,
+    fp8: bool,
 ) -> Result<BlockMatrices, DitError> {
-    Ok(BlockMatrices {
+    let matrices = BlockMatrices {
         qkv: tensor_from_role(gpu, weights, Role::BlockQkv(layer), Dtype::Bf16)?,
         out: tensor_from_role(gpu, weights, Role::BlockOut(layer), Dtype::Bf16)?,
         fc1: tensor_from_role(gpu, weights, Role::BlockFc1(layer), Dtype::Bf16)?,
         fc2: tensor_from_role(gpu, weights, Role::BlockFc2(layer), Dtype::Bf16)?,
+        scales: None,
+    };
+    match fp8 {
+        false => Ok(matrices),
+        true => fp8_block(gpu, matrices),
+    }
+}
+
+/// The release's conversion, on the BF16 tensor the loader already uploaded:
+/// one tensorwise scale per matrix, then its E4M3 copy. The BF16 tensor is
+/// dropped as the reference drops the parameter it converted, which is half of
+/// what the FP8 route saves on the projections.
+fn fp8_block(gpu: &Gpu, bf16: BlockMatrices) -> Result<BlockMatrices, DitError> {
+    let (qkv, qkv_scale) = fp8_matrix(gpu, bf16.qkv)?;
+    let (out, out_scale) = fp8_matrix(gpu, bf16.out)?;
+    let (fc1, fc1_scale) = fp8_matrix(gpu, bf16.fc1)?;
+    let (fc2, fc2_scale) = fp8_matrix(gpu, bf16.fc2)?;
+    Ok(BlockMatrices {
+        qkv,
+        out,
+        fc1,
+        fc2,
+        scales: Some(BlockScales {
+            qkv: qkv_scale,
+            out: out_scale,
+            fc1: fc1_scale,
+            fc2: fc2_scale,
+        }),
     })
+}
+
+/// One matrix's two steps, as `convert_model_to_fp8` runs them: the amax
+/// reduction and the scale, then the E4M3 rounding.
+fn fp8_matrix(gpu: &Gpu, bf16: Tensor) -> Result<(Tensor, Tensor), DitError> {
+    let e4m3 = gpu_alloc(gpu, Dtype::Fp8, bf16.elements())?;
+    let scale = gpu_alloc(gpu, Dtype::F32, 1)?;
+    device(gpu.fp8_scale(&scale, &bf16))?;
+    device(gpu.fp8_quantize(&e4m3, &scale, &bf16, bf16.elements()))?;
+    Ok((e4m3, scale))
 }
 
 fn load_refiner_block(gpu: &Gpu, weights: &Weights, layer: u32) -> Result<Block, DitError> {

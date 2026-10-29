@@ -91,6 +91,38 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3d_fp8_scale(
+        context: *mut Context,
+        scale: *mut CTensor,
+        input: *const CTensor,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_quantize(
+        context: *mut Context,
+        output: *mut CTensor,
+        scale: *const CTensor,
+        input: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_linear_e4m3(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        input_scale: *const CTensor,
+        weight: *const CTensor,
+        weight_scale: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3d_set_vae_option(
         context: *mut Context,
         name: *const c_char,
@@ -967,6 +999,8 @@ pub enum Dtype {
     Bf16,
     F32,
     U32,
+    /// E4M3, one byte per element: the FP8 projection route's operand type.
+    Fp8,
 }
 
 impl Dtype {
@@ -975,6 +1009,7 @@ impl Dtype {
             Dtype::Bf16 => 0,
             Dtype::F32 => 1,
             Dtype::U32 => 2,
+            Dtype::Fp8 => 3,
         }
     }
 
@@ -983,6 +1018,7 @@ impl Dtype {
         match self {
             Dtype::Bf16 => 2,
             Dtype::F32 | Dtype::U32 => 4,
+            Dtype::Fp8 => 1,
         }
     }
 }
@@ -1196,6 +1232,87 @@ impl Gpu {
                 )
             },
             "linear",
+        )
+    }
+
+    /// The release's FP8 route (`h3d_fp8_scale`): one element of `scale`
+    /// receives the tensorwise scale of `input`, `max(amax / 448, 1/(448*512))`
+    /// in F32, which is the number `torch._scaled_mm` receives as its scale.
+    pub fn fp8_scale(&self, scale: &Tensor, input: &Tensor) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_scale(
+                    self.raw.as_ptr(),
+                    scale.raw(),
+                    input.raw(),
+                    error,
+                    size,
+                )
+            },
+            "fp8 scale",
+        )
+    }
+
+    /// `h3d_fp8_quantize`: the first `elements` of `input` rounded to E4M3
+    /// through `scale`, the reference's
+    /// `(x / x_scale).clamp(-448, 448).to(float8_e4m3fn)`. `output` may be a
+    /// scratch larger than the activation, as the four projections' shared one
+    /// is.
+    pub fn fp8_quantize(
+        &self,
+        output: &Tensor,
+        scale: &Tensor,
+        input: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_quantize(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    scale.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "fp8 quantize",
+        )
+    }
+
+    /// `torch._scaled_mm`'s matmul (`h3d_linear_e4m3`): E4M3 operands at the
+    /// same row-major TRANSB shapes as `linear`, a BF16 output, and the two
+    /// tensorwise scales applied by the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_e4m3(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        input_scale: &Tensor,
+        weight: &Tensor,
+        weight_scale: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_linear_e4m3(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    input_scale.raw(),
+                    weight.raw(),
+                    weight_scale.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "fp8 linear",
         )
     }
 

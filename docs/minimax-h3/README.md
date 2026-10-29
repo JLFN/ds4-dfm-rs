@@ -106,6 +106,7 @@ The model's license is included in the downloaded repository.
 - [The DiT's elementwise pair: a staged layout, bit for bit, 2026-10-29](dit-elementwise-2026-10-29.md)
 - [The projections' true shapes, the gap that was bookkeeping, and FP8 re-priced, 2026-10-29](dit-gemm-shape-2026-10-29.md)
 - [The projections in FP8, and the in-model gap, 2026-10-29](fp8-projections-2026-10-29.md)
+- [The release's own FP8 route, ported and measured in both arms, 2026-10-29](fp8-route-2026-10-29.md)
 - [Where a DiT evaluation goes: the per-kernel table, 2026-10-28](denoise-attribution-2026-10-28.md)
 - [The server's steady state, 2026-10-28](steady-state-2026-10-28.md)
 - [The video VAE decoder's bench options, 2026-10-28](vae-options-2026-10-28.md)
