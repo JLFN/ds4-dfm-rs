@@ -319,30 +319,46 @@ static void report_exact(const char *name, const Diff &diff,
                 diff.rel_rms);
 }
 
-/* Where a head-major attention difference sits, for the first few of them. */
+/* Where a head-major attention difference sits, and which rows it touches: the
+ * fully masked left-padding rows are their own regime (uniform softmax over a
+ * row of `finfo(bfloat16).min`). */
 static void dump_attention(const std::vector<__nv_bfloat16> &got,
                            const std::vector<__nv_bfloat16> &want,
-                           uint32_t heads, uint32_t dim) {
-    uint32_t shown = 0;
-    for (size_t i = 0; i < want.size() && shown < 6; ++i) {
+                           uint32_t heads, uint32_t dim, uint32_t padded) {
+    const size_t inner = (size_t)heads * dim;
+    uint32_t shown = 0, rows = 0, masked_rows = 0;
+    std::vector<uint32_t> seen(want.size() / inner, 0);
+    for (size_t i = 0; i < want.size(); ++i) {
         if (bits_of(got[i]) == bits_of(want[i])) continue;
-        const size_t inner = (size_t)heads * dim;
-        std::printf("  [%zu] row %zu head %zu dim %zu: got %.6g want %.6g\n", i,
-                    i / inner, (i % inner) / dim, (i % inner) % dim,
-                    __bfloat162float(got[i]), __bfloat162float(want[i]));
-        ++shown;
+        const uint32_t row = (uint32_t)(i / inner);
+        if (!seen[row]) {
+            seen[row] = 1;
+            ++rows;
+            masked_rows += row < padded;
+        }
+        if (shown < 3) {
+            std::printf("  row %u head %zu dim %zu: got %.6g want %.6g\n", row,
+                        (i % inner) / dim, (i % inner) % dim,
+                        __bfloat162float(got[i]), __bfloat162float(want[i]));
+            ++shown;
+        }
     }
+    std::printf("  %u rows differ, %u of them fully masked (of %u padded)\n",
+                rows, masked_rows, padded);
 }
 
 int main(int argc, char **argv) {
     char error[512] = {};
     setvbuf(stdout, NULL, _IONBF, 0);
     const uint32_t rows = argc > 1 ? (uint32_t)std::atoi(argv[1]) : 128;
+    /* The left padding the release's tokenizer adds; 0 turns it off, which is
+     * how the fully masked rows are separated from the rest. */
+    const uint32_t padded = argc > 2 ? (uint32_t)std::atoi(argv[2]) : rows / 8;
     const uint32_t heads = 16;
 
     h3d_context *gpu = h3d_create(error, sizeof(error));
     if (!gpu) fail("create", error);
-    std::printf("rows %u, heads %u\n", rows, heads);
+    std::printf("rows %u, heads %u, padded %u\n", rows, heads, padded);
 
     /* ---- the embedding: a gather and one BF16 product ---- */
     {
@@ -589,7 +605,7 @@ int main(int argc, char **argv) {
         /* ---- the mask and attention on this layer's shape ---- */
         for (uint32_t window : {0u, 32u}) {
             std::vector<uint32_t> padding(rows, 1);
-            for (uint32_t i = 0; i < rows / 8; ++i) padding[i] = 0;
+            for (uint32_t i = 0; i < padded; ++i) padding[i] = 0;
             std::vector<__nv_bfloat16> want_mask((size_t)rows * rows);
             host_mask(want_mask, rows, window, padding);
 
@@ -645,7 +661,7 @@ int main(int argc, char **argv) {
             const Diff attention_diff = compare(attention, want_attention);
             report(name, attention_diff, 1e-3);
             if (attention_diff.differ) {
-                dump_attention(attention, want_attention, heads, dim);
+                dump_attention(attention, want_attention, heads, dim, padded);
             }
             h3d_free(device_attention);
             h3d_free(device_value);

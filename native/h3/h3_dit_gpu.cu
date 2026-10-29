@@ -1600,6 +1600,12 @@ __global__ static void h3d_gemma_attention_kernel(
         __syncthreads();
     }
     maximum = partial[0];
+    /* `partial` is reused for the sum below, so every thread must have read the
+     * maximum before any thread overwrites its own slot: without this barrier a
+     * warp that reaches its (empty) sum loop ahead of another warp's read lets
+     * that read pick up the sum instead of the maximum. It is timing-dependent,
+     * which is why the gate's repeated runs - and sm_121 - caught it. */
+    __syncthreads();
 
     float total = 0.0f;
     for (uint32_t k = threadIdx.x; k < rows; k += blockDim.x) {

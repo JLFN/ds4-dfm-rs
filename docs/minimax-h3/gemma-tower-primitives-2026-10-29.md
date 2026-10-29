@@ -54,9 +54,12 @@ fractions are measured below, not argued.
 
 Host transcriptions of the same expressions, with the kernels' own reduction
 trees reproduced so that a check with no transcendental in it is bit-exact.
-`make CUDA_ARCH=sm_89 tests/h3/gemma_tower_bm`, then `./tests/h3/gemma_tower_bm
-1024` on vizzio's RTX 4070 SUPER (sm_89, CUDA 13.3). Every check passes; the
-numbers below are the run's own output.
+`make CUDA_ARCH=sm_89 tests/h3/gemma_tower_bm`, then
+`./tests/h3/gemma_tower_bm <rows> [padded]` - `padded` is the left padding the
+release's tokenizer adds, default `rows / 8`, and 0 turns it off, which is how
+the fully masked rows were separated from the race in section 4. On vizzio's RTX
+4070 SUPER (sm_89, CUDA 13.3) and on the Spark's GB10 (sm_121, CUDA 13.0) every
+check passes; the numbers below are the sm_89 run's own output.
 
 Exact, `rows = 1024`:
 
@@ -90,10 +93,10 @@ two real bugs the gate caught both showed rel RMS above 0.35.
 At `rows = 128` the same 22 checks pass with the embeddings, products and masks
 exact and 1, 0, 2 and 0 differing values in the four transcendental rows.
 
-## 4. The two bugs the gate caught
+## 4. The three bugs the gate caught
 
-Worth recording, because both were the same mistake and neither was visible in a
-single run:
+Worth recording, because two were the same mistake, and the third only a second
+host could find:
 
 1. `h3d_gemma_rope_kernel` read `x[partner]` and wrote `x[dimension]` in the same
    block with no barrier between the reads and the writes, so the rotation read a
@@ -105,6 +108,18 @@ single run:
    read `x[dimension - half]` for the upper half, which it had already
    overwritten. Fixed by snapshotting the row first, as torch materialises
    `rotate_half` before the products.
+3. `h3d_gemma_attention_kernel` reused one shared array for the block's maximum
+   and then for its sum, and the sum's first write was not separated from the
+   read of the maximum. A warp that reached its own (empty) sum loop ahead of a
+   straggler's read of `partial[0]` let that read pick up the sum - 128.0 for a
+   128-key row - as the maximum, which drives every `exp` in the row to zero and
+   changes the output completely. One `__syncthreads()` between the two.
+
+The third is the reason the Spark's sm_121 is not optional. It read as clean on
+sm_89 across four runs and failed on sm_121 in the first one; with the harness
+able to turn the left padding off, the same local command then disagreed with
+itself across consecutive runs, which is what confirmed it as timing rather than
+architecture. Eight consecutive runs of each configuration agree after the fix.
 
 The first run also had a harness bug (a `float` uploaded into a BF16 `[1]`),
 which read as a 100%-wrong layer scalar.
