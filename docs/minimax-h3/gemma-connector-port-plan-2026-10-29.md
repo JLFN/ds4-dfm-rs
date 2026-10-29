@@ -44,9 +44,10 @@ Contents (safetensors header, read over gvfs):
 - Text tower: 48 layers, hidden 3840, intermediate 15360, `head_dim` 256 with
   `global_head_dim` 512, `layer_types` mixing `sliding_attention` and
   `full_attention`, `attention_k_eq_v` true, `gelu_pytorch_tanh`,
-  `rms_norm_eps` 1e-6; three norms per layer
-  (`input_layernorm`, `post_attention_layernorm`, `post_feedforward_layernorm`),
-  all BF16 [3840]. Config from the file's own `__metadata__["gemma_config"]`
+  `rms_norm_eps` 1e-6; four norms per layer
+  (`input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm`,
+  `post_feedforward_layernorm`), all BF16 [3840]. Config from the file's own
+  `__metadata__["gemma_config"]`
   (`architectures: ["Gemma4UnifiedForConditionalGeneration"]`, `model_type`
   `gemma4_unified`, `gemma_version` `gemma4-12b-ltx-v1`).
 - Caption projection: `text_embedding_projection.video_aggregate_embed.weight`
@@ -99,7 +100,7 @@ That is the handle for gating our port on hardware without the extension.
 | Entry | `encoders/base_encoder.py:30-72` | `LTXGemmaTextEncoder.encode(prompts)` returns `[(hidden_states, mask)]`; system-prompt and generation defaults at `:76-92`, `:170-190` |
 | Assets | `gemma_assets.py:59-153`, `:230-292` | the embedded sidecars become an HF config, tokenizer and processor; `resolve_gemma_weight_paths` |
 | Weights | `encoders/encoder_configurator.py:231-481` | key ops for gemma3 / gemma4-unified / gemma4-dense, rotary buffers, model construction |
-| Tokenizer | `tokenizer.py:11-63` | `tokenize_with_weights` — per-token weights, not a plain id list |
+| Tokenizer | `tokenizer.py:11-63` | `tokenize_with_weights` — the second element is the attention mask, not a per-token weight (`base_encoder.py:56-66`) |
 | Features | `feature_extractor.py:12-128` | `norm_and_concat_per_token_rms`, `_rescale_norm`, `FeatureExtractorV1/V2` with the aggregate embed |
 | Connector | `embeddings_connector.py:15-256` | eight `_BasicTransformerBlock1D`, `_replace_padded_with_learnable_registers`, the AV wiring |
 | Processor | `embeddings_processor.py:10-117` | `process_hidden_states`, `convert_to_additive_mask`, right-pad ordering, binary mask |
@@ -112,7 +113,7 @@ That is the handle for gating our port on hardware without the extension.
    epilogue, bias. Gate: bit-compare against the eager reference on fixed inputs
    (deterministic, no model), then against the CUDA backend on the same inputs
    to quantify the backend spread.
-2. **The Gemma4 text tower**: 48 layers, three norms, sliding and full attention,
+2. **The Gemma4 text tower**: 48 layers, four norms, sliding and full attention,
    `attention_k_eq_v`, `gelu_pytorch_tanh`, HF-side rotary. Gate: hidden states
    against the pinned encoder run on the fixed prompt.
 3. **The tokenizer and processor**: tokenize_with_weights plus the embedded chat
@@ -139,10 +140,12 @@ That is the handle for gating our port on hardware without the extension.
   workstation already has torch 2.13.0 and transformers 5.14.1, which satisfies
   the pin's `< 5.15`). Backend and device differences are a named deviation to
   quantify, not a free assumption.
-- **Tokenizer fidelity** is the likeliest silent failure: the weights matter
-  (`prompt_stats` counts kept tokens through `tokenize_with_weights`, and
-  `feature_extractor` consumes them), so a plain id-only tokenizer would produce
-  a plausible but wrong context.
+- **Tokenizer fidelity** is the likeliest silent failure: the second element of
+  each `tokenize_with_weights` pair is the attention mask, and the mask is what
+  `feature_extractor` uses to zero the padded positions and to weight its
+  per-token statistics (`feature_extractor.py:30-66`), so a tokenizer that
+  disagrees on where the real tokens end produces a plausible but wrong context.
+  Corrected 2026-10-29: the pair is `(id, mask)`, not `(id, weight)`.
 - **Numeric contract**: the refiner block gate and this port gate are both
   against pinned Python, not against bit identity; the int8 kernel itself can be
   held to bit equality with the eager reference because it is deterministic.
