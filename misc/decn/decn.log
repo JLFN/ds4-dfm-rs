@@ -1,0 +1,20 @@
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+TEXT tokens=11 width=5120 fnv=d97d6ce16b160dbf seconds=14.511
+LOAD seconds=10.208 layers=50 latent=32x48x48 frames=107 audio_t=178
+SOL sparsity=0.900 prefix_blocks=6 first call: 18799 rows, 56 heads, exact share 0.1370
+DENOISE steps=4 reuse=1 selected=4 seconds=31.031
+AUDIO channels=2 samples=142400 rate=32000 seconds=2.570
+FRAMES frames=107 height=768 width=768 seconds=34.511
+VIDEO path=/home/leandro/decn.mp4 width=768 height=768 frames=107 fps=24 sample_rate=32000 seconds=0.619
+Collecting data...
+Generating '/tmp/nsys-report-cd52.qdstrm'
+[1/1] [0%                          ] decn.nsys-rep[1/1] [0%                          ] decn.nsys-rep[1/1] [0%                          ] decn.nsys-rep[1/1] [9%                          ] decn.nsys-rep[1/1] [8%                          ] decn.nsys-rep[1/1] [=15%                        ] decn.nsys-rep[1/1] [===22%                      ] decn.nsys-rep[1/1] [=====29%                    ] decn.nsys-rep[1/1] [=======36%                  ] decn.nsys-rep[1/1] [=========44%                ] decn.nsys-rep[1/1] [===========51%              ] decn.nsys-rep[1/1] [=============59%            ] decn.nsys-rep[1/1] [===============66%          ] decn.nsys-rep[1/1] [=================74%        ] decn.nsys-rep[1/1] [===================80%      ] decn.nsys-rep[1/1] [========================100%] decn.nsys-rep[1/1] [========================100%] decn.nsys-rep
+Generated:
+	/home/leandro/decn.nsys-rep
+4611c9478c00ee28c159e04d9a057ee19bb08fe827aad7d79ef2f855392532aa  /home/leandro/decn.mp4
+637 MHz, 11.68 W, 54
