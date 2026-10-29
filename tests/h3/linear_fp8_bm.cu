@@ -6,8 +6,12 @@
  *   tests/h3/linear_fp8_bm [rows] [calls]
  *
  * job A's shapes: 18,799 rows and (K, N) of 5376/21504 (qkv), 7168/5376
- * (out), 5376/14336 (fc1) and 14336/5376 (fc2), each once per layer per
- * evaluation, 50 layers.
+ * (out), 5376/28672 (fc1) and 14336/5376 (fc2), each once per layer per
+ * evaluation, 50 layers. fc1 is the fused gate+up pair, not `ffn`:
+ * `mlp.fc1.weight` is `FFN*2 x HIDDEN` (`h3_dit.c:501-525`, mirrored in
+ * `crates/ds4-core/src/minimax_h3/layout.rs:563`), and the model's own trace
+ * confirms it (a 28,672-wide N shows as grid.y 28 against 14 for `ffn`;
+ * `dit-gemm-shape-2026-10-29.md`).
  *
  * This prices the arithmetic, not a quantization scheme: the operands are
  * synthetic and unscaled (alpha = 1), so the number below is the GEMM's own
@@ -34,7 +38,7 @@ struct shape {
 static const shape SHAPES[] = {
     {"qkv", 5376, 21504},
     {"out", 7168, 5376},
-    {"fc1", 5376, 14336},
+    {"fc1", 5376, 28672},
     {"fc2", 14336, 5376},
 };
 

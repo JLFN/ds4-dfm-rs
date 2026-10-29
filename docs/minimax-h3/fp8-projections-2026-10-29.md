@@ -1,5 +1,18 @@
 # The projections in FP8, and the gap between the same GEMMs alone and in the model
 
+*Corrected 2026-10-29*: the `fc1` row below priced N at `ffn` (14,336) when the
+model's fc1 is the fused gate+up pair, N = 2 x `ffn` = 28,672
+(`h3_dit.c:501-525`, `layout.rs:563`, and the model's own trace, which shows
+grid.y 28 for that shape against the bench's 14). The bench is fixed in the
+same commit; the corrected table, the resolution of section 2's contradiction
+(it was mostly this error, not a real kernel-selection gap), the retired
+alignment hypothesis and the re-priced FP8 lever are in
+[`dit-gemm-shape-2026-10-29.md`](dit-gemm-shape-2026-10-29.md). The `bf16 ms`
+and `fp8 ms` columns here are unchanged measurements; the `TFLOP` column, the
+"50 layers" total and the section 2 conclusions are superseded: the model runs
+724.5 TFLOP per evaluation at 87.6 TFLOPS, and FP8 is worth about 4,400 ms per
+evaluation, not 3,262.
+
 Two measurements, and a contradiction between them that is worth more than the
 FP8 answer itself.
 

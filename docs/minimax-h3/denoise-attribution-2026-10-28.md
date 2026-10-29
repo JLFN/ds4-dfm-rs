@@ -55,6 +55,19 @@ for four. The table sums to 12,345.9 ms per evaluation against those 12.33-12.64
   say three of the four projections run on the first kernel and one on the
   second; which is which, and why one of them asks for a `relu` epilogue, is a
   reading of the block code, and the FLOP figure above assumes all four are here.
+
+  *Corrected 2026-10-29*: `mlp.fc1` is the fused gate+up pair, so its N is
+  `FFN*2` = 28,672, not 14,336 (`h3_dit.c:501-525`, `layout.rs:563`, and the
+  trace's own grid.y of 28 for that shape). The block is therefore 14.49 TFLOP
+  per layer and **724.5 TFLOP per evaluation**, which against the measured
+  8.27 s of steady-state projection time is **87.6 TFLOPS: 73% of the peak at
+  2.45 GHz**. The three kernels' shapes are now identified by their grid
+  dimensions (fc1 (592,28), qkv (592,21), fc2 (592,6), out NVJet (632,6)) in
+  [`dit-gemm-shape-2026-10-29.md`](dit-gemm-shape-2026-10-29.md), and the
+  standalone bench reproduces the model's rate to 12% rather than the 41% this
+  record inferred - the difference was the fc1 width, not the library's pick.
+  The FP8 price in section 3 below is 4,400 ms per evaluation, not 2.7 s of
+  the 579.5 TFLOP.
 - **The two elementwise kernels: 2,044 ms, 16.6%.** `qkv_rope` (20.6 ms per
   call) at minimum writes q, k and v — 18,799 x 21,504 x 2 bytes, 808 MB — after
   reading the 202 MB input, which is 4.0 ms at 250 GB/s. `adaln` (9.94 ms per
@@ -89,15 +102,19 @@ for four. The table sums to 12,345.9 ms per evaluation against those 12.33-12.64
 Ranked by recoverable time, with each change's numerical class stated as the
 kind of work it is:
 
-1. The projections, 7.901 s. Reaching 90% of the peak at 2.45 GHz would make
-   them 5.36 s and give back 2.54 s per evaluation. What that takes — a better
-   cuBLASLt algorithm and workspace, a different layout, or our own tile — is
-   the next measurement, not an assumption. This is also the term FP8 would
-   halve, and the two are additive: FP8 at today's 61-68% efficiency would make
-   the same 579.5 TFLOP take about 2.7 s.
+1. The projections, 8.27 s of the 11.3 s evaluation (see the correction
+   above; this record's 7.901 s and 579.5 TFLOP are superseded by the
+   shape-identified 8,257-8,270 ms and 724.5 TFLOP). Reaching 90% of the peak
+   at 2.45 GHz would make them 6.7 s and give back 1.6 s per evaluation. FP8 is
+   the bigger term and is now measured, not projected: 212 TFLOPS against 99
+   makes the four projections 3,870 ms, **4,400 ms off the evaluation, 39% of
+   it** ([`dit-gemm-shape-2026-10-29.md`](dit-gemm-shape-2026-10-29.md)), and
+   the release reaches FP8 the same way, by converting BF16 weights at load.
 2. `qkv_rope` and `adaln`, 2.044 s. At their floors they would be about
    0.2 s. Neither is a numerical change: same arithmetic, better access pattern
-   and fewer passes.
+   and fewer passes. **Done 2026-10-29** (`6752b7b3`,
+   [`dit-elementwise-2026-10-29.md`](dit-elementwise-2026-10-29.md)): the pair
+   is now 659 ms per evaluation, 1,382 ms given back, bit-identical.
 3. The sparse path, 1.719 s, of which `sol_forward` is 1.311 s. It is not at
    1% of the peak - see the correction above: it is at 53 TFLOPS, 79% of the
    rate its own all-exact control reaches. What is left here is the fold's
