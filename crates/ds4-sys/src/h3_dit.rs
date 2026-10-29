@@ -687,6 +687,53 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3b_planar(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        kw: u32,
+        pad_t: u32,
+        pad_h: u32,
+        pad_w: u32,
+        out_width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_weight_pack(
+        context: *mut Context,
+        output: *mut CTensor,
+        weight: *const CTensor,
+        dtype: c_int,
+        out_channels: u32,
+        in_channels: u32,
+        taps: u32,
+        kw: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3b_matmul_planar(
+        context: *mut Context,
+        output: *mut CTensor,
+        planar: *const CTensor,
+        a_offset: usize,
+        weight: *const CTensor,
+        b_offset: usize,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        accumulate: c_int,
+        dtype: c_int,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3b_matmul(
         context: *mut Context,
         output: *mut CTensor,
@@ -2635,6 +2682,123 @@ impl Gpu {
                 )
             },
             "latent_matmul",
+        )
+    }
+
+    /// `h3b_planar`: the padded activation in channel-last form, once per
+    /// column tap of the kernel — the layout that turns each tap of a same-shape
+    /// convolution into a dense matmul (`latent_matmul_planar`). Elements:
+    /// `channels * (depth + 2*pad_t) * (height + 2*pad_h) * out_width * kw`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_planar(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        kw: u32,
+        pad_t: u32,
+        pad_h: u32,
+        pad_w: u32,
+        out_width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, error_size| unsafe {
+                h3b_planar(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    channels,
+                    depth,
+                    height,
+                    width,
+                    kw,
+                    pad_t,
+                    pad_h,
+                    pad_w,
+                    out_width,
+                    error,
+                    error_size,
+                )
+            },
+            "latent_planar",
+        )
+    }
+
+    /// `h3b_weight_pack`: `weight (out_channels, in_channels*kd*kh*kw)` into
+    /// `kd*kh` passes of `(out_channels, kw*in_channels)`, the order
+    /// `latent_matmul_planar` reads. Same element count, no value change.
+    pub fn latent_weight_pack(
+        &self,
+        output: &Tensor,
+        weight: &Tensor,
+        dtype: Dtype,
+        out_channels: u32,
+        in_channels: u32,
+        taps: u32,
+        kw: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, error_size| unsafe {
+                h3b_weight_pack(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    weight.raw(),
+                    dtype.code(),
+                    out_channels,
+                    in_channels,
+                    taps,
+                    kw,
+                    error,
+                    error_size,
+                )
+            },
+            "latent_weight_pack",
+        )
+    }
+
+    /// `h3b_matmul_planar`: one tap of the convolution as a dense matmul.
+    /// `planar`'s window starts at `a_offset` elements and is `rows` by
+    /// `input_dim` with leading dimension `input_dim`; `weight`'s window starts
+    /// at `b_offset` and is `output_dim` by `input_dim` row-major; `output` is
+    /// f32 and, with `accumulate`, receives `alpha*AB + output`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn latent_matmul_planar(
+        &self,
+        output: &Tensor,
+        planar: &Tensor,
+        a_offset: usize,
+        weight: &Tensor,
+        b_offset: usize,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        accumulate: bool,
+        dtype: Dtype,
+    ) -> Result<(), String> {
+        self.call(
+            |error, error_size| unsafe {
+                h3b_matmul_planar(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    planar.raw(),
+                    a_offset,
+                    weight.raw(),
+                    b_offset,
+                    rows,
+                    input_dim,
+                    output_dim,
+                    if accumulate { 1 } else { 0 },
+                    dtype.code(),
+                    error,
+                    error_size,
+                )
+            },
+            "latent_matmul_planar",
         )
     }
 

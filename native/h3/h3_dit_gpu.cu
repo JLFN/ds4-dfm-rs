@@ -4384,6 +4384,109 @@ __global__ static void h3b_im2col_kernel(T *out, const T *padded,
                 (y + ky)) * pad_width + (x + kx)];
 }
 
+/* The planar buffer, which is what replaces the im2col matrix: the padded
+ * activation in channel-last form, once per kernel column tap.
+ *
+ * `planar[t'][y'][x][s][c] = padded[c][t'][y'][x + s]` with `s` the column tap,
+ * so `planar[t'][y'][x][s][c]` sits at `((t'*pad_height + y')*out_width + x) *
+ * kw*channels + s*channels + c`. One row of the buffer is a full image row of
+ * `kw*channels` values, and the element (row `m = y*out_width + x`, column `k =
+ * s*channels + c`) of the convolution's A operand for the tap `(kt, ky)` is at
+ * `((t + kt)*pad_height + y + ky)*out_width*K + m*K + k` with `K = kw*channels`
+ * — a plain row-major matrix with leading dimension `K`, so every tap is one
+ * strided-batched `cublasLt` call over a dense operand and no im2col matrix is
+ * ever materialized (`h3b_matmul_planar`).
+ *
+ * The source is channel-major, so the read is coalesced along the image's own
+ * `x` and the write along the channel: the tile is transposed in shared memory
+ * the way `h3b_epilogue_kernel` does it, and each source element is written
+ * `kw` times, once per shift. */
+#define H3B_PLANAR_CHANNELS 32u
+
+template <typename T>
+__global__ static void h3b_planar_kernel(T *out, const T *in, uint32_t channels,
+                                         uint32_t depth, uint32_t height,
+                                         uint32_t width, uint32_t kw,
+                                         uint32_t pad_t, uint32_t pad_h,
+                                         uint32_t pad_w, uint32_t pad_depth,
+                                         uint32_t pad_height,
+                                         uint32_t out_width) {
+    uint32_t padded_width = width + 2 * pad_w;
+    uint32_t column = blockIdx.y * H3B_PLANAR_CHANNELS;
+    uint32_t block_channels = channels - column < H3B_PLANAR_CHANNELS
+                                  ? channels - column
+                                  : H3B_PLANAR_CHANNELS;
+    uint32_t t = blockIdx.x / pad_height;
+    uint32_t y = blockIdx.x % pad_height;
+    int source_t = (int)t - (int)pad_t;
+    int source_y = (int)y - (int)pad_h;
+
+    // Row `i` of the tile is `in[column + i]`'s image row, zero where the
+    // padding reaches: the entry is read once per padded coordinate and the
+    // shifts below read it again, so the halo costs nothing extra.
+    extern __shared__ __align__(16) unsigned char raw[];
+    float *tile = (float *)raw;
+    size_t stride = padded_width + 1u;
+
+    for (size_t index = threadIdx.x; index < (size_t)block_channels * padded_width;
+         index += blockDim.x) {
+        uint32_t i = (uint32_t)(index / padded_width);
+        uint32_t px = (uint32_t)(index % padded_width);
+        int source_x = (int)px - (int)pad_w;
+        float value = 0.0f;
+        if (source_t >= 0 && source_t < (int)depth && source_y >= 0 &&
+            source_y < (int)height && source_x >= 0 && source_x < (int)width) {
+            size_t at = (((size_t)(column + i) * depth + source_t) * height +
+                         source_y) *
+                            width +
+                        source_x;
+            value = h3b_element<T>::to(in[at]);
+        }
+        tile[i * stride + px] = value;
+    }
+    __syncthreads();
+
+    uint32_t kernel_columns = kw * channels;
+    size_t base = ((size_t)t * pad_height + y) * out_width * kernel_columns;
+    size_t writes = (size_t)kw * out_width * block_channels;
+    for (size_t index = threadIdx.x; index < writes; index += blockDim.x) {
+        // Fastest first: the channel within the block, so a warp's 32 stores
+        // are 32 consecutive `T` and every shift is its own coalesced pass.
+        uint32_t i = (uint32_t)(index % block_channels);
+        size_t rest = index / block_channels;
+        uint32_t x = (uint32_t)(rest % out_width);
+        uint32_t s = (uint32_t)(rest / out_width);
+        out[base + (size_t)x * kernel_columns + (size_t)s * channels + column + i] =
+            h3b_element<T>::from(tile[i * stride + x + s]);
+    }
+}
+
+/* The pass decomposition's B operand: `packed[tap][o][s*channels + c] =
+ * weight[o][c][kt][ky][s]` with `tap = kt*kh + ky`.
+ *
+ * The checkpoint's `[out][in][kd][kh][kw]` order cannot express it — there the
+ * `kw` triple is contiguous and the channel stride is `kd*kh*kw` — so the
+ * passes need their own copy. It is a layout copy at load and changes no
+ * value; the gate checks it against the same permutation on the host. */
+template <typename T>
+__global__ static void h3b_pack_kernel(T *out, const T *weight,
+                                       uint32_t out_channels,
+                                       uint32_t in_channels, uint32_t taps,
+                                       uint32_t kw, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    // Fastest first: the input channel, so the write is coalesced and the read
+    // (stride `taps`) is the one that strides.
+    uint32_t c = (uint32_t)(index % in_channels);
+    size_t rest = index / in_channels;
+    uint32_t s = (uint32_t)(rest % kw);
+    size_t pass_and_out = rest / kw;
+    uint32_t o = (uint32_t)(pass_and_out % out_channels);
+    uint32_t pass = (uint32_t)(pass_and_out / out_channels);
+    out[index] = weight[((size_t)o * in_channels + c) * taps +
+                        (size_t)pass * kw + s];
+}
+
 /* `[channel][spatial]` -> `[spatial][channel]` with the bias added in f32 and
  * one rounding: the convolution's epilogue, a tiled transpose (both the f32
  * read and the `T` write stay coalesced, the tile is transposed in shared
@@ -4816,6 +4919,115 @@ static int h3b_gemm_rows(h3d_context *context, float *out, const void *a,
     return h3d_blas_ok(status, "cuBLASLt latent matmul", error, error_size);
 }
 
+/* The convolution's A operand as a dense matrix, which is what the planar
+ * buffer makes possible: `a` is already offset to the tap's row of the padded
+ * image, `rows` is one frame's output plane, `input_dim` is `kw*channels` (the
+ * column taps of one channel block), and the leading dimension is `input_dim`
+ * because consecutive image positions are exactly one matrix row apart.
+ *
+ * `accumulate` sets beta, so the taps of one convolution sum in f32 without a
+ * second pass over the result: the same arithmetic the materialized im2col
+ * performed in one K = channels*kd*kh*kw reduction, in `kd*kh` of them.
+ *
+ * The algorithm comes from the heuristic where one with no workspace exists —
+ * the default `NULL` asks the library the same question, so the difference is
+ * only which of the two answers is used — and stays `NULL` otherwise. */
+/* Whether the planar matmul asks the heuristic for an algorithm. Measured on
+ * the released shapes: the heuristic returns the same kernel the library picks
+ * by itself (`H3_LTX_GEMM_ALGO=heuristic` reproduces the mix exactly), so the
+ * explicit per-call query is off unless asked for. */
+static int h3b_gemm_query(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("H3_LTX_GEMM_ALGO");
+        enabled = setting && strcmp(setting, "heuristic") == 0;
+    }
+    return enabled;
+}
+
+static int h3b_gemm_planar(h3d_context *context, float *out, const void *a,
+                           const void *b, uint32_t rows, uint32_t input_dim,
+                           uint32_t output_dim, int accumulate,
+                           cudaDataType_t type, char *error,
+                           size_t error_size) {
+    cublasLtMatmulDesc_t operation = NULL;
+    cublasLtMatrixLayout_t a_layout = NULL;
+    cublasLtMatrixLayout_t b_layout = NULL;
+    cublasLtMatrixLayout_t c_layout = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    cublasLtMatmulAlgo_t algorithm;
+    const cublasLtMatmulAlgo_t *chosen = NULL;
+    float alpha = 1.0f;
+    float beta = accumulate ? 1.0f : 0.0f;
+    cublasStatus_t status =
+        cublasLtMatmulDescCreate(&operation, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
+            sizeof(transpose));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&a_layout, type, rows, input_dim,
+                                            input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&b_layout, type, output_dim,
+                                            input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&c_layout, CUDA_R_32F, rows,
+                                            output_dim, output_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            a_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            b_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            c_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS && h3b_gemm_query()) {
+        cublasLtMatmulPreference_t preference = NULL;
+        size_t workspace = 0;
+        if (cublasLtMatmulPreferenceCreate(&preference) ==
+            CUBLAS_STATUS_SUCCESS) {
+            cublasLtMatmulHeuristicResult_t heuristic;
+            int returned = 0;
+            cublasLtMatmulPreferenceSetAttribute(
+                preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &workspace, sizeof(workspace));
+            if (cublasLtMatmulAlgoGetHeuristic(
+                    context->blas, operation, a_layout, b_layout, c_layout,
+                    c_layout, preference, 1, &heuristic, &returned) ==
+                    CUBLAS_STATUS_SUCCESS &&
+                returned == 1 && heuristic.workspaceSize == 0) {
+                algorithm = heuristic.algo;
+                chosen = &algorithm;
+            }
+            cublasLtMatmulPreferenceDestroy(preference);
+        }
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmul(context->blas, operation, &alpha, a, a_layout,
+                                b, b_layout, &beta, out, c_layout, out,
+                                c_layout, chosen, NULL, 0, context->stream);
+    }
+    if (c_layout) cublasLtMatrixLayoutDestroy(c_layout);
+    if (b_layout) cublasLtMatrixLayoutDestroy(b_layout);
+    if (a_layout) cublasLtMatrixLayoutDestroy(a_layout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return h3d_blas_ok(status, "cuBLASLt latent planar matmul", error,
+                       error_size);
+}
+
 static int h3b_gemm_channels(h3d_context *context, float *out,
                              const void *input, const void *weight,
                              uint32_t spatial, uint32_t input_dim,
@@ -4936,6 +5148,103 @@ int h3b_im2col(h3d_context *context, h3d_tensor *output,
             outputs);
     }
     return h3d_launch_ok("latent im2col", error, error_size);
+}
+
+int h3b_planar(h3d_context *context, h3d_tensor *output,
+               const h3d_tensor *input, int dtype, uint32_t channels,
+               uint32_t depth, uint32_t height, uint32_t width, uint32_t kw,
+               uint32_t pad_t, uint32_t pad_h, uint32_t pad_w,
+               uint32_t out_width, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t sources = 0, outputs = 0;
+    uint32_t pad_depth = depth + 2 * pad_t;
+    uint32_t pad_height = height + 2 * pad_h;
+    // The A view `h3b_matmul_planar` takes is only valid for a same-shape
+    // kernel, where every output row of the padded image is a row of the
+    // buffer; anything else would need the halo folded back in.
+    if (out_width + kw - 1 != width + 2 * pad_w) {
+        return h3d_set_error(error, error_size, "latent planar shape is not a same-shape convolution");
+    }
+    if (!context || !channels || !depth || !height || !width || !kw ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * depth * height, width, &sources) ||
+        !h3d_mul_size((size_t)channels * pad_depth * pad_height,
+                      (size_t)out_width * kw, &outputs) ||
+        !h3d_is(input, dtype, sources) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size, "invalid latent planar shape");
+    }
+    if (outputs == 0) return 1;
+    uint32_t columns = (channels + H3B_PLANAR_CHANNELS - 1) / H3B_PLANAR_CHANNELS;
+    dim3 grid(pad_depth * pad_height, columns);
+    size_t shared = (size_t)H3B_PLANAR_CHANNELS * (width + 2 * pad_w + 1) *
+                    sizeof(float);
+    if (dtype == H3D_F32) {
+        h3b_planar_kernel<float><<<grid, H3B_BLOCK, shared, context->stream>>>(
+            (float *)output->data, (const float *)input->data, channels, depth,
+            height, width, kw, pad_t, pad_h, pad_w, pad_depth, pad_height,
+            out_width);
+    } else {
+        h3b_planar_kernel<__nv_bfloat16>
+            <<<grid, H3B_BLOCK, shared, context->stream>>>(
+                (__nv_bfloat16 *)output->data,
+                (const __nv_bfloat16 *)input->data, channels, depth, height,
+                width, kw, pad_t, pad_h, pad_w, pad_depth, pad_height,
+                out_width);
+    }
+    return h3d_launch_ok("latent planar", error, error_size);
+}
+
+int h3b_weight_pack(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *weight, int dtype, uint32_t out_channels,
+                    uint32_t in_channels, uint32_t taps, uint32_t kw,
+                    char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0;
+    if (!context || !out_channels || !in_channels || !taps || !kw ||
+        taps % kw || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)out_channels * in_channels, taps, &elements) ||
+        !h3d_is(weight, dtype, elements) ||
+        !h3d_is(output, dtype, elements)) {
+        return h3d_set_error(error, error_size, "invalid latent pack shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3b_pack_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                 context->stream>>>(
+            (float *)output->data, (const float *)weight->data, out_channels,
+            in_channels, taps, kw, elements);
+    } else {
+        h3b_pack_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                         context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)weight->data,
+            out_channels, in_channels, taps, kw, elements);
+    }
+    return h3d_launch_ok("latent weight pack", error, error_size);
+}
+
+int h3b_matmul_planar(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *a, size_t a_offset,
+                      const h3d_tensor *b, size_t b_offset, uint32_t rows,
+                      uint32_t input_dim, uint32_t output_dim, int accumulate,
+                      int dtype, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t ae = 0, be = 0, ce = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size(rows, input_dim, &ae) ||
+        !h3d_mul_size(output_dim, input_dim, &be) ||
+        !h3d_mul_size(rows, output_dim, &ce) ||
+        !h3d_is(a, dtype, a_offset + ae) || !h3d_is(b, dtype, b_offset + be) ||
+        !h3d_is(output, H3D_F32, ce)) {
+        return h3d_set_error(error, error_size, "invalid latent planar matmul shape");
+    }
+    return h3b_gemm_planar(context, (float *)output->data,
+                           (const char *)a->data +
+                               a_offset * h3d_dtype_size(dtype),
+                           (const char *)b->data +
+                               b_offset * h3d_dtype_size(dtype),
+                           rows, input_dim, output_dim, accumulate, type, error,
+                           error_size);
 }
 
 int h3b_matmul(h3d_context *context, h3d_tensor *output,

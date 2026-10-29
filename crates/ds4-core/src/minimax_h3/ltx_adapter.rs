@@ -808,14 +808,147 @@ impl Store {
 
 /// One convolution as the checkpoint stores it. `weight` is PyTorch's
 /// `[out][in][kd][kh][kw]`, whose memory order *is* the `(out, in*kd*kh*kw)`
-/// matrix both matmuls want — so no weight is ever permuted or repacked.
+/// matrix the im2col matmul wants, so the classic path never permutes a weight.
+///
+/// `packed` is the same values in the planar path's order —
+/// `[kt*kh + ky][out][s*in + c]`, one `(out, kw*in)` matrix per `(kt, ky)` tap —
+/// built once at load by `h3b_weight_pack`. The classic path's `[out][in][kd]
+/// [kh][kw]` order cannot express it, because there the `kw` triple is
+/// contiguous and the channel stride is `kd*kh*kw`; the copy changes no value.
 struct Conv {
     weight: Tensor,
+    packed: Tensor,
     bias: Tensor,
     input_channels: u32,
     output_channels: u32,
     kernel: [u32; 3],
     padding: [u32; 3],
+}
+
+/// Which convolution the latent path runs. The planar one (`h3b_planar` plus
+/// `h3b_matmul_planar`) never materializes an im2col matrix; the classic one
+/// does, and is the A/B and the fallback. `H3_LTX_CONV=classic` selects it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConvPath {
+    Planar,
+    Classic,
+}
+
+fn conv_path() -> ConvPath {
+    static PATH: OnceLock<ConvPath> = OnceLock::new();
+    *PATH.get_or_init(|| match std::env::var("H3_LTX_CONV").as_deref() {
+        Ok("classic") => ConvPath::Classic,
+        _ => ConvPath::Planar,
+    })
+}
+
+/// The planar convolution: `h3b_planar` writes the padded activation once per
+/// kernel column tap, then each of the `kd*kh` tap pairs is one dense matmul
+/// whose A operand is a window of that buffer — leading dimension
+/// `kw*channels`, the element (row `m`, column `k`) at `base + m*columns + k` —
+/// accumulating in f32, and the epilogue transposes the frame's result into
+/// channel-major order.
+///
+/// One frame at a time, and that is the point of the form: the A window a frame
+/// reads is `kd` images of `kh + out_height` rows of `kw*channels` halfwords,
+/// which is small enough that the taps' nine passes over it are served by L2
+/// rather than by DRAM. The materialized im2col moved 104 GiB per conversion.
+fn convolve_planar(
+    gpu: &Gpu,
+    arm: Arm,
+    planar: &Tensor,
+    temp: &Tensor,
+    out: &Tensor,
+    input: &Tensor,
+    conv: &Conv,
+    shape: Shape,
+) -> Result<(), LatentError> {
+    let dtype = arm.dtype();
+    let [kt, kh, kw] = conv.kernel;
+    let [pt, ph, pw] = conv.padding;
+    let frames = shape.frames;
+    let out_height = shape.height + 2 * ph - kh + 1;
+    let out_width = shape.width + 2 * pw - kw + 1;
+    let out_plane = out_height as usize * out_width as usize;
+    let padded_height = (shape.height + 2 * ph) as usize;
+    let columns = conv.input_channels as usize * kw as usize;
+
+    // Fail loud rather than let a mis-sized scratch truncate the buffer: the
+    // A windows walk `frames + kd - 1` images of `height + kh - 1` rows.
+    let needed = planar_elements(
+        conv.input_channels as u64,
+        frames as u64,
+        shape.height as u64,
+        out_width as u64,
+        [kt as u64, kh as u64, kw as u64],
+    ) as usize;
+    if planar.elements() < needed {
+        return Err(LatentError::Shape(format!(
+            "planar scratch holds {} elements, this convolution reads {needed}",
+            planar.elements()
+        )));
+    }
+    if temp.elements() < out_plane * conv.output_channels as usize {
+        return Err(LatentError::Shape(format!(
+            "accumulator holds {} elements, this convolution writes {}",
+            temp.elements(),
+            out_plane * conv.output_channels as usize
+        )));
+    }
+
+    device(gpu.latent_planar(
+        planar,
+        input,
+        dtype,
+        conv.input_channels,
+        frames,
+        shape.height,
+        shape.width,
+        kw,
+        pt,
+        ph,
+        pw,
+        out_width,
+    ))?;
+
+    for frame in 0..frames {
+        for tap_t in 0..kt {
+            for tap_h in 0..kh {
+                let pass = (tap_t * kh + tap_h) as usize;
+                // The tap's window: image row `(frame + tap_t, tap_h)` of the
+                // planar buffer, which is `m*columns` from the window's start
+                // for the output row `m` — the planar layout puts consecutive
+                // image positions exactly one matrix row apart.
+                let offset =
+                    ((frame + tap_t) as usize * padded_height + tap_h as usize)
+                        * out_width as usize
+                        * columns;
+                device(gpu.latent_matmul_planar(
+                    temp,
+                    planar,
+                    offset,
+                    &conv.packed,
+                    pass * conv.output_channels as usize * columns,
+                    out_plane as u32,
+                    columns as u32,
+                    conv.output_channels,
+                    tap_t != 0 || tap_h != 0,
+                    dtype,
+                ))?;
+            }
+        }
+        device(gpu.latent_epilogue(
+            out,
+            temp,
+            Some(&conv.bias),
+            dtype,
+            conv.output_channels,
+            out_plane as u32,
+            frames as usize * out_plane,
+            frame as usize * out_plane,
+        ))?;
+    }
+    Ok(())
 }
 
 /// A normalization and its fixed axes: `channels` per group and the epsilon
@@ -922,11 +1055,27 @@ fn load_conv(
         )));
     }
 
+    let weight = store.load(gpu, arm, &format!("{name}.weight"), shape)?;
+    let output_channels = shape[0] as u32;
+    let input_channels = shape[1] as u32;
+    let taps = kernel[0] * kernel[1] * kernel[2];
+    let packed = device(gpu.alloc(arm.dtype(), weight.elements()))?;
+    device(gpu.latent_weight_pack(
+        &packed,
+        &weight,
+        arm.dtype(),
+        output_channels,
+        input_channels,
+        taps,
+        kernel[2],
+    ))?;
+
     Ok(Conv {
-        weight: store.load(gpu, arm, &format!("{name}.weight"), shape)?,
+        weight,
+        packed,
         bias: store.load(gpu, arm, &format!("{name}.bias"), store.shape(&format!("{name}.bias"))?)?,
-        input_channels: shape[1] as u32,
-        output_channels: shape[0] as u32,
+        input_channels,
+        output_channels,
         kernel,
         padding,
     })
@@ -1200,8 +1349,25 @@ impl UpModel {
     }
 }
 
-/// The zero-padded element count of `[channels, frames + 2, height + 2,
+/// Every convolution in the upscaler (`load` builds all of them from this one
+/// kernel shape).
+const UPSCALER_KERNEL: [u64; 3] = [3, 3, 3];
 
+/// The planar buffer's element count for a convolution that reads
+/// `(channels, frames, height, ·)`: the padded image in channel-last form, once
+/// per column tap. `out_width` is the convolution's own output width, which for
+/// a same-shape kernel is the input width.
+fn planar_elements(
+    channels: u64,
+    frames: u64,
+    height: u64,
+    out_width: u64,
+    kernel: [u64; 3],
+) -> u64 {
+    channels * (frames + kernel[0] - 1) * (height + kernel[1] - 1) * out_width * kernel[2]
+}
+
+/// The zero-padded element count of `[channels, frames + 2, height + 2,
 fn padded_elements(channels: u64, frames: u64, height: u64, width: u64) -> u64 {
     channels * (frames + 2) * (height + 2) * (width + 2)
 }
@@ -1228,6 +1394,10 @@ struct UpScratch {
     padded: Tensor,
     acts: [Tensor; 4],
     matrix: Tensor,
+    /// The planar path's A operand: the padded activation in channel-last form,
+    /// `kw` copies wide, sized for the largest convolution at the largest
+    /// segment (`conv3d`'s classic side uses `matrix` instead).
+    planar: Tensor,
     temp: Tensor,
     accumulator: Tensor,
     weight_total: Tensor,
@@ -1277,6 +1447,36 @@ impl UpScratch {
             height: out_height,
             width: out_width,
         };
+        // The largest planar buffer: the padded image in channel-last form,
+        // once per column tap. The upscaler's three convolutions differ in
+        // input channel count (24 for `conv_in`, 512 for the rest) and in
+        // resolution, so all three are sized and the biggest wins.
+        let planar = [
+            planar_elements(
+                UPSCALER_CHANNELS as u64,
+                largest as u64,
+                out_height as u64,
+                out_width as u64,
+                UPSCALER_KERNEL,
+            ),
+            planar_elements(
+                UPSCALER_CHANNELS as u64,
+                largest as u64,
+                height as u64,
+                width as u64,
+                UPSCALER_KERNEL,
+            ),
+            planar_elements(
+                UPSCALER_IN_CHANNELS as u64,
+                largest as u64,
+                height as u64,
+                width as u64,
+                UPSCALER_KERNEL,
+            ),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0) as usize;
         // The largest zero-padded activation any convolution materializes: one
         // frame of halo on every axis, at whichever of the two resolutions is
         // bigger.
@@ -1299,8 +1499,15 @@ impl UpScratch {
         .unwrap_or(0) as usize;
         // The im2col matrix holds `SLAB_FRAMES` output frames of the 3x3x3 at
         // the widest resolution; the convolution computes its own slab from
-        // whatever this leaves.
-        let matrix = SLAB_FRAMES * out_plane * UPSCALER_CHANNELS * 3 * 3 * 3;
+        // whatever this leaves. Only the classic path writes it, so under the
+        // planar one it stays at a single element instead of holding half a
+        // gibibyte nothing reads.
+        let matrix = match conv_path() {
+            ConvPath::Planar => 1,
+            ConvPath::Classic => {
+                SLAB_FRAMES * out_plane * UPSCALER_CHANNELS * 3 * 3 * 3
+            }
+        };
         // The slabs differ per convolution: one that runs at the narrow
         // resolution fits the whole segment in the matrix, so its row count is
         // the segment's frames, not `SLAB_FRAMES`.
@@ -1342,6 +1549,7 @@ impl UpScratch {
                 alloc(activations.elements())?,
             ],
             matrix: alloc(matrix)?,
+            planar: alloc(planar)?,
             temp: alloc_f32(temp)?,
             accumulator: alloc_f32(H3_LATENT_CHANNELS * frames as usize * out_plane)?,
             weight_total: totals,
@@ -1865,8 +2073,9 @@ impl Upscaler {
         Ok(())
     }
 
-    /// The convolution itself: zero-pad, then im2col and `cublasLt` in
-    /// temporal slabs, so the whole matrix never has to exist at once.
+    /// The convolution itself: whichever of the two forms `H3_LTX_CONV`
+    /// selects — `convolve_planar` for the planar one, the im2col matrix for
+    /// the classic one.
     fn conv3d(
         &self,
         out: &Tensor,
@@ -1874,6 +2083,18 @@ impl Upscaler {
         conv: &Conv,
         input_shape: Shape,
     ) -> Result<(), LatentError> {
+        if conv_path() == ConvPath::Planar {
+            return convolve_planar(
+                &self.gpu,
+                self.arm,
+                &self.scratch.planar,
+                &self.scratch.temp,
+                out,
+                input,
+                conv,
+                input_shape,
+            );
+        }
         let gpu = &self.gpu;
         let dtype = self.arm.dtype();
         let [kt, kh, kw] = conv.kernel;
@@ -2180,6 +2401,8 @@ struct AdScratch {
     residual: Tensor,
     skipped: Tensor,
     matrix: Tensor,
+    /// The planar path's A operand, as in `UpScratch`.
+    planar: Tensor,
     temp: Tensor,
     norm: NormScratch,
     left: Tensor,
@@ -2204,9 +2427,37 @@ impl AdScratch {
         // The largest matmul the adapter runs: `in_proj`'s 752 -> 3008 over the
         // whole latent grid, which is what sizes the f32 accumulator.
         let temp = (grid as usize) * (2 * ADAPTER_WIDTH * ADAPTER_EXPANSION);
-        let matrix = SLAB_FRAMES
-            * plane
-            * (ADAPTER_WIDTH * 3 * 3).max(ADAPTER_IN_CHANNELS * 3 * 3 * 3);
+        // The two convolutions the adapter runs differ in kernel and input
+        // channel count: the stem is a 3x3x3 over 384 channels, the blocks a
+        // 1x3x3 over 752.
+        let planar = [
+            planar_elements(
+                ADAPTER_WIDTH as u64,
+                ltx_frames as u64,
+                ltx_height as u64,
+                ltx_width as u64,
+                [1, 3, 3],
+            ),
+            planar_elements(
+                ADAPTER_IN_CHANNELS as u64,
+                ltx_frames as u64,
+                ltx_height as u64,
+                ltx_width as u64,
+                [3, 3, 3],
+            ),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0) as usize;
+        let matrix = match conv_path() {
+            ConvPath::Planar => 1,
+            ConvPath::Classic => {
+                SLAB_FRAMES
+                    * plane
+                    * (ADAPTER_WIDTH * 3 * 3)
+                        .max(ADAPTER_IN_CHANNELS * 3 * 3 * 3)
+            }
+        };
         let max_plane = ltx_frames as usize * plane;
         let chunks = max_plane.div_ceil(8192);
         let partial = ADAPTER_GROUPS
@@ -2251,6 +2502,7 @@ impl AdScratch {
             residual: alloc(ADAPTER_OUT_CHANNELS * ltx_frames as usize * plane)?,
             skipped: alloc(ADAPTER_OUT_CHANNELS * ltx_frames as usize * plane)?,
             matrix: alloc(matrix)?,
+            planar: alloc(planar)?,
             temp: device(gpu.alloc(Dtype::F32, temp))?,
             norm: NormScratch {
                 partial: device(gpu.alloc(Dtype::F32, partial))?,
@@ -2537,7 +2789,7 @@ impl Adapter {
         Ok(())
     }
 
-    /// The same slabbed convolution the upscaler runs.
+    /// The same two convolution forms the upscaler selects between.
     fn conv3d(
         &self,
         out: &Tensor,
@@ -2545,6 +2797,18 @@ impl Adapter {
         conv: &Conv,
         input_shape: Shape,
     ) -> Result<(), LatentError> {
+        if conv_path() == ConvPath::Planar {
+            return convolve_planar(
+                &self.gpu,
+                self.arm,
+                &self.scratch.planar,
+                &self.scratch.temp,
+                out,
+                input,
+                conv,
+                input_shape,
+            );
+        }
         let gpu = &self.gpu;
         let dtype = self.arm.dtype();
         let [kt, kh, kw] = conv.kernel;

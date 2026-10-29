@@ -59,6 +59,15 @@ fn run() -> Result<ExitCode, String> {
     if !im2col(&gpu, &mut rng)? {
         failures += 1;
     }
+    if !planar(&gpu, &mut rng)? {
+        failures += 1;
+    }
+    if !pack(&gpu, &mut rng)? {
+        failures += 1;
+    }
+    if !matmul_planar(&gpu, &mut rng)? {
+        failures += 1;
+    }
     if !matmul(&gpu, &mut rng)? {
         failures += 1;
     }
@@ -263,8 +272,194 @@ fn im2col(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
     Ok(check("im2col", &download(gpu, &out)?, &expected, 0.0))
 }
 
-fn matmul(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
-    let (rows, input_dim, output_dim) = (5usize, 3usize, 7usize);
+/// The planar buffer: the padded activation in channel-last form, once per
+/// column tap, which is the operand the convolution's dense matmuls read.
+fn planar(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
+    let (channels, depth, height, width) = (3usize, 3usize, 4usize, 5usize);
+    let kw = 3usize;
+    let pad = [1usize, 1, 1];
+    let input = rng.values(channels * depth * height * width);
+    let tensor = upload(gpu, Dtype::F32, &input)?;
+
+    let (pad_depth, pad_height) = (depth + 2 * pad[0], height + 2 * pad[1]);
+    let elements = channels * pad_depth * pad_height * width * kw;
+    let out = gpu.alloc(Dtype::F32, elements)?;
+    gpu.latent_planar(
+        &out,
+        &tensor,
+        Dtype::F32,
+        channels as u32,
+        depth as u32,
+        height as u32,
+        width as u32,
+        kw as u32,
+        pad[0] as u32,
+        pad[1] as u32,
+        pad[2] as u32,
+        width as u32,
+    )?;
+
+    let mut expected = vec![0.0f32; elements];
+    for t in 0..pad_depth {
+        for y in 0..pad_height {
+            for x in 0..width {
+                for s in 0..kw {
+                    for c in 0..channels {
+                        let st = t as isize - pad[0] as isize;
+                        let sy = y as isize - pad[1] as isize;
+                        let sx = (x + s) as isize - pad[2] as isize;
+                        let inside = st >= 0
+                            && (st as usize) < depth
+                            && sy >= 0
+                            && (sy as usize) < height
+                            && sx >= 0
+                            && (sx as usize) < width;
+                        let value = if inside {
+                            input[((c * depth + st as usize) * height + sy as usize)
+                                * width
+                                + sx as usize]
+                        } else {
+                            0.0
+                        };
+                        let index = ((t * pad_height + y) * width + x) * kw * channels
+                            + s * channels
+                            + c;
+                        expected[index] = value;
+                    }
+                }
+            }
+        }
+    }
+    Ok(check("planar", &download(gpu, &out)?, &expected, 0.0))
+}
+
+/// The weights in the pass order the planar matmul reads: `[kt*kh + ky][out]
+/// [s*in + c]`, a permuted copy of `[out][in][kd][kh][kw]`.
+fn pack(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
+    let (out_channels, in_channels) = (2usize, 3usize);
+    let kernel = [2usize, 3, 4];
+    let taps = kernel[0] * kernel[1] * kernel[2];
+    let passes = kernel[0] * kernel[1];
+    let weight = rng.values(out_channels * in_channels * taps);
+    let tensor = upload(gpu, Dtype::F32, &weight)?;
+    let out = gpu.alloc(Dtype::F32, weight.len())?;
+    gpu.latent_weight_pack(
+        &out,
+        &tensor,
+        Dtype::F32,
+        out_channels as u32,
+        in_channels as u32,
+        taps as u32,
+        kernel[2] as u32,
+    )?;
+
+    let mut expected = vec![0.0f32; weight.len()];
+    for pass in 0..passes {
+        for o in 0..out_channels {
+            for s in 0..kernel[2] {
+                for c in 0..in_channels {
+                    let index = ((pass * out_channels + o) * kernel[2] + s) * in_channels + c;
+                    expected[index] = weight[(o * in_channels + c) * taps + pass * kernel[2] + s];
+                }
+            }
+        }
+    }
+    Ok(check("pack", &download(gpu, &out)?, &expected, 0.0))
+}
+
+/// One tap as a dense matmul over a window of the planar buffer, twice, the
+/// second time accumulating — which is how `kd*kh` of them sum into one
+/// convolution.
+fn matmul_planar(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
+    let (channels, depth, height, width) = (3usize, 3usize, 4usize, 5usize);
+    let (kw, out_channels) = (3usize, 2usize);
+    let pad = [1usize, 1, 1];
+    let input = rng.values(channels * depth * height * width);
+    let tensor = upload(gpu, Dtype::F32, &input)?;
+
+    let (pad_depth, pad_height) = (depth + 2 * pad[0], height + 2 * pad[1]);
+    let planar = gpu.alloc(
+        Dtype::F32,
+        channels * pad_depth * pad_height * width * kw,
+    )?;
+    gpu.latent_planar(
+        &planar,
+        &tensor,
+        Dtype::F32,
+        channels as u32,
+        depth as u32,
+        height as u32,
+        width as u32,
+        kw as u32,
+        pad[0] as u32,
+        pad[1] as u32,
+        pad[2] as u32,
+        width as u32,
+    )?;
+
+    let columns = kw * channels;
+    let out_plane = height * width;
+    let (tap_t, tap_h) = (1usize, 1usize);
+    let offset = ((tap_t * pad_height) + tap_h) * width * columns;
+    let first = rng.values(out_channels * columns);
+    let second = rng.values(out_channels * columns);
+    let first_tensor = upload(gpu, Dtype::F32, &first)?;
+    let second_tensor = upload(gpu, Dtype::F32, &second)?;
+    let out = gpu.alloc(Dtype::F32, out_plane * out_channels)?;
+
+    // The device A window, read back, so the host sum uses the same operand:
+    // the planar case above is what checks the window itself.
+    let window = download(gpu, &planar)?[offset..offset + out_plane * columns].to_vec();
+    let sum = |weights: &[f32]| -> Vec<f32> {
+        let mut values = vec![0.0f32; out_plane * out_channels];
+        for row in 0..out_plane {
+            for o in 0..out_channels {
+                let mut accumulator = 0.0f32;
+                for k in 0..columns {
+                    accumulator += window[row * columns + k] * weights[o * columns + k];
+                }
+                values[row * out_channels + o] = accumulator;
+            }
+        }
+        values
+    };
+
+    gpu.latent_matmul_planar(
+        &out,
+        &planar,
+        offset,
+        &first_tensor,
+        0,
+        out_plane as u32,
+        columns as u32,
+        out_channels as u32,
+        false,
+        Dtype::F32,
+    )?;
+    let mut pass = check("matmul_planar", &download(gpu, &out)?, &sum(&first), 1e-5);
+
+    gpu.latent_matmul_planar(
+        &out,
+        &planar,
+        offset,
+        &second_tensor,
+        0,
+        out_plane as u32,
+        columns as u32,
+        out_channels as u32,
+        true,
+        Dtype::F32,
+    )?;
+    let both: Vec<f32> = sum(&first)
+        .iter()
+        .zip(sum(&second))
+        .map(|(left, right)| left + right)
+        .collect();
+    pass &= check("matmul_planar_accumulate", &download(gpu, &out)?, &both, 1e-5);
+    Ok(pass)
+}
+
+fn matmul(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {    let (rows, input_dim, output_dim) = (5usize, 3usize, 7usize);
     let left = rng.values(rows * input_dim);
     let right = rng.values(output_dim * input_dim);
     let left_tensor = upload(gpu, Dtype::F32, &left)?;
