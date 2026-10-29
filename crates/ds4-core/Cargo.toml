@@ -94,3 +94,9 @@ required-features = ["h3-gates"]
 name = "test_av_mux"
 path = "../../tests/h3/test_av_mux.rs"
 required-features = ["h3-gates"]
+
+# Needs the release's Gemma4 pair over the mount; exits 3 without them.
+[[example]]
+name = "test_int8_convrot"
+path = "../../tests/h3/test_int8_convrot.rs"
+required-features = ["h3-gates"]

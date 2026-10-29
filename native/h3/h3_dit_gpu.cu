@@ -179,8 +179,10 @@ static int h3d_blas_ok(cublasStatus_t status, const char *operation,
 static size_t h3d_dtype_size(int dtype) {
     switch (dtype) {
         case H3D_F32:
-        case H3D_U32: return sizeof(uint32_t);
-        case H3D_FP8: return 1;
+        case H3D_U32:
+        case H3D_I32: return sizeof(uint32_t);
+        case H3D_FP8:
+        case H3D_I8: return 1;
         default: return sizeof(__nv_bfloat16);
     }
 }
@@ -246,7 +248,8 @@ void h3d_destroy(h3d_context *context) {
 h3d_tensor *h3d_alloc(h3d_context *context, int dtype, size_t elements,
                       char *error, size_t error_size) {
     if (!context || (dtype != H3D_BF16 && dtype != H3D_F32 &&
-                     dtype != H3D_U32 && dtype != H3D_FP8)) {
+                     dtype != H3D_U32 && dtype != H3D_FP8 &&
+                     dtype != H3D_I8 && dtype != H3D_I32)) {
         h3d_set_error(error, error_size, "unknown DiT dtype %d", dtype);
         return NULL;
     }
@@ -969,6 +972,434 @@ int h3d_linear_e4m3_raw(h3d_context *context, h3d_tensor *output,
     return h3d_linear_e4m3_compute(context, output->data, CUDA_R_32F,
                                    input->data, weight->data, NULL, NULL, rows,
                                    input_dim, output_dim, error, error_size);
+}
+
+/* ---- the Gemma4 encoder's INT8 convrot route ----
+ *
+ * The reference is `comfy-kitchen` 0.2.26, unpacked read-only at
+ * `/data/refs/comfy-kitchen-v0.2.26`; the release calls it through
+ * `runtime/cache_ops/int8_policy.py:58-107` (`DevInt8ConvRotLinear`), which
+ * passes `convrot=True`, the layer's `convrot_groupsize` and a BF16 output
+ * dtype code. Five steps, each cited where it is implemented:
+ *
+ *   1. grouped Hadamard rotation of the activation   `tensor/int8_utils.py:55-70`
+ *   2. row-wise absmax and scale                     `backends/eager/quantization.py:857-871`
+ *   3. row-wise INT8 quantization in the operand's dtype   (same lines)
+ *   4. int8 x int8 -> int32 accumulation             `:749-781`
+ *   5. F32 scale epilogue, BF16 cast, bias last      `:1006-1051`
+ *
+ * The Hadamard matrix is stored as sign bits rather than as BF16 values. That
+ * is exact and not an approximation: `_build_hadamard` divides the Kronecker
+ * power of `h4` by `sqrt(size)` (`tensor/int8_utils.py:10-38`) and `size` is a
+ * power of 4, so every entry is exactly +/- 2^-k; adding `+x` or `-x` and
+ * applying one power-of-two scale at the end is the same arithmetic the
+ * reference's dense matmul does, term for term and rounding for rounding. The
+ * gate checks the sign bits against a host Kronecker build. */
+#define H3D_INT8_MAX 127.0f
+#define H3D_INT8_MIN_SCALE 1e-30f
+/* `torch.finfo(torch.bfloat16).tiny`, the `_int8_scale_for_math` floor
+ * (`:815-817`). It cannot fire here - the scale is clamped at `1e-30` first -
+ * but the reference's guard is kept rather than argued away. */
+#define H3D_INT8_TINY_BF16 1.1754943508222875e-38f
+#define H3D_INT8_THREADS 256
+
+/* `kron(h4, h4, ...)`: for `size = 4^k` every entry is the product of `h4`'s
+ * own entries over the base-4 digits of its two indices, and `h4[i][j]` is -1
+ * exactly when `i + j == 3` (`tensor/int8_utils.py:24-27`). One bit per entry,
+ * set for +1. */
+__global__ static void h3d_int8_hadamard_kernel(uint32_t *words,
+                                                uint32_t size,
+                                                uint32_t words_per_row) {
+    size_t total = (size_t)size * words_per_row;
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < total; index += (size_t)gridDim.x * blockDim.x) {
+        uint32_t row = (uint32_t)(index / words_per_row);
+        uint32_t first = (uint32_t)(index % words_per_row) * 32u;
+        uint32_t packed = 0;
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+            uint32_t column = first + lane;
+            if (column >= size) break;
+            uint32_t negative = 0;
+            for (uint32_t step = size / 4;; step /= 4) {
+                if ((row / step) % 4 + (column / step) % 4 == 3) {
+                    negative ^= 1u;
+                }
+                if (step <= 1) break;
+            }
+            if (!negative) packed |= 1u << lane;
+        }
+        words[index] = packed;
+    }
+}
+
+/* `_rotate_activation` (`tensor/int8_utils.py:55-70`): the last dimension is
+ * reshaped into groups of `group_size` and each group is multiplied by the
+ * matrix, `out[j] = sum_i in[i] * h[i][j]`. One block per (row, group); every
+ * thread owns one output column and walks the inputs in index order, so the
+ * accumulation is a single F32 register and the two-or-three-rounding drift a
+ * cuBLAS tile order would add is absent. The reference accumulates the same
+ * sum in F32; its own tile order is not pinned, which the gate measures. */
+__global__ static void h3d_int8_rotate_kernel(__nv_bfloat16 *output,
+                                              const __nv_bfloat16 *input,
+                                              const uint32_t *words,
+                                              uint32_t group,
+                                              uint32_t words_per_row,
+                                              float recip) {
+    __shared__ __nv_bfloat16 column[H3D_INT8_GROUP_MAX];
+    const uint32_t row = blockIdx.x, index = blockIdx.y;
+    const uint32_t groups = gridDim.y;
+    const uint32_t columns = groups * group;
+    const __nv_bfloat16 *in = input + (size_t)row * columns + (size_t)index * group;
+    __nv_bfloat16 *out = output + (size_t)row * columns + (size_t)index * group;
+    for (uint32_t i = threadIdx.x; i < group; i += blockDim.x) column[i] = in[i];
+    __syncthreads();
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < group; ++i) {
+        /* The sign bit is a broadcast read: every thread of a warp wants the
+         * same word, since the word index moves once per 32 columns. */
+        uint32_t word = __ldg(&words[i * words_per_row + (threadIdx.x >> 5)]);
+        sum += ((word >> (threadIdx.x & 31u)) & 1u) ? __bfloat162float(column[i])
+                                                    : -__bfloat162float(column[i]);
+    }
+    out[threadIdx.x] = __float2bfloat16(sum * recip);
+}
+
+/* `abs_max = x.abs().amax(dim=-1, keepdim=True)` (`:870`) and
+ * `scale = (abs_max.float() / 127.0).clamp(min=1e-30)` (`:871`). The
+ * reduction is the FP8 route's own per-row amax, which is the same maximum of
+ * the same absolute values; only the divisor below differs. */
+__global__ static void h3d_int8_scale_rows_kernel(float *scales, size_t rows) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= rows) return;
+    scales[index] = fmaxf(scales[index] / H3D_INT8_MAX, H3D_INT8_MIN_SCALE);
+}
+
+/* `_round_int8(x / _int8_scale_for_math(scale, x))` (`:820-826`, `:857-871`).
+ * The divisor is the scale rounded to the operand's dtype, because the
+ * reference divides a BF16 tensor by a BF16 scale; the quotient is rounded to
+ * BF16 for the same reason before `round_` (half to even) and the clamp. The
+ * value is integral after the round, so the cast to int8 only reinterprets. */
+__global__ static void h3d_int8_quantize_rows_kernel(int8_t *output,
+                                                     const __nv_bfloat16 *input,
+                                                     const float *scales,
+                                                     size_t columns) {
+    __nv_bfloat16 rounded = __float2bfloat16(scales[blockIdx.x]);
+    if (__bfloat162float(rounded) == 0.0f) {
+        rounded = __float2bfloat16(H3D_INT8_TINY_BF16);
+    }
+    const float divisor = __bfloat162float(rounded);
+    for (size_t index = threadIdx.x; index < columns; index += blockDim.x) {
+        size_t at = (size_t)blockIdx.x * columns + index;
+        float value = __bfloat162float(input[at]) / divisor;
+        value = __bfloat162float(__float2bfloat16(value));
+        value = rintf(value);
+        value = fminf(fmaxf(value, -128.0f), H3D_INT8_MAX);
+        output[at] = (int8_t)value;
+    }
+}
+
+/* `torch._int_mm(x_8, weight.T.contiguous())` (`:749-781`, `:1021`): int8 x
+ * int8 into an int32 accumulator, row-major and TRANSB as the BF16 and FP8
+ * routes are laid out. The reference zero-pads M, K and N to cuBLASLt's
+ * alignments before the call; padding a dimension with zeros cannot change the
+ * accumulator, so the port instead requires the alignments the artifacts
+ * already satisfy (K and N multiples of 8) and pads only M, which costs the
+ * caller nothing but a wider scratch. */
+static int h3d_linear_int8_compute(h3d_context *context, void *output,
+                                   const void *input, const void *weight,
+                                   uint32_t rows, uint32_t input_dim,
+                                   uint32_t output_dim, char *error,
+                                   size_t error_size) {
+    cublasLtMatmulDesc_t operation = NULL;
+    cublasLtMatrixLayout_t input_layout = NULL;
+    cublasLtMatrixLayout_t weight_layout = NULL;
+    cublasLtMatrixLayout_t output_layout = NULL;
+    cublasOperation_t transpose = CUBLAS_OP_T;
+    cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+    int32_t alpha = 1, beta = 0;
+    cublasStatus_t status = cublasLtMatmulDescCreate(&operation,
+                                                     CUBLAS_COMPUTE_32I,
+                                                     CUDA_R_32I);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulDescSetAttribute(
+            operation, CUBLASLT_MATMUL_DESC_TRANSB, &transpose,
+            sizeof(transpose));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&input_layout, CUDA_R_8I, rows,
+                                            input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&weight_layout, CUDA_R_8I,
+                                            output_dim, input_dim, input_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&output_layout, CUDA_R_32I, rows,
+                                            output_dim, output_dim);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            input_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            weight_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutSetAttribute(
+            output_layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major,
+            sizeof(row_major));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmul(context->blas, operation, &alpha, input,
+                                input_layout, weight, weight_layout, &beta,
+                                output, output_layout, output, output_layout,
+                                NULL, NULL, 0, context->stream);
+    }
+    if (output_layout) cublasLtMatrixLayoutDestroy(output_layout);
+    if (weight_layout) cublasLtMatrixLayoutDestroy(weight_layout);
+    if (input_layout) cublasLtMatrixLayoutDestroy(input_layout);
+    if (operation) cublasLtMatmulDescDestroy(operation);
+    return h3d_blas_ok(status, "cuBLASLt INT8 linear", error, error_size);
+}
+
+/* `chunk.float() * (x_scale * weight_scale)` then `.to(bf16)` (`:1035-1040`):
+ * the two F32 multiplies in the reference's own association, the row scale and
+ * the column scale multiplied first and the F32 accumulator scaled by that
+ * product, with one BF16 rounding. `h3d_linear_bias_kernel` adds the bias
+ * afterwards in BF16, which is the reference's own `result + bias` (`:1047`). */
+__global__ static void h3d_int8_scale_epilogue_kernel(
+    __nv_bfloat16 *output, const int32_t *accumulator, const float *row_scale,
+    const float *column_scale, size_t columns) {
+    const size_t row = blockIdx.x;
+    const float row_factor = row_scale[row];
+    const int32_t *in = accumulator + row * columns;
+    __nv_bfloat16 *out = output + row * columns;
+    for (size_t index = threadIdx.x; index < columns; index += blockDim.x) {
+        out[index] = __float2bfloat16((float)in[index] *
+                                      (row_factor * column_scale[index]));
+    }
+}
+
+/* `size` is a power of 4, so `sqrt(size)` is a power of two and the reciprocal
+ * is exact in F32; no libm call is needed on either side. */
+static float h3d_int8_reciprocal(uint32_t size) {
+    float root = 1.0f;
+    while (root * root < (float)size) root *= 2.0f;
+    return 1.0f / root;
+}
+
+static int h3d_int8_check_group(uint32_t group_size, char *error,
+                                size_t error_size) {
+    if (group_size < 4 || group_size > H3D_INT8_GROUP_MAX ||
+        (group_size & (group_size - 1)) != 0) {
+        return h3d_set_error(error, error_size,
+                             "INT8 convrot group %u is not a power of two in "
+                             "[4, %d]",
+                             group_size, (int)H3D_INT8_GROUP_MAX);
+    }
+    float root = 1.0f;
+    while (root * root < (float)group_size) root *= 2.0f;
+    if (root * root != (float)group_size) {
+        return h3d_set_error(error, error_size,
+                             "INT8 convrot group %u is not a power of 4",
+                             group_size);
+    }
+    return 1;
+}
+
+int h3d_int8_hadamard(h3d_context *context, h3d_tensor *words,
+                      uint32_t group_size, char *error, size_t error_size) {
+    size_t per_row = (group_size + 31) / 32, total = 0;
+    if (!context || !h3d_int8_check_group(group_size, error, error_size) ||
+        !h3d_mul_size(group_size, per_row, &total) ||
+        !h3d_is(words, H3D_U32, total)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 Hadamard tensors or group");
+    }
+    unsigned blocks = (unsigned)((total + H3D_INT8_THREADS - 1) / H3D_INT8_THREADS);
+    if (blocks > H3D_FP8_MAX_BLOCKS) blocks = H3D_FP8_MAX_BLOCKS;
+    h3d_int8_hadamard_kernel<<<blocks, H3D_INT8_THREADS, 0, context->stream>>>(
+        (uint32_t *)words->data, group_size, (uint32_t)per_row);
+    return h3d_launch_ok("INT8 Hadamard", error, error_size);
+}
+
+int h3d_int8_rotate(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *words, const h3d_tensor *input,
+                    uint32_t rows, uint32_t columns, uint32_t group_size,
+                    char *error, size_t error_size) {
+    size_t elements = 0, total = 0;
+    if (!context || !rows || !columns || !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_int8_check_group(group_size, error, error_size) ||
+        columns % group_size != 0 ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 rotation tensors or shape");
+    }
+    size_t per_row = (group_size + 31) / 32;
+    if (!h3d_mul_size(group_size, per_row, &total) ||
+        !h3d_is(words, H3D_U32, total)) {
+        return h3d_set_error(error, error_size, "invalid INT8 Hadamard tensor");
+    }
+    uint32_t groups = columns / group_size;
+    if (groups > 65535) {
+        return h3d_set_error(error, error_size,
+                             "INT8 rotation needs %u groups, at most 65535",
+                             groups);
+    }
+    dim3 grid(rows, groups);
+    h3d_int8_rotate_kernel<<<grid, group_size, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        (const uint32_t *)words->data, group_size, (uint32_t)per_row,
+        h3d_int8_reciprocal(group_size));
+    return h3d_launch_ok("INT8 rotate", error, error_size);
+}
+
+int h3d_int8_scale_rows(h3d_context *context, h3d_tensor *scales,
+                        const h3d_tensor *input, uint32_t rows,
+                        uint32_t columns, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !columns ||
+        !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_is(scales, H3D_F32, rows) || !h3d_is(input, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 row scale tensors");
+    }
+    h3d_fp8_amax_rows_kernel<<<rows, H3D_FP8_THREADS, 0, context->stream>>>(
+        (const __nv_bfloat16 *)input->data, (float *)scales->data, columns);
+    if (!h3d_launch_ok("INT8 row amax", error, error_size)) return 0;
+    unsigned blocks = (unsigned)((rows + H3D_INT8_THREADS - 1) / H3D_INT8_THREADS);
+    h3d_int8_scale_rows_kernel<<<blocks, H3D_INT8_THREADS, 0,
+                                 context->stream>>>((float *)scales->data, rows);
+    return h3d_launch_ok("INT8 row scale", error, error_size);
+}
+
+int h3d_int8_quantize_rows(h3d_context *context, h3d_tensor *output,
+                           const h3d_tensor *scales, const h3d_tensor *input,
+                           uint32_t rows, uint32_t columns, char *error,
+                           size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !columns ||
+        !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_is(scales, H3D_F32, rows) || !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_I8, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 row quantize tensors");
+    }
+    h3d_int8_quantize_rows_kernel<<<rows, H3D_INT8_THREADS, 0,
+                                    context->stream>>>(
+        (int8_t *)output->data, (const __nv_bfloat16 *)input->data,
+        (const float *)scales->data, columns);
+    return h3d_launch_ok("INT8 row quantize", error, error_size);
+}
+
+int h3d_linear_int8_raw(h3d_context *context, h3d_tensor *accumulator,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                        char *error, size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_I8, inputs) || !h3d_is(weight, H3D_I8, weights) ||
+        !h3d_is(accumulator, H3D_I32, outputs) ||
+        (input_dim % 8) || (output_dim % 8)) {
+        return h3d_set_error(error, error_size,
+                             "invalid raw INT8 linear tensors or shape");
+    }
+    return h3d_linear_int8_compute(context, accumulator->data, input->data,
+                                   weight->data, rows, input_dim, output_dim,
+                                   error, error_size);
+}
+
+int h3d_int8_scale_epilogue(h3d_context *context, h3d_tensor *output,
+                            const h3d_tensor *accumulator,
+                            const h3d_tensor *row_scale,
+                            const h3d_tensor *column_scale, uint32_t rows,
+                            uint32_t columns, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !columns ||
+        !h3d_mul_size(rows, columns, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(accumulator, H3D_I32, elements) ||
+        !h3d_is(row_scale, H3D_F32, rows) ||
+        !h3d_is(column_scale, H3D_F32, columns)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 scale epilogue tensors");
+    }
+    h3d_int8_scale_epilogue_kernel<<<rows, H3D_INT8_THREADS, 0,
+                                     context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const int32_t *)accumulator->data,
+        (const float *)row_scale->data, (const float *)column_scale->data,
+        columns);
+    return h3d_launch_ok("INT8 scale epilogue", error, error_size);
+}
+
+/* `max(rows, 32)` rounded up to 32: the reference's own M padding for CUDA
+ * (`_int8_matmul_accumulate`, `:762-765`), so a short prompt's row count is
+ * legal. Padding a row with zeros cannot change an int32 accumulator, and the
+ * epilogue reads only the real rows, so the extra rows do not need zeroing. */
+uint32_t h3d_int8_pad_rows(uint32_t rows) {
+    uint32_t padded = rows < 32 ? 32 : rows;
+    return (padded + 31u) & ~31u;
+}
+
+int h3d_linear_int8_convrot(h3d_context *context, h3d_tensor *output,
+                            const h3d_tensor *input, const h3d_tensor *weight,
+                            const h3d_tensor *weight_scale,
+                            const h3d_tensor *bias, uint32_t rows,
+                            uint32_t input_dim, uint32_t output_dim,
+                            uint32_t group_size,
+                            const struct h3d_int8_plan *plan, char *error,
+                            size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    uint32_t padded = h3d_int8_pad_rows(rows);
+    if (!context || !rows || !input_dim || !output_dim || !plan ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_BF16, inputs) || !h3d_is(weight, H3D_I8, weights) ||
+        !h3d_is(weight_scale, H3D_F32, output_dim) ||
+        !h3d_is(output, H3D_BF16, outputs) ||
+        (bias && !h3d_is(bias, H3D_BF16, output_dim)) ||
+        !h3d_int8_check_group(group_size, error, error_size)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 convrot linear tensors or shape");
+    }
+    if (!plan->rotated || !plan->quantized || !plan->row_scales ||
+        !plan->accumulator || !plan->words ||
+        !h3d_is(plan->rotated, H3D_BF16, inputs) ||
+        !h3d_is(plan->quantized, H3D_I8, (size_t)padded * input_dim) ||
+        !h3d_is(plan->row_scales, H3D_F32, padded) ||
+        !h3d_is(plan->accumulator, H3D_I32, (size_t)padded * output_dim)) {
+        return h3d_set_error(error, error_size,
+                             "invalid INT8 convrot plan tensors");
+    }
+    if (!h3d_int8_rotate(context, plan->rotated, plan->words, input, rows,
+                         input_dim, group_size, error, error_size) ||
+        !h3d_int8_scale_rows(context, plan->row_scales, plan->rotated, rows,
+                             input_dim, error, error_size) ||
+        !h3d_int8_quantize_rows(context, plan->quantized, plan->row_scales,
+                                plan->rotated, rows, input_dim, error,
+                                error_size) ||
+        !h3d_linear_int8_raw(context, plan->accumulator, plan->quantized,
+                             weight, padded, input_dim, output_dim, error,
+                             error_size) ||
+        !h3d_int8_scale_epilogue(context, output, plan->accumulator,
+                                 plan->row_scales, weight_scale, rows,
+                                 output_dim, error, error_size)) {
+        return 0;
+    }
+    if (!bias) return 1;
+    unsigned blocks = (unsigned)((outputs + 255) / 256);
+    h3d_linear_bias_kernel<<<blocks, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)bias->data,
+        outputs, output_dim);
+    return h3d_launch_ok("INT8 convrot bias", error, error_size);
 }
 
 /* The video VAE decoder's F32 linear: the reference's `h3_gpu_linear_f32`

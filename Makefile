@@ -480,11 +480,22 @@ tests/h3/fp8_gemm_bm: tests/h3/fp8_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/
 tests/h3/elementwise_bm: tests/h3/elementwise_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
-# Portable reference tests: host-only, without model weights.
-H3_REFERENCE_TESTS := test_host_portable test_av_mux test_tokenizer_portable
-H3_REFERENCE_SUITE := $(addprefix tests/h3-,$(H3_REFERENCE_TESTS))
+# The Gemma4 encoder's INT8 convrot route in isolation: the Hadamard sign
+# matrix, the grouped rotation, the row scale, the INT8 values, the INT32
+# accumulator and the F32 epilogue, each checked against a host transcription of
+# comfy-kitchen 0.2.26's eager backend, then the route priced piece by piece.
+tests/h3/int8_convrot_bm: tests/h3/int8_convrot_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
-$(H3_REFERENCE_SUITE): tests/h3-%: $(DS4_RS_SOURCES)
+# Portable reference tests: host-only, without model weights.
+H3_REFERENCE_TESTS := test_host_portable test_av_mux test_tokenizer_portable test_int8_convrot
+H3_REFERENCE_SUITE := $(addprefix tests/h3-,$(H3_REFERENCE_TESTS))
+# The suite's sources live outside crates/, so DS4_RS_SOURCES does not cover
+# them: without this an edited portable test rebuilt nothing and the copy
+# stayed stale.
+H3_REFERENCE_SOURCES := $(shell find tests/h3 -maxdepth 1 -name 'test_*.rs' -print)
+
+$(H3_REFERENCE_SUITE): tests/h3-%: $(DS4_RS_SOURCES) $(H3_REFERENCE_SOURCES)
 	cargo build -p ds4-core --example $* --release --features h3-gates --locked
 	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/$*" $@
 

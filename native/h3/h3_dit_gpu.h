@@ -22,10 +22,11 @@
  * `fmaf` where the reference relies on contraction changes the last bit.
  *
  * Deviation, named: the reference carries F32, BF16, U32 and int8 tensors in
- * one `h3_gpu_tensor`; this ABI keeps the two dtypes the BF16 path uses and
- * refuses the int8/fused-NAX variants (CUDA returns 0 from
+ * one `h3_gpu_tensor`; this ABI carries F32, BF16, U32, I8 and I32 and still
+ * refuses the DiT's int8/fused-NAX variants (CUDA returns 0 from
  * `h3_gpu_has_int8_mlp`/`h3_gpu_has_nax_mlp`, `h3_gpu_cuda.cu:332-334`, so the
- * reference's own CUDA path is the one implemented here).
+ * reference's own CUDA path is the one implemented here). The I8/I32 pair
+ * exists for the Gemma4 encoder's INT8 convrot route below, not for the DiT.
  */
 #ifndef H3D_DIT_GPU_H
 #define H3D_DIT_GPU_H
@@ -38,9 +39,17 @@ extern "C" {
 #endif
 
 /* `H3D_FP8` is E4M3, one byte per element, and exists only for the FP8
- * projection route below. `h3d_is` still matches a dtype exactly, so no
+ * projection route below; `H3D_I8` and `H3D_I32` exist only for the Gemma4
+ * encoder's INT8 convrot route. `h3d_is` still matches a dtype exactly, so no
  * existing op can be handed one by accident. */
-enum h3d_dtype { H3D_BF16 = 0, H3D_F32 = 1, H3D_U32 = 2, H3D_FP8 = 3 };
+enum h3d_dtype {
+    H3D_BF16 = 0,
+    H3D_F32 = 1,
+    H3D_U32 = 2,
+    H3D_FP8 = 3,
+    H3D_I8 = 4,
+    H3D_I32 = 5,
+};
 
 /* Sol-Attn's fixed shapes (`techniques/sparse_backends/sol_attn/preprocess.py`
  * `:10-12` in NVIDIA's Sana `sol-engine` tree: BLOCK_SIZE 64, HEAD_DIM 128;
@@ -171,6 +180,82 @@ int h3d_fp8_scale_epilogue(h3d_context *context, h3d_tensor *output,
                            const h3d_tensor *row_scale,
                            const h3d_tensor *column_scale, uint32_t rows,
                            uint32_t columns, char *error, size_t error_size);
+
+/* ---- the release's INT8 convrot route, for the Gemma4 encoder ----
+ *
+ * The conditioning this port has to build offline is Gemma-4-12B features
+ * through the LTX connector, and the release serves both quantized with Comfy's
+ * `int8_tensorwise` + `convrot` layout (`runtime/cache_ops/int8_policy.py:97-104`,
+ * `DevInt8ConvRotLinear`). The reference arithmetic is `comfy-kitchen` 0.2.26
+ * (`/data/refs/comfy-kitchen-v0.2.26`): a normalized regular Hadamard rotation
+ * of the activation in groups of `group_size`, row-wise INT8 quantization in
+ * the activation's own dtype, an int8 -> int32 matmul, then an F32 scale
+ * epilogue cast to BF16 and the bias last. Every entry point names its
+ * reference lines, and the weight side is already rotated and quantized in the
+ * checkpoint, so nothing here rotates a weight.
+ *
+ * The Hadamard matrix is stored as sign bits, which is exact: the matrix is
+ * `kron(h4, ...) / sqrt(size)` (`tensor/int8_utils.py:10-38`) and `size` is a
+ * power of 4, so every entry is exactly +/- a power of two and the accumulation
+ * can add `+x` or `-x` and apply that one scale at the end. */
+
+/* The sign matrix's shape: `group_size` must be a power of 4 and at most
+ * `H3D_INT8_GROUP_MAX`, one bit per entry packed row-major with
+ * `ceil(group/32)` words per row. `words` is a U32 tensor of
+ * `group * ceil(group/32)` elements. */
+enum { H3D_INT8_GROUP_MAX = 1024 };
+
+int h3d_int8_hadamard(h3d_context *context, h3d_tensor *words,
+                      uint32_t group_size, char *error, size_t error_size);
+int h3d_int8_rotate(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *words, const h3d_tensor *input,
+                    uint32_t rows, uint32_t columns, uint32_t group_size,
+                    char *error, size_t error_size);
+int h3d_int8_scale_rows(h3d_context *context, h3d_tensor *scales,
+                        const h3d_tensor *input, uint32_t rows,
+                        uint32_t columns, char *error, size_t error_size);
+int h3d_int8_quantize_rows(h3d_context *context, h3d_tensor *output,
+                           const h3d_tensor *scales, const h3d_tensor *input,
+                           uint32_t rows, uint32_t columns, char *error,
+                           size_t error_size);
+int h3d_linear_int8_raw(h3d_context *context, h3d_tensor *accumulator,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                        char *error, size_t error_size);
+int h3d_int8_scale_epilogue(h3d_context *context, h3d_tensor *output,
+                            const h3d_tensor *accumulator,
+                            const h3d_tensor *row_scale,
+                            const h3d_tensor *column_scale, uint32_t rows,
+                            uint32_t columns, char *error, size_t error_size);
+
+/* The chain's workspace, the way `h3d_sol_plan` holds the search step's. One
+ * plan serves every layer of one shape, so the encoder allocates it once. The
+ * two padded tensors follow the reference's own M padding to 32 rows
+ * (`_int8_matmul_accumulate`, `backends/eager/quantization.py:762-765`); only
+ * the rows before `padded_rows` are ever read, so they need no zeroing. */
+struct h3d_int8_plan {
+    h3d_tensor *words;       /* U32,  group * ceil(group/32)     */
+    h3d_tensor *rotated;     /* BF16, rows * input_dim           */
+    h3d_tensor *quantized;   /* I8,   padded_rows * input_dim    */
+    h3d_tensor *row_scales;  /* F32,  padded_rows                */
+    h3d_tensor *accumulator; /* I32,  padded_rows * output_dim   */
+};
+
+/* `max(rows, 32)` rounded up to 32, the reference's own M padding. */
+uint32_t h3d_int8_pad_rows(uint32_t rows);
+
+/* `DevInt8ConvRotLinear.forward` -> `int8_linear`
+ * (`backends/eager/quantization.py:965-1051`) end to end: rotate, quantize,
+ * accumulate, scale, cast, bias. `weight` is I8 `[output_dim, input_dim]` and
+ * `weight_scale` F32 `[output_dim]`, both as the checkpoint carries them. */
+int h3d_linear_int8_convrot(h3d_context *context, h3d_tensor *output,
+                            const h3d_tensor *input, const h3d_tensor *weight,
+                            const h3d_tensor *weight_scale,
+                            const h3d_tensor *bias, uint32_t rows,
+                            uint32_t input_dim, uint32_t output_dim,
+                            uint32_t group_size,
+                            const struct h3d_int8_plan *plan, char *error,
+                            size_t error_size);
 
 /* The video VAE decoder's F32 linear: `h3d_linear` at `H3D_F32` with the
  * decoder's own options applied (`h3d_set_vae_option`). Separate from
