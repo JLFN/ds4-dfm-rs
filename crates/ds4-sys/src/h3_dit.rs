@@ -563,6 +563,7 @@ unsafe extern "C" {
         context: *mut Context,
         output: *mut CTensor,
         fused: *const CTensor,
+        bias: *const CTensor,
         rows: u32,
         width: u32,
         error: *mut c_char,
@@ -574,6 +575,7 @@ unsafe extern "C" {
         output: *mut CTensor,
         residual: *const CTensor,
         branch: *const CTensor,
+        bias: *const CTensor,
         scale: *const CTensor,
         rows: u32,
         width: u32,
@@ -587,6 +589,7 @@ unsafe extern "C" {
         key: *mut CTensor,
         value: *mut CTensor,
         qkv: *const CTensor,
+        bias: *const CTensor,
         rope_cos: *const CTensor,
         rope_sin: *const CTensor,
         sequence: u32,
@@ -2459,10 +2462,13 @@ impl Gpu {
         )
     }
 
+    /// `bias`, when given, is the fused linear's own: the kernel adds it on
+    /// load, so its producer is called with `H3D`'s bias left off.
     pub fn swiglu_f32(
         &self,
         output: &Tensor,
         fused: &Tensor,
+        bias: Option<&Tensor>,
         rows: u32,
         width: u32,
     ) -> Result<(), String> {
@@ -2472,6 +2478,7 @@ impl Gpu {
                     self.raw.as_ptr(),
                     output.raw(),
                     fused.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
                     rows,
                     width,
                     error,
@@ -2487,6 +2494,7 @@ impl Gpu {
         output: &Tensor,
         residual: &Tensor,
         branch: &Tensor,
+        bias: Option<&Tensor>,
         scale: &Tensor,
         rows: u32,
         width: u32,
@@ -2498,6 +2506,7 @@ impl Gpu {
                     output.raw(),
                     residual.raw(),
                     branch.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
                     scale.raw(),
                     rows,
                     width,
@@ -2516,6 +2525,7 @@ impl Gpu {
         key: &Tensor,
         value: &Tensor,
         qkv: &Tensor,
+        bias: Option<&Tensor>,
         rope_cos: &Tensor,
         rope_sin: &Tensor,
         sequence: u32,
@@ -2532,6 +2542,7 @@ impl Gpu {
                     key.raw(),
                     value.raw(),
                     qkv.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
                     rope_cos.raw(),
                     rope_sin.raw(),
                     sequence,

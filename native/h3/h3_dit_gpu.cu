@@ -3246,6 +3246,7 @@ int h3d_layer_norm_f32(h3d_context *context, h3d_tensor *output,
  * and the gate passes through `gate / (1 + expf(-gate))`, not `1 / (1 + ...)`. */
 __global__ static void h3d_swiglu_f32_kernel(float *output,
                                              const float *fused,
+                                             const float *bias,
                                              uint32_t rows, uint32_t width) {
     uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t row = blockIdx.y;
@@ -3253,31 +3254,40 @@ __global__ static void h3d_swiglu_f32_kernel(float *output,
     size_t base = (size_t)row * width * 2;
     float gate = fused[base + column];
     float up = fused[base + width + column];
+    if (bias) {
+        gate += bias[column];
+        up += bias[width + column];
+    }
     output[(size_t)row * width + column] =
         gate / (1.0f + expf(-gate)) * up;
 }
 
 int h3d_swiglu_f32(h3d_context *context, h3d_tensor *output,
-                   const h3d_tensor *fused, uint32_t rows, uint32_t width,
+                   const h3d_tensor *fused, const h3d_tensor *bias,
+                   uint32_t rows, uint32_t width,
                    char *error, size_t error_size) {
     size_t elements = 0;
     if (!context || !h3d_mul_size(rows, width, &elements) ||
         elements > SIZE_MAX / 2 ||
         !h3d_is(output, H3D_F32, elements) ||
-        !h3d_is(fused, H3D_F32, elements * 2)) {
+        !h3d_is(fused, H3D_F32, elements * 2) ||
+        (bias && !h3d_is(bias, H3D_F32, (size_t)width * 2))) {
         return h3d_set_error(error, error_size, "invalid SwiGLU arguments");
     }
     dim3 grid((width + 255) / 256, rows);
     h3d_swiglu_f32_kernel<<<grid, 256, 0, context->stream>>>(
-        (float *)output->data, (const float *)fused->data, rows, width);
+        (float *)output->data, (const float *)fused->data,
+        bias ? (const float *)bias->data : NULL, rows, width);
     return h3d_launch_ok("F32 SwiGLU", error, error_size);
 }
 
 /* `h3_scale_add_kernel` (`:2885-2893`): `residual + branch * scale`, one
- * multiply, and no fma. */
+ * multiply, and no fma. `bias` is added to the branch on load, which is the
+ * same F32 add the bias kernel would have made in place. */
 __global__ static void h3d_scale_add_f32_kernel(float *output,
                                                 const float *residual,
                                                 const float *branch,
+                                                const float *bias,
                                                 const float *scale,
                                                 uint32_t rows,
                                                 uint32_t width) {
@@ -3285,26 +3295,31 @@ __global__ static void h3d_scale_add_f32_kernel(float *output,
     uint32_t row = blockIdx.y;
     if (row >= rows || column >= width) return;
     size_t index = (size_t)row * width + column;
-    output[index] = residual[index] + branch[index] * scale[column];
+    float value = branch[index];
+    if (bias) value += bias[column];
+    output[index] = residual[index] + value * scale[column];
 }
 
 int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
                       const h3d_tensor *residual, const h3d_tensor *branch,
-                      const h3d_tensor *scale, uint32_t rows, uint32_t width,
+                      const h3d_tensor *bias, const h3d_tensor *scale,
+                      uint32_t rows, uint32_t width,
                       char *error, size_t error_size) {
     size_t elements = 0;
     if (!context || !h3d_mul_size(rows, width, &elements) ||
         !h3d_is(output, H3D_F32, elements) ||
         !h3d_is(residual, H3D_F32, elements) ||
         !h3d_is(branch, H3D_F32, elements) ||
-        !h3d_is(scale, H3D_F32, width)) {
+        !h3d_is(scale, H3D_F32, width) ||
+        (bias && !h3d_is(bias, H3D_F32, width))) {
         return h3d_set_error(error, error_size,
                              "invalid F32 scale-add arguments");
     }
     dim3 grid((width + 255) / 256, rows);
     h3d_scale_add_f32_kernel<<<grid, 256, 0, context->stream>>>(
         (float *)output->data, (const float *)residual->data,
-        (const float *)branch->data, (const float *)scale->data, rows, width);
+        (const float *)branch->data, bias ? (const float *)bias->data : NULL,
+        (const float *)scale->data, rows, width);
     return h3d_launch_ok("F32 scale add", error, error_size);
 }
 
@@ -3312,38 +3327,52 @@ int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
  * `normalize = 1`, `weighted = 0` (`:3199-3203`): the checkpoint's
  * [head][q,k,v][dim] rows, the Q/K RMS over the head with no learned scale,
  * then the pair rotation over the first `2 * rope_half` dimensions. */
+/* The QKV linear's bias, added on load: `h3d_linear_bias_kernel<float>`'s own
+ * F32 add, one column per qkv element. `bias` is NULL when the caller already
+ * added it. */
+static __device__ inline float h3d_qkv_bias(const float *qkv, const float *bias,
+                                            size_t index, size_t column) {
+    return bias ? qkv[index] + bias[column] : qkv[index];
+}
+
 __global__ static void h3d_video_qkv_rope_f32_kernel(
         float *query, float *key, float *value, const float *qkv,
-        const float *rope_cos, const float *rope_sin, uint32_t sequence,
-        uint32_t heads, uint32_t head_dim, uint32_t rope_half, float epsilon) {
+        const float *bias, const float *rope_cos, const float *rope_sin,
+        uint32_t sequence, uint32_t heads, uint32_t head_dim,
+        uint32_t rope_half, float epsilon) {
     uint32_t dimension = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t head = blockIdx.y;
     uint32_t row = blockIdx.z;
     if (row >= sequence || head >= heads || dimension >= head_dim) return;
     size_t inner = (size_t)heads * head_dim;
     size_t row_base = (size_t)row * inner * 3;
-    size_t q_base = row_base + (size_t)head * head_dim * 3;
+    size_t column_base = (size_t)head * head_dim * 3;
+    size_t q_base = row_base + column_base;
     size_t k_base = q_base + head_dim;
     size_t v_base = k_base + head_dim;
 
     float q_sum = 0.0f, k_sum = 0.0f;
     for (uint32_t d = 0; d < head_dim; d++) {
-        float q = qkv[q_base + d];
-        float k = qkv[k_base + d];
+        float q = h3d_qkv_bias(qkv, bias, q_base + d, column_base + d);
+        float k = h3d_qkv_bias(qkv, bias, k_base + d, column_base + head_dim + d);
         q_sum = fmaf(q, q, q_sum);
         k_sum = fmaf(k, k, k_sum);
     }
     float q_inverse = rsqrtf(q_sum / (float)head_dim + epsilon);
     float k_inverse = rsqrtf(k_sum / (float)head_dim + epsilon);
 
-    float q0 = qkv[q_base + dimension] * q_inverse;
-    float k0 = qkv[k_base + dimension] * k_inverse;
+    float q0 = h3d_qkv_bias(qkv, bias, q_base + dimension,
+                            column_base + dimension) * q_inverse;
+    float k0 = h3d_qkv_bias(qkv, bias, k_base + dimension,
+                            column_base + head_dim + dimension) * k_inverse;
     if (dimension < rope_half * 2) {
         uint32_t rope_index = dimension % rope_half;
         uint32_t pair = dimension < rope_half ? dimension + rope_half :
                                                  dimension - rope_half;
-        float q1 = qkv[q_base + pair] * q_inverse;
-        float k1 = qkv[k_base + pair] * k_inverse;
+        float q1 = h3d_qkv_bias(qkv, bias, q_base + pair,
+                                column_base + pair) * q_inverse;
+        float k1 = h3d_qkv_bias(qkv, bias, k_base + pair,
+                                column_base + head_dim + pair) * k_inverse;
         float c = rope_cos[(size_t)row * rope_half + rope_index];
         float s = rope_sin[(size_t)row * rope_half + rope_index];
         if (dimension < rope_half) {
@@ -3357,12 +3386,13 @@ __global__ static void h3d_video_qkv_rope_f32_kernel(
     size_t output_index = ((size_t)head * sequence + row) * head_dim + dimension;
     query[output_index] = q0;
     key[output_index] = k0;
-    value[output_index] = qkv[v_base + dimension];
+    value[output_index] = h3d_qkv_bias(qkv, bias, v_base + dimension,
+                                       column_base + 2 * head_dim + dimension);
 }
 
 int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
                            h3d_tensor *key, h3d_tensor *value,
-                           const h3d_tensor *qkv,
+                           const h3d_tensor *qkv, const h3d_tensor *bias,
                            const h3d_tensor *rope_cos,
                            const h3d_tensor *rope_sin, uint32_t sequence,
                            uint32_t heads, uint32_t head_dim,
@@ -3376,6 +3406,7 @@ int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
         !h3d_is(key, H3D_F32, elements) ||
         !h3d_is(value, H3D_F32, elements) ||
         !h3d_is(qkv, H3D_F32, elements * 3) ||
+        (bias && !h3d_is(bias, H3D_F32, (size_t)heads * head_dim * 3)) ||
         !h3d_is(rope_cos, H3D_F32, (size_t)sequence * rope_half) ||
         !h3d_is(rope_sin, H3D_F32, (size_t)sequence * rope_half)) {
         return h3d_set_error(error, error_size, "invalid QKV/RoPE tensors");
@@ -3383,9 +3414,9 @@ int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
     dim3 grid((head_dim + 127) / 128, heads, sequence);
     h3d_video_qkv_rope_f32_kernel<<<grid, 128, 0, context->stream>>>(
         (float *)query->data, (float *)key->data, (float *)value->data,
-        (const float *)qkv->data, (const float *)rope_cos->data,
-        (const float *)rope_sin->data, sequence, heads, head_dim, rope_half,
-        epsilon);
+        (const float *)qkv->data, bias ? (const float *)bias->data : NULL,
+        (const float *)rope_cos->data, (const float *)rope_sin->data, sequence,
+        heads, head_dim, rope_half, epsilon);
     return h3d_launch_ok("F32 video QKV RoPE", error, error_size);
 }
 

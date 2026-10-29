@@ -388,26 +388,32 @@ int h3d_layer_norm_f32(h3d_context *context, h3d_tensor *output,
                        float epsilon, char *error, size_t error_size);
 
 /* `h3_gpu_swiglu_f32` (`:2874-2877`) with `h3_swiglu_kernel` (`:2841-2852`):
- * gate and up halves of each fused row, `gate / (1 + expf(-gate)) * up`. */
+ * gate and up halves of each fused row, `gate / (1 + expf(-gate)) * up`.
+ * `bias` is the producing linear's own bias or NULL: adding it on load is the
+ * same F32 add `h3_linear_bias_kernel<float>` makes, and `h3d_vae_linear` is
+ * then called without one. */
 int h3d_swiglu_f32(h3d_context *context, h3d_tensor *output,
-                   const h3d_tensor *fused, uint32_t rows, uint32_t width,
-                   char *error, size_t error_size);
+                   const h3d_tensor *fused, const h3d_tensor *bias,
+                   uint32_t rows, uint32_t width, char *error,
+                   size_t error_size);
 
 /* `h3_gpu_scale_add_f32` (`:2895-2910`) with `h3_scale_add_kernel`
- * (`:2885-2893`): `residual + branch * scale`, one multiply, no fma. */
+ * (`:2885-2893`): `residual + branch * scale`, one multiply, no fma. `bias`,
+ * when given, is added to `branch` on load, before the multiply. */
 int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
                       const h3d_tensor *residual, const h3d_tensor *branch,
-                      const h3d_tensor *scale, uint32_t rows, uint32_t width,
-                      char *error, size_t error_size);
+                      const h3d_tensor *bias, const h3d_tensor *scale,
+                      uint32_t rows, uint32_t width, char *error,
+                      size_t error_size);
 
 /* `h3_gpu_video_qkv_rope_f32` (`:3190-3205`) with `h3_qkv_rope_kernel`
  * (`:3078-3136`) at `grouped = 1`, `normalize = 1`, `weighted = 0`: the
  * checkpoint's [head][q,k,v][dim] rows, Q/K RMS over the head with no learned
  * weight, then the pair rotation. This is the video VAE variant, not the
- * DiT's. */
+ * DiT's. `bias`, when given, is the QKV linear's own, added on load. */
 int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
                            h3d_tensor *key, h3d_tensor *value,
-                           const h3d_tensor *qkv,
+                           const h3d_tensor *qkv, const h3d_tensor *bias,
                            const h3d_tensor *rope_cos,
                            const h3d_tensor *rope_sin, uint32_t sequence,
                            uint32_t heads, uint32_t head_dim,

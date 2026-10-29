@@ -28,6 +28,13 @@
 //! - `H3_VAE_TILE_PIXELS` (`:666-690`) is not read; the default search that
 //!   the reference uses when the variable is absent is. Every released shape
 //!   picks the reference's tile size.
+//!
+//! A third is a schedule change with no value change: the four block linears
+//! are called without their bias and the bias is added on load by their
+//! consumer (`run_block`). The reference's `h3_linear_bias_kernel`
+//! (`:783-791`) adds the same F32 value to the same element before the
+//! consumer reads it, so every consumer sees identical inputs and the render
+//! stays byte-identical; it removes one read-modify-write pass per linear.
 
 use std::fmt;
 use std::path::Path;
@@ -478,7 +485,7 @@ impl Decoder {
             &buffers.qkv,
             &buffers.norm,
             &block.qkv_w,
-            Some(&block.qkv_b),
+            None,
             rows,
             HIDDEN as u32,
             (INNER * 3) as u32,
@@ -488,6 +495,7 @@ impl Decoder {
             &buffers.key,
             &buffers.value,
             &buffers.qkv,
+            Some(&block.qkv_b),
             &self.rope_cos,
             &self.rope_sin,
             rows,
@@ -510,7 +518,7 @@ impl Decoder {
             &buffers.branch,
             &buffers.heads,
             &block.out_w,
-            Some(&block.out_b),
+            None,
             rows,
             INNER as u32,
             HIDDEN as u32,
@@ -519,6 +527,7 @@ impl Decoder {
             hidden,
             hidden,
             &buffers.branch,
+            Some(&block.out_b),
             &block.scale1,
             rows,
             HIDDEN as u32,
@@ -536,17 +545,23 @@ impl Decoder {
             &buffers.ff1,
             &buffers.norm,
             &block.w1,
-            Some(&block.w1_b),
+            None,
             rows,
             HIDDEN as u32,
             (FFN * 2) as u32,
         ))?;
-        device(gpu.swiglu_f32(&buffers.activated, &buffers.ff1, rows, FFN as u32))?;
+        device(gpu.swiglu_f32(
+            &buffers.activated,
+            &buffers.ff1,
+            Some(&block.w1_b),
+            rows,
+            FFN as u32,
+        ))?;
         device(gpu.vae_linear(
             &buffers.branch,
             &buffers.activated,
             &block.w2,
-            Some(&block.w2_b),
+            None,
             rows,
             FFN as u32,
             HIDDEN as u32,
@@ -555,6 +570,7 @@ impl Decoder {
             hidden,
             hidden,
             &buffers.branch,
+            Some(&block.w2_b),
             &block.scale2,
             rows,
             HIDDEN as u32,
