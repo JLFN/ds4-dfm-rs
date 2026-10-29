@@ -87,7 +87,8 @@ void h3d_set_attention(h3d_context *context, int scalar);
 /* One video VAE decoder option per call, for benchmarking an arm on one binary.
  * Names and values: "attention" (scalar | tensor, the F32 attention kernel),
  * "sdpa_order" (heads | rows, the F32 attention CTA order), "gemm" (fp32 |
- * tf32 | bf16, the decoder's F32 matmul compute mode). Every default is the
+ * tf32 | bf16 | bf16i, the decoder's F32 matmul compute mode, where bf16i is
+ * BF16 operands and output). Every default is the
  * reference path, so a context that is never set is unchanged, and all three
  * are read from H3_VAE_ATTENTION, H3_VAE_SDPA_ORDER and H3_VAE_GEMM at create.
  * Only the decoder's own entry points read them: the video VAE encoder and the
@@ -96,6 +97,11 @@ void h3d_set_attention(h3d_context *context, int scalar);
  * typo is refused rather than ignored. */
 int h3d_set_vae_option(h3d_context *context, const char *name,
                        const char *value);
+
+/* The decoder's GEMM mode in effect on this context, as one of the
+ * `H3D_VAE_GEMM_*` values the `.cu` defines. A host that must choose the weight
+ * dtype and the kernel path asks here instead of reading H3_VAE_GEMM again. */
+int h3d_vae_gemm_mode(const h3d_context *context);
 
 h3d_tensor *h3d_alloc(h3d_context *context, int dtype, size_t elements,
                       char *error, size_t error_size);
@@ -173,6 +179,14 @@ int h3d_vae_linear(h3d_context *context, h3d_tensor *output,
                    const h3d_tensor *input, const h3d_tensor *weight,
                    const h3d_tensor *bias, uint32_t rows, uint32_t input_dim,
                    uint32_t output_dim, char *error, size_t error_size);
+
+/* The `bf16i` arm's block GEMM: BF16 operands and a BF16 output, so the caller
+ * narrows the activation and widens the result. See the `.cu` for why the F32
+ * output form is not available. */
+int h3d_vae_linear_bf16(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                        char *error, size_t error_size);
 
 /* `h3_gpu_patch_linear_bf16_offset` (`:872-906`) and `h3_patch_convert_kernel`
  * (`:808-829`): an F32 matmul with F32 weights, bias added in F32, one BF16
@@ -284,6 +298,12 @@ int h3d_sub(h3d_context *context, h3d_tensor *output,
             const h3d_tensor *left, const h3d_tensor *right, size_t elements,
             char *error, size_t error_size);
 int h3d_cast_f32_to_bf16(h3d_context *context, h3d_tensor *output,
+                         const h3d_tensor *input, size_t elements, char *error,
+                         size_t error_size);
+
+/* The reverse of the cast above, for the video VAE decoder's BF16 arm: the
+ * GEMMs there write BF16 and every consumer reads F32. Exact, not a rounding. */
+int h3d_cast_bf16_to_f32(h3d_context *context, h3d_tensor *output,
                          const h3d_tensor *input, size_t elements, char *error,
                          size_t error_size);
 int h3d_silu_f32(h3d_context *context, h3d_tensor *output,

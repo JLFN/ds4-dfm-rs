@@ -4,7 +4,8 @@
 //! `h3_audio_vae.c:128-133`): shards sorted by path, the first shard holding a
 //! name wins, each shard mapped on first use and never copied. Both decoders
 //! are F32 end to end, so a tensor of any other dtype is refused by name
-//! rather than converted.
+//! rather than converted. `load_bf16` is the one rounding that exists, for the
+//! video decoder's BF16 arm, and it reads the same F32 bytes.
 //!
 //! `label` only prefixes the error text ("audio VAE", "video VAE"), so a
 //! failure names the decoder that hit it.
@@ -93,6 +94,26 @@ impl Store {
         Ok(tensor)
     }
 
+    /// Upload `name` as BF16 after the same exact-shape check, rounding every
+    /// value to nearest even at the BF16 boundary (`nvfp4::push_bf16`'s
+    /// arithmetic, `h3_text_encoder.c:29-36`'s rule). The decoder's BF16 arm is
+    /// the only caller: rounding once at load is where the arm wants it, and it
+    /// halves the resident bytes of the four weights that arm narrows.
+    pub fn load_bf16(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        shape: &[u64],
+        error: &str,
+    ) -> Result<Tensor, String> {
+        let bytes = self.bytes(name, shape)?;
+        let narrowed = narrow_bytes(bytes);
+        let tensor = gpu.alloc(Dtype::Bf16, narrowed.len() / 2)?;
+        gpu.upload(&tensor, &narrowed)
+            .map_err(|detail| format!("{error}: {detail}"))?;
+        Ok(tensor)
+    }
+
     fn bytes(&self, name: &str, shape: &[u64]) -> Result<&[u8], String> {
         let site = self
             .sites
@@ -111,12 +132,46 @@ impl Store {
     }
 }
 
+/// F32 bytes in, BF16 bytes out, nearest even, little endian both ways.
+///
+/// A BF16 is the F32's top 16 bits, so the round is the F32 word plus half a
+/// BF16 ulp (`0x7FFF` in the dropped 16) plus the dropped word's own low bit,
+/// which is what makes an exact tie land on an even mantissa. `bits` is taken
+/// as unsigned, so a sign bit and a carry into the exponent behave as they do
+/// in `text_rope::round_bf16`; NaN and infinity are preserved.
+fn narrow_bytes(bytes: &[u8]) -> Vec<u8> {
+    let values = bytes.as_chunks::<4>().0;
+    let mut narrowed = Vec::with_capacity(values.len() * 2);
+
+    for value in values {
+        let bits = f32::from_le_bytes(*value).to_bits();
+        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+        narrowed.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
+    }
+    narrowed
+}
+
 pub fn f1(store: &Store, gpu: &Gpu, name: &str, width: u64) -> Result<Tensor, String> {
     store.load(gpu, name, &[width], name)
 }
 
 pub fn f2(store: &Store, gpu: &Gpu, name: &str, rows: u64, columns: u64) -> Result<Tensor, String> {
     store.load(gpu, name, &[rows, columns], name)
+}
+
+/// The BF16 arm's two weight widths (`load_bf16`).
+pub fn f1_bf16(store: &Store, gpu: &Gpu, name: &str, width: u64) -> Result<Tensor, String> {
+    store.load_bf16(gpu, name, &[width], name)
+}
+
+pub fn f2_bf16(
+    store: &Store,
+    gpu: &Gpu,
+    name: &str,
+    rows: u64,
+    columns: u64,
+) -> Result<Tensor, String> {
+    store.load_bf16(gpu, name, &[rows, columns], name)
 }
 
 pub fn f3(
@@ -169,5 +224,44 @@ mod tests {
         let store = Store::open(&dir, "test VAE").unwrap();
         assert_eq!(store.bytes("w", &[2, 3]).unwrap(), &[1; 24]);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The BF16 boundary at 1.0: a BF16 ulp is `2^-7`, so an F32 word's dropped
+    /// 16 bits tie at `0x8000` and the round goes to whichever neighbour has an
+    /// even mantissa, which is `1.0` when the kept word is even and the next
+    /// value up when it is odd.
+    #[test]
+    fn narrows_f32_bytes_to_bf16_by_nearest_even() {
+        let words: Vec<f32> = [
+            0x3F80_0000, // 1.0, exact
+            0x3F80_7FFF, // just below the tie
+            0x3F80_8000, // the tie, kept word even: down
+            0x3F80_8001, // just above the tie: up
+            0x3F81_8000, // the tie, kept word odd: up
+            0x3F81_0000, // exactly one BF16 ulp above 1.0
+            0x4000_0000, // 2.0
+            0xBF80_0000, // -1.0
+            0x0000_0000,
+            0x7F80_0000, // infinity survives
+        ]
+        .into_iter()
+        .map(f32::from_bits)
+        .collect();
+        let mut bytes = Vec::new();
+        for word in &words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+
+        let narrowed = narrow_bytes(&bytes);
+        let kept: Vec<u16> = narrowed
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|word| u16::from_le_bytes(*word))
+            .collect();
+        assert_eq!(
+            kept,
+            [0x3F80, 0x3F80, 0x3F80, 0x3F81, 0x3F82, 0x3F81, 0x4000, 0xBF80, 0x0000, 0x7F80]
+        );
     }
 }

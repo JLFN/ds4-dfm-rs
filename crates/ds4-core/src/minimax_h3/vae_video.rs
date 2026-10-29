@@ -35,13 +35,20 @@
 //! (`:783-791`) adds the same F32 value to the same element before the
 //! consumer reads it, so every consumer sees identical inputs and the render
 //! stays byte-identical; it removes one read-modify-write pass per linear.
+//!
+//! The fourth is an arm, not a deviation: `H3_VAE_GEMM=bf16i` runs the same
+//! four block linears on BF16 operands and a BF16 output, narrowing each
+//! activation before the GEMM and widening each result after it (`project`).
+//! The reference has no analogue and the value changes - the arm is the
+//! decoder's only numerical switch beyond the compute mode, and the F32 route
+//! stays the default.
 
 use std::fmt;
 use std::path::Path;
 
 use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
 
-use super::vae_store::{f1, f2, Store};
+use super::vae_store::{f1, f2, f2_bf16, Store};
 
 pub const LATENT_CHANNELS: usize = 24;
 /// One trained chunk: seven latents in, twenty-two frames out.
@@ -111,6 +118,10 @@ fn device<T>(result: Result<T, String>) -> Result<T, VaeError> {
 
 fn f32_alloc(gpu: &Gpu, elements: usize) -> Result<Tensor, VaeError> {
     device(gpu.alloc(Dtype::F32, elements))
+}
+
+fn bf16_alloc(gpu: &Gpu, elements: usize) -> Result<Tensor, VaeError> {
+    device(gpu.alloc(Dtype::Bf16, elements))
 }
 
 /// Upload an f32 slice as its own bytes; the reference streams the same
@@ -228,20 +239,60 @@ fn chunk_plan(latent_time: usize) -> Result<(usize, usize), VaeError> {
     Ok((chunks, chunks * CHUNK_STRIDE + CHUNK_OVERLAP))
 }
 
-/// One transformer block's tensors (`load_block`, `:169-203`).
+/// One transformer block's tensors (`load_block`, `:169-203`). The four
+/// projections carry their dtype with them, so `run_block` reads the arm off the
+/// weight rather than off a second flag that could disagree with it. The norms,
+/// the two scales and the two biases stay F32 in both arms.
 struct Block {
     norm1: Tensor,
-    qkv_w: Tensor,
+    qkv_w: Weight,
     qkv_b: Tensor,
-    out_w: Tensor,
+    out_w: Weight,
     out_b: Tensor,
     scale1: Tensor,
     norm2: Tensor,
-    w1: Tensor,
+    w1: Weight,
     w1_b: Tensor,
-    w2: Tensor,
+    w2: Weight,
     w2_b: Tensor,
     scale2: Tensor,
+}
+
+/// A block projection's weight: the reference's F32, or the BF16 copy the arm
+/// narrows it to at load. The F32 copy is not kept beside the BF16 one, so the
+/// arm's four weights are half the resident bytes.
+enum Weight {
+    F32(Tensor),
+    Bf16(Tensor),
+}
+
+/// The decoder's block arithmetic: the reference's F32 projections, or the
+/// `bf16i` arm's narrow, compute, widen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arithmetic {
+    F32,
+    Bf16,
+}
+
+impl Arithmetic {
+    /// What this context's decoder was set to (`H3_VAE_GEMM`). The context
+    /// parsed the variable when it was created, so the host asks it instead of
+    /// reading the same variable a second time and risking a different answer.
+    fn of(gpu: &Gpu) -> Arithmetic {
+        if gpu.vae_bf16_operands() {
+            Arithmetic::Bf16
+        } else {
+            Arithmetic::F32
+        }
+    }
+}
+
+/// The arm's scratch: one activation and one result, BF16, sized to the largest
+/// of the four projections (`sequence * FFN` in and `sequence * FFN * 2` out,
+/// both `w1` and `w2`), so one pair serves the block's whole chain.
+struct Narrow {
+    activations: Tensor,
+    results: Tensor,
 }
 
 /// The projections around the blocks (`load_input_weights` `:205-220`,
@@ -267,43 +318,42 @@ pub struct Decoder {
     sequence: usize,
     rope_cos: Tensor,
     rope_sin: Tensor,
+    /// Present exactly when the context's `H3_VAE_GEMM` is `bf16i`.
+    narrow: Option<Narrow>,
     mean: Vec<f32>,
     deviation: Vec<f32>,
 }
 
-fn load_block(store: &Store, gpu: &Gpu, index: usize) -> Result<Block, VaeError> {
+fn load_block(
+    store: &Store,
+    gpu: &Gpu,
+    index: usize,
+    arithmetic: Arithmetic,
+) -> Result<Block, VaeError> {
     let prefix = format!("decoder.transformer_blocks.{index}.");
     let name = |suffix: &str| format!("{prefix}{suffix}");
+    // The arm's four projections are loaded already rounded, which is the only
+    // difference between the arms at load: the checkpoint is F32 either way.
+    let projection = |suffix: &str, rows: u64, columns: u64| -> Result<Weight, VaeError> {
+        let name = name(suffix);
+        Ok(if arithmetic == Arithmetic::Bf16 {
+            Weight::Bf16(f2_bf16(store, gpu, &name, rows, columns)?)
+        } else {
+            Weight::F32(f2(store, gpu, &name, rows, columns)?)
+        })
+    };
 
     Ok(Block {
         norm1: f1(store, gpu, &name("norm1.weight"), HIDDEN as u64)?,
-        qkv_w: f2(
-            store,
-            gpu,
-            &name("attn.to_qkv.weight"),
-            (INNER * 3) as u64,
-            HIDDEN as u64,
-        )?,
+        qkv_w: projection("attn.to_qkv.weight", (INNER * 3) as u64, HIDDEN as u64)?,
         qkv_b: f1(store, gpu, &name("attn.to_qkv.bias"), (INNER * 3) as u64)?,
-        out_w: f2(
-            store,
-            gpu,
-            &name("attn.to_out.weight"),
-            HIDDEN as u64,
-            INNER as u64,
-        )?,
+        out_w: projection("attn.to_out.weight", HIDDEN as u64, INNER as u64)?,
         out_b: f1(store, gpu, &name("attn.to_out.bias"), HIDDEN as u64)?,
         scale1: f1(store, gpu, &name("scale1"), HIDDEN as u64)?,
         norm2: f1(store, gpu, &name("norm2.weight"), HIDDEN as u64)?,
-        w1: f2(
-            store,
-            gpu,
-            &name("ff.w1.weight"),
-            (FFN * 2) as u64,
-            HIDDEN as u64,
-        )?,
+        w1: projection("ff.w1.weight", (FFN * 2) as u64, HIDDEN as u64)?,
         w1_b: f1(store, gpu, &name("ff.w1.bias"), (FFN * 2) as u64)?,
-        w2: f2(store, gpu, &name("ff.w2.weight"), HIDDEN as u64, FFN as u64)?,
+        w2: projection("ff.w2.weight", HIDDEN as u64, FFN as u64)?,
         w2_b: f1(store, gpu, &name("ff.w2.bias"), HIDDEN as u64)?,
         scale2: f1(store, gpu, &name("scale2"), HIDDEN as u64)?,
     })
@@ -401,6 +451,7 @@ impl Decoder {
         }
         let gpu = device(Gpu::create())?;
         let store = Store::open(directory, "video VAE")?;
+        let arithmetic = Arithmetic::of(&gpu);
 
         let patches = CHUNK_LATENT_TIME * latent_height * latent_width;
         let sequence = patches + SUFFIX;
@@ -441,7 +492,7 @@ impl Decoder {
         };
         let mut blocks = Vec::with_capacity(LAYERS);
         for index in 0..LAYERS {
-            blocks.push(load_block(&store, &gpu, index)?);
+            blocks.push(load_block(&store, &gpu, index, arithmetic)?);
         }
         drop(store);
 
@@ -449,6 +500,15 @@ impl Decoder {
         upload_f32(&gpu, &rope_cos, &cosines)?;
         let rope_sin = f32_alloc(&gpu, sequence * ROPE_HALF as usize)?;
         upload_f32(&gpu, &rope_sin, &sines)?;
+
+        let narrow = if arithmetic == Arithmetic::Bf16 {
+            Some(Narrow {
+                activations: bf16_alloc(&gpu, sequence * FFN)?,
+                results: bf16_alloc(&gpu, sequence * FFN * 2)?,
+            })
+        } else {
+            None
+        };
 
         Ok(Decoder {
             gpu,
@@ -458,9 +518,51 @@ impl Decoder {
             sequence,
             rope_cos,
             rope_sin,
+            narrow,
             mean,
             deviation,
         })
+    }
+
+    /// One block projection: the reference's F32 linear, or the arm's narrow,
+    /// compute, widen. The scratch is the largest of the four, so no shape in
+    /// the block can overflow it, and a widened result is the same value a
+    /// consumer would read had the GEMM written F32 itself.
+    fn project(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Weight,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+
+        match weight {
+            Weight::F32(weight) => {
+                device(gpu.vae_linear(output, input, weight, None, rows, input_dim, output_dim))
+            }
+            Weight::Bf16(weight) => {
+                let narrow = self
+                    .narrow
+                    .as_ref()
+                    .ok_or_else(|| VaeError("video VAE BF16 arm has no scratch".into()))?;
+                let activations = rows as usize * input_dim as usize;
+                let results = rows as usize * output_dim as usize;
+
+                device(gpu.cast_narrow(&narrow.activations, input, activations))?;
+                device(gpu.vae_linear_bf16(
+                    &narrow.results,
+                    &narrow.activations,
+                    weight,
+                    rows,
+                    input_dim,
+                    output_dim,
+                ))?;
+                device(gpu.cast_widen(output, &narrow.results, results))
+            }
+        }
     }
 
     /// One block (`run_block`, `:423-456`) in the reference's op order.
@@ -481,15 +583,14 @@ impl Decoder {
             HIDDEN as u32,
             EPSILON,
         ))?;
-        device(gpu.vae_linear(
+        self.project(
             &buffers.qkv,
             &buffers.norm,
             &block.qkv_w,
-            None,
             rows,
             HIDDEN as u32,
             (INNER * 3) as u32,
-        ))?;
+        )?;
         device(gpu.video_qkv_rope_f32(
             &buffers.query,
             &buffers.key,
@@ -514,15 +615,14 @@ impl Decoder {
             HEAD_DIM,
             1.0f32 / (HEAD_DIM as f32).sqrt(),
         ))?;
-        device(gpu.vae_linear(
+        self.project(
             &buffers.branch,
             &buffers.heads,
             &block.out_w,
-            None,
             rows,
             INNER as u32,
             HIDDEN as u32,
-        ))?;
+        )?;
         device(gpu.scale_add_f32(
             hidden,
             hidden,
@@ -541,15 +641,14 @@ impl Decoder {
             HIDDEN as u32,
             EPSILON,
         ))?;
-        device(gpu.vae_linear(
+        self.project(
             &buffers.ff1,
             &buffers.norm,
             &block.w1,
-            None,
             rows,
             HIDDEN as u32,
             (FFN * 2) as u32,
-        ))?;
+        )?;
         device(gpu.swiglu_f32(
             &buffers.activated,
             &buffers.ff1,
@@ -557,15 +656,14 @@ impl Decoder {
             rows,
             FFN as u32,
         ))?;
-        device(gpu.vae_linear(
+        self.project(
             &buffers.branch,
             &buffers.activated,
             &block.w2,
-            None,
             rows,
             FFN as u32,
             HIDDEN as u32,
-        ))?;
+        )?;
         device(gpu.scale_add_f32(
             hidden,
             hidden,

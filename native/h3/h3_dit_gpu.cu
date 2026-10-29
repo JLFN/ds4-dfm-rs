@@ -40,7 +40,9 @@ struct h3d_tensor {
 enum {
     H3D_VAE_GEMM_FP32 = 0,   /* CUBLAS_COMPUTE_32F, the reference's SIMT F32 */
     H3D_VAE_GEMM_TF32 = 1,   /* CUBLAS_COMPUTE_32F_FAST_TF32 */
-    H3D_VAE_GEMM_BF16 = 2,   /* CUBLAS_COMPUTE_32F_FAST_16BF */
+    H3D_VAE_GEMM_BF16 = 2,   /* CUBLAS_COMPUTE_32F_FAST_16BF, which cuBLASLt
+                              * serves with a TF32-class kernel */
+    H3D_VAE_GEMM_BF16_INPUTS = 3, /* CUDA_R_16BF operands and output ("bf16i") */
 };
 
 struct h3d_vae_options {
@@ -89,7 +91,8 @@ void h3d_set_attention(h3d_context *context, int scalar) {
  * context. Unset means the reference path, so an arm is always a comparison
  * against the same binary's own default. Each value is matched on its first
  * letter, which is unambiguous within a name: scalar/tensor, heads/rows,
- * fp32/tf32/bf16. */
+ * fp32/tf32/bf16. `bf16i` is the one value whose first letter is not its key,
+ * so it is matched whole. */
 static struct h3d_vae_options h3d_vae_options_from_env(void) {
     struct h3d_vae_options options = {0, 0, H3D_VAE_GEMM_FP32};
     const char *attention = getenv("H3_VAE_ATTENTION");
@@ -98,16 +101,26 @@ static struct h3d_vae_options h3d_vae_options_from_env(void) {
     if (attention) options.attention_mma = attention[0] == 't' || attention[0] == 'T';
     if (order) options.query_major = order[0] == 'r' || order[0] == 'R';
     if (gemm && (gemm[0] == 't' || gemm[0] == 'T')) options.gemm = H3D_VAE_GEMM_TF32;
-    if (gemm && (gemm[0] == 'b' || gemm[0] == 'B')) options.gemm = H3D_VAE_GEMM_BF16;
+    if (gemm && (gemm[0] == 'b' || gemm[0] == 'B')) {
+        options.gemm = strcmp(gemm, "bf16i") == 0 ? H3D_VAE_GEMM_BF16_INPUTS
+                                                  : H3D_VAE_GEMM_BF16;
+    }
     return options;
 }
 
+/* The decoder's GEMM mode in effect on this context. A host that has to choose
+ * the weight dtype and the kernel path asks for it here rather than parsing
+ * `H3_VAE_GEMM` a second time. Returns an `H3D_VAE_GEMM_*` value. */
+int h3d_vae_gemm_mode(const h3d_context *context) {
+    return context ? context->vae.gemm : H3D_VAE_GEMM_FP32;
+}
+
 /* Select one video VAE decoder option per run. Names and values: "attention"
- * (scalar, tensor), "sdpa_order" (heads, rows), "gemm" (fp32, tf32, bf16).
- * Exact words here, unlike the environment's first-letter rule, because a host
- * that sets an option wants a typo refused rather than silently read as a
- * default. Overrides H3_VAE_* for this context. Returns 0 when the name or the
- * value is not one of those. */
+ * (scalar, tensor), "sdpa_order" (heads, rows), "gemm" (fp32, tf32, bf16,
+ * bf16i). Exact words here, unlike the environment's first-letter rule,
+ * because a host that sets an option wants a typo refused rather than silently
+ * read as a default. Overrides H3_VAE_* for this context. Returns 0 when the
+ * name or the value is not one of those. */
 int h3d_set_vae_option(h3d_context *context, const char *name,
                        const char *value) {
     if (!context || !name || !value) return 0;
@@ -125,6 +138,7 @@ int h3d_set_vae_option(h3d_context *context, const char *name,
         if (strcmp(value, "fp32") == 0) { context->vae.gemm = H3D_VAE_GEMM_FP32; return 1; }
         if (strcmp(value, "tf32") == 0) { context->vae.gemm = H3D_VAE_GEMM_TF32; return 1; }
         if (strcmp(value, "bf16") == 0) { context->vae.gemm = H3D_VAE_GEMM_BF16; return 1; }
+        if (strcmp(value, "bf16i") == 0) { context->vae.gemm = H3D_VAE_GEMM_BF16_INPUTS; return 1; }
         return 0;
     }
     return 0;
@@ -943,6 +957,38 @@ int h3d_vae_linear(h3d_context *context, h3d_tensor *output,
     h3d_linear_bias_kernel<<<blocks, 256, 0, context->stream>>>(
         (float *)output->data, (const float *)bias->data, outputs, output_dim);
     return h3d_launch_ok("video VAE linear bias", error, error_size);
+}
+
+/* The `bf16i` arm's block GEMM: the same cuBLASLt call as `h3d_vae_linear`'s,
+ * with BF16 operands and a BF16 output instead of F32. `tests/h3/vae_gemm_bm`
+ * priced this class at 3.634 ms a block against the 11.283 the FAST modes
+ * reach, so it is the one lever section 8.3 of the 2026-10-29 attribution
+ * leaves in the decoder.
+ *
+ * The output has to be BF16 because cuBLASLt refuses BF16 operands with an F32
+ * output on both hosts (sm_89 `CUBLAS_STATUS_INTERNAL_ERROR`, sm_121 a segfault
+ * inside the call), which is why the arm narrows its activation, computes, and
+ * widens the result back for the F32 consumers. No bias argument: every block
+ * linear's bias is added by its consumer since `c7bb59e1`, and this arm has no
+ * F32 output for `h3d_linear_bias_kernel` to round. */
+int h3d_vae_linear_bf16(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                        char *error, size_t error_size) {
+    size_t inputs = 0, weights = 0, outputs = 0;
+    if (!context || !rows || !input_dim || !output_dim ||
+        !h3d_mul_size(rows, input_dim, &inputs) ||
+        !h3d_mul_size(output_dim, input_dim, &weights) ||
+        !h3d_mul_size(rows, output_dim, &outputs) ||
+        !h3d_is(input, H3D_BF16, inputs) || !h3d_is(weight, H3D_BF16, weights) ||
+        !h3d_is(output, H3D_BF16, outputs)) {
+        return h3d_set_error(error, error_size,
+                             "invalid video VAE BF16 linear tensors or shape");
+    }
+    return h3d_linear_lt_compute(context, output->data, input->data,
+                                 weight->data, rows, input_dim, output_dim,
+                                 CUDA_R_16BF, CUBLAS_COMPUTE_32F, error,
+                                 error_size);
 }
 
 int h3d_patch_linear(h3d_context *context, h3d_tensor *output,
@@ -2254,6 +2300,32 @@ int h3d_cast_f32_to_bf16(h3d_context *context, h3d_tensor *output,
                       context->stream>>>((__nv_bfloat16 *)output->data,
                                          (const float *)input->data, elements);
     return h3d_launch_ok("BF16 cast", error, error_size);
+}
+
+/* `h3d_cast_kernel`'s reverse: the video VAE decoder's BF16 arm runs its GEMMs
+ * narrowed and its consumers in F32, so every result is widened once. The value
+ * is exact - a BF16 is an F32 with the low 16 bits zero. */
+__global__ static void h3d_uncast_kernel(float *output,
+                                         const __nv_bfloat16 *input,
+                                         size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = __bfloat162float(input[index]);
+}
+
+int h3d_cast_bf16_to_f32(h3d_context *context, h3d_tensor *output,
+                         const h3d_tensor *input, size_t elements, char *error,
+                         size_t error_size) {
+    if (!context || !h3d_is(output, H3D_F32, elements) ||
+        !h3d_is(input, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size, "invalid F32 cast tensors");
+    }
+    if (!elements) return 1;
+    h3d_uncast_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                        context->stream>>>((float *)output->data,
+                                           (const __nv_bfloat16 *)input->data,
+                                           elements);
+    return h3d_launch_ok("F32 cast", error, error_size);
 }
 
 /* `h3_copy` (`:672-688`). */

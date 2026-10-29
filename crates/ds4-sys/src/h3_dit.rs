@@ -91,6 +91,20 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3d_vae_linear_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_vae_gemm_mode(context: *const Context) -> c_int;
+
     fn h3d_fp8_scale(
         context: *mut Context,
         scale: *mut CTensor,
@@ -376,6 +390,15 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn h3d_cast_f32_to_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_cast_bf16_to_f32(
         context: *mut Context,
         output: *mut CTensor,
         input: *const CTensor,
@@ -1289,13 +1312,7 @@ impl Gpu {
     pub fn fp8_scale(&self, scale: &Tensor, input: &Tensor) -> Result<(), String> {
         self.call(
             |error, size| unsafe {
-                h3d_fp8_scale(
-                    self.raw.as_ptr(),
-                    scale.raw(),
-                    input.raw(),
-                    error,
-                    size,
-                )
+                h3d_fp8_scale(self.raw.as_ptr(), scale.raw(), input.raw(), error, size)
             },
             "fp8 scale",
         )
@@ -1512,11 +1529,50 @@ impl Gpu {
         )
     }
 
+    /// The decoder's block GEMM on BF16 operands and a BF16 output
+    /// (`h3d_vae_linear_bf16`), the `bf16i` arm. It takes no bias: the arm's
+    /// consumers add the bias in F32, as they do since `c7bb59e1`.
+    pub fn vae_linear_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_vae_linear_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "video VAE BF16 linear",
+        )
+    }
+
+    /// Whether this context's video VAE decoder takes BF16 GEMM operands, which
+    /// is `H3_VAE_GEMM=bf16i`. The context parsed the value when it was created,
+    /// so the host asks it rather than reading the environment a second time.
+    pub fn vae_bf16_operands(&self) -> bool {
+        const BF16_INPUTS: c_int = 3; // H3D_VAE_GEMM_BF16_INPUTS
+
+        unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) == BF16_INPUTS }
+    }
+
     /// Set one video VAE decoder bench option on this context
     /// (`h3d_set_vae_option`). The native side owns the names and the accepted
     /// values — "attention" (scalar, tensor), "sdpa_order" (heads, rows),
-    /// "gemm" (fp32, tf32, bf16) — and refuses an unknown pair, so a typo is an
-    /// error rather than a silent default.
+    /// "gemm" (fp32, tf32, bf16, bf16i) — and refuses an unknown pair, so a
+    /// typo is an error rather than a silent default.
     pub fn set_vae_option(&self, name: &str, value: &str) -> Result<(), String> {
         let name = CString::new(name).map_err(|_| "option name has a NUL".to_string())?;
         let value = CString::new(value).map_err(|_| "option value has a NUL".to_string())?;
@@ -2122,6 +2178,52 @@ impl Gpu {
                 )
             },
             "cast",
+        )
+    }
+
+    /// The same cast over `elements` values, which may be fewer than the tensors
+    /// hold: the video VAE decoder's BF16 arm keeps one scratch pair for every
+    /// projection, sized to the tile's largest of each.
+    pub fn cast_narrow(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_cast_f32_to_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "narrow cast",
+        )
+    }
+
+    /// `h3_gpu_cast_bf16_to_f32`, its reverse: exact, not a rounding.
+    pub fn cast_widen(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_cast_bf16_to_f32(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "wide cast",
         )
     }
 
