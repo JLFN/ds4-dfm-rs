@@ -943,7 +943,12 @@ int h3d_vae_linear(h3d_context *context, h3d_tensor *output,
     cublasComputeType_t compute = CUBLAS_COMPUTE_32F;
     if (context->vae.gemm == H3D_VAE_GEMM_TF32) {
         compute = CUBLAS_COMPUTE_32F_FAST_TF32;
-    } else if (context->vae.gemm == H3D_VAE_GEMM_BF16) {
+    } else if (context->vae.gemm == H3D_VAE_GEMM_BF16 ||
+               /* The `bf16i` arm serves only the four block GEMMs
+                * (`h3d_vae_linear_bf16`); the projections around them are F32
+                * operands and keep the FAST class the F32 route runs, which is
+                * what this entry point gives them. */
+               context->vae.gemm == H3D_VAE_GEMM_BF16_INPUTS) {
         compute = CUBLAS_COMPUTE_32F_FAST_16BF;
     }
     if (!h3d_linear_lt_compute(context, output->data, input->data,

@@ -132,6 +132,13 @@ impl Store {
     }
 }
 
+/// Host threads a weight is narrowed with, at most. The decoder's four block
+/// weights are 9.65 GB of F32 at job A's tile: single-threaded that is 2.1 s on
+/// the workstation (0.517 s a 2.42 GB piece), against the 1.70 s the arm's
+/// FRAMES wall grew past its own GPU window on the Spark, and 0.5-0.7 s split
+/// over the machine's cores.
+const NARROW_THREADS: usize = 16;
+
 /// F32 bytes in, BF16 bytes out, nearest even, little endian both ways.
 ///
 /// A BF16 is the F32's top 16 bits, so the round is the F32 word plus half a
@@ -139,16 +146,48 @@ impl Store {
 /// which is what makes an exact tie land on an even mantissa. `bits` is taken
 /// as unsigned, so a sign bit and a carry into the exponent behave as they do
 /// in `text_rope::round_bf16`; NaN and infinity are preserved.
+///
+/// The ranges are independent per value, so splitting the bytes across threads
+/// changes no bit of the result; the chunk sizes follow
+/// `minimax_vq::release`'s worker count, without the atomic queue a pure
+/// elementwise map does not need.
 fn narrow_bytes(bytes: &[u8]) -> Vec<u8> {
     let values = bytes.as_chunks::<4>().0;
-    let mut narrowed = Vec::with_capacity(values.len() * 2);
+    let mut narrowed = vec![0u8; values.len() * 2];
+    let words = narrowed.as_chunks_mut::<2>().0;
 
-    for value in values {
-        let bits = f32::from_le_bytes(*value).to_bits();
-        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
-        narrowed.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get())
+        .min(NARROW_THREADS)
+        .min(values.len());
+    if workers < 2 {
+        narrow_into(values, words);
+        return narrowed;
     }
+
+    let chunk = values.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut rest_values = values;
+        let mut rest_words = words;
+        while !rest_values.is_empty() {
+            let take = chunk.min(rest_values.len());
+            let (head_values, tail_values) = rest_values.split_at(take);
+            let (head_words, tail_words) = rest_words.split_at_mut(take);
+            rest_values = tail_values;
+            rest_words = tail_words;
+            scope.spawn(move || narrow_into(head_values, head_words));
+        }
+    });
     narrowed
+}
+
+/// One range of `narrow_bytes`: `width` F32 words in, one BF16 each out.
+fn narrow_into(values: &[[u8; 4]], words: &mut [[u8; 2]]) {
+    for (value, word) in values.iter().zip(words.iter_mut()) {
+        let bits = u32::from_le_bytes(*value);
+        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+        *word = ((rounded >> 16) as u16).to_le_bytes();
+    }
 }
 
 pub fn f1(store: &Store, gpu: &Gpu, name: &str, width: u64) -> Result<Tensor, String> {

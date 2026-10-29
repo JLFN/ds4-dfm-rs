@@ -17,9 +17,13 @@
  * It then prices the one candidate the attribution leaves: the same four
  * matmuls with BF16 operands and an F32 output, which is what a BF16 kernel
  * would run against the TF32-class kernel cuBLASLt picks for `FAST_16BF`. That
- * arm is not in the port (`h3d_vae_linear` has three modes); the figure is the
- * GEMM's own ceiling, without the per-call activation rounding an adopted arm
- * would also pay.
+ * figure is the GEMM's own ceiling, without the per-call activation rounding
+ * the arm also pays.
+ *
+ * Finally it runs the arm the port now has (`H3_VAE_GEMM=bf16i`,
+ * `h3d_vae_linear_bf16` behind the two casts `vae_video::project` uses), which
+ * is the ceiling plus the rounding it leaves out, and reports the deviation
+ * between the widened result and the F32 path's.
  *
  * Build: `make tests/h3/vae_gemm_bm`.
  */
@@ -331,7 +335,7 @@ int main(int argc, char **argv) {
         }
     }
     rounded_ms /= (double)calls;
-    std::printf("rows=%u mode=%-4s ms_per_block=%.3f (BF16 operands, probe)\n", rows,
+    std::printf("rows=%u mode=%-4s ms_per_block=%.3f (BF16 operands, GEMM only)\n", rows,
                 "bf16i", rounded_ms);
     std::vector<float> probe;
     for (int index = 0; index < 4; index++) {
@@ -362,11 +366,85 @@ int main(int argc, char **argv) {
                 "bf16i vs fp32", worst, rms, scale > 0.0 ? rms / scale : 0.0,
                 100.0 * (double)differing / (double)elements);
 
+    /* The arm as the port runs it (`vae_video::project`): narrow the
+     * activation, GEMM on BF16, widen the result. The activation scratch is the
+     * port's own size (`sequence * FFN`, its largest activation is `w2`'s), and
+     * each `narrowed[]` result is exactly the shape its projection writes, as
+     * the port's single result scratch is for the largest of the four. */
+    h3d_tensor *activations =
+            h3d_alloc(gpu, H3D_BF16, (size_t)rows * FFN, error, sizeof(error));
+    std::vector<h3d_tensor *> widened(4);
     for (int index = 0; index < 4; index++) {
+        widened[index] = h3d_alloc(gpu, H3D_F32, (size_t)rows * matmuls[index].output_dim,
+                                   error, sizeof(error));
+        if (!widened[index]) {
+            fail("arm output", error);
+        }
+    }
+    if (!activations) {
+        fail("arm scratch", error);
+    }
+
+    double arm_ms = 0.0;
+    for (int call = 0; call <= calls; call++) {
+        auto start = std::chrono::steady_clock::now();
+        for (int index = 0; index < 4; index++) {
+            const Matmul &matmul = matmuls[index];
+            const size_t in = (size_t)rows * matmul.input_dim;
+            const size_t out = (size_t)rows * matmul.output_dim;
+            if (!h3d_cast_f32_to_bf16(gpu, activations, matmul.input, in, error, sizeof(error)) ||
+                !h3d_vae_linear_bf16(gpu, narrowed[index], activations,
+                                     rounded_weight[index], rows, matmul.input_dim,
+                                     matmul.output_dim, error, sizeof(error)) ||
+                !h3d_cast_bf16_to_f32(gpu, widened[index], narrowed[index], out, error,
+                                      sizeof(error))) {
+                fail("arm", error);
+            }
+        }
+        if (!h3d_sync(gpu, error, sizeof(error))) {
+            fail("arm sync", error);
+        }
+        auto finish = std::chrono::steady_clock::now();
+        const double this_call =
+                std::chrono::duration<double, std::milli>(finish - start).count();
+        std::printf("  bf16i arm call %d: %.3f ms%s\n", call, this_call,
+                    call == 0 ? " (discarded)" : "");
+        if (call > 0) {
+            arm_ms += this_call;
+        }
+    }
+    arm_ms /= (double)calls;
+    std::printf("rows=%u mode=%-4s ms_per_block=%.3f (the arm: cast, GEMM, cast)\n", rows,
+                "bf16i", arm_ms);
+
+    worst = square = scale = 0.0;
+    differing = elements = 0;
+    for (size_t piece = 0; piece < results[0].size(); piece++) {
+        std::vector<float> host((size_t)rows * matmuls[piece].output_dim);
+        if (!h3d_read(gpu, host.data(), widened[piece], error, sizeof(error))) {
+            fail("arm read", error);
+        }
+        for (size_t index = 0; index < host.size(); index++) {
+            const double delta = (double)host[index] - (double)results[0][piece][index];
+            if (host[index] != results[0][piece][index]) differing++;
+            worst = std::fmax(worst, std::fabs(delta));
+            scale = std::fmax(scale, std::fabs((double)results[0][piece][index]));
+            square += delta * delta;
+            elements++;
+        }
+    }
+    const double arm_rms = std::sqrt(square / (double)elements);
+    std::printf("%-14s max_abs=%.6g rms=%.6g rel_rms=%.3g differing=%.2f%%\n",
+                "arm vs fp32", worst, arm_rms, scale > 0.0 ? arm_rms / scale : 0.0,
+                100.0 * (double)differing / (double)elements);
+
+    for (int index = 0; index < 4; index++) {
+        h3d_free(widened[index]);
         h3d_free(narrowed[index]);
         h3d_free(rounded_weight[index]);
         h3d_free(rounded_input[index]);
     }
+    h3d_free(activations);
     for (Matmul &matmul : matmuls) {
         h3d_free(matmul.output);
         h3d_free(matmul.bias);
