@@ -463,6 +463,11 @@ tests/h3/sol_forward_bm: tests/h3/sol_forward_bm.cu native/h3/h3_dit_gpu.cu nati
 tests/h3/sol_vsa_bm: tests/h3/sol_vsa_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# What FP8 weights would buy the DiT's four projections: the same cuBLASLt
+# configuration in BF16 and in E4M3 at job A's shapes.
+tests/h3/linear_fp8_bm: tests/h3/linear_fp8_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # The DiT's two elementwise kernels at the denoise shape: AdaLN's row chain and
 # the QKV/RoPE boundary, each timed against the reduction-free control and the
 # candidate designs, with every arm's output hashed.
@@ -2665,7 +2670,7 @@ BUILD_OBJECTS += tests/test_iquest_prefix.o $(H3_OBJS)
 BUILD_PROGRAMS += h3-rs h3-server-rs $(H3_GATES) $(H3_REFERENCE_SUITE) \
     tests/h3/native_test tests/h3/attn_bm tests/h3/attn_f32_bm \
     tests/h3/vae_gemm_bm tests/h3/sol_route_bm tests/h3/sol_forward_bm \
-    tests/h3/elementwise_bm \
+    tests/h3/elementwise_bm tests/h3/linear_fp8_bm \
     tools/minimax_h3/ppm_diff
 DEPFILES := $(addsuffix .d,$(BUILD_OBJECTS))
 -include $(wildcard $(DEPFILES))
