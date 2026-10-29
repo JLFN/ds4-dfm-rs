@@ -45,10 +45,11 @@
 
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
 
-use super::vae_store::{f1, f2, f2_bf16, Store};
+use super::vae_store::{Store, f1, f2, f2_bf16};
 
 pub const LATENT_CHANNELS: usize = 24;
 /// One trained chunk: seven latents in, twenty-two frames out.
@@ -677,8 +678,18 @@ impl Decoder {
     }
 
     /// `run_resident_tile` (`:533-578`): one tile through every block, then
-    /// the output layer norm and projection, read back as F32 rows.
-    fn run_tile(&self, scratch: &TileScratch, rows_input: &[f32]) -> Result<Vec<f32>, VaeError> {
+    /// the output layer norm and projection, read back as F32 rows into `out`.
+    ///
+    /// `out` is the caller's buffer, reused tile after tile: the readback is
+    /// 31 MB per tile and 54 tiles to a render, and the byte form of it cost a
+    /// fresh 31 MB buffer and a `f32::from_le_bytes` pass over 7.8 million
+    /// words on every one of them.
+    fn run_tile(
+        &self,
+        scratch: &TileScratch,
+        rows_input: &[f32],
+        out: &mut Vec<f32>,
+    ) -> Result<(), VaeError> {
         let gpu = &self.gpu;
         let patches = self.patches;
         let rows = u32::try_from(self.sequence)
@@ -748,14 +759,15 @@ impl Decoder {
         ))?;
         device(gpu.sync())?;
 
-        let mut bytes = vec![0u8; self.sequence * OUTPUT_PATCH * 4];
-        device(gpu.read(&buffers.projected, &mut bytes))?;
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect())
+        // Sized once and then reused: the readback overwrites every byte, so a
+        // resize that zeroes 31 MB on each of 54 tiles would be the same waste
+        // this change removes.
+        let elements = self.sequence * OUTPUT_PATCH;
+        if out.len() != elements {
+            out.resize(elements, 0.0);
+        }
+        device(gpu.read_f32(&buffers.projected, out))?;
+        Ok(())
     }
 }
 
@@ -1012,6 +1024,14 @@ fn decode_chunk(
     let tile_h = y_axis.length / SPATIAL_RATIO;
     let tile_w = x_axis.length / SPATIAL_RATIO;
     let mut tiles = Vec::with_capacity(y_axis.count() * x_axis.count());
+    // `H3_VAE_TIMING=1` splits the phase's host time: the latent tile's
+    // extraction and normalization, the graph call (which carries the readback
+    // wait), and the per-tile unpack. The stitch is the last line.
+    let timing = std::env::var_os("H3_VAE_TIMING").is_some();
+    let mut extracted = Duration::ZERO;
+    let mut graphed = Duration::ZERO;
+    let mut unpacked = Duration::ZERO;
+    let mut projected = Vec::new();
     // `h3_video_vae.c:850`: a preview asks for one frame, so only that frame
     // is unpacked per tile (`:874-877`) instead of the whole chunk.
     let (first_frame, frame_count) = match selected {
@@ -1028,6 +1048,7 @@ fn decode_chunk(
 
     for tile_y in 0..y_axis.count() {
         for tile_x in 0..x_axis.count() {
+            let started = Instant::now();
             let input = extract_latent_tile(
                 latent,
                 latent_time,
@@ -1041,7 +1062,13 @@ fn decode_chunk(
             );
             let rows =
                 prepare_input_rows(&input, tile_h, tile_w, &decoder.mean, &decoder.deviation);
-            let projected = decoder.run_tile(scratch, &rows)?;
+            extracted += started.elapsed();
+
+            let started = Instant::now();
+            decoder.run_tile(scratch, &rows, &mut projected)?;
+            graphed += started.elapsed();
+
+            let started = Instant::now();
             tiles.push(unpack_frames(
                 &projected,
                 tile_h,
@@ -1050,10 +1077,23 @@ fn decode_chunk(
                 first_frame,
                 frame_count,
             )?);
+            unpacked += started.elapsed();
         }
     }
 
-    Ok(stitch_tiles(&tiles, y_axis, x_axis, frame_count))
+    let started = Instant::now();
+    let frames = stitch_tiles(&tiles, y_axis, x_axis, frame_count);
+    if timing {
+        eprintln!(
+            "vae chunk {chunk}: extract {:.3}s graph {:.3}s unpack {:.3}s stitch {:.3}s ({} tiles)",
+            extracted.as_secs_f64(),
+            graphed.as_secs_f64(),
+            unpacked.as_secs_f64(),
+            started.elapsed().as_secs_f64(),
+            tiles.len()
+        );
+    }
+    Ok(frames)
 }
 
 /// `load_latent_normalization` (`:271-318`): `latents_mean` and `latents_std`
@@ -1253,7 +1293,8 @@ pub fn decode(
             &decoder.mean,
             &decoder.deviation,
         );
-        let projected = decoder.run_tile(&scratch, &rows)?;
+        let mut projected = Vec::new();
+        decoder.run_tile(&scratch, &rows, &mut projected)?;
         let rgb = unpack_frames(
             &projected,
             latent_h,

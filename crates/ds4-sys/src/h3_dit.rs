@@ -9,7 +9,7 @@
 //! than inventing a friendlier one: a swapped shape argument would still be
 //! accepted by cuBLASLt and would silently change the graph.
 
-use std::ffi::{c_char, CString};
+use std::ffi::{CString, c_char};
 use std::os::raw::c_int;
 use std::ptr::NonNull;
 
@@ -1270,6 +1270,33 @@ impl Gpu {
             },
             "read",
         )
+    }
+
+    /// Copy an F32 tensor back to the host as `f32`, waiting for the stream.
+    ///
+    /// The decoder reads 31 MB back per tile and 54 tiles per render, and the
+    /// byte form of that readback cost it a fresh buffer plus a
+    /// `f32::from_le_bytes` pass over 7.8 million words every tile. On a
+    /// little-endian host the device's bytes are already the host's `f32`
+    /// values and every bit pattern is a valid `f32`, so this is the same copy
+    /// `read` makes with no conversion at all.
+    pub fn read_f32(&self, tensor: &Tensor, out: &mut [f32]) -> Result<(), String> {
+        if out.len() * 4 != tensor.bytes() {
+            return Err(format!(
+                "read_f32 of {} floats from a {} byte tensor",
+                out.len(),
+                tensor.bytes()
+            ));
+        }
+        if !cfg!(target_endian = "little") {
+            return Err("read_f32 needs a little-endian host; use read".into());
+        }
+        // SAFETY: four bytes per element with no padding, `out.len() * 4` bytes
+        // long, and `f32` has no invalid bit patterns, so the view is in bounds
+        // for its whole length and the copy writes only `f32` values.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len() * 4) };
+        self.read(tensor, bytes)
     }
 
     /// `h3_gpu_linear_bf16` (or `h3_gpu_linear_f32`): `rows x input_dim` by

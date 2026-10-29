@@ -288,20 +288,27 @@ void h3d_free(h3d_tensor *tensor) {
  * so stream order and the numeric result are unchanged. */
 static const size_t H3D_STAGE_BYTES = (size_t)8 << 20;
 
+/* The pinned staging buffer and its completion event, allocated on first use.
+ * Both directions use it: uploads refill it only after the DMA that read it
+ * has landed, reads only read out of it after the DMA that wrote it has. */
+static int h3d_stage_ready(h3d_context *context, char *error,
+                           size_t error_size) {
+    if (context->stage) return 1;
+    if (!h3d_cuda_ok(cudaHostAlloc(&context->stage, H3D_STAGE_BYTES,
+                                   cudaHostAllocDefault),
+                     "allocate staging", error, error_size)) {
+        return 0;
+    }
+    return h3d_cuda_ok(cudaEventCreateWithFlags(&context->stage_done,
+                                                cudaEventDisableTiming),
+                       "create staging event", error, error_size);
+}
+
 static int h3d_upload_range(h3d_context *context, void *destination,
                             const void *source, size_t bytes, char *error,
                             size_t error_size) {
-    if (!context->stage) {
-        if (!h3d_cuda_ok(cudaHostAlloc(&context->stage, H3D_STAGE_BYTES,
-                                       cudaHostAllocDefault),
-                         "allocate upload staging", error, error_size)) {
-            return 0;
-        }
-        if (!h3d_cuda_ok(cudaEventCreateWithFlags(&context->stage_done,
-                                                  cudaEventDisableTiming),
-                         "create upload event", error, error_size)) {
-            return 0;
-        }
+    if (!h3d_stage_ready(context, error, error_size)) {
+        return 0;
     }
 
     const char *from = (const char *)source;
@@ -361,17 +368,66 @@ int h3d_upload_at(h3d_context *context, h3d_tensor *tensor, size_t element,
                             host, elements * item, error, error_size);
 }
 
+/* The readback's mirror of `h3d_upload_range`: `cudaMemcpyAsync` into pageable
+ * memory is not a DMA either. The driver stages the destination through its own
+ * pinned buffer, and because the requested destination is not pinned the call
+ * does not return until the copy has landed - so the decoder's per-tile
+ * readback paid the same penalty the uploads did: 1.65 GB in 53 copies took
+ * 1.87 s, 0.88 GB/s, against 28.5 GB/s measured for the same bytes out of
+ * pinned memory above. Staging in bounded pieces in the reverse direction
+ * keeps the copy on the caller's stream, in stream order with the kernels that
+ * produced the tensor, and leaves the bytes unchanged. */
+static int h3d_read_staged(h3d_context *context, void *host,
+                           const void *device, size_t bytes, char *error,
+                           size_t error_size) {
+    if (!h3d_stage_ready(context, error, error_size)) {
+        return 0;
+    }
+
+    char *to = (char *)host;
+    for (size_t done = 0; done < bytes;) {
+        size_t piece = bytes - done < H3D_STAGE_BYTES ? bytes - done
+                                                     : H3D_STAGE_BYTES;
+        /* The staging buffer may only be written once whatever last used it
+         * has landed: the previous upload's DMA out of it, or this read's
+         * previous piece. */
+        if (context->stage_pending &&
+            !h3d_cuda_ok(cudaEventSynchronize(context->stage_done),
+                         "wait for staged read", error, error_size)) {
+            return 0;
+        }
+        if (!h3d_cuda_ok(cudaMemcpyAsync(context->stage,
+                                         (const char *)device + done, piece,
+                                         cudaMemcpyDeviceToHost,
+                                         context->stream),
+                         "read tensor", error, error_size)) {
+            return 0;
+        }
+        if (!h3d_cuda_ok(cudaEventRecord(context->stage_done, context->stream),
+                         "record staged read", error, error_size)) {
+            return 0;
+        }
+        context->stage_pending = 1;
+        /* And the host may only read it once that DMA has landed. */
+        if (!h3d_cuda_ok(cudaEventSynchronize(context->stage_done),
+                         "land staged read", error, error_size)) {
+            return 0;
+        }
+        memcpy(to + done, context->stage, piece);
+        done += piece;
+    }
+    return 1;
+}
+
 int h3d_read(h3d_context *context, void *host, const h3d_tensor *tensor,
              char *error, size_t error_size) {
     if (!context || !tensor || !host) {
         return h3d_set_error(error, error_size, "invalid read");
     }
     if (!tensor->elements) return 1;
-    if (!h3d_cuda_ok(
-        cudaMemcpyAsync(host, tensor->data,
-                        tensor->elements * h3d_dtype_size(tensor->dtype),
-                        cudaMemcpyDeviceToHost, context->stream),
-        "read tensor", error, error_size)) {
+    if (!h3d_read_staged(context, host, tensor->data,
+                         tensor->elements * h3d_dtype_size(tensor->dtype),
+                         error, error_size)) {
         return 0;
     }
     return h3d_cuda_ok(cudaStreamSynchronize(context->stream),
