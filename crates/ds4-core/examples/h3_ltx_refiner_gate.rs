@@ -973,7 +973,7 @@ fn probe_sampler(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
         .collect();
     failed |= report("to_denoised", &got, &want, Verdict::Residual);
 
-    // `EulerDiffusionStep.step` (`diffusion_steps.py:31-40`).
+    // `EulerDiffusionStep.step` (`diffusion_steps.py:32-40`).
     let output = alloc(gpu, Device::Bf16, elements)?;
     gpu.euler_step(&output, &latent, &velocity, delta)
         .map_err(|detail| format!("euler_step: {detail}"))?;

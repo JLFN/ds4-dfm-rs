@@ -235,7 +235,7 @@ struct Attention {
 
 /// One modality's AV cross-attention inputs. All four exist together or not at
 /// all: `MultiModalTransformerArgsPreprocessor.prepare` returns the simple
-/// args untouched for `cross_modality=None` (`transformer_args.py:352-355`),
+/// args untouched for `cross_modality=None` (`transformer_args.py:355-356`),
 /// which is the whole cross group.
 pub struct Cross {
     pub scale_shift: Tensor,
@@ -327,7 +327,7 @@ impl Refiner {
     /// read and written in place. `audio: None` is `audio=None` at
     /// `LTXModel.forward` (`model.py:504-509`): the audio branch, the AV
     /// cross-attention and the audio feed-forward do not run
-    /// (`transformer.py:261-269`).
+    /// (`transformer.py:265-269`).
     pub fn apply(
         &self,
         gpu: &Gpu,
@@ -505,7 +505,7 @@ impl Block {
     /// `BasicAVTransformerBlock.forward` (`transformer.py:253-417`). `video`
     /// and `audio` are `vx` and `ax`, read and written in place.
     ///
-    /// The four guards are `transformer.py:261-269`: `run_vx`, `run_ax`,
+    /// The four guards are `transformer.py:265-269`: `run_vx`, `run_ax`,
     /// `run_a2v` and `run_v2a`. With both latents present and enabled all four
     /// hold; with `audio = None` - the release's stage-2 denoise
     /// (`refiner_encoder_ablation_single_gpu.py:706-712`) - only `run_vx`
@@ -2207,7 +2207,7 @@ impl Edges {
 
         // The AV cross group exists only with a partner: `prepare` returns the
         // simple args untouched for `cross_modality=None`
-        // (`transformer_args.py:352-355`), so a video-only forward computes no
+        // (`transformer_args.py:355-356`), so a video-only forward computes no
         // cross AdaLN, no gate and no cross RoPE at all - and the audio state
         // does not exist either.
         let mut video_cross = None;

@@ -4025,7 +4025,7 @@ int h3d_to_denoised(h3d_context *context, h3d_tensor *output,
  * in float32. `EulerDiffusionStep.step` calls it once per step and then rounds
  * again, so the two roundings are separate: this kernel writes the bf16
  * velocity, `h3d_euler_step` reads it back as float32
- * (`components/diffusion_steps.py:31-40`). */
+ * (`components/diffusion_steps.py:32-40`). */
 __global__ static void h3d_to_velocity_kernel(__nv_bfloat16 *output,
                                               const __nv_bfloat16 *sample,
                                               const __nv_bfloat16 *denoised,
@@ -4056,7 +4056,7 @@ int h3d_to_velocity(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("BF16 to-velocity", error, error_size);
 }
 
-/* `EulerDiffusionStep.step` (`diffusion_steps.py:31-40`):
+/* `EulerDiffusionStep.step` (`diffusion_steps.py:32-40`):
  * `sample + velocity * (sigma_next - sigma)` in float32, then one cast back to
  * the sample's dtype. `delta` is `sigma_next - sigma` computed in float32 by
  * the caller, which is how the reference forms `dt`. */

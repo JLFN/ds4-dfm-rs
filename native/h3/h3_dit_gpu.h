@@ -700,7 +700,7 @@ int h3d_to_denoised(h3d_context *context, h3d_tensor *output,
                     char *error, size_t error_size);
 
 /* `to_velocity` (`utils.py:21-35`) and `EulerDiffusionStep.step`
- * (`components/diffusion_steps.py:31-40`), kept apart because the reference
+ * (`components/diffusion_steps.py:32-40`), kept apart because the reference
  * rounds between them: `to_velocity` writes the BF16 velocity, the step reads
  * it back as F32 and adds `delta = sigma_next - sigma`. */
 int h3d_to_velocity(h3d_context *context, h3d_tensor *output,

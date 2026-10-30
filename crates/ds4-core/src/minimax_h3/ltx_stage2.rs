@@ -13,7 +13,7 @@
 //!                      denoiser=SimpleDenoiser(v_context=context, a_context=None))
 //! ```
 //!
-//! (`:703-714`), so every step is one `SimpleDenoiser` call: `X0Model` around
+//! (`:704-714`), so every step is one `SimpleDenoiser` call: `X0Model` around
 //! the transformer, `to_denoised` at the per-token timestep, `post_process_latent`
 //! against the clean latent, and one Euler step per schedule interval.
 //!
@@ -37,7 +37,7 @@ use super::ltx_refiner::{
 };
 
 /// `STAGE2_SIGMAS` (`runtime/stage2_ops/models.py:19`). `euler_denoising_loop`
-/// iterates `sigmas[:-1]` (`samplers.py:77`), so the last value is where the
+/// iterates `sigmas[:-1]` (`samplers.py:73`), so the last value is where the
 /// loop stops and not a fourth interval; `X0Model`'s own terminal behaviour at
 /// a zero sigma is `EulerAncestralDiffusionStep`'s business, not this stepper's.
 pub const SIGMAS: [f32; 4] = [0.909375, 0.725, 0.421875, 0.0];
@@ -318,7 +318,7 @@ impl Stage2 {
         )
         .map_err(RefinerError::Run)?;
 
-        // `EulerDiffusionStep.step` (`components/diffusion_steps.py:31-40`):
+        // `EulerDiffusionStep.step` (`components/diffusion_steps.py:32-40`):
         // `dt = sigma_next - sigma` in float32, the velocity rounded to BF16,
         // then the float32 sum rounded back to the state's dtype.
         gpu.to_velocity(
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn the_schedule_is_the_releases_and_walks_three_intervals() {
-        // `runtime/stage2_ops/models.py:19` and `samplers.py:77`.
+        // `runtime/stage2_ops/models.py:19` and `samplers.py:73`.
         assert_eq!(SIGMAS, [0.909375, 0.725, 0.421875, 0.0]);
         assert_eq!(STEPS, 3);
         assert_eq!(NOISE_SCALE, SIGMAS[0]);
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn the_euler_step_contracts_the_state_at_every_interval() {
-        // `components/diffusion_steps.py:31-40`: `to_velocity(sample, sigma,
+        // `components/diffusion_steps.py:32-40`: `to_velocity(sample, sigma,
         // denoised)` then `sample + velocity*dt`. With a zero denoised
         // prediction the step is `sample*(1 + dt/sigma)`, whose factor is in
         // [0, 1) exactly when the schedule descends without overshooting. The

@@ -3670,7 +3670,7 @@ impl Gpu {
         )
     }
 
-    /// `EulerDiffusionStep.step` (`diffusion_steps.py:31-40`) with
+    /// `EulerDiffusionStep.step` (`diffusion_steps.py:32-40`) with
     /// `delta = sigma_next - sigma`.
     pub fn euler_step(
         &self,
