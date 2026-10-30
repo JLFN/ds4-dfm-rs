@@ -142,6 +142,9 @@ pub enum GemmaError {
     Shape { name: String, detail: String },
     /// The artifact's own `comfy_quant` blob disagrees with [`GROUP`].
     Group(String),
+    /// The tokenizer asset is absent, malformed, or a pipeline this port does
+    /// not implement.
+    Token(String),
     /// A device call refused, or the arguments do not fit the graph's contract.
     Run(String),
 }
@@ -154,6 +157,7 @@ impl GemmaError {
             Self::Missing(name) => format!("missing {name}"),
             Self::Shape { name, detail } => format!("shape {name}: {detail}"),
             Self::Group(detail) => format!("convrot group: {detail}"),
+            Self::Token(detail) => format!("token: {detail}"),
             Self::Run(detail) => format!("run: {detail}"),
         }
     }

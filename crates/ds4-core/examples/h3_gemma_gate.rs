@@ -34,6 +34,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::gemma::{self, GROUP, HIDDEN, INTERMEDIATE, STATES, Tower};
+use ds4_core::minimax_h3::gemma_token::Tokenizer as GemmaTokenizer;
 use ds4_core::minimax_h3::safetensors::{self, Dtype, Shard};
 use ds4_core::minimax_h3::text_forward::fnv1a;
 use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
@@ -69,27 +70,62 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let path = &positional[0];
     let layers = options.layers.unwrap_or(1);
-    let rows = options.rows.unwrap_or(8);
-    // `--padding` is the release's left padding in front of the ids, so the
-    // run's row count is `--rows` either way.
-    let padding = options.padding.unwrap_or(rows / 8);
 
-    if padding >= rows {
-        return Err(usage("--padding must leave at least one token"));
-    }
+    // `--prompt` runs the checkpoint's own tokenizer, which is unit 3's port,
+    // and gives the tower the ids the reference's wrapper would produce:
+    // 1024 rows, left-padded, BOS first.
+    let (ids, mask) = match &options.prompt {
+        Some(prompt) => {
+            let tokenizer =
+                GemmaTokenizer::open(std::path::Path::new(path)).map_err(|error| error.token())?;
+            let (ids, mask) = tokenizer.tokenize(prompt);
+            let padding = mask.iter().filter(|value| **value == 0).count();
 
-    let ids = if let Some(list) = &options.ids {
-        list.clone()
-    } else {
-        synth_ids(rows - padding, options.seed.unwrap_or(1))
+            println!(
+                "TOKENS width={} vocabulary={} bos={} padding={} first={:?} last={:?}",
+                ids.len(),
+                tokenizer.width(),
+                tokenizer.bos(),
+                padding,
+                &ids[..8.min(ids.len())],
+                &ids[ids.len().saturating_sub(8)..]
+            );
+            println!(
+                "IDS {}",
+                ids.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
+            );
+
+            if options.tokens_only {
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            (ids, mask)
+        }
+        None => {
+            let rows = options.rows.unwrap_or(8);
+            // `--padding` is the release's left padding in front of the ids, so
+            // the run's row count is `--rows` either way.
+            let padding = options.padding.unwrap_or(rows / 8);
+
+            if padding >= rows {
+                return Err(usage("--padding must leave at least one token"));
+            }
+
+            let ids = if let Some(list) = &options.ids {
+                list.clone()
+            } else {
+                synth_ids(rows - padding, options.seed.unwrap_or(1))
+            };
+            let ids = pad(&ids, padding);
+
+            (ids.clone(), attention_mask(ids.len(), padding))
+        }
     };
-    let ids = pad(&ids, padding);
-    let mask = attention_mask(ids.len(), padding);
 
     let gpu = Gpu::create().map_err(|detail| format!("device: {detail}"))?;
 
     if options.probe {
-        probe(&gpu, std::path::Path::new(path), rows)?;
+        probe(&gpu, std::path::Path::new(path), options.rows.unwrap_or(8))?;
 
         return Ok(ExitCode::SUCCESS);
     }
@@ -110,7 +146,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "TOWER layers={} rows={} padding={} tensors={} bytes={} load={:.3} run={:.3}",
         tower.layers(),
         ids.len(),
-        padding,
+        mask.iter().filter(|value| **value == 0).count(),
         tensors,
         bytes,
         load,
@@ -1374,6 +1410,8 @@ fn bf16_bits(value: f32) -> u16 {
 
 struct Options {
     layers: Option<usize>,
+    prompt: Option<String>,
+    tokens_only: bool,
     rows: Option<usize>,
     padding: Option<usize>,
     seed: Option<u32>,
@@ -1387,6 +1425,8 @@ fn split(args: &[String]) -> Result<(Vec<String>, Options), String> {
     let mut positional = Vec::new();
     let mut options = Options {
         layers: None,
+        prompt: None,
+        tokens_only: false,
         rows: None,
         padding: None,
         seed: None,
@@ -1408,6 +1448,17 @@ fn split(args: &[String]) -> Result<(Vec<String>, Options), String> {
             "--probe" => {
                 options.probe = true;
                 index += 1;
+            }
+            "--tokens-only" => {
+                options.tokens_only = true;
+                index += 1;
+            }
+            "--prompt" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| usage("--prompt needs a value"))?;
+                options.prompt = Some(value.clone());
+                index += 2;
             }
             "--layers" | "--rows" | "--padding" | "--seed" | "--ids" | "--expect" => {
                 let value = args
@@ -1484,7 +1535,8 @@ fn split(args: &[String]) -> Result<(Vec<String>, Options), String> {
 
 fn usage(detail: &str) -> String {
     format!(
-        "{detail}\nusage: h3_gemma_gate <checkpoint> [--layers N] [--rows R] \
-         [--padding P] [--seed S] [--ids a,b,c] [--oracle] [--probe] [--expect HEX]"
+        "{detail}\nusage: h3_gemma_gate <checkpoint> [--prompt TEXT] [--tokens-only] \
+         [--layers N] [--rows R] [--padding P] [--seed S] [--ids a,b,c] \
+         [--oracle] [--probe] [--expect HEX]"
     )
 }
