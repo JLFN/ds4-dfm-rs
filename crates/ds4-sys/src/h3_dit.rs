@@ -9,7 +9,7 @@
 //! than inventing a friendlier one: a swapped shape argument would still be
 //! accepted by cuBLASLt and would silently change the graph.
 
-use std::ffi::{CString, c_char};
+use std::ffi::{c_char, CString};
 use std::os::raw::c_int;
 use std::ptr::NonNull;
 
@@ -345,9 +345,23 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3d_ltx_attention(
+        context: *mut Context,
+        output: *mut CTensor,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        q_rows: u32,
+        kv_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     /// `h3d_sol_words`: the mask words one query block carries at this length.
     fn h3d_sol_words(sequence: u32) -> u32;
-
     /// VSA's selector: the reference's own sparsity rule for the H3 stage.
     fn h3d_sol_vsa(
         context: *mut Context,
@@ -2979,6 +2993,44 @@ impl Gpu {
                 )
             },
             "attention",
+        )
+    }
+
+    /// `h3d_ltx_attention`: the token-major dense attention
+    /// `PytorchAttention.__call__` runs (`attention.py:82-102`), with the query
+    /// and key row counts independent - the AV cross-attention reads 16,128
+    /// video queries against 126 audio keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ltx_attention(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        q_rows: u32,
+        kv_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_ltx_attention(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    q_rows,
+                    kv_rows,
+                    heads,
+                    head_dim,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "LTX attention",
         )
     }
 

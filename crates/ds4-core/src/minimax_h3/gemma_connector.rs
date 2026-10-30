@@ -544,14 +544,17 @@ impl Block {
         .map_err(ConnectorError::Run)?;
 
         // `scaled_dot_product_attention` at its default scale,
-        // `1 / sqrt(dim_head)` (`attention.py:99-100` with no `scale`), and no
-        // mask: the register replacement zeroed it.
+        // `1 / sqrt(dim_head)` (`attention.py:99-100` with no `scale`), no
+        // mask (the register replacement zeroed it), and `PytorchAttention`'s
+        // own operand convention: `q.view(b, -1, heads, dim_head)` reads the
+        // projections token-major, which is what the linears above produce.
         let scale = 1.0 / (scratch.head_dim as f32).sqrt();
-        gpu.sdpa(
+        gpu.ltx_attention(
             &scratch.attention,
             &scratch.query,
             &scratch.key,
             &scratch.value,
+            rows,
             rows,
             heads as u32,
             scratch.head_dim as u32,

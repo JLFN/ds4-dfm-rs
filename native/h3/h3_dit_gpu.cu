@@ -3193,6 +3193,172 @@ __device__ __forceinline__ static uint32_t h3d_mma_pair(float low, float high) {
     return lo | (hi << 16);
 }
 
+/* `PytorchAttention.__call__` (`attention.py:82-102`):
+ * `q.view(b, -1, heads, dim_head).transpose(1, 2)`, SDPA at
+ * `1 / sqrt(dim_head)`, then `.transpose(1, 2).reshape(b, -1, heads * dim_head)`.
+ * The operands are therefore token-major `(rows, heads, head_dim)`, which is
+ * what every LTX caller hands in (`to_q`/`to_k`/`to_v` are plain
+ * `torch.nn.Linear`s) and the one thing `h3d_sdpa` does not accept: that
+ * kernel is the H3 engine's, whose `h3d_qkv_rope` writes query/key/value
+ * head-major `[heads][sequence][head_dim]`. The head count is shared; only the
+ * two row counts differ, and the AV cross-attention needs them apart (16,128
+ * video queries against 126 audio keys). The arithmetic is
+ * `h3d_attention_tiled_kernel`'s, online softmax included; only the two
+ * operand addresses and the key-loop bound change.
+ *
+ * `HEAD_DIM` is a template parameter for the same reason it is there: 128 for
+ * the video half, 64 for the audio half and their cross-attentions. */
+template <uint32_t HEAD_DIM>
+__global__ static void h3d_ltx_attention_kernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *query,
+        const __nv_bfloat16 *key, const __nv_bfloat16 *value,
+        uint32_t q_rows, uint32_t kv_rows, uint32_t heads, float scale) {
+    enum { PARTS = HEAD_DIM / 32, KEYS = 8, ROWS = H3D_ATTENTION_ROWS,
+           QUERIES = 8 * ROWS };
+    __shared__ float shared_key[KEYS][HEAD_DIM];
+    __shared__ float shared_value[KEYS][HEAD_DIM];
+    uint32_t warp = threadIdx.x / 32;
+    uint32_t lane = threadIdx.x % 32;
+    uint32_t head = blockIdx.y;
+    uint32_t first_row = blockIdx.x * QUERIES + warp * ROWS;
+    int active[ROWS];
+    float result[ROWS][PARTS];
+    float maximum[ROWS];
+    float denominator[ROWS];
+    float query_item[ROWS][PARTS];
+#pragma unroll
+    for (uint32_t r = 0; r < ROWS; r++) {
+        uint32_t row = first_row + r;
+        active[r] = row < q_rows;
+        maximum[r] = -INFINITY;
+        denominator[r] = 0.0f;
+#pragma unroll
+        for (uint32_t part = 0; part < PARTS; part++) {
+            result[r][part] = 0.0f;
+            query_item[r][part] = 0.0f;
+        }
+        if (!active[r]) {
+            continue;
+        }
+        size_t query_base = ((size_t)row * heads + head) * HEAD_DIM;
+#pragma unroll
+        for (uint32_t part = 0; part < PARTS; part++) {
+            query_item[r][part] =
+                    __bfloat162float(query[query_base + lane + part * 32]);
+        }
+    }
+    for (uint32_t key_block = 0; key_block < kv_rows; key_block += KEYS) {
+        if (threadIdx.x < HEAD_DIM) {
+#pragma unroll
+            for (uint32_t item = 0; item < KEYS; item++) {
+                uint32_t source = key_block + item;
+                if (source < kv_rows) {
+                    size_t index =
+                            ((size_t)source * heads + head) * HEAD_DIM +
+                            threadIdx.x;
+                    shared_key[item][threadIdx.x] =
+                            __bfloat162float(key[index]);
+                    shared_value[item][threadIdx.x] =
+                            __bfloat162float(value[index]);
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t item = 0; item < KEYS; item++) {
+            if (key_block + item >= kv_rows) {
+                break;
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < ROWS; r++) {
+                float product = 0.0f;
+                if (active[r]) {
+#pragma unroll
+                    for (uint32_t part = 0; part < PARTS; part++) {
+                        uint32_t dimension = lane + part * 32;
+                        product += query_item[r][part] *
+                                   shared_key[item][dimension];
+                    }
+#pragma unroll
+                    for (uint32_t offset = 16; offset; offset >>= 1) {
+                        product += __shfl_down_sync(0xffffffffu, product, offset);
+                    }
+                }
+                float rescale = 1.0f;
+                float weight = 0.0f;
+                if (active[r] && lane == 0) {
+                    float score = product * scale;
+                    float next_maximum = fmaxf(maximum[r], score);
+                    rescale = expf(maximum[r] - next_maximum);
+                    weight = expf(score - next_maximum);
+                    denominator[r] = denominator[r] * rescale + weight;
+                    maximum[r] = next_maximum;
+                }
+                rescale = __shfl_sync(0xffffffffu, rescale, 0);
+                weight = __shfl_sync(0xffffffffu, weight, 0);
+                if (active[r]) {
+#pragma unroll
+                    for (uint32_t part = 0; part < PARTS; part++) {
+                        uint32_t dimension = lane + part * 32;
+                        result[r][part] = result[r][part] * rescale +
+                                          weight *
+                                          shared_value[item][dimension];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < ROWS; r++) {
+        denominator[r] = __shfl_sync(0xffffffffu, denominator[r], 0);
+        if (!active[r]) {
+            continue;
+        }
+        uint32_t row = first_row + r;
+#pragma unroll
+        for (uint32_t item = 0; item < PARTS; item++) {
+            uint32_t dimension = lane + item * 32;
+            size_t index = ((size_t)row * heads + head) * HEAD_DIM + dimension;
+            output[index] = __float2bfloat16(result[r][item] / denominator[r]);
+        }
+    }
+}
+
+int h3d_ltx_attention(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *query, const h3d_tensor *key,
+                      const h3d_tensor *value, uint32_t q_rows,
+                      uint32_t kv_rows, uint32_t heads, uint32_t head_dim,
+                      float scale, char *error, size_t error_size) {
+    size_t query_elements = 0, key_elements = 0;
+    if (!context || !q_rows || !kv_rows || !heads ||
+        (head_dim != 128 && head_dim != 64) ||
+        !h3d_mul_size((size_t)q_rows * heads, head_dim, &query_elements) ||
+        !h3d_mul_size((size_t)kv_rows * heads, head_dim, &key_elements) ||
+        !h3d_is(output, H3D_BF16, query_elements) ||
+        !h3d_is(query, H3D_BF16, query_elements) ||
+        !h3d_is(key, H3D_BF16, key_elements) ||
+        !h3d_is(value, H3D_BF16, key_elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid LTX attention tensors or shape");
+    }
+    dim3 grid((q_rows + 8 * H3D_ATTENTION_ROWS - 1) /
+                      (8 * H3D_ATTENTION_ROWS),
+              heads);
+    if (head_dim == 64) {
+        h3d_ltx_attention_kernel<64><<<grid, 256, 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)query->data,
+            (const __nv_bfloat16 *)key->data,
+            (const __nv_bfloat16 *)value->data, q_rows, kv_rows, heads, scale);
+        return h3d_launch_ok("LTX attention 64", error, error_size);
+    }
+    h3d_ltx_attention_kernel<128><<<grid, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)query->data,
+        (const __nv_bfloat16 *)key->data, (const __nv_bfloat16 *)value->data,
+        q_rows, kv_rows, heads, scale);
+    return h3d_launch_ok("LTX attention", error, error_size);
+}
+
 enum {
     H3D_MMA_HD = 128,                 /* head dimension, the one shape served */
     H3D_MMA_KEYS = 64,                /* key rows staged per tile */

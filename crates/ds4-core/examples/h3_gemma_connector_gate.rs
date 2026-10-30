@@ -400,6 +400,47 @@ fn probe(gpu: &Gpu, rows: usize, seed: u32) -> Result<(), String> {
     let want = host_per_head_gate(&values, &logits, rows, HEADS, VIDEO_HEAD_DIM);
     failed |= report("per_head_gate", &got, &want, Verdict::Residual);
 
+    // Dense attention at both connector geometries, transcribed the way the
+    // reference's `PytorchAttention` reads its operands (`attention.py:82-102`):
+    // `q.view(b, -1, heads, dim_head).transpose(1, 2)`, SDPA at
+    // `1 / sqrt(dim_head)`, then `.transpose(1, 2).reshape(b, -1, heads * dim)`.
+    // The operands are token-major - the layout every LTX caller produces,
+    // since `to_q`/`to_k`/`to_v` are plain `torch.nn.Linear`s.
+    for (head_dim, label) in [
+        (VIDEO_HEAD_DIM, "video"),
+        (connector::AUDIO_HEAD_DIM, "audio"),
+    ] {
+        let inner = HEADS * head_dim;
+        let (query, query_bytes) = seq(rows * inner, &mut state);
+        let (key, key_bytes) = seq(rows * inner, &mut state);
+        let (value, value_bytes) = seq(rows * inner, &mut state);
+        let query_dev = upload_bf16(gpu, &query_bytes)?;
+        let key_dev = upload_bf16(gpu, &key_bytes)?;
+        let value_dev = upload_bf16(gpu, &value_bytes)?;
+        let attention_dev = alloc(gpu, Device::Bf16, rows * inner)?;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        gpu.ltx_attention(
+            &attention_dev,
+            &query_dev,
+            &key_dev,
+            &value_dev,
+            rows as u32,
+            rows as u32,
+            HEADS as u32,
+            head_dim as u32,
+            scale,
+        )
+        .map_err(|detail| format!("attention: {detail}"))?;
+        let got = read_bf16(gpu, &attention_dev)?;
+        let want = host_attention(&query, &key, &value, rows, rows, HEADS, head_dim, scale);
+        failed |= report(
+            &format!("attention_{label}"),
+            &got,
+            &want,
+            Verdict::Residual,
+        );
+    }
+
     if failed {
         return Err("a probe failed its verdict".to_string());
     }
@@ -591,6 +632,65 @@ fn host_per_head_gate(
 
             for dimension in 0..head_dim {
                 output[base + dimension] = bf16(values[base + dimension] * gate);
+            }
+        }
+    }
+
+    output
+}
+
+/// The host transcription of `PytorchAttention.__call__` (`attention.py:82-102`):
+/// the operands are token-major `(rows, heads, dim_head)`, the softmax runs
+/// over each `(head, row)`'s own keys at `1 / sqrt(dim_head)`, and the output
+/// is written back token-major. `expf` has no host opposite, so this is a
+/// residual probe.
+fn host_attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    q_rows: usize,
+    kv_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut output = vec![0.0f32; q_rows * heads * head_dim];
+
+    for row in 0..q_rows {
+        for head in 0..heads {
+            let query_base = (row * heads + head) * head_dim;
+            let mut scores = vec![0.0f32; kv_rows];
+            let mut maximum = f32::NEG_INFINITY;
+
+            for source in 0..kv_rows {
+                let key_base = (source * heads + head) * head_dim;
+                let mut product = 0.0f32;
+
+                for dimension in 0..head_dim {
+                    product += query[query_base + dimension] * key[key_base + dimension];
+                }
+
+                let score = product * scale;
+                scores[source] = score;
+                maximum = maximum.max(score);
+            }
+
+            let mut denominator = 0.0f32;
+
+            for score in scores.iter_mut() {
+                *score = (*score - maximum).exp();
+                denominator += *score;
+            }
+
+            for dimension in 0..head_dim {
+                let mut total = 0.0f32;
+
+                for source in 0..kv_rows {
+                    let value_base = (source * heads + head) * head_dim;
+                    total += scores[source] * value[value_base + dimension];
+                }
+
+                output[query_base + dimension] = total / denominator;
             }
         }
     }

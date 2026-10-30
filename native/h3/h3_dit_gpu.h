@@ -574,6 +574,18 @@ int h3d_sdpa(h3d_context *context, h3d_tensor *output,
              const h3d_tensor *value, uint32_t sequence, uint32_t heads,
              uint32_t head_dim, float scale, char *error, size_t error_size);
 
+/* `PytorchAttention.__call__` (`attention.py:82-102`): token-major operands
+ * `(rows, heads, head_dim)` and a token-major output, at
+ * `1 / sqrt(head_dim)`, with the query and key row counts independent - which
+ * the AV cross-attention needs (16,128 video queries, 126 audio keys).
+ * `h3d_sdpa` is the H3 engine's convention (head-major operands, written by
+ * `h3d_qkv_rope`); this is the one the LTX blocks read. */
+int h3d_ltx_attention(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *query, const h3d_tensor *key,
+                      const h3d_tensor *value, uint32_t q_rows,
+                      uint32_t kv_rows, uint32_t heads, uint32_t head_dim,
+                      float scale, char *error, size_t error_size);
+
 /* `h3_gpu_add_bf16` (`:2373-2376`) with `h3_binary_bf16_kernel`
  * (`:2347-2357`), `h3_gpu_cast_f32_to_bf16` (`:2287-2296`), and the SiLU
  * branches of `h3_gpu_silu_f32`/`h3_gpu_silu_bf16` (`:2276-2306`, `:2321-2329`)
