@@ -297,6 +297,7 @@ fn planar(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
         pad[1] as u32,
         pad[2] as u32,
         width as u32,
+        false,
     )?;
 
     let mut expected = vec![0.0f32; elements];
@@ -395,6 +396,7 @@ fn matmul_planar(gpu: &Gpu, rng: &mut Rng) -> Result<bool, String> {
         pad[1] as u32,
         pad[2] as u32,
         width as u32,
+        false,
     )?;
 
     let columns = kw * channels;

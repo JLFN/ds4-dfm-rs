@@ -1130,7 +1130,8 @@ int h3b_planar(h3d_context *context, h3d_tensor *output,
                const h3d_tensor *input, int dtype, uint32_t channels,
                uint32_t depth, uint32_t height, uint32_t width, uint32_t kw,
                uint32_t pad_t, uint32_t pad_h, uint32_t pad_w,
-               uint32_t out_width, char *error, size_t error_size);
+               uint32_t out_width, int replicate_t, char *error,
+               size_t error_size);
 
 int h3b_weight_pack(h3d_context *context, h3d_tensor *output,
                     const h3d_tensor *weight, int dtype, uint32_t out_channels,
@@ -1261,6 +1262,54 @@ int h3b_copy_offset(h3d_context *context, h3d_tensor *output,
                     const h3d_tensor *input, int dtype, size_t out_offset,
                     size_t in_offset, size_t elements, char *error,
                     size_t error_size);
+
+/* ------------------------------------------------------------------------
+ * h3v_* — the LTX-2.5 video VAE decoder's own ops
+ * (`minimax_h3::ltx_vae`).
+ *
+ * The decoder's convolutions are the `h3b_planar` path with
+ * `replicate_t = 1`: 3x3x3, stride 1, one zero frame of spatial halo and one
+ * replicated frame each side in time (`video_vae/convolution.py:302-312`).
+ * What is left of the graph is here: the PixelNorm that precedes every
+ * convolution, the per-channel denormalization the latents arrive in, the
+ * depth-to-space upsampler, the final unpatchify and the RGB fold. Each
+ * rounds exactly where the reference's own expression rounds, all of them in
+ * bf16.
+ * ------------------------------------------------------------------------ */
+
+/* `PixelNorm` (`video_vae/normalization.py:31-38`). Channel-major input. */
+int h3v_pixel_norm(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, int dtype, uint32_t channels,
+                   size_t plane, float epsilon, char *error, size_t error_size);
+
+/* `PerChannelStatistics.un_normalize` (`video_vae/ops.py:74-78`): `x * std +
+ * mean` per channel, two roundings. */
+int h3v_denormalize(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *mean,
+                    const h3d_tensor *scale, int dtype, uint32_t channels,
+                    size_t plane, char *error, size_t error_size);
+
+/* `DepthToSpaceUpsample` (`video_vae/sampling.py:66-124`). `drop` is the
+ * reference's first-output-frame slice when the temporal axis doubles. */
+int h3v_depth_to_space(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *input, int dtype,
+                       uint32_t in_channels, uint32_t depth, uint32_t height,
+                       uint32_t width, uint32_t p1, uint32_t p2, uint32_t p3,
+                       uint32_t drop, char *error, size_t error_size);
+
+/* `unpatchify` (`video_vae/ops.py:34-60`) at one temporal patch:
+ * `channels * patch^2` in, `channels` out at `patch` times the resolution. */
+int h3v_unpatchify(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, int dtype, uint32_t channels,
+                   uint32_t patch, uint32_t depth, uint32_t height,
+                   uint32_t width, char *error, size_t error_size);
+
+/* `decode_video`'s `to_rgb` (`conv_video_decoder.py:497-499`):
+ * `(x + 1) / 2` clamped to `[0, 1]`, `[channel][time][height][width]` to
+ * `[time][height][width][channel]`. */
+int h3v_to_rgb(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+               int dtype, uint32_t depth, uint32_t height, uint32_t width,
+               char *error, size_t error_size);
 
 #ifdef __cplusplus
 }

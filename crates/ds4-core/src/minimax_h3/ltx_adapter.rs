@@ -922,6 +922,7 @@ fn convolve_planar(
         ph,
         pw,
         out_width,
+        false,
     ))?;
 
     for frame in 0..frames {

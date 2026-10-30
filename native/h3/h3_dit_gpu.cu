@@ -7712,8 +7712,8 @@ __global__ static void h3b_planar_kernel(T *out, const T *in, uint32_t channels,
                                          uint32_t width, uint32_t kw,
                                          uint32_t pad_t, uint32_t pad_h,
                                          uint32_t pad_w, uint32_t pad_depth,
-                                         uint32_t pad_height,
-                                         uint32_t out_width) {
+                                         uint32_t pad_height, uint32_t out_width,
+                                         int replicate_t) {
     uint32_t padded_width = width + 2 * pad_w;
     uint32_t column = blockIdx.y * H3B_PLANAR_CHANNELS;
     uint32_t block_channels = channels - column < H3B_PLANAR_CHANNELS
@@ -7723,6 +7723,12 @@ __global__ static void h3b_planar_kernel(T *out, const T *in, uint32_t channels,
     uint32_t y = blockIdx.x % pad_height;
     int source_t = (int)t - (int)pad_t;
     int source_y = (int)y - (int)pad_h;
+    // `CausalConv3d`'s non-causal temporal halo is the edge frame repeated
+    // (`convolution.py:307-311`, `(kernel_size - 1) // 2` frames each side),
+    // not zeros: the clamp is what makes the decoder's first and last frames
+    // read the right values.
+    if (replicate_t && source_t < 0) source_t = 0;
+    if (replicate_t && source_t >= (int)depth) source_t = (int)depth - 1;
 
     // Row `i` of the tile is `in[column + i]`'s image row, zero where the
     // padding reaches: the entry is read once per padded coordinate and the
@@ -8457,7 +8463,8 @@ int h3b_planar(h3d_context *context, h3d_tensor *output,
                const h3d_tensor *input, int dtype, uint32_t channels,
                uint32_t depth, uint32_t height, uint32_t width, uint32_t kw,
                uint32_t pad_t, uint32_t pad_h, uint32_t pad_w,
-               uint32_t out_width, char *error, size_t error_size) {
+               uint32_t out_width, int replicate_t, char *error,
+               size_t error_size) {
     cudaDataType_t type = CUDA_R_32F;
     size_t sources = 0, outputs = 0;
     uint32_t pad_depth = depth + 2 * pad_t;
@@ -8485,14 +8492,14 @@ int h3b_planar(h3d_context *context, h3d_tensor *output,
         h3b_planar_kernel<float><<<grid, H3B_BLOCK, shared, context->stream>>>(
             (float *)output->data, (const float *)input->data, channels, depth,
             height, width, kw, pad_t, pad_h, pad_w, pad_depth, pad_height,
-            out_width);
+            out_width, replicate_t);
     } else {
         h3b_planar_kernel<__nv_bfloat16>
             <<<grid, H3B_BLOCK, shared, context->stream>>>(
                 (__nv_bfloat16 *)output->data,
                 (const __nv_bfloat16 *)input->data, channels, depth, height,
                 width, kw, pad_t, pad_h, pad_w, pad_depth, pad_height,
-                out_width);
+                out_width, replicate_t);
     }
     return h3d_launch_ok("latent planar", error, error_size);
 }
@@ -9074,4 +9081,291 @@ int h3b_copy_offset(h3d_context *context, h3d_tensor *output,
             (const __nv_bfloat16 *)input->data, in_offset, elements);
     }
     return h3d_launch_ok("latent copy", error, error_size);
+}
+
+/* ------------------------------------------------------------------------
+ * h3v_* — the LTX-2.5 video VAE decoder (`minimax_h3::ltx_vae`).
+ *
+ * The release decodes the refiner's latent with LTX's own ConvVideoDecoder
+ * (`ltx-core/src/ltx_core/model/video_vae/conv_video_decoder.py`, read at
+ * `/data/ltx2-pin/packages`, pin d1511477 = tag v1.2.0). Its convolutions are
+ * the h3b planar path above with the artifact's own padding: 3x3x3, stride 1,
+ * one zero frame of spatial halo, and one *replicated* frame each side in time
+ * (`convolution.py:302-312`, `CausalConv3d` with `causal=False`). The four ops
+ * below are the rest of the graph.
+ * ------------------------------------------------------------------------ */
+
+/* `PixelNorm` (`normalization.py:31-38`): `x / sqrt(mean(x^2, dim=1) + 1e-8)`
+ * at every position. Torch's expression is five ops and five bf16 roundings -
+ * the square, the mean, the epsilon add, the square root and the divide - and
+ * the kernel rounds where the expression does, in that order.
+ *
+ * One thread per position, walking the channels: at every channel the block's
+ * 256 threads read 256 consecutive positions, so every pass is coalesced. */
+template <typename T>
+__global__ static void h3v_pixel_norm_kernel(T *out, const T *in,
+                                             uint32_t channels, size_t plane,
+                                             float epsilon, size_t positions) {
+    size_t position = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (position >= positions) return;
+    float total = 0.0f;
+    for (uint32_t channel = 0; channel < channels; ++channel) {
+        float value = h3b_element<T>::to(in[(size_t)channel * plane + position]);
+        total += h3b_element<T>::to(h3b_element<T>::from(value * value));
+    }
+    float mean = h3b_element<T>::to(
+        h3b_element<T>::from(total / (float)channels));
+    float variance = h3b_element<T>::to(
+        h3b_element<T>::from(mean + epsilon));
+    float rms = h3b_element<T>::to(h3b_element<T>::from(sqrtf(variance)));
+    for (uint32_t channel = 0; channel < channels; ++channel) {
+        size_t at = (size_t)channel * plane + position;
+        out[at] = h3b_element<T>::from(h3b_element<T>::to(in[at]) / rms);
+    }
+}
+
+/* `PerChannelStatistics.un_normalize` (`ops.py:74-78`): `(x * std) + mean` per
+ * channel, in bf16 - two ops and two roundings, which is why it is not
+ * `h3b_scale`'s single-rounded form. The buffers arrive `.to(x)`
+ * (`ops.py:75`), and the artifact stores them bf16 already. */
+template <typename T>
+__global__ static void h3v_denormalize_kernel(T *out, const T *in,
+                                              const T *mean, const T *scale,
+                                              uint32_t channels, size_t plane,
+                                              size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t channel = (uint32_t)(index / plane);
+    float scaled = h3b_element<T>::to(
+        h3b_element<T>::from(h3b_element<T>::to(in[index]) *
+                             h3b_element<T>::to(scale[channel])));
+    out[index] = h3b_element<T>::from(scaled +
+                                      h3b_element<T>::to(mean[channel]));
+}
+
+/* `DepthToSpaceUpsample` (`sampling.py:66-124`): the convolution's output
+ * pixel-shuffled by the block's stride, one frame dropped when the temporal
+ * axis doubles (`:119-120`). The rearrange is
+ * `(c p1 p2 p3) -> c (d p1) (h p2) (w p3)` (`:111-117`), so the source
+ * channel is `((c p1 + a) p2 + b) p3 + g` for the temporal, height and width
+ * sub-positions, and the output carries `p1*p2*p3` times fewer channels. */
+template <typename T>
+__global__ static void h3v_depth_to_space_kernel(
+    T *out, const T *in, uint32_t in_channels, uint32_t depth, uint32_t height,
+    uint32_t width, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t drop,
+    size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t out_depth = depth * p1 - drop;
+    uint32_t out_height = height * p2;
+    uint32_t out_width = width * p3;
+    uint32_t x = (uint32_t)(index % out_width);
+    size_t rest = index / out_width;
+    uint32_t y = (uint32_t)(rest % out_height);
+    rest /= out_height;
+    uint32_t t = (uint32_t)(rest % out_depth);
+    uint32_t channel = (uint32_t)(rest / out_depth);
+    uint32_t g = x % p3, source_x = x / p3;
+    uint32_t b = y % p2, source_y = y / p2;
+    uint32_t a = (t + drop) % p1, source_t = (t + drop) / p1;
+    uint32_t source = ((channel * p1 + a) * p2 + b) * p3 + g;
+    out[index] = in[(((size_t)source * depth + source_t) * height + source_y) *
+                        width +
+                    source_x];
+}
+
+/* `unpatchify` at the artifact's patch size 4 and one temporal patch
+ * (`ops.py:34-60`): the decoder's 48 output channels are `3 x 4 x 4` and the
+ * rearrange `(c p r q) f h w -> c (f p) (h q) (w r)` reads source channel
+ * `c p^2 + r p + q` for output row `h p + q` and column `w p + r`
+ * (`:56-58`), with `p = 1`. */
+template <typename T>
+__global__ static void h3v_unpatchify_kernel(T *out, const T *in,
+                                             uint32_t channels, uint32_t patch,
+                                             uint32_t depth, uint32_t height,
+                                             uint32_t width, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t out_height = height * patch;
+    uint32_t out_width = width * patch;
+    uint32_t x = (uint32_t)(index % out_width);
+    size_t rest = index / out_width;
+    uint32_t y = (uint32_t)(rest % out_height);
+    rest /= out_height;
+    uint32_t t = (uint32_t)(rest % depth);
+    uint32_t channel = (uint32_t)(rest / depth);
+    uint32_t q = y % patch, source_y = y / patch;
+    uint32_t r = x % patch, source_x = x / patch;
+    uint32_t source = (channel * patch + r) * patch + q;
+    out[index] =
+        in[(((size_t)source * depth + t) * height + source_y) * width +
+           source_x];
+}
+
+/* `decode_video`'s `to_rgb` (`conv_video_decoder.py:497-499`):
+ * `rearrange(frames[0], "c f h w -> f h w c")` then `add_(1).mul_(0.5)
+ * .clamp_(0, 1)` - in bf16, so the add and the multiply each round once and
+ * the clamp is exact. The output is the release's own chunk layout, RGB
+ * interleaved fastest. */
+template <typename T>
+__global__ static void h3v_to_rgb_kernel(T *out, const T *in, uint32_t depth,
+                                         uint32_t height, uint32_t width,
+                                         size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    size_t plane = (size_t)depth * height * width;
+    uint32_t channel = (uint32_t)(index % 3);
+    size_t point = index / 3;
+    float value = h3b_element<T>::to(in[(size_t)channel * plane + point]);
+    float shifted = h3b_element<T>::to(h3b_element<T>::from(value + 1.0f));
+    float scaled = h3b_element<T>::from(0.5f * shifted);
+    out[index] = h3b_element<T>::from(fminf(fmaxf(scaled, 0.0f), 1.0f));
+}
+
+int h3v_pixel_norm(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, int dtype, uint32_t channels,
+                   size_t plane, float epsilon, char *error,
+                   size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0;
+    if (!context || !channels || !plane || !h3b_type(&type, dtype) ||
+        !h3d_mul_size(channels, plane, &elements) ||
+        !h3d_is(input, dtype, elements) || !h3d_is(output, dtype, elements)) {
+        return h3d_set_error(error, error_size, "invalid pixel norm shape");
+    }
+    if (elements == 0) return 1;
+    // The `plane` of a position: the op reduces over channels, so the walk is
+    // strided and the thread count is the position count.
+    size_t positions = plane;
+    if (dtype == H3D_F32) {
+        h3v_pixel_norm_kernel<float><<<h3b_blocks(positions), H3B_BLOCK, 0,
+                                       context->stream>>>(
+            (float *)output->data, (const float *)input->data, channels, plane,
+            epsilon, positions);
+    } else {
+        h3v_pixel_norm_kernel<__nv_bfloat16><<<h3b_blocks(positions), H3B_BLOCK,
+                                               0, context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, channels, plane, epsilon,
+            positions);
+    }
+    return h3d_launch_ok("pixel norm", error, error_size);
+}
+
+int h3v_denormalize(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *mean,
+                    const h3d_tensor *scale, int dtype, uint32_t channels,
+                    size_t plane, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t elements = 0;
+    if (!context || !channels || !plane || !h3b_type(&type, dtype) ||
+        !h3d_mul_size(channels, plane, &elements) ||
+        !h3d_is(input, dtype, elements) || !h3d_is(output, dtype, elements) ||
+        !h3d_is(mean, dtype, channels) || !h3d_is(scale, dtype, channels)) {
+        return h3d_set_error(error, error_size, "invalid denormalize shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3v_denormalize_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                        context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const float *)mean->data, (const float *)scale->data, channels,
+            plane, elements);
+    } else {
+        h3v_denormalize_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK,
+                                                0, context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data,
+            (const __nv_bfloat16 *)mean->data,
+            (const __nv_bfloat16 *)scale->data, channels, plane, elements);
+    }
+    return h3d_launch_ok("denormalize", error, error_size);
+}
+
+int h3v_depth_to_space(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *input, int dtype, uint32_t in_channels,
+                       uint32_t depth, uint32_t height, uint32_t width,
+                       uint32_t p1, uint32_t p2, uint32_t p3, uint32_t drop,
+                       char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t sources = 0, outputs = 0;
+    if (!context || !in_channels || !depth || !height || !width || !p1 || !p2 ||
+        !p3 || drop > 1 || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)in_channels * depth * height, width, &sources) ||
+        !h3d_mul_size((size_t)(in_channels / (p1 * p2 * p3)) * (depth * p1 - drop),
+                      (size_t)(height * p2) * (width * p3), &outputs) ||
+        !h3d_is(input, dtype, sources) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size, "invalid depth to space shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3v_depth_to_space_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                           context->stream>>>(
+            (float *)output->data, (const float *)input->data, in_channels,
+            depth, height, width, p1, p2, p3, drop, outputs);
+    } else {
+        h3v_depth_to_space_kernel<__nv_bfloat16>
+            <<<h3b_blocks(outputs), H3B_BLOCK, 0, context->stream>>>(
+                (__nv_bfloat16 *)output->data,
+                (const __nv_bfloat16 *)input->data, in_channels, depth, height,
+                width, p1, p2, p3, drop, outputs);
+    }
+    return h3d_launch_ok("depth to space", error, error_size);
+}
+
+int h3v_unpatchify(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, int dtype, uint32_t channels,
+                   uint32_t patch, uint32_t depth, uint32_t height,
+                   uint32_t width, char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t sources = 0, outputs = 0;
+    if (!context || !channels || !patch || !depth || !height || !width ||
+        !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)channels * patch * patch * depth,
+                      (size_t)height * width, &sources) ||
+        !h3d_mul_size((size_t)channels * depth, (size_t)height * patch, &outputs) ||
+        !h3d_mul_size(outputs, (size_t)width * patch, &outputs) ||
+        !h3d_is(input, dtype, sources) || !h3d_is(output, dtype, outputs)) {
+        return h3d_set_error(error, error_size, "invalid unpatchify shape");
+    }
+    if (outputs == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3v_unpatchify_kernel<float><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                       context->stream>>>(
+            (float *)output->data, (const float *)input->data, channels, patch,
+            depth, height, width, outputs);
+    } else {
+        h3v_unpatchify_kernel<__nv_bfloat16><<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                                               context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, channels, patch, depth, height,
+            width, outputs);
+    }
+    return h3d_launch_ok("unpatchify", error, error_size);
+}
+
+int h3v_to_rgb(h3d_context *context, h3d_tensor *output, const h3d_tensor *input,
+               int dtype, uint32_t depth, uint32_t height, uint32_t width,
+               char *error, size_t error_size) {
+    cudaDataType_t type = CUDA_R_32F;
+    size_t plane = 0, elements = 0;
+    if (!context || !depth || !height || !width || !h3b_type(&type, dtype) ||
+        !h3d_mul_size((size_t)depth * height, width, &plane) ||
+        !h3d_mul_size(plane, 3, &elements) ||
+        !h3d_is(input, dtype, elements) || !h3d_is(output, dtype, elements)) {
+        return h3d_set_error(error, error_size, "invalid to-rgb shape");
+    }
+    if (elements == 0) return 1;
+    if (dtype == H3D_F32) {
+        h3v_to_rgb_kernel<float><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                   context->stream>>>(
+            (float *)output->data, (const float *)input->data, depth, height,
+            width, elements);
+    } else {
+        h3v_to_rgb_kernel<__nv_bfloat16><<<h3b_blocks(elements), H3B_BLOCK, 0,
+                                           context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)input->data, depth, height, width, elements);
+    }
+    return h3d_launch_ok("to rgb", error, error_size);
 }

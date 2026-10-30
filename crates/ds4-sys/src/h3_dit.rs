@@ -1062,6 +1062,76 @@ unsafe extern "C" {
         pad_h: u32,
         pad_w: u32,
         out_width: u32,
+        replicate_t: c_int,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3v_pixel_norm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        plane: usize,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3v_denormalize(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        mean: *const CTensor,
+        scale: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        plane: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3v_depth_to_space(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        in_channels: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        p1: u32,
+        p2: u32,
+        p3: u32,
+        drop: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3v_unpatchify(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        channels: u32,
+        patch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3v_to_rgb(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        dtype: c_int,
+        depth: u32,
+        height: u32,
+        width: u32,
         error: *mut c_char,
         error_size: usize,
     ) -> c_int;
@@ -4975,6 +5045,7 @@ impl Gpu {
         pad_h: u32,
         pad_w: u32,
         out_width: u32,
+        replicate_t: bool,
     ) -> Result<(), String> {
         self.call(
             |error, error_size| unsafe {
@@ -4992,6 +5063,7 @@ impl Gpu {
                     pad_h,
                     pad_w,
                     out_width,
+                    c_int::from(replicate_t),
                     error,
                     error_size,
                 )
@@ -5571,6 +5643,170 @@ impl Gpu {
                 )
             },
             "latent_copy_offset",
+        )
+    }
+
+    /// `h3v_pixel_norm` (`video_vae/normalization.py:31-38`): `x /
+    /// sqrt(mean(x^2, channels) + eps)` at every position of a channel-major
+    /// tensor, `plane` elements per channel.
+    pub fn video_vae_pixel_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        plane: usize,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3v_pixel_norm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    channels,
+                    plane,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "video_vae_pixel_norm",
+        )
+    }
+
+    /// `h3v_denormalize` (`video_vae/ops.py:74-78`): `x * scale + mean` per
+    /// channel, each op rounding once.
+    pub fn video_vae_denormalize(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        mean: &Tensor,
+        scale: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        plane: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3v_denormalize(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    mean.raw(),
+                    scale.raw(),
+                    dtype.code(),
+                    channels,
+                    plane,
+                    error,
+                    size,
+                )
+            },
+            "video_vae_denormalize",
+        )
+    }
+
+    /// `h3v_depth_to_space` (`video_vae/sampling.py:66-124`): the
+    /// `(c p1 p2 p3) -> c (d p1) (h p2) (w p3)` shuffle with `drop` output
+    /// frames cut from the front.
+    #[allow(clippy::too_many_arguments)]
+    pub fn video_vae_depth_to_space(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        in_channels: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        p1: u32,
+        p2: u32,
+        p3: u32,
+        drop: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3v_depth_to_space(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    in_channels,
+                    depth,
+                    height,
+                    width,
+                    p1,
+                    p2,
+                    p3,
+                    drop,
+                    error,
+                    size,
+                )
+            },
+            "video_vae_depth_to_space",
+        )
+    }
+
+    /// `h3v_unpatchify` (`video_vae/ops.py:34-60`) at one temporal patch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn video_vae_unpatchify(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        channels: u32,
+        patch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3v_unpatchify(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    channels,
+                    patch,
+                    depth,
+                    height,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "video_vae_unpatchify",
+        )
+    }
+
+    /// `h3v_to_rgb` (`conv_video_decoder.py:497-499`): `(x + 1) / 2` clamped,
+    /// channel-major in, RGB-interleaved out.
+    pub fn video_vae_to_rgb(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        dtype: Dtype,
+        depth: u32,
+        height: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3v_to_rgb(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    dtype.code(),
+                    depth,
+                    height,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "video_vae_to_rgb",
         )
     }
 }
