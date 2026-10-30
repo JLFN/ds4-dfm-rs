@@ -147,15 +147,19 @@ one step, and not at all across axes. It does not. Measured at
 
     IMPULSE cell=(4,13) step_down=(22.41,-0.50) step_right=(23.77,-0.46) scale=32 spread=(106.2,105.2)
 
-The cross-axis steps are zero (so an axis swap *would* show), but the along-axis
-step is 0.7 of a cell, and the reason is in the same line: the impulse
-response's own spread is 106 pixels against a 32-pixel cell. This decoder's
-receptive field is essentially global - twelve 3x3x3 convolutions at the pixel
-scale, and four res groups at 1/8 and 1/4 resolution before them - so most of a
-response is a diffuse field centred on the frame and the centroid is damped
-towards it. The instrument stays in the gate as `--impulse-check`, reporting
-only; the geometry is pinned by the exact `depth_to_space` and `unpatchify`
-probes instead, which is where it belongs.
+The cross-axis steps are zero, so an axis swap would show; the along-axis step is
+0.7 of a cell. The cause is structural rather than a geometry error: this
+decoder's receptive radius is about twelve latent cells (twelve 3x3x3
+convolutions at the pixel scale), roughly 384 pixels against the 32-pixel cell,
+so a single cell's response is a diffuse field centred near the frame and the
+centroid is damped towards it. The measured spread (106 pixels) is a centroid
+statistic, not that radius, and this probe places the impulse three cells from
+the frame's edge, so boundary truncation confounds it too. The instrument stays
+in the gate as `--impulse-check`, reporting only; the geometry is pinned by the
+exact `depth_to_space` and `unpatchify` probes instead, which is where it
+belongs. If a geometric guard is wanted later, the interior form is translation
+equivalence - shift a latent cell away from the borders and the response should
+shift by exactly one cell - not a centroid.
 
 ## 4. The tiling decision, named
 

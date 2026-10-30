@@ -81,9 +81,9 @@ One pixel apart is the *small* step and four pixels apart is three times it.
 That is the unpatchify's own block structure: sixteen channels are interleaved
 into every 4x4 block (`ops.py:56-58`), so pixels inside a block share a latent
 cell and are correlated, while pixels one block apart are driven by different
-cells - which on an iid latent are independent. The step grows with distance
-towards the 1.128 sigma white-noise limit, as an independent-cell input
-requires.
+cells - through the overlapping convolutions that sit between the shuffle and the
+output, so "independent" is not exact. The step grows with distance towards the
+1.128 sigma white-noise limit, consistent with a decorrelated latent.
 
 This is a report, not a verdict, and the reason is in the numbers: a
 *transposed* sub-position order (the shuffle's `(h q)` read as `(w r)`) would
@@ -94,24 +94,29 @@ element by element.
 
 ## 4. The impulse at the release geometry
 
-`--impulse-check` at `(16, 24, 42)`, reporting only (12a recorded the reason: a
-centroid is damped by this decoder's near-global receptive field):
+`--impulse-check` at `(16, 24, 42)`, reporting only (12a section 3.1 has the
+reason: a centroid is damped by the decoder's large structural receptive radius,
+and this probe places the impulse near the frame's edge):
 
     IMPULSE cell=(12,39) step_down=(23.99,-0.20) step_right=(25.16,-0.25) scale=32 spread=(130.6,131.5)
 
-The cross-axis steps are 0.2 pixels (no axis swap), the along-axis steps are
-0.75 of the 32-pixel scale factor, and the response's own spread is 130.6
-pixels against a 32-pixel cell - on a bigger frame the spread grows with the
-frame, which is the receptive field and not a geometry error.
+The cross-axis steps are 0.2 pixels (no axis swap) and the along-axis steps are
+0.75 of the 32-pixel scale factor. The response's own spread of 130.6 pixels
+against a 32-pixel cell is a property of one cell's response, not of the
+geometry, and it grows with the frame because the impulse sits close to the right
+edge at this width. This is a report; the geometry is pinned by the exact
+movement probes.
 
 ## 5. The footprint
 
 `free` sampled every 0.5 s through the whole 12b run (`~/ds4-test/u12b-free.log`,
 287 samples): used memory rose from 3,040 MB to a peak of **23,398 MB**, and
-free fell from 46,328 MB to a minimum of 26,553 MB - about 20 GB resident, of
-which the preallocated working set is 15,029,747,712 B (14.0 GiB, section 4 of
-the 12a record), the decoder's weights are 814,338,656 B and their planar pack
-is a second copy of most of them. The rest is cuBLASLt's own workspace.
+free fell from 46,328 MB to a minimum of 26,553 MB - a ~20 GB host-wide rise.
+That is a system-wide measurement, not the decoder's own footprint: of it, the
+preallocated working set is 15,029,747,712 B (14.0 GiB, section 4 of the 12a
+record) and the decoder's weights are 814,338,656 B with a planar pack that is a
+second copy of most of them; the remainder (allocator retention, page cache,
+cuBLASLt workspace) is unattributed.
 
 That is the untiled deviation's price, on a host with 121 GB. A tiled decode
 (the release's own four tiles) or a temporal-slabbed planar path is what would

@@ -85,8 +85,8 @@ arrives with the chain's entry point (unit 13) or the encoder half.
 
 ## 4. Corrections to 12a and 12b
 
-Both advisors read the same two records and flagged the same four sentences.
-They are corrected in place; the measurements are untouched.
+Both advisors read the same two records and flagged overclaims in the same
+sentences. They are corrected in place; the measurements are untouched.
 
 1. **12a, the tiling sentence.** It said "the arithmetic inside every tile is
    identical" and put the difference only in the overlap. Wrong: the release
@@ -107,6 +107,19 @@ They are corrected in place; the measurements are untouched.
 7. **12b, the encoder-half round trip.** Softened from "a value-level proof of
    the whole pair" to a check of the pair, with the compensating-error caveat
    that is Astra's reason for preferring the entry point.
+8. **12a section 3.1 and 12b section 4, the impulse explanation.** The damped
+   centroid was explained as a near-global receptive field. The radius is
+   structural (about twelve cells, from the convolution count); the measured
+   spread is a centroid statistic, not that radius, and the probe sits three
+   cells from the frame edge, so boundary truncation confounds it. Both records
+   now say so, and name translation equivalence - shift a cell away from the
+   borders, the response should shift by exactly one cell - as the interior form
+   (agy's suggestion).
+9. **12b section 3, block independence.** Pixels one block apart are not
+   independent; the convolutions between the shuffle and the output overlap.
+10. **12b section 5, the footprint.** The host-wide `free` rise was attributed
+    to the decoder. It is a system-wide measurement; the remainder beyond the
+    working set and weights is unattributed.
 
 ## 5. Guards
 
