@@ -28,6 +28,7 @@ pub mod condition;
 pub mod device;
 pub mod dit;
 pub mod engine;
+pub mod gemma;
 pub mod host;
 pub mod layout;
 pub mod local_api;
