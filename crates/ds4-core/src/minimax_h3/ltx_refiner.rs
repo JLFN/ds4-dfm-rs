@@ -52,10 +52,10 @@
 //! preprocessing that turns the latents, a sigma and the prompt contexts into
 //! the [`Signals`] and states the 48 blocks consume
 //! (`transformer_args.py:174-410`), and [`Edges::head`], the model-level output
-//! head (`model.py:471-489`). Three of the reference's steps are host
+//! head (`model.py:472-490`). Three of the reference's steps are host
 //! arithmetic, cited to the line that defines them: the patch positions
-//! (`patchifiers.py:71-170`, `tools.py:158-172`), the RoPE tables
-//! (`rope.py:86-223`) and the AdaLN sinusoid (`timestep_embedding.py:5-51`).
+//! (`patchifiers.py:64-169`, `tools.py:139-174`), the RoPE tables
+//! (`rope.py:88-223`) and the AdaLN sinusoid (`timestep_embedding.py:6-52`).
 //!
 //! One layout note: `split_freqs_cis` reshapes the RoPE tables to
 //! `(b, heads, t, half)` because it rotates a head-major tensor
@@ -1372,10 +1372,10 @@ fn alloc(gpu: &Gpu, elements: usize) -> Result<Tensor, RefinerError> {
 
 // ---------------------------------------------------------------------------
 // The edges: the preprocessing (`transformer_args.py:174-410`) and the output
-// head (`model.py:471-489`), the 59 tensors outside the 48 blocks.
+// head (`model.py:472-490`), the 59 tensors outside the 48 blocks.
 // ---------------------------------------------------------------------------
 
-/// The release's frame rate (`tools.py:170`, the stage's own `24.0`).
+/// The release's frame rate (`tools.py:174`, the stage's own `24.0`).
 pub const FPS: f32 = 24.0;
 /// `SpatioTemporalScaleFactors.default()` (`types.py:31-33`): the VAE's
 /// `(time, height, width)` downsampling.
@@ -1440,12 +1440,12 @@ impl Geometry {
     }
 }
 
-/// `create_initial_state`'s positions (`patchifiers.py:71-170`, `tools.py:158-172`):
+/// `create_initial_state`'s positions (`patchifiers.py:64-169`, `tools.py:139-174`):
 /// every video patch's `[start, end)` bounds in seconds, `[rows, 3, 2]` over
 /// `(time, height, width)` with the token order `(f h w)`.
 ///
 /// The pixel coordinates are `latent * scale` with the causal fix on the
-/// temporal axis only, and `tools.py:170` divides that axis by the frame rate;
+/// temporal axis only, and `tools.py:174` divides that axis by the frame rate;
 /// height and width stay in pixels.
 pub fn video_positions(geometry: &Geometry) -> Vec<f32> {
     let seconds =
@@ -1468,10 +1468,10 @@ pub fn video_positions(geometry: &Geometry) -> Vec<f32> {
     positions
 }
 
-/// `AudioPatchifier.get_patch_grid_bounds` (`patchifiers.py:215-283`, causal,
+/// `AudioPatchifier.get_patch_grid_bounds` (`patchifiers.py:217-260`, causal,
 /// no shift): every audio patch's bounds in seconds, `[rows, 1, 2]`. The
 /// audio tools never scale these - the patchifier is already in seconds
-/// (`tools.py:257-278`).
+/// (`tools.py:246-278`).
 pub fn audio_positions(geometry: &Geometry) -> Vec<f32> {
     let seconds = |index: u32| {
         let mel = (index * AUDIO_DOWNSAMPLE) as f32;
@@ -1498,11 +1498,11 @@ pub fn time_axis(positions: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// `precompute_freqs_cis` with the float64 grid (`rope.py:196-223`, `:86-108`,
+/// `precompute_freqs_cis` with the float64 grid (`rope.py:198-223`, `:88-108`,
 /// the config's `frequencies_precision: "float64"`).
 ///
 /// `positions` is `[rows, axes, 2]` - the patch bounds whose midpoint RoPE is
-/// evaluated at (`rope.py:149-155`) - and the result is the
+/// evaluated at (`rope.py:146-155`) - and the result is the
 /// `[rows, heads, dim/2/heads]` BF16 `(cos, sin)` pair, the padding the
 /// reference prepends included (`split_freqs_cis:163-184`). Note the layout:
 /// the reference reshapes to `(b, t, heads, -1)` and swaps to head-major
@@ -1587,7 +1587,7 @@ pub fn rope_tables(
 }
 
 /// `get_timestep_embedding` at the AdaLN `Timesteps`'s parameters
-/// (`timestep_embedding.py:5-51`, `:131`): 256 channels, `flip_sin_to_cos`
+/// (`timestep_embedding.py:6-52`, `:133`): 256 channels, `flip_sin_to_cos`
 /// true, `downscale_freq_shift` 0, `scale` 1. The output is `[cos, sin]`,
 /// each half 128 wide.
 pub fn sinusoid(timestep: f32) -> [f32; SINUSOID_WIDTH] {
@@ -1711,7 +1711,7 @@ impl AdaLn {
     }
 }
 
-/// The model-level output head (`model.py:471-489`, `:520-536`): the table
+/// The model-level output head (`model.py:472-490`, `:520-536`): the table
 /// combined with the embedded timestep - **row 0 the shift, row 1 the scale** -
 /// the affine-free LayerNorm, the modulation and `proj_out` to 128 channels.
 struct Head {
@@ -1767,7 +1767,7 @@ fn process_output(
     let (rows, dim) = (scratch.rows, scratch.dim);
 
     // `scale_shift_table[None, None].to(dtype) + embedded_timestep[:, :, None]`
-    // (`model.py:484-485`), then `shift, scale = [..., 0], [..., 1]`.
+    // (`model.py:483-485`), then `shift, scale = [..., 0], [..., 1]`.
     gpu.ada_add(&scratch.shift, table, embedded, rows, dim, 1, 0, 0)
         .map_err(RefinerError::Run)?;
     gpu.ada_add(&scratch.scale, table, embedded, rows, dim, 1, 1, 0)
@@ -1790,7 +1790,7 @@ fn process_output(
     proj.apply(gpu, &scratch.output, &scratch.normed, rows)
 }
 
-/// `VideoLatentPatchifier.unpatchify` at patch size 1 (`patchifiers.py:40-64`):
+/// `VideoLatentPatchifier.unpatchify` at patch size 1 (`patchifiers.py:41-63`):
 /// the head's `[tokens, 128]` back to the `(1, 128, f, h, w)` latent, the same
 /// transpose the patchify direction uses.
 pub fn unpatchify_video(
@@ -2375,8 +2375,8 @@ mod tests {
 
     #[test]
     fn the_video_positions_are_the_releases() {
-        // `patchifiers.py:113-124` + `get_pixel_coords` (`:137-170`) +
-        // `tools.py:170`: frame 0's bounds are `(0*8 + 1 - 8).clamp(min=0)` to
+        // `patchifiers.py:97-121` + `get_pixel_coords` (`:137-169`) +
+        // `tools.py:174`: frame 0's bounds are `(0*8 + 1 - 8).clamp(min=0)` to
         // `(8 + 1 - 8)` in pixel frames, divided by 24 fps; the spatial axes
         // stay in pixels.
         let positions = video_positions(&Geometry::release());
@@ -2409,7 +2409,7 @@ mod tests {
 
     #[test]
     fn the_video_rope_table_is_padded_and_head_split() {
-        // `split_freqs_cis` (`rope.py:163-184`): 682 angles over 3 axes is
+        // `split_freqs_cis` (`rope.py:164-184`): 682 angles over 3 axes is
         // 2046 values, and the 2 the half-width 2048 is missing are cos 1,
         // sin 0 in head 0; a zero position puts the first angle at
         // `-grid[0] = -pi/2`.
