@@ -54,6 +54,10 @@ required-features = ["h3-gates"]
 name = "h3_gemma_gate"
 required-features = ["h3-gates"]
 
+[[example]]
+name = "h3_gemma_connector_gate"
+required-features = ["h3-gates"]
+
 [dependencies]
 ds4-sys = { path = "../ds4-sys" }
 serde_json = { version = "1", features = ["float_roundtrip"] }

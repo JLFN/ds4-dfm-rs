@@ -1246,6 +1246,88 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> c_int;
+
+    fn h3d_connector_stack_scale(
+        context: *mut Context,
+        scales: *mut CTensor,
+        stacked: *const CTensor,
+        rows: u32,
+        width: u32,
+        layers: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_scale_constant(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        factor: f32,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_connector_interleave(
+        context: *mut Context,
+        output: *mut CTensor,
+        stacked: *const CTensor,
+        scales: *const CTensor,
+        rows: u32,
+        width: u32,
+        layers: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_gather_rows(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        indices: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_register_fill(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        binary: *const CTensor,
+        registers: *const CTensor,
+        rows: u32,
+        width: u32,
+        count: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_ltx_rope(
+        context: *mut Context,
+        query: *mut CTensor,
+        key: *mut CTensor,
+        cos: *const CTensor,
+        sin: *const CTensor,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_per_head_gate(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        logits: *const CTensor,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
 }
 
 /// `h3d_dtype`.
@@ -2215,6 +2297,208 @@ impl Gpu {
                 )
             },
             "gemma attention",
+        )
+    }
+
+    /// `_rescale_norm` (`feature_extractor.py:68-69`): scale by an F32
+    /// constant, the product rounding to BF16 once.
+    pub fn scale_constant(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        factor: f32,
+    ) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_scale_constant(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    factor,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 constant scale",
+        )
+    }
+
+    /// `norm_and_concat_per_token_rms`'s rsqrt (`feature_extractor.py:48-64`):
+    /// the BF16 `[rows, layers]` scale of each `(row, layer)` of the
+    /// `[layers, rows, width]` stack.
+    pub fn connector_stack_scale(
+        &self,
+        scales: &Tensor,
+        stacked: &Tensor,
+        rows: u32,
+        width: u32,
+        layers: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_connector_stack_scale(
+                    self.raw.as_ptr(),
+                    scales.raw(),
+                    stacked.raw(),
+                    rows,
+                    width,
+                    layers,
+                    error,
+                    size,
+                )
+            },
+            "connector stack scale",
+        )
+    }
+
+    /// The extractor's `reshape(B, T, D * L)` (`:62`): the layered stack
+    /// written interleaved, each value scaled by its layer's scale.
+    pub fn connector_interleave(
+        &self,
+        output: &Tensor,
+        stacked: &Tensor,
+        scales: &Tensor,
+        rows: u32,
+        width: u32,
+        layers: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_connector_interleave(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    stacked.raw(),
+                    scales.raw(),
+                    rows,
+                    width,
+                    layers,
+                    error,
+                    size,
+                )
+            },
+            "connector interleave",
+        )
+    }
+
+    /// `_apply_right_pad_order` (`embeddings_processor.py:40-42`): gather the
+    /// rows by a host-computed permutation.
+    pub fn gather_rows(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        indices: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_gather_rows(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    indices.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "row gather",
+        )
+    }
+
+    /// `_replace_padded_with_learnable_registers`
+    /// (`embeddings_connector.py:139-151`): keep the row where `binary` is set,
+    /// else take the tiled register row.
+    pub fn register_fill(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        binary: &Tensor,
+        registers: &Tensor,
+        rows: u32,
+        width: u32,
+        count: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_register_fill(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    binary.raw(),
+                    registers.raw(),
+                    rows,
+                    width,
+                    count,
+                    error,
+                    size,
+                )
+            },
+            "register fill",
+        )
+    }
+
+    /// `apply_split_rotary_emb` (`rope.py:42-85`) in place, `cos`/`sin` the
+    /// BF16 `[rows, heads, head_dim / 2]` tables.
+    pub fn ltx_rope(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_ltx_rope(
+                    self.raw.as_ptr(),
+                    query.raw(),
+                    key.raw(),
+                    cos.raw(),
+                    sin.raw(),
+                    rows,
+                    heads,
+                    head_dim,
+                    error,
+                    size,
+                )
+            },
+            "LTX RoPE",
+        )
+    }
+
+    /// `PytorchGatedAttention` (`ops.py:94-106`): `input * 2 *
+    /// sigmoid(logits)`, one gate per head.
+    pub fn per_head_gate(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        logits: &Tensor,
+        rows: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_per_head_gate(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    logits.raw(),
+                    rows,
+                    heads,
+                    head_dim,
+                    error,
+                    size,
+                )
+            },
+            "per-head gate",
         )
     }
 

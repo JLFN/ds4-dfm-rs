@@ -29,6 +29,7 @@ pub mod device;
 pub mod dit;
 pub mod engine;
 pub mod gemma;
+pub mod gemma_connector;
 pub mod gemma_token;
 pub mod host;
 pub mod layout;

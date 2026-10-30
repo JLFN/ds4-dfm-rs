@@ -385,6 +385,79 @@ int h3d_gemma_attention(h3d_context *context, h3d_tensor *output,
                         uint32_t head_dim, float scale, char *error,
                         size_t error_size);
 
+/* ---- the LTX AV connector and its feature extractor ----
+ *
+ * Gemma-4-12B hidden states reach the refiner through LTX's own 1D connector
+ * (`ltx-core/src/ltx_core/text_encoders/gemma/{feature_extractor,
+ * embeddings_connector,embeddings_processor}.py`, read at
+ * `/data/ltx2-pin/packages`). Its norms, linears, SDPA, GELU and residual adds
+ * are the generic entries above; the six below are the rest, and the refiner
+ * built on the same primitives reuses them. The RoPE tables are built on the
+ * host (`minimax_h3::gemma_connector`), because the reference's own grid is
+ * float64 numpy (`rope.py:113-131`). */
+
+/* `_rescale_norm` (`feature_extractor.py:68-69`): `x * sqrt(target / source)`,
+ * the multiplier an F32 Python float, so the product rounds to BF16 once and
+ * the scalar is not BF16-rounded first. */
+int h3d_scale_constant(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *input, float factor,
+                       size_t elements, char *error, size_t error_size);
+
+/* `norm_and_concat_per_token_rms` (`feature_extractor.py:48-64`) up to its
+ * rsqrt: `variance = mean(encoded ** 2, dim=2)` over `[layers, rows, width]`,
+ * then `rsqrt(variance + 1e-6)`. `scales` is the BF16 `[rows, layers]` result.
+ * The reference squares in BF16 before accumulating and rounds each of the
+ * mean, the epsilon add and the rsqrt; this port's 256-partial tree is the one
+ * deviation. */
+int h3d_connector_stack_scale(h3d_context *context, h3d_tensor *scales,
+                              const h3d_tensor *stacked, uint32_t rows,
+                              uint32_t width, uint32_t layers, char *error,
+                              size_t error_size);
+
+/* `normed.reshape(B, T, D * L)` (`:62`): the `[layers, rows, width]` stack
+ * written `[rows, width * layers]` in `d * layers + l` order, each value
+ * multiplied by its layer's scale. `output` and `stacked` are the same
+ * element count; `scales` is `h3d_connector_stack_scale`'s. */
+int h3d_connector_interleave(h3d_context *context, h3d_tensor *output,
+                             const h3d_tensor *stacked,
+                             const h3d_tensor *scales, uint32_t rows,
+                             uint32_t width, uint32_t layers, char *error,
+                             size_t error_size);
+
+/* `_apply_right_pad_order` (`embeddings_processor.py:40-42`): gather the
+ * `[rows, width]` rows by `indices` (U32 `[rows]`, a permutation). */
+int h3d_gather_rows(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *input, const h3d_tensor *indices,
+                    uint32_t rows, uint32_t width, char *error,
+                    size_t error_size);
+
+/* `_replace_padded_with_learnable_registers`
+ * (`embeddings_connector.py:139-151`): keep `input`'s row where `binary`
+ * (U32 `[rows]`) is set, else take `registers`' row `r % count`. The additive
+ * mask the reference then passes the blocks is all zeros, so the connector's
+ * attention takes no mask. */
+int h3d_register_fill(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *input, const h3d_tensor *binary,
+                      const h3d_tensor *registers, uint32_t rows,
+                      uint32_t width, uint32_t count, char *error,
+                      size_t error_size);
+
+/* `apply_split_rotary_emb` (`rope.py:42-85`) in place on head-major Q and K,
+ * with `cos`/`sin` the BF16 `[rows, heads, head_dim / 2]` tables
+ * (`split_freqs_cis` `:163-184`). */
+int h3d_ltx_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
+                 const h3d_tensor *cos, const h3d_tensor *sin, uint32_t rows,
+                 uint32_t heads, uint32_t head_dim, char *error,
+                 size_t error_size);
+
+/* `PytorchGatedAttention` (`ops.py:94-106`): `output = input * 2 *
+ * sigmoid(logits)`, `logits` BF16 `[rows, heads]` broadcast over each head's
+ * `head_dim`. */
+int h3d_per_head_gate(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *input, const h3d_tensor *logits,
+                      uint32_t rows, uint32_t heads, uint32_t head_dim,
+                      char *error, size_t error_size);
+
 /* The video VAE decoder's F32 linear: `h3d_linear` at `H3D_F32` with the
  * decoder's own options applied (`h3d_set_vae_option`). Separate from
  * `h3d_linear` on purpose, because the options must not reach the video VAE
@@ -493,7 +566,9 @@ int h3d_qkv_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
 
 /* `h3_gpu_sdpa_bf16` (`:1667-1672`) taking the CUDA tiled dispatch
  * (`:1620-1631`) with `h3_attention_tiled_bf16_kernel` (`:1418-1487`):
- * one block per (head, 8 rows), head-major input, row-major output. */
+ * one block per (head, 8 rows), head-major input, row-major output. `head_dim`
+ * is 128 (the video VAE's width) or 64 (the AV connector's audio half); the
+ * tiled kernel is templated on it. */
 int h3d_sdpa(h3d_context *context, h3d_tensor *output,
              const h3d_tensor *query, const h3d_tensor *key,
              const h3d_tensor *value, uint32_t sequence, uint32_t heads,
