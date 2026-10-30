@@ -32,8 +32,8 @@
 use ds4_sys::h3_dit::{Dtype, Gpu, SolPlanBuffers, Tensor};
 
 use super::ltx_refiner::{
-    patchify_video, unpatchify_video, EdgeScratch, Edges, Geometry, Refiner, RefinerError,
-    RefinerScratch, Request, Sol, CHANNELS, CONTEXT_ROWS, HEADS, TAU_SCHEDULE,
+    patchify_video, unpatchify_video, Diagnostic, EdgeScratch, Edges, Geometry, Refiner,
+    RefinerError, RefinerScratch, Request, Sol, CHANNELS, CONTEXT_ROWS, HEADS, TAU_SCHEDULE,
 };
 
 /// `STAGE2_SIGMAS` (`runtime/stage2_ops/models.py:19`). `euler_denoising_loop`
@@ -223,6 +223,12 @@ impl Stage2 {
     /// The routing plan, for a caller that reads the mask back.
     pub fn sol_plan(&self) -> Option<&SolPlanBuffers> {
         self.sol.as_ref()
+    }
+
+    /// Turn on a diagnostic for every later step, so one run can price the
+    /// video self-attention's term against an otherwise identical run.
+    pub fn set_diagnostic(&mut self, diagnostic: Diagnostic) {
+        self.refiner.set_diagnostic(diagnostic);
     }
 
     pub fn geometry(&self) -> Geometry {

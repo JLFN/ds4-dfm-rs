@@ -39,9 +39,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_refiner::{
-    patchify_video, unpatchify_video, Cross, EdgeScratch, Edges, Geometry, Refiner, RefinerScratch,
-    Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM,
-    AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, SOL_LAYERS, TAU_SCHEDULE,
+    patchify_video, unpatchify_video, Cross, Diagnostic, EdgeScratch, Edges, Geometry, Refiner,
+    RefinerScratch, Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM,
+    AUDIO_HEAD_DIM, AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, SOL_LAYERS, TAU_SCHEDULE,
     VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
 use ds4_core::minimax_h3::ltx_stage2::{Generator, Stage2, NOISE_SCALE, SIGMAS, STEPS};
@@ -225,6 +225,13 @@ fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
             "STAGE-SOL-POLICY tau={TAU_SCHEDULE:?} dense_layers=[0] sol_layers=[1..{}]",
             LAYERS
         );
+    }
+
+    // The diagnostic is this run's own, not the release's: dropping the video
+    // self-attention's term is what prices that term against the state.
+    if options.diagnostic != Diagnostic::Off {
+        stage.set_diagnostic(options.diagnostic);
+        println!("STAGE-DIAGNOSTIC {:?}", options.diagnostic);
     }
 
     let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
@@ -1319,9 +1326,11 @@ fn report_state(
         .map_err(|detail| format!("read {name}: {detail}"))?;
     let hash = fnv1a(&payload);
     let (high, low) = extremes(&values);
+    let rms = mean_square(&values);
 
     println!(
-        "STAGE {name} values={} fnv={hash:016x} high={high:.6} low={low:.6} run={seconds:.3}",
+        "STAGE {name} values={} fnv={hash:016x} high={high:.6} low={low:.6} rms={rms:.6} \
+         run={seconds:.3}",
         values.len()
     );
 
@@ -2070,6 +2079,22 @@ fn extremes(values: &[f32]) -> (f32, f32) {
     (high, low)
 }
 
+/// The root mean square of a state, the denominator a BF16 state's own
+/// resolution is measured against: one ulp is `2^-8` of the binade's power of
+/// two, so a relative step below ~4e-3 cannot move a BF16 value at all.
+fn mean_square(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+
+    let sum: f64 = values
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum();
+
+    (sum / values.len() as f64).sqrt() as f32
+}
+
 /// A BF16 value widened to f32, so both sides of a comparison see the same
 /// input.
 fn bf16(value: f32) -> f32 {
@@ -2206,8 +2231,8 @@ fn usage(detail: &str) -> String {
          \x20                            [--residual DIR] [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --stage --transformer PATH [--layers K] [--seed S]\n\
          \x20                            [--latent FILE] [--context FILE] [--sol]\n\
-         \x20                            [--dump DIR] [--residual DIR]\n\
-         \x20                            [--expect NAME=HEX ...]\n       \
+         \x20                            [--no-self-attention] [--dump DIR]\n\
+         \x20                            [--residual DIR] [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --compare LEFT RIGHT"
     )
 }
@@ -2218,6 +2243,7 @@ struct Options {
     edges: bool,
     stage: bool,
     sol: bool,
+    diagnostic: Diagnostic,
     latent: Option<PathBuf>,
     prompt: Option<PathBuf>,
     layers: Option<usize>,
@@ -2241,6 +2267,7 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut edges = false;
     let mut stage = false;
     let mut sol = false;
+    let mut no_self_attention = false;
     let mut latent = None;
     let mut prompt = None;
     let mut layers = None;
@@ -2267,6 +2294,7 @@ fn split(args: &[String]) -> Result<Options, String> {
             "--edges" => edges = true,
             "--stage" => stage = true,
             "--sol" => sol = true,
+            "--no-self-attention" => no_self_attention = true,
             "--signals" => signals = true,
             "--latent" => latent = Some(PathBuf::from(take(args, &mut index)?)),
             "--context" => prompt = Some(PathBuf::from(take(args, &mut index)?)),
@@ -2323,6 +2351,11 @@ fn split(args: &[String]) -> Result<Options, String> {
         edges,
         stage,
         sol,
+        diagnostic: if no_self_attention {
+            Diagnostic::NoSelfAttention
+        } else {
+            Diagnostic::Off
+        },
         latent,
         prompt,
         layers,

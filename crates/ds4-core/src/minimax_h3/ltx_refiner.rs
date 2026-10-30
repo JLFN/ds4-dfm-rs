@@ -173,6 +173,21 @@ impl<'a> Sol<'a> {
     }
 }
 
+/// A switch a run may turn on, with no counterpart in the release. It exists
+/// so the gate can price the video self-attention's own term: with the term
+/// dropped, `x + y * gate` (`ops.py:74-82`) lands on `x`, and a second run
+/// with identical inputs and seed isolates what the term contributes to the
+/// state against that state's own BF16 resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Diagnostic {
+    /// The released graph, unmodified.
+    Off,
+    /// Every block's video self-attention output is left out of the residual
+    /// (`transformer.py:278-285`), so `post_normed` is the norm of `state`
+    /// alone.
+    NoSelfAttention,
+}
+
 /// The AV pair's table rows: `slice(0, 2)` for A2V and `slice(2, 4)` for V2A
 /// (`transformer.py:341`, `:369`).
 const A2V_ROWS: u32 = 0;
@@ -325,6 +340,7 @@ pub struct Refiner {
     blocks: Vec<Block>,
     tensors: usize,
     bytes: u64,
+    diagnostic: Diagnostic,
 }
 
 impl Refiner {
@@ -360,6 +376,7 @@ impl Refiner {
             blocks,
             tensors: reader.tensors,
             bytes: reader.bytes,
+            diagnostic: Diagnostic::Off,
         })
     }
 
@@ -371,6 +388,11 @@ impl Refiner {
     /// The blocks held.
     pub fn blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// The diagnostic every later [`Refiner::apply`] runs with.
+    pub fn set_diagnostic(&mut self, diagnostic: Diagnostic) {
+        self.diagnostic = diagnostic;
     }
 
     /// `LTXModel._process_transformer_blocks` (`model.py:434-470`) over the
@@ -407,7 +429,15 @@ impl Refiner {
                 }
             }
 
-            block.apply(gpu, video, video_signals, audio, scratch, block_sol)?;
+            block.apply(
+                gpu,
+                video,
+                video_signals,
+                audio,
+                scratch,
+                block_sol,
+                self.diagnostic,
+            )?;
         }
 
         Ok((routed, dense))
@@ -437,7 +467,15 @@ impl Refiner {
             _ => (0, 0),
         };
 
-        block.apply(gpu, video, video_signals, audio, scratch, block_sol)?;
+        block.apply(
+            gpu,
+            video,
+            video_signals,
+            audio,
+            scratch,
+            block_sol,
+            self.diagnostic,
+        )?;
 
         Ok(calls)
     }
@@ -605,6 +643,7 @@ impl Block {
         audio: Option<(&Tensor, &Signals<'_>)>,
         s: &RefinerScratch,
         sol: Option<&Sol<'_>>,
+        diagnostic: Diagnostic,
     ) -> Result<(), RefinerError> {
         // 1-2. Video self-attention, then the text cross-attention
         // (`transformer.py:270-298`). Only the self-attention's video rows
@@ -620,6 +659,7 @@ impl Block {
             v,
             &s.video,
             sol,
+            diagnostic,
         )?;
 
         // 3. Audio self-attention and text cross-attention (`:300-326`).
@@ -634,6 +674,7 @@ impl Block {
                 a,
                 &s.audio,
                 None,
+                Diagnostic::Off,
             )?;
         }
 
@@ -747,6 +788,7 @@ fn self_and_text(
     signals: &Signals<'_>,
     m: &ModalityScratch,
     sol: Option<&Sol<'_>>,
+    diagnostic: Diagnostic,
 ) -> Result<(), RefinerError> {
     let (rows, dim) = (signals.rows, signals.dim);
 
@@ -792,10 +834,19 @@ fn self_and_text(
         sol,
     )?;
 
-    gpu.mul(&m.gated, &m.attention, &m.gate)
-        .map_err(RefinerError::Run)?;
-    gpu.add(&m.residual, state, &m.gated)
-        .map_err(RefinerError::Run)?;
+    // `x + y * gate` (`ops.py:74-82`): the short-circuit path is the
+    // diagnostic's, and it leaves `post_normed` the norm of `state` alone.
+    match diagnostic {
+        Diagnostic::Off => {
+            gpu.mul(&m.gated, &m.attention, &m.gate)
+                .map_err(RefinerError::Run)?;
+            gpu.add(&m.residual, state, &m.gated)
+                .map_err(RefinerError::Run)?;
+        }
+        Diagnostic::NoSelfAttention => gpu
+            .copy(&m.residual, 0, state, 0, (rows * dim) as usize)
+            .map_err(RefinerError::Run)?,
+    }
     gpu.rms_norm(&m.post_normed, &m.residual, None, rows, dim, RMS_EPSILON)
         .map_err(RefinerError::Run)?;
 
