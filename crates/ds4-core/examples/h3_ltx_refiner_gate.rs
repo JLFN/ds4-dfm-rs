@@ -41,8 +41,8 @@ use std::time::Instant;
 use ds4_core::minimax_h3::ltx_refiner::{
     patchify_video, unpatchify_video, Cross, EdgeScratch, Edges, Geometry, Refiner, RefinerScratch,
     Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM,
-    AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, TAU_SCHEDULE, VIDEO_CONTEXT_DIM,
-    VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
+    AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, SOL_LAYERS, TAU_SCHEDULE,
+    VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
 use ds4_core::minimax_h3::ltx_stage2::{Generator, Stage2, NOISE_SCALE, SIGMAS, STEPS};
 use ds4_core::minimax_h3::safetensors::{self, Entry, Shard, ShardWriter};
@@ -298,22 +298,32 @@ fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
 
     for index in 0..STEPS {
         let step_started = Instant::now();
-        stage
+        let calls = stage
             .step(gpu, index, &context)
             .map_err(|error| error.token())?;
         steps[index] = step_started.elapsed().as_secs_f64();
 
-        // The plan is rewritten once per layer, so this is the last routing
-        // layer's mask at this step's tau: the one number that says whether a
-        // tau is mis-scaled without a golden.
+        // The release's own accounting for its 48-layer stage 2: one dense
+        // video self-attention per step and 47 that route
+        // (`refiner_encoder_ablation_single_gpu.py:771-780`). The plan is
+        // rewritten once per layer, so the share below is the last routing
+        // layer's mask at this step's tau - the number a mis-scaled tau moves
+        // without a golden.
         if let Some(plan) = stage.sol_plan() {
             let share = gpu
                 .sol_exact_share(plan, rows, HEADS as u32)
                 .map_err(|detail| format!("sol share: {detail}"))?;
+            let (routed, dense) = calls;
             println!(
-                "STAGE-SOL step={index} tau={} exact_share={share:.4}",
+                "STAGE-SOL step={index} tau={} exact_share={share:.4} sol_calls={routed} \
+                 dense_calls={dense}",
                 TAU_SCHEDULE[index]
             );
+
+            if layers.len() == SOL_LAYERS && (routed, dense) != (47, 1) {
+                println!("STAGE-SOL step={index} expected sol_calls=47 dense_calls=1");
+                failed = true;
+            }
         }
 
         failed |= report_state(
@@ -399,7 +409,7 @@ fn run_blocks(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Str
 
     for block in 0..refiner.blocks() {
         let started = Instant::now();
-        refiner
+        let _ = refiner
             .apply_one(block, gpu, &video, &v, Some((&audio, &a)), &scratch, None)
             .map_err(|error| error.token())?;
         let seconds = started.elapsed().as_secs_f64();
@@ -474,7 +484,7 @@ fn identity(gpu: &Gpu, path: &Path, target: &Path, options: &Options) -> Result<
         &mut lcg,
     )?;
 
-    refiner
+    let _ = refiner
         .apply(gpu, &video, &v, Some((&audio, &a)), &scratch, None)
         .map_err(|error| error.token())?;
 
@@ -681,7 +691,7 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
 
     for block in 0..refiner.blocks() {
         let started = Instant::now();
-        refiner
+        let _ = refiner
             .apply_one(
                 block,
                 gpu,

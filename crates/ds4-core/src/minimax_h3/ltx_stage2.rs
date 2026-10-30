@@ -293,7 +293,12 @@ impl Stage2 {
     /// One interval of `euler_denoising_loop` (`samplers.py:74-79`):
     /// `SimpleDenoiser` -> `X0Model`'s `to_denoised` -> `post_process_latent` ->
     /// `EulerDiffusionStep.step`.
-    pub fn step(&self, gpu: &Gpu, index: usize, context: &Tensor) -> Result<(), RefinerError> {
+    pub fn step(
+        &self,
+        gpu: &Gpu,
+        index: usize,
+        context: &Tensor,
+    ) -> Result<(u32, u32), RefinerError> {
         let sigma = SIGMAS[index];
         let next = SIGMAS[index + 1];
         let (rows, width) = (self.scratch.rows, self.scratch.width);
@@ -320,7 +325,10 @@ impl Stage2 {
             .as_ref()
             .map(|plan| Sol::new(plan, TAU_SCHEDULE[index]));
 
-        self.refiner.apply(
+        // The release's per-step attention accounting: `(sol_calls,
+        // dense_calls)` is `(47, 1)` for its 48-layer stage 2
+        // (`refiner_encoder_ablation_single_gpu.py:771-780`).
+        let calls = self.refiner.apply(
             gpu,
             &prepared.video,
             &prepared.video_signals,
@@ -328,6 +336,7 @@ impl Stage2 {
             &self.blocks,
             sol.as_ref(),
         )?;
+
         self.edges.head(gpu, &prepared, &self.edges_scratch)?;
 
         gpu.timesteps(&self.scratch.timesteps, &self.scratch.mask, rows, sigma)
@@ -369,7 +378,9 @@ impl Stage2 {
             &self.scratch.velocity,
             next - sigma,
         )
-        .map_err(RefinerError::Run)
+        .map_err(RefinerError::Run)?;
+
+        Ok(calls)
     }
 
     /// `euler_denoising_loop` (`samplers.py:39-80`) over `SIGMAS[:-1]`.

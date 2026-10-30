@@ -387,19 +387,35 @@ impl Refiner {
         audio: Option<(&Tensor, &Signals<'_>)>,
         scratch: &RefinerScratch,
         sol: Option<&Sol<'_>>,
-    ) -> Result<(), RefinerError> {
+    ) -> Result<(u32, u32), RefinerError> {
+        // The release's own attention accounting: `dense_calls` counts the
+        // video self-attentions the policy left dense - layer 0, one per step -
+        // and `sol_calls` the rest (`refiner_encoder_ablation_single_gpu.py:
+        // 771-780` expects 47 and 1 for its 48-layer stage 2).
+        let (mut routed, mut dense) = (0u32, 0u32);
+
         for block in &self.blocks {
             // Layer 0 does not route (`sol_attention.py:4-5`); the policy
             // reaches a block only from layer 1 up.
-            let routed = sol.filter(|policy| block.layer >= policy.first_layer);
+            let block_sol = sol.filter(|policy| block.layer >= policy.first_layer);
 
-            block.apply(gpu, video, video_signals, audio, scratch, routed)?;
+            if sol.is_some() {
+                if block_sol.is_some() {
+                    routed += 1;
+                } else {
+                    dense += 1;
+                }
+            }
+
+            block.apply(gpu, video, video_signals, audio, scratch, block_sol)?;
         }
 
-        Ok(())
+        Ok((routed, dense))
     }
 
-    /// One block, by index into the loaded set.
+    /// One block, by index into the loaded set. Returns the block's own
+    /// `(routed, dense)` pair, which is `(1, 0)` for a routing layer, `(0, 1)`
+    /// for a dense one the policy covers, and `(0, 0)` when no policy is set.
     pub fn apply_one(
         &self,
         index: usize,
@@ -409,14 +425,21 @@ impl Refiner {
         audio: Option<(&Tensor, &Signals<'_>)>,
         scratch: &RefinerScratch,
         sol: Option<&Sol<'_>>,
-    ) -> Result<(), RefinerError> {
+    ) -> Result<(u32, u32), RefinerError> {
         let block = self
             .blocks
             .get(index)
             .ok_or_else(|| RefinerError::Run(format!("no block {index} is loaded")))?;
-        let routed = sol.filter(|policy| block.layer >= policy.first_layer);
+        let block_sol = sol.filter(|policy| block.layer >= policy.first_layer);
+        let calls = match (sol.is_some(), block_sol.is_some()) {
+            (true, true) => (1, 0),
+            (true, false) => (0, 1),
+            _ => (0, 0),
+        };
 
-        block.apply(gpu, video, video_signals, audio, scratch, routed)
+        block.apply(gpu, video, video_signals, audio, scratch, block_sol)?;
+
+        Ok(calls)
     }
 }
 
