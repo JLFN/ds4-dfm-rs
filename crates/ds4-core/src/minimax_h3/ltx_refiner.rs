@@ -62,11 +62,11 @@ use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
 use crate::minimax_h3::gemma::bf16_round;
 use crate::minimax_h3::safetensors::{self, Dtype, Shard};
 
-/// `num_layers` (`model_configurator.py:222-225`).
+/// `num_layers` (`model.py:56`, `model_configurator.py:52`).
 pub const LAYERS: usize = 48;
-/// `num_attention_heads` (`model.py:53`), every attention module.
+/// `num_attention_heads` (`model.py:52`), every attention module.
 pub const HEADS: usize = 32;
-/// `attention_head_dim` (`model.py:54`).
+/// `attention_head_dim` (`model.py:53`).
 pub const VIDEO_HEAD_DIM: usize = 128;
 /// `audio_attention_head_dim` (`model.py:65`): the audio and both AV modules.
 pub const AUDIO_HEAD_DIM: usize = 64;
@@ -82,9 +82,9 @@ pub const CHANNELS: usize = 128;
 pub const VIDEO_CONTEXT_DIM: usize = 4096;
 /// `audio_cross_attention_dim` (`model.py:68`), the audio text context's.
 pub const AUDIO_CONTEXT_DIM: usize = 2048;
-/// `adaln_embedding_coefficient(True)` (`adaln.py:11-22`): 6 base + 3 cross.
+/// `adaln_embedding_coefficient(True)` (`adaln.py:9-16`): 6 base + 3 cross.
 pub const COEFFICIENT: usize = 9;
-/// `_init_audio_video(num_scale_shift_values=4)` (`model.py:132`): the A2V/V2A
+/// `_init_audio_video(num_scale_shift_values=4)` (`model.py:133`): the A2V/V2A
 /// scale/shift row pairs, with the gate on the table's fifth row.
 pub const CROSS_COEFFICIENT: usize = 4;
 /// `embedding_coefficient=1` for the two AV gate AdaLN singles.
@@ -146,7 +146,7 @@ impl fmt::Display for RefinerError {
 impl std::error::Error for RefinerError {}
 
 /// Whether a `torch.nn.Linear` in this checkpoint carries a bias. The video
-/// feed-forward is bias-free while the audio one is not (`model.py:76-81`:
+/// feed-forward is bias-free while the audio one is not (`model.py:78-79`:
 /// `ff_bias false` with `audio_ff_bias` absent, so it keeps its `True`
 /// default).
 #[derive(Clone, Copy)]
@@ -1361,7 +1361,7 @@ mod tests {
 
     #[test]
     fn the_geometry_is_the_configs_own() {
-        // `model_configurator.py:222-225` against the shard's own header: 48
+        // `model.py:56` and `model_configurator.py:52` against the shard's own header: 48
         // blocks at 4096 and 2048 inner width.
         assert_eq!(HEADS * VIDEO_HEAD_DIM, VIDEO_DIM);
         assert_eq!(HEADS * AUDIO_HEAD_DIM, AUDIO_DIM);
