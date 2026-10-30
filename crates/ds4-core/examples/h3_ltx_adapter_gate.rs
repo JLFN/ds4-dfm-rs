@@ -30,8 +30,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_adapter::{
-    geometry, temporal_plan, Adapter, Arm, Geometry, TemporalPlan, Upscaler,
-    H3_LATENT_CHANNELS, TEMPORAL_PACK_SLOTS,
+    geometry, temporal_plan, Adapter, Arm, Geometry, TemporalPlan, Upscaler, H3_LATENT_CHANNELS,
+    REFINER_FRAMES, TEMPORAL_PACK_SLOTS,
 };
 use ds4_core::minimax_h3::safetensors;
 use ds4_sys::h3_dit::{Dtype, Gpu};
@@ -50,6 +50,9 @@ struct Options {
     adapter: PathBuf,
     arm: Arm,
     relative: f64,
+    /// Where the port's own refiner-shaped latent goes when it is asked for:
+    /// the `--latent` file `h3_ltx_refiner_gate --stage` reads.
+    refiner_latent: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -190,6 +193,13 @@ fn run(arguments: &[String]) -> Result<ExitCode, String> {
     }
     println!("SECONDS adapter_load={load_seconds:.3} adapter_convert={convert_seconds:.3}");
 
+    // The port's own latent for the refiner, in the shape and dtype the refiner
+    // gate's `--latent` reads. The reference's vector above is a comparison;
+    // this is the file a stage-2 evaluation is driven with.
+    if let Some(path) = &options.refiner_latent {
+        write_refiner_latent(&gpu, &latent, &geometry, path)?;
+    }
+
     if failures != 0 {
         println!("GATE FAIL stages={failures}");
         return Ok(ExitCode::from(3));
@@ -208,6 +218,7 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
         adapter: PathBuf::from(&arguments[2]),
         arm: Arm::from_env(),
         relative: 0.0,
+        refiner_latent: None,
     };
     let mut index = 3;
     while index < arguments.len() {
@@ -226,6 +237,11 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
                 let value = arguments.get(index).ok_or_else(usage)?;
                 options.relative = value.parse().map_err(|_| format!("bad {value}"))?;
             }
+            "--dump-latent" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(usage)?;
+                options.refiner_latent = Some(PathBuf::from(value));
+            }
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
         index += 1;
@@ -235,7 +251,7 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
 
 fn usage() -> String {
     "usage: h3_ltx_adapter_gate <golden-dir> <upscaler.safetensors> <adapter-dir> \
-     [--arm f32|bf16] [--relative N]"
+     [--arm f32|bf16] [--relative N] [--dump-latent FILE]"
         .to_string()
 }
 
@@ -317,6 +333,44 @@ fn upload(gpu: &Gpu, arm: Arm, values: &[f32]) -> Result<ds4_sys::h3_dit::Tensor
     let tensor = gpu.alloc(arm_dtype(arm), values.len())?;
     gpu.upload(&tensor, &bytes)?;
     Ok(tensor)
+}
+
+/// The port's own `refiner_input` (`runtime/stage2.py:76`, `latent[:, :, :16]`),
+/// written as the raw BF16 file `h3_ltx_refiner_gate --latent` reads: one run
+/// of 16 frames per channel, `[channels, rows]`, which is the `(1, 128, 16,
+/// 24, 42)` grid `patchify_video` takes its rows from.
+fn write_refiner_latent(
+    gpu: &Gpu,
+    latent: &ds4_sys::h3_dit::Tensor,
+    geometry: &Geometry,
+    path: &Path,
+) -> Result<(), String> {
+    if latent.dtype() != Dtype::Bf16 {
+        return Err("--dump-latent is the bf16 arm's file; the f32 arm is not a latent".into());
+    }
+
+    let [channels, frames, height, width] = geometry.ltx;
+    let plane = height * width;
+
+    // The crop is per channel, not a prefix: `[:, :, :16]` keeps the first 16
+    // of the 17 frames inside each channel's own run.
+    let (stride, keep) = (frames * plane * 2, REFINER_FRAMES * plane * 2);
+    let mut payload = vec![0u8; latent.bytes()];
+    gpu.read(latent, &mut payload)?;
+
+    let mut cropped = Vec::with_capacity(channels * keep);
+    for channel in 0..channels {
+        cropped.extend_from_slice(&payload[channel * stride..channel * stride + keep]);
+    }
+    std::fs::write(path, &cropped).map_err(|error| format!("{}: {error}", path.display()))?;
+
+    println!(
+        "REFINER-LATENT path={} channels={channels} frames={REFINER_FRAMES} plane={plane} \
+         bytes={}",
+        path.display(),
+        cropped.len()
+    );
+    Ok(())
 }
 
 fn download(gpu: &Gpu, tensor: &ds4_sys::h3_dit::Tensor) -> Result<Vec<f32>, String> {
