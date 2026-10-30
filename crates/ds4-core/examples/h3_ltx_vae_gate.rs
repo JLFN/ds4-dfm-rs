@@ -228,6 +228,18 @@ fn decode_vae(
     }
     println!("RANGE outside={outside}");
 
+    // The frame's own spatial structure, in pixels. The last step of the
+    // decode interleaves sixteen channels into every 4x4 block
+    // (`ops.py:56-58`) and the latent's cells are independent, so pixels inside
+    // one block are correlated through their shared latent cell and pixels one
+    // block apart are not: the one-pixel step is the small one. A decode whose
+    // sub-positions went somewhere else loses that. What this cannot see is a
+    // *transposed* sub-position order on an isotropic latent (the block
+    // structure would move to the other axis), so it is a report and not a
+    // verdict; the ordering itself is pinned by the exact `unpatchify` probe.
+    let [d1, d4, d16] = steps(&values, pixel);
+    println!("PIXEL step_1={d1:.4e} step_4={d4:.4e} step_16={d16:.4e}");
+
     let mut failed = outside != 0;
 
     if let Some(expect) = options.expect {
@@ -357,6 +369,41 @@ fn impulse_centroid(
     let spread_y = (square_y / mass - centroid_y * centroid_y).max(0.0).sqrt();
 
     Ok((centroid_x, centroid_y, spread_x.max(spread_y)))
+}
+
+/// The first frame's mean absolute difference between pixels one, four and
+/// sixteen apart along the width, over the frame's own standard deviation.
+fn steps(values: &[f32], pixel: [u32; 3]) -> [f64; 3] {
+    let (height, width) = (pixel[1] as usize, pixel[2] as usize);
+    let plane = height * width;
+
+    let mut total = 0.0f64;
+    let mut square = 0.0f64;
+    for value in values[..plane * 3].iter() {
+        total += *value as f64;
+        square += (*value as f64).powi(2);
+    }
+    let mean = total / (plane * 3) as f64;
+    let deviation = (square / (plane * 3) as f64 - mean * mean).max(0.0).sqrt();
+
+    let mut differences = [0.0f64; 3];
+    let mut counts = [0usize; 3];
+    for y in 0..height {
+        for x in 0..width {
+            for (index, step) in [1usize, 4, 16].iter().enumerate() {
+                if x + step >= width {
+                    continue;
+                }
+                for channel in 0..3 {
+                    let at = (y * width + x) * 3 + channel;
+                    differences[index] += (values[at] as f64 - values[at + step * 3] as f64).abs();
+                    counts[index] += 1;
+                }
+            }
+        }
+    }
+
+    [0, 1, 2].map(|index| differences[index] / counts[index].max(1) as f64 / deviation.max(1e-9))
 }
 
 /// Every new device op against a host transcription of the reference's own
