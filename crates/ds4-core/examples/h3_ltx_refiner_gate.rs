@@ -198,14 +198,14 @@ fn widen_bf16(payload: &[u8]) -> Vec<f32> {
 /// the release's three intervals, and the final latent, with a hash per step
 /// for the golden diff.
 ///
-/// The two inputs are the route's own and are not this gate's to produce. The
-/// initial latent is the H3 latent through the adapter and the latent
-/// upsampler (`runtime/stage2_ops/h3_upscale.py`), which is not ported, so it
-/// is synthetic unless `--latent` names a dumped one; the prompt context is the
-/// Gemma4 tower plus the LTX connector's output, so it is synthetic unless
-/// `--context` names the connector gate's dump. A synthetic pair still
-/// exercises every kernel on the release's shapes and prices the step; it says
-/// nothing about the video.
+/// The two inputs are produced by other gates, not this one: the initial
+/// latent is a real H3 latent through the ported upscaler and adapter
+/// (`minimax_h3::ltx_adapter`, gated by `h3_ltx_adapter_gate`), and the prompt
+/// context is the Gemma4 tower plus the connector's output
+/// (`h3_gemma_connector_gate --cache`). Neither is run here, so a stage
+/// evaluation without `--latent` and `--context` is synthetic: it still
+/// exercises every kernel on the release's shapes and prices the step, and it
+/// says nothing about the video.
 fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, String> {
     let geometry = Geometry::release();
     let rows = geometry.video_tokens();

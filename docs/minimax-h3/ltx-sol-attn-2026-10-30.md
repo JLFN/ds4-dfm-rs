@@ -297,9 +297,15 @@ Triton), `kv_splits > 1` (SM90 only, `interface.py:113-119`), the `exact`
 threshold type (`thresh_type` is `"diag"` in the release's policy, and only
 that is implemented), the fused MMDiT path with a text KV sink (H3's, already
 ported head-major), Morton ordering (`install_wan_morton_forward`, which the
-H3 policy's own docstring explains H3 does not need), and the latent
-upsampler, decoder, audio unpatchify, keyframe slots and LoRA merge that unit 8
-also left out.
+H3 policy's own docstring explains H3 does not need), and the decoder, audio
+unpatchify, keyframe slots and LoRA merge that unit 8 also left out.
+
+The upscaler and the adapter are **not** among them: `minimax_h3::ltx_adapter`'s
+`Upscaler` and `Adapter` are ported and gated
+([`latent-path-2026-10-29.md`](latent-path-2026-10-29.md)), as is the Gemma4
+connector (`h3_gemma_connector_gate --cache`). What the stage mode does not do
+is *run* them, which is why a stage evaluation without `--latent` and
+`--context` is synthetic.
 
 ## 8. Reproduction
 
@@ -327,8 +333,10 @@ and wrong for a policy change.
 
 ## 9. Owed decisions
 
-1. **A real input latent and context** (the upsampler and the connector), without
-   which the policy's quality is a property of random operands only.
+1. **Run the ported producers** — `h3_ltx_adapter_gate` for the refiner latent
+   and `h3_gemma_connector_gate --cache` for the context — and re-run the
+   evaluation through `--latent`/`--context`, without which the policy's
+   quality is a property of random operands only.
 2. **A measurement, not an inference, of why the states do not move**: the
    video self-attention contribution and its gate against the state's
    resolution.

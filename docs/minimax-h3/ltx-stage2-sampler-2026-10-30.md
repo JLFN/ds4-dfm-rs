@@ -213,11 +213,15 @@ assumptions the earlier ones did not have:
    fill, determinism at one generator state and a fresh draw at the advanced
    offset; they cannot pin "these are torch's numbers" without the golden.
 
-The final latent has no correctness check at all beyond its own round trip: the
-input latent is synthetic (the upsampler is not ported) and the context is
-synthetic (the connector's is producible but unused here), so the values are
-meaningless even though every kernel on the path is exercised at the release's
-shapes and the per-step cost is real.
+The final latent has no correctness check at all beyond its own round trip:
+neither producer of the two inputs is run by this gate, so the latent and the
+context are synthetic and the values are meaningless even though every kernel
+on the path is exercised at the release's shapes and the per-step cost is real.
+(Corrected 2026-10-30: an earlier draft of this section said the latent
+upsampler "is not ported". It is — `minimax_h3::ltx_adapter`'s `Upscaler` and
+`Adapter`, gated by `h3_ltx_adapter_gate`, landed in
+[`latent-path-2026-10-29.md`](latent-path-2026-10-29.md). What is missing is
+that the stage mode does not run it.)
 
 ## 8. The `unpatchify_video` defect
 
@@ -235,10 +239,10 @@ This is the campaign's own lesson repeating: a path with no caller has no gate.
 ## 9. What is not ported
 
 The Sol-Attn policy (unit 9, and it is the 17x: 126.7 s against the release's
-8.2 s per step), the latent upsampler (`runtime/stage2_ops/h3_upscale.py`) and
-so the real input latent, the decoder, the audio unpatchify, the generated
-keyframe slots, the conditioning items, the attention_mask path, the `res2s`
-and ancestral samplers, and the LoRA merge at strength 0.8.
+8.2 s per step), the decoder, the audio unpatchify, the generated keyframe
+slots, the conditioning items, the attention_mask path, the `res2s` and
+ancestral samplers, and the LoRA merge at strength 0.8. (The latent upsampler
+is ported; the stage mode does not run it. See section 7.)
 
 ## 10. Reproduction
 
