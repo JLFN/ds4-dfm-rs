@@ -412,7 +412,7 @@ H3_LINK_ARGS = -C metadata=$(shell cksum $(filter %.o,$^) </dev/null 2>/dev/null
 $(H3_OBJS): %.o: %.cu %.h
 	$(NVCC) $(H3_NVCCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-H3_GATES := $(addprefix tests/h3_,$(addsuffix _gate,text dit vision multimodal video_encoder audio_encoder device partition canvas reference ltx_adapter ltx_ops gemma gemma_connector))
+H3_GATES := $(addprefix tests/h3_,$(addsuffix _gate,text dit vision multimodal video_encoder audio_encoder device partition canvas reference ltx_adapter ltx_ops gemma gemma_connector prompt_cache))
 tests/h3_text_gate: native/h3/h3_text_gpu.o
 tests/h3_dit_gate: native/h3/h3_text_gpu.o native/h3/h3_dit_gpu.o
 tests/h3_gemma_gate: native/h3/h3_text_gpu.o native/h3/h3_dit_gpu.o
@@ -424,6 +424,8 @@ tests/h3_device_gate: native/h3/h3_device_gpu.o
 tests/h3_device_gate: H3_LIBS = $(DS4_RS_LIBS)
 # Header/canvas readers do not need a GPU object or CUDA libraries.
 tests/h3_partition_gate tests/h3_canvas_gate: H3_LIBS =
+# The cache gate is host-only: the container, the pickle and the payload rules.
+tests/h3_prompt_cache_gate: H3_LIBS =
 
 $(H3_GATES): tests/%: $(DS4_RS_SOURCES)
 	cargo rustc -p ds4-core --example $* --release --features h3-gates -- \

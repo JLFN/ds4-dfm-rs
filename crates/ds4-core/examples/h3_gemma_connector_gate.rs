@@ -27,16 +27,18 @@
 //! .py` / `rope.py` / `ops.py` line by line.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ds4_core::minimax_h3::gemma::{HIDDEN, LAYERS as TOWER_LAYERS, STATES, Tower};
+use ds4_core::minimax_h3::gemma::{Tower, HIDDEN, LAYERS as TOWER_LAYERS, STATES};
 use ds4_core::minimax_h3::gemma_connector::{
-    self as connector, HEADS, Processor, REGISTERS, VIDEO_HEAD_DIM, VIDEO_INNER,
+    self as connector, Processor, AUDIO_INNER, HEADS, REGISTERS, VIDEO_HEAD_DIM, VIDEO_INNER,
 };
 use ds4_core::minimax_h3::gemma_token::Tokenizer as GemmaTokenizer;
+use ds4_core::minimax_h3::prompt_cache::{self, Cache, PromptStats};
 use ds4_core::minimax_h3::text_forward::fnv1a;
+use ds4_core::minimax_h3::torch_file::{Tensor as HostTensor, TorchDtype};
 use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
 
 /// The ceiling a probe whose reference ends in a libm call must stay under.
@@ -187,8 +189,78 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(3));
     }
 
+    if let Some(path) = &options.cache {
+        write_cache(&gpu, &stages, options.prompt.as_deref(), path)?;
+    }
+
     println!("GEMMA-CONNECTOR-OK");
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write the port's own two contexts as a stage-2 cache the refiner loads. The
+/// cache contract is `runtime/prompt_cache.py`; the payload is
+/// `runtime/cache_builder.py:129-150`.
+fn write_cache(
+    gpu: &Gpu,
+    stages: &connector::Stages,
+    prompt: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
+    let prompt = prompt.ok_or_else(|| usage("--cache needs --prompt"))?;
+    if stages.rows as usize != connector::ROWS {
+        return Err(usage("--cache needs the recipe's 1024 rows"));
+    }
+    let read = |tensor: &Tensor| -> Result<Vec<u8>, String> {
+        let mut payload = vec![0u8; tensor.bytes()];
+        gpu.read(tensor, &mut payload)
+            .map_err(|detail| format!("read context: {detail}"))?;
+        Ok(payload)
+    };
+    let shape = |inner: usize| vec![1, stages.rows as u64, inner as u64];
+    let cache = Cache {
+        prompt: prompt.to_string(),
+        fingerprint: prompt_cache::fingerprint(prompt),
+        video: HostTensor::contiguous(
+            TorchDtype::BFloat16,
+            shape(VIDEO_INNER),
+            read(&stages.video)?,
+        ),
+        audio: HostTensor::contiguous(
+            TorchDtype::BFloat16,
+            shape(AUDIO_INNER),
+            read(&stages.audio)?,
+        ),
+        stats: PromptStats {
+            characters: prompt.chars().count() as u64,
+            whitespace_words: Some(prompt.split_whitespace().count() as u64),
+            raw_tokens_including_bos: None,
+            kept_tokens: None,
+            max_tokens: None,
+            truncated: false,
+        },
+        generation: ds4_core::minimax_h3::torch_file::map(vec![
+            (
+                "builder",
+                ds4_core::minimax_h3::torch_file::Value::Str(
+                    "ds4-dfm-rs h3_gemma_connector_gate".to_string(),
+                ),
+            ),
+            (
+                "source",
+                ds4_core::minimax_h3::torch_file::Value::Str(
+                    "port tokenizer, tower and connector".to_string(),
+                ),
+            ),
+        ]),
+    };
+    prompt_cache::save(path, &cache).map_err(|error| error.token())?;
+    println!(
+        "CACHE path={} rows={} fingerprint={}",
+        path.display(),
+        stages.rows,
+        cache.fingerprint
+    );
+    Ok(())
 }
 
 /// Each new device kernel against a host transcription of the same
@@ -648,6 +720,7 @@ struct Options {
     probe: bool,
     prompt: Option<String>,
     dump: Option<PathBuf>,
+    cache: Option<PathBuf>,
     expect: HashMap<&'static str, u64>,
 }
 
@@ -660,6 +733,7 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut probe = false;
     let mut prompt = None;
     let mut dump = None;
+    let mut cache = None;
     let mut expect = HashMap::new();
     let mut index = 0;
 
@@ -672,7 +746,7 @@ fn split(args: &[String]) -> Result<Options, String> {
                 index += 1;
             }
             "--gemma" | "--connector" | "--rows" | "--padding" | "--seed" | "--prompt"
-            | "--dump" | "--expect" => {
+            | "--dump" | "--cache" | "--expect" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| usage(&format!("{argument} needs a value")))?;
@@ -681,6 +755,7 @@ fn split(args: &[String]) -> Result<Options, String> {
                     "--gemma" => gemma = Some(PathBuf::from(value)),
                     "--connector" => connector = Some(PathBuf::from(value)),
                     "--dump" => dump = Some(PathBuf::from(value)),
+                    "--cache" => cache = Some(PathBuf::from(value)),
                     "--rows" => {
                         rows = Some(
                             value
@@ -746,6 +821,7 @@ fn split(args: &[String]) -> Result<Options, String> {
         probe,
         prompt,
         dump,
+        cache,
         expect,
     })
 }
@@ -754,6 +830,6 @@ fn usage(detail: &str) -> String {
     format!(
         "{detail}\nusage: h3_gemma_connector_gate --gemma PATH --connector PATH \
          [--rows R] [--padding P] [--seed S] [--probe] [--prompt TEXT] \
-         [--dump DIR] [--expect NAME=HEX ...]"
+         [--dump DIR] [--cache FILE] [--expect NAME=HEX ...]"
     )
 }
