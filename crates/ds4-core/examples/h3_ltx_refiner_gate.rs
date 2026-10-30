@@ -1154,7 +1154,18 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
                 edges.audio_output(&scratch),
             ),
         ] {
-            failed |= head_check(gpu, path, name, dim, table, proj, state, embedded, output)?;
+            failed |= head_check(
+                gpu,
+                path,
+                name,
+                dim,
+                table,
+                proj,
+                state,
+                embedded,
+                output,
+                options.lora.as_ref(),
+            )?;
         }
     }
 
@@ -1192,6 +1203,7 @@ fn head_check(
     state: &Tensor,
     embedded: &Tensor,
     output: &Tensor,
+    lora: Option<&Lora>,
 ) -> Result<bool, String> {
     let shard = safetensors::read_shard(path).map_err(|error| error.token())?;
     let at = "model.diffusion_model";
@@ -1224,10 +1236,26 @@ fn head_check(
 
     let input = upload_bf16(gpu, &pack_bf16(&modulated))?;
     let want = alloc(gpu, Device::Bf16, rows * CHANNELS)?;
+    let projection = upload_bf16(gpu, &weight)?;
+
+    // With the distilled LoRA on, the head runs on the fused projection, so
+    // this transcription has to as well. The fusion itself is priced by
+    // `--lora-probe`, not here: this check is the head's own graph.
+    if let Some(lora) = lora {
+        lora.fuse(
+            gpu,
+            &format!("{at}.{proj_name}.weight"),
+            &projection,
+            CHANNELS as u32,
+            dim as u32,
+        )
+        .map_err(|error| error.token())?;
+    }
+
     gpu.linear(
         &want,
         &input,
-        &upload_bf16(gpu, &weight)?,
+        &projection,
         Some(&upload_bf16(gpu, &bias)?),
         rows as u32,
         dim as u32,
@@ -2742,6 +2770,15 @@ fn split(args: &[String]) -> Result<Options, String> {
         if layers == 0 {
             return Err(usage("--layers must be at least 1"));
         }
+    }
+
+    // `--identity` zeroes the residual projections and requires the state back
+    // unchanged. A LoRA adds a delta to those same projections
+    // (`attn1/2.to_out.0`, the feed-forwards), so the two cannot hold at once.
+    if identity.is_some() && lora_path.is_some() {
+        return Err(usage(
+            "--identity zeroes the projections a LoRA writes into; run it without --lora",
+        ));
     }
 
     // The LoRA is opened here, not inside a mode: it is a file read and the

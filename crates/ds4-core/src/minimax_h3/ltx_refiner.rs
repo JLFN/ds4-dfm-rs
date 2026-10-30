@@ -68,7 +68,7 @@
 //! unpatchify.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -1439,9 +1439,8 @@ pub struct Lora {
     shard: Shard,
     strength: f32,
     targets: usize,
-    fused: Cell<usize>,
     bytes: Cell<u64>,
-    classes: RefCell<BTreeMap<String, usize>>,
+    fused: RefCell<BTreeSet<String>>,
 }
 
 impl Lora {
@@ -1481,9 +1480,8 @@ impl Lora {
             shard,
             strength,
             targets,
-            fused: Cell::new(0),
             bytes: Cell::new(0),
-            classes: RefCell::new(BTreeMap::new()),
+            fused: RefCell::new(BTreeSet::new()),
         })
     }
 
@@ -1497,9 +1495,10 @@ impl Lora {
         self.targets
     }
 
-    /// The tensors fused so far.
+    /// The weights fused so far, distinct by key: a caller that fuses one
+    /// weight twice counts it once.
     pub fn fused(&self) -> usize {
-        self.fused.get()
+        self.fused.borrow().len()
     }
 
     /// The LoRA bytes read.
@@ -1507,16 +1506,18 @@ impl Lora {
         self.bytes.get()
     }
 
-    /// The classes fused, and how many tensors of each. A class drops the
-    /// model's prefix and the block index (`transformer_blocks.7.attn1.to_q`
+    /// The classes fused, and how many of the file's modules each met. A class
+    /// drops the model's prefix and the block index (`transformer_blocks.7.attn1.to_q`
     /// becomes `attn1.to_q`), which is the granularity a delta is worth
     /// quoting at: 48 of the modules are the same module 48 times.
     pub fn classes(&self) -> Vec<(String, usize)> {
-        self.classes
-            .borrow()
-            .iter()
-            .map(|(name, count)| (name.clone(), *count))
-            .collect()
+        let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+
+        for key in self.fused.borrow().iter() {
+            *classes.entry(class_of(key)).or_insert(0) += 1;
+        }
+
+        classes.into_iter().collect()
     }
 
     /// Fuse `name`'s delta into `weight` in place, or `None` when the LoRA has
@@ -1574,8 +1575,7 @@ impl Lora {
         // `deltas.add_(weight)` (`:67`): one BF16 rounding of the sum.
         gpu.add(weight, weight, &delta).map_err(RefinerError::Run)?;
 
-        self.fused.set(self.fused.get() + 1);
-        *self.classes.borrow_mut().entry(class_of(name)).or_insert(0) += 1;
+        self.fused.borrow_mut().insert(name.to_string());
 
         Ok(Some(delta))
     }
