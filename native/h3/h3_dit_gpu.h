@@ -568,7 +568,9 @@ int h3d_qkv_rope(h3d_context *context, h3d_tensor *query, h3d_tensor *key,
  * (`:1620-1631`) with `h3_attention_tiled_bf16_kernel` (`:1418-1487`):
  * one block per (head, 8 rows), head-major input, row-major output. `head_dim`
  * is 128 (the video VAE's width) or 64 (the AV connector's audio half); the
- * tiled kernel is templated on it. */
+ * tiled kernel is templated on it. The head-major operands are the H3 engine's
+ * convention and `h3d_qkv_rope` is what writes them; an LTX caller must use
+ * `h3d_ltx_attention` instead (2026-10-30). */
 int h3d_sdpa(h3d_context *context, h3d_tensor *output,
              const h3d_tensor *query, const h3d_tensor *key,
              const h3d_tensor *value, uint32_t sequence, uint32_t heads,
