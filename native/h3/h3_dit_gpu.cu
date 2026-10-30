@@ -7298,7 +7298,6 @@ __global__ static void h3d_sol_ltx_forward_kernel(
     const uint32_t lane = threadIdx.x % 32;
     const uint32_t head = blockIdx.y;
     const uint32_t first_row = blockIdx.x * QUERIES + warp * ROWS;
-    const size_t stride = (size_t)heads * H3D_SOL_HEAD_DIM;
     /* Every row of this CTA's 16-row tile lies in one 64-token query block
      * (16 divides 64), so the mask word is the tile's, not the warp's. */
     const uint32_t q_block = (blockIdx.x * QUERIES) / H3D_SOL_BLOCK;
