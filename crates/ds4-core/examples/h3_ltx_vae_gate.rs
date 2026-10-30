@@ -34,6 +34,7 @@
 //!
 //! Exit 3 when a probe or a comparison fails.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -47,6 +48,15 @@ use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
 /// What a transcribed convolution may differ by: same inputs, f32 accumulation
 /// in both, only the order inside a tap differs.
 const CONV_RELATIVE: f64 = 1e-3;
+/// The band the host transcription and the device must agree inside: ten BF16
+/// ulps at 0.5, which is what two implementations that round at the same
+/// boundaries can differ by once a tap's F32 sum lands on the other side of a
+/// rounding boundary.
+const TRANSCRIBE_TOLERANCE: f64 = 0.02;
+/// The largest shape a naive single-threaded host walk is allowed to take on:
+/// a few seconds at this decoder's widths, and the transcription is a one-off
+/// check rather than a production path.
+const TRANSCRIBE_MAX_ELEMENTS: usize = 8_000_000;
 /// The ceiling a *zero-padded* transcription is expected to exceed, so a probe
 /// that cannot tell the two halo policies apart fails loudly.
 const HALO_SEPARATION: f64 = 1e-2;
@@ -55,6 +65,7 @@ struct Options {
     probe: bool,
     shapes: bool,
     impulse: bool,
+    transcribe: bool,
     vae: Option<PathBuf>,
     latent: Option<PathBuf>,
     frame: Option<PathBuf>,
@@ -190,18 +201,23 @@ fn decode_vae(
         }
     );
 
-    let latent = match &options.latent {
-        Some(file) => read_latent(gpu, file, shape)?,
+    let latent_bytes = match &options.latent {
+        Some(file) => read_latent_bytes(file, shape)?,
         None => {
             let mut state = options.seed.wrapping_mul(2_654_435_761).wrapping_add(1);
-            draw(gpu, shape.elements(), &mut state)?
+            draw_bytes(shape.elements(), &mut state)
         }
     };
+    let latent = upload_bf16(gpu, &latent_bytes)?;
 
     let started = Instant::now();
     let rgb = vae
         .decode(gpu, &latent, shape)
         .map_err(|error| error.to_string())?;
+    // The kernels are asynchronous and the native entries only report launch
+    // errors, so a timer that stopped at submission would not delimit the
+    // decode. Bound the span with a synchronize at each end.
+    gpu.sync().map_err(|detail| format!("sync: {detail}"))?;
     let seconds = started.elapsed().as_secs_f64();
 
     let pixel = pixel_shape([shape.frames, shape.height, shape.width]);
@@ -259,7 +275,64 @@ fn decode_vae(
         impulse_check(gpu, &vae, shape, pixel)?;
     }
 
+    if options.transcribe {
+        failed |= transcribe(path, shape, &latent_bytes, &values)?;
+    }
+
     Ok(ExitCode::from(if failed { 3 } else { 0 }))
+}
+
+/// The host transcription against the device's own decode of the same latent.
+fn transcribe(
+    path: &Path,
+    shape: Shape,
+    latent_bytes: &[u8],
+    device: &[f32],
+) -> Result<bool, String> {
+    if shape.elements() > TRANSCRIBE_MAX_ELEMENTS {
+        return Err(format!(
+            "--transcribe is for small latents: {} values is above {TRANSCRIBE_MAX_ELEMENTS}",
+            shape.elements()
+        ));
+    }
+
+    let shard = HostShard::open(path)?;
+    let latent: Vec<f32> = latent_bytes
+        .chunks_exact(2)
+        .map(|pair| f32::from_bits((u16::from_le_bytes([pair[0], pair[1]]) as u32) << 16))
+        .collect();
+
+    let started = Instant::now();
+    let host = host_decode(&shard, &latent, shape)?;
+    let seconds = started.elapsed().as_secs_f64();
+
+    // The comparison is a band, not an equality. Every op but the convolution
+    // is transcribed exactly, and the outputs are BF16, so the only freedom
+    // left is that a tap's F32 sum lands on a different side of a BF16
+    // rounding boundary than cuBLASLt's - which flips that element by one ulp
+    // and a fraction of the frame by one ulp each, two dozen convolutions deep.
+    // A composition error does not do that: it moves values by their own
+    // magnitude. The band is ten ulps at 0.5, and `worst` is reported so the
+    // reader can see which regime the agreement is in.
+    let (differ, rel_rms) = compare(device, &host);
+    let mut worst = 0.0f64;
+    let mut over = 0usize;
+    for (left, right) in device.iter().zip(host.iter()) {
+        let gap = (*left - *right).abs() as f64;
+        worst = worst.max(gap);
+        if gap > TRANSCRIBE_TOLERANCE {
+            over += 1;
+        }
+    }
+    let pass = over == 0;
+    println!(
+        "TRANSCRIBE values={} differ={differ} rel_rms={rel_rms:.3e} worst={worst:.5} over={over} \
+         seconds={seconds:.1} verdict=band {}",
+        host.len(),
+        if pass { "pass" } else { "FAIL" }
+    );
+
+    Ok(!pass)
 }
 
 /// Where a single latent cell lands in the frame, as a measurement rather than
@@ -931,7 +1004,7 @@ fn fnv(values: &[f32]) -> u64 {
     hash
 }
 
-fn read_latent(gpu: &Gpu, path: &Path, shape: Shape) -> Result<Tensor, String> {
+fn read_latent_bytes(path: &Path, shape: Shape) -> Result<Vec<u8>, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let want = shape.elements() * 2;
 
@@ -947,7 +1020,7 @@ fn read_latent(gpu: &Gpu, path: &Path, shape: Shape) -> Result<Tensor, String> {
         ));
     }
 
-    upload_bf16(gpu, &bytes)
+    Ok(bytes)
 }
 
 /// The first frame as a PNG, so the end of the chain can be looked at.
@@ -991,6 +1064,10 @@ fn upload_bf16(gpu: &Gpu, bytes: &[u8]) -> Result<Tensor, String> {
 /// A draw in `[-1, 1)` exactly representable in BF16, so the probes' inputs
 /// are the same values on the host and the device.
 fn draw(gpu: &Gpu, elements: usize, state: &mut u64) -> Result<Tensor, String> {
+    upload_bf16(gpu, &draw_bytes(elements, state))
+}
+
+fn draw_bytes(elements: usize, state: &mut u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(elements * 2);
 
     for _ in 0..elements {
@@ -998,7 +1075,7 @@ fn draw(gpu: &Gpu, elements: usize, state: &mut u64) -> Result<Tensor, String> {
         bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
     }
 
-    upload_bf16(gpu, &bytes)
+    bytes
 }
 
 fn next(state: &mut u64) -> f32 {
@@ -1024,6 +1101,7 @@ fn split(arguments: &[String]) -> Result<Options, String> {
         probe: false,
         shapes: false,
         impulse: false,
+        transcribe: false,
         vae: None,
         latent: None,
         frame: None,
@@ -1041,6 +1119,7 @@ fn split(arguments: &[String]) -> Result<Options, String> {
             "--probe" => options.probe = true,
             "--shapes" => options.shapes = true,
             "--impulse-check" => options.impulse = true,
+            "--transcribe" => options.transcribe = true,
             "--vae" => options.vae = Some(PathBuf::from(value(arguments, &mut index, argument)?)),
             "--latent" => {
                 options.latent = Some(PathBuf::from(value(arguments, &mut index, argument)?))
@@ -1091,4 +1170,356 @@ fn value<'a>(arguments: &'a [String], index: &mut usize, name: &str) -> Result<&
 
 fn usage(detail: &str) -> String {
     format!("{detail}\n\nusage:\n  h3_ltx_vae_gate --probe [--seed S]\n  h3_ltx_vae_gate --shapes\n  h3_ltx_vae_gate --vae PATH --decode-shape F,H,W [--latent FILE] [--frame FILE] [--seed S] [--expect HEX]")
+}
+
+/// The untiled decode's values, transcribed on the host from the reference's
+/// own expressions and the artifact's own weights.
+///
+/// This is the whole-graph counterpart of `--probe`: the probes show that each
+/// kernel equals a transcription of one expression, and this shows that the
+/// *composition* does - every weight read by the name the plan derives, every
+/// op in the order and the place `conv_video_decoder.py:263-357` puts it, at
+/// production channel widths. It catches what per-op probes and shape checks
+/// cannot: a same-shaped substitution (`conv1` for `conv2`), a residual added
+/// from the wrong activation, a norm applied twice, a block order that happens
+/// to have the same shapes.
+///
+/// It is affordable only at a small latent: the walk is naive and
+/// single-threaded, so `--transcribe` refuses a shape above
+/// [`TRANSCRIBE_MAX_ELEMENTS`]. Its verdict is residual, because the
+/// convolutions accumulate in a different order than cuBLASLt's taps do and
+/// nothing else; the reference's arithmetic is otherwise reproduced op by op,
+/// with each rounding where the expression has it.
+struct HostShard {
+    bytes: Vec<u8>,
+    tensors: HashMap<String, (Vec<u64>, usize)>,
+}
+
+impl HostShard {
+    fn open(path: &Path) -> Result<HostShard, String> {
+        let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if bytes.len() < 8 {
+            return Err(format!("{} is not a safetensors file", path.display()));
+        }
+
+        let length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + length])
+            .map_err(|error| format!("{}: header: {error}", path.display()))?;
+        let entries = header
+            .as_object()
+            .ok_or_else(|| format!("{}: header is not an object", path.display()))?;
+
+        let mut tensors = HashMap::new();
+        for (name, entry) in entries {
+            if name == "__metadata__" {
+                continue;
+            }
+            let shape = entry["shape"]
+                .as_array()
+                .ok_or_else(|| format!("{name}: no shape"))?
+                .iter()
+                .map(|dim| dim.as_u64().unwrap_or(0))
+                .collect();
+            let offset = entry["data_offsets"][0].as_u64().unwrap_or(0) as usize;
+            tensors.insert(name.clone(), (shape, 8 + length + offset));
+        }
+
+        Ok(HostShard { bytes, tensors })
+    }
+
+    /// One BF16 tensor as F32 values, checked against the shape the plan
+    /// derives before it is read.
+    fn values(&self, name: &str, want: &[usize]) -> Result<Vec<f32>, String> {
+        let (shape, offset) = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("checkpoint has no {name}"))?;
+        let want_shape: Vec<u64> = want.iter().map(|dim| *dim as u64).collect();
+        if *shape != want_shape {
+            return Err(format!("{name}: {shape:?} is not {want_shape:?}"));
+        }
+
+        let elements: usize = want.iter().product();
+        Ok((0..elements)
+            .map(|index| {
+                let at = offset + index * 2;
+                let bits = u16::from_le_bytes([self.bytes[at], self.bytes[at + 1]]);
+                f32::from_bits((bits as u32) << 16)
+            })
+            .collect())
+    }
+}
+
+/// The host walk: `down` is the checkpoint's tensor names for one convolution.
+fn host_conv(
+    shard: &HostShard,
+    name: &str,
+    input: &[f32],
+    input_shape: Shape,
+    output_shape: Shape,
+) -> Result<Vec<f32>, String> {
+    let in_channels = input_shape.channels as usize;
+    let out_channels = output_shape.channels as usize;
+    let (frames, height, width) = (
+        input_shape.frames as usize,
+        input_shape.height as usize,
+        input_shape.width as usize,
+    );
+    let weight = shard.values(
+        &format!("{name}.weight"),
+        &[out_channels, in_channels, 3, 3, 3],
+    )?;
+    let bias = shard.values(&format!("{name}.bias"), &[out_channels])?;
+    let mut output = vec![0.0f32; output_shape.elements()];
+
+    for channel in 0..out_channels {
+        for t in 0..frames {
+            for y in 0..height {
+                for x in 0..width {
+                    let mut total = 0.0f32;
+                    for source in 0..in_channels {
+                        for kt in 0..3 {
+                            // `convolution.py:302-312`: `causal=False` replicates
+                            // the edge frame; this artifact's
+                            // `spatial_padding_mode` is zeros, so the spatial
+                            // halo contributes nothing.
+                            let source_t = (t as i64 + kt as i64 - 1).clamp(0, frames as i64 - 1);
+                            for ky in 0..3 {
+                                let source_y = y as i64 + ky as i64 - 1;
+                                if source_y < 0 || source_y >= height as i64 {
+                                    continue;
+                                }
+                                for kx in 0..3 {
+                                    let source_x = x as i64 + kx as i64 - 1;
+                                    if source_x < 0 || source_x >= width as i64 {
+                                        continue;
+                                    }
+                                    let at = ((source * frames + source_t as usize) * height
+                                        + source_y as usize)
+                                        * width
+                                        + source_x as usize;
+                                    let tap = ((source * 3 + kt) * 3 + ky) * 3 + kx;
+                                    total += input[at] * weight[channel * in_channels * 27 + tap];
+                                }
+                            }
+                        }
+                    }
+                    output[((channel * frames + t) * height + y) * width + x] =
+                        bf16(total + bias[channel]);
+                }
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// `PixelNorm` (`normalization.py:31-38`), the five roundings the kernel has.
+fn host_pixel_norm(values: &mut [f32], channels: usize, plane: usize) {
+    for position in 0..plane {
+        let mut total = 0.0f32;
+        for channel in 0..channels {
+            let value = values[channel * plane + position];
+            total += bf16(value * value);
+        }
+        let mean = bf16(total / channels as f32);
+        let rms = bf16(bf16(mean + PIXEL_NORM_EPSILON).sqrt());
+        for channel in 0..channels {
+            let at = channel * plane + position;
+            values[at] = bf16(values[at] / rms);
+        }
+    }
+}
+
+fn host_silu(values: &mut [f32]) {
+    for value in values.iter_mut() {
+        *value = bf16(*value / (1.0 + (-*value).exp()));
+    }
+}
+
+fn host_denormalize(values: &mut [f32], mean: &[f32], scale: &[f32], plane: usize) {
+    for channel in 0..mean.len() {
+        for position in 0..plane {
+            let at = channel * plane + position;
+            let scaled = bf16(values[at] * scale[channel]);
+            values[at] = bf16(scaled + mean[channel]);
+        }
+    }
+}
+
+/// `sampling.py:111-120`, the shuffle and the dropped first frame. The input
+/// is the convolution's own output, whose channels are `prod(stride)` times the
+/// shuffle's.
+fn host_depth_to_space(input: &[f32], shape: Shape, stride: [u32; 3]) -> Vec<f32> {
+    let (p1, p2, p3) = (stride[0] as usize, stride[1] as usize, stride[2] as usize);
+    let drop = usize::from(stride[0] == 2);
+    let out_channels = shape.channels as usize / (p1 * p2 * p3);
+    let (depth, height, width) = (
+        shape.frames as usize,
+        shape.height as usize,
+        shape.width as usize,
+    );
+    let (out_depth, out_height, out_width) = (depth * p1 - drop, height * p2, width * p3);
+    let mut output = vec![0.0f32; out_channels * out_depth * out_height * out_width];
+
+    for channel in 0..out_channels {
+        for t in 0..out_depth {
+            for y in 0..out_height {
+                for x in 0..out_width {
+                    let (a, source_t) = ((t + drop) % p1, (t + drop) / p1);
+                    let source = ((channel * p1 + a) * p2 + y % p2) * p3 + x % p3;
+                    output[((channel * out_depth + t) * out_height + y) * out_width + x] =
+                        input[((source * depth + source_t) * height + y / p2) * width + x / p3];
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// `ops.py:34-60` at `patch_size_t = 1`.
+fn host_unpatchify(input: &[f32], channels: usize, patch: usize, shape: Shape) -> Vec<f32> {
+    let (depth, height, width) = (
+        shape.frames as usize,
+        shape.height as usize,
+        shape.width as usize,
+    );
+    let (out_height, out_width) = (height * patch, width * patch);
+    let mut output = vec![0.0f32; channels * depth * out_height * out_width];
+
+    for channel in 0..channels {
+        for t in 0..depth {
+            for y in 0..out_height {
+                for x in 0..out_width {
+                    let (q, source_y) = (y % patch, y / patch);
+                    let (r, source_x) = (x % patch, x / patch);
+                    let source = (channel * patch + r) * patch + q;
+                    output[((channel * depth + t) * out_height + y) * out_width + x] =
+                        input[((source * depth + t) * height + source_y) * width + source_x];
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// `conv_video_decoder.py:497-499`, two roundings and the clamp.
+fn host_to_rgb(input: &[f32], shape: Shape) -> Vec<f32> {
+    let plane = shape.elements() / 3;
+    let mut output = vec![0.0f32; shape.elements()];
+
+    for channel in 0..3 {
+        for point in 0..plane {
+            let scaled = bf16(0.5 * bf16(input[channel * plane + point] + 1.0));
+            output[point * 3 + channel] = if scaled < 0.0 {
+                0.0
+            } else if scaled > 1.0 {
+                1.0
+            } else {
+                scaled
+            };
+        }
+    }
+
+    output
+}
+
+/// The whole graph, host-side, at a small shape. Returns the RGB frames.
+fn host_decode(shard: &HostShard, latent: &[f32], shape: Shape) -> Result<Vec<f32>, String> {
+    // The channel stride, which grows with the upsamplers: a normalization at
+    // one stage reduces over that stage's own positions and no other shape's.
+    let plane_of =
+        |shape: Shape| shape.frames as usize * shape.height as usize * shape.width as usize;
+    let mean = shard.values(
+        "per_channel_statistics.mean-of-means",
+        &[shape.channels as usize],
+    )?;
+    let std = shard.values(
+        "per_channel_statistics.std-of-means",
+        &[shape.channels as usize],
+    )?;
+    let mut state = latent.to_vec();
+    host_denormalize(&mut state, &mean, &std, plane_of(shape));
+
+    let mut current = Shape {
+        channels: 1024,
+        ..shape
+    };
+    state = host_conv(shard, "decoder.conv_in.conv", &state, shape, current)?;
+
+    for (index, block) in DECODER_BLOCKS.iter().rev().enumerate() {
+        let name = format!("decoder.up_blocks.{index}");
+        match block {
+            Block::Res { layers } => {
+                for layer in 0..*layers {
+                    let resnet = format!("{name}.res_blocks.{layer}");
+                    let mut branch = state.clone();
+                    host_pixel_norm(&mut branch, current.channels as usize, plane_of(current));
+                    host_silu(&mut branch);
+                    branch = host_conv(
+                        shard,
+                        &format!("{resnet}.conv1.conv"),
+                        &branch,
+                        current,
+                        current,
+                    )?;
+                    host_pixel_norm(&mut branch, current.channels as usize, plane_of(current));
+                    host_silu(&mut branch);
+                    branch = host_conv(
+                        shard,
+                        &format!("{resnet}.conv2.conv"),
+                        &branch,
+                        current,
+                        current,
+                    )?;
+                    for (value, branch) in state.iter_mut().zip(branch.iter()) {
+                        *value = bf16(*value + *branch);
+                    }
+                }
+            }
+            Block::Upsample {
+                stride, reduction, ..
+            } => {
+                // `sampling.py:96-120`, derived here rather than asked of the
+                // port: the convolution carries `prod(stride)` times the
+                // input's channels and the shuffle divides them back out, and
+                // the temporal axis loses its first output frame when it
+                // doubles.
+                let output = Shape {
+                    channels: current.channels * stride[0] * stride[1] * stride[2] / reduction,
+                    ..current
+                };
+                let conv = host_conv(shard, &format!("{name}.conv.conv"), &state, current, output)?;
+                state = host_depth_to_space(&conv, output, *stride);
+                current = Shape {
+                    channels: current.channels / reduction,
+                    frames: current.frames * stride[0] - u32::from(stride[0] == 2),
+                    height: current.height * stride[1],
+                    width: current.width * stride[2],
+                };
+            }
+        }
+    }
+
+    host_pixel_norm(&mut state, current.channels as usize, plane_of(current));
+    host_silu(&mut state);
+    // The head's convolution carries `3 * patch^2` channels, the 16 spatial
+    // sub-positions of the three output channels (`ops.py:56-58`).
+    let patchified = Shape {
+        channels: 3 * 4 * 4,
+        ..current
+    };
+    state = host_conv(shard, "decoder.conv_out.conv", &state, current, patchified)?;
+
+    let pixel = Shape {
+        channels: 3,
+        frames: current.frames,
+        height: current.height * 4,
+        width: current.width * 4,
+    };
+    let patchified = host_unpatchify(&state, 3, 4, current);
+
+    Ok(host_to_rgb(&patchified, pixel))
 }

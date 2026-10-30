@@ -9206,7 +9206,13 @@ __global__ static void h3v_unpatchify_kernel(T *out, const T *in,
  * `rearrange(frames[0], "c f h w -> f h w c")` then `add_(1).mul_(0.5)
  * .clamp_(0, 1)` - in bf16, so the add and the multiply each round once and
  * the clamp is exact. The output is the release's own chunk layout, RGB
- * interleaved fastest. */
+ * interleaved fastest.
+ *
+ * The clamp is written as two comparisons rather than `fminf(fmaxf(...))` on
+ * purpose: both of those return the *numeric* operand when the other is a NaN,
+ * which would turn a NaN activation into 0 or 1 and hide it from every caller's
+ * range check. A comparison with a NaN is false, so a NaN stays a NaN and the
+ * caller sees it - which is also what `torch.clamp` does. */
 template <typename T>
 __global__ static void h3v_to_rgb_kernel(T *out, const T *in, uint32_t depth,
                                          uint32_t height, uint32_t width,
@@ -9219,7 +9225,9 @@ __global__ static void h3v_to_rgb_kernel(T *out, const T *in, uint32_t depth,
     float value = h3b_element<T>::to(in[(size_t)channel * plane + point]);
     float shifted = h3b_element<T>::to(h3b_element<T>::from(value + 1.0f));
     float scaled = h3b_element<T>::from(0.5f * shifted);
-    out[index] = h3b_element<T>::from(fminf(fmaxf(scaled, 0.0f), 1.0f));
+    if (scaled < 0.0f) scaled = 0.0f;
+    if (scaled > 1.0f) scaled = 1.0f;
+    out[index] = h3b_element<T>::from(scaled);
 }
 
 int h3v_pixel_norm(h3d_context *context, h3d_tensor *output,

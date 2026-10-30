@@ -647,6 +647,19 @@ impl LtxVae {
     /// decoder's own buffer and come back as `[frame][height][width][channel]`
     /// in `[0, 1]`.
     pub fn decode(&self, gpu: &Gpu, latent: &Tensor, shape: Shape) -> Result<&Tensor, VaeError> {
+        if shape.channels != LATENT_CHANNELS {
+            return Err(VaeError::Shape(format!(
+                "a latent carries {LATENT_CHANNELS} channels, not {}",
+                shape.channels
+            )));
+        }
+        if latent.elements() < shape.elements() {
+            return Err(VaeError::Shape(format!(
+                "the latent holds {} values, a {shape:?} latent needs {}",
+                latent.elements(),
+                shape.elements()
+            )));
+        }
         let expected = pixel_elements(shape);
         if expected > self.scratch.rgb.elements() {
             return Err(VaeError::Shape(format!(
@@ -719,7 +732,7 @@ impl LtxVae {
         // `conv_norm_out` (a `PixelNorm` with no parameters), `conv_act`, and
         // `conv_out` (`conv_video_decoder.py:328`, `:349-351`).
         pixel_norm(gpu, &scratch.work, &scratch.state, state)?;
-        silu(gpu, &scratch.work)?;
+        silu(gpu, &scratch.work, state.elements())?;
         self.conv(gpu, &scratch.conv_out, &scratch.work, &self.conv_out, state)?;
 
         let patchified = Shape {
@@ -765,10 +778,10 @@ impl LtxVae {
         let scratch = &self.scratch;
 
         pixel_norm(gpu, &scratch.aux, &scratch.state, shape)?;
-        silu(gpu, &scratch.aux)?;
+        silu(gpu, &scratch.aux, shape.elements())?;
         self.conv(gpu, &scratch.work, &scratch.aux, &resnet.conv1, shape)?;
         pixel_norm(gpu, &scratch.aux, &scratch.work, shape)?;
-        silu(gpu, &scratch.aux)?;
+        silu(gpu, &scratch.aux, shape.elements())?;
         self.conv(gpu, &scratch.work, &scratch.aux, &resnet.conv2, shape)?;
         add(gpu, &scratch.state, &scratch.work, shape.elements())
     }
@@ -871,8 +884,12 @@ fn pixel_norm(gpu: &Gpu, out: &Tensor, input: &Tensor, shape: Shape) -> Result<(
     .map_err(VaeError::run("pixel norm"))
 }
 
-fn silu(gpu: &Gpu, tensor: &Tensor) -> Result<(), VaeError> {
-    gpu.latent_silu(tensor, tensor, Dtype::Bf16, tensor.elements())
+/// `nn.SiLU()`, one rounding (`h3b_silu`). The element count is the *live*
+/// activation's, not the scratch tensor's capacity: the buffers are sized for
+/// the graph's widest stage, and a call that walked the whole capacity would
+/// do tens of gigacycles of arithmetic on unwritten tails per decode.
+fn silu(gpu: &Gpu, tensor: &Tensor, elements: usize) -> Result<(), VaeError> {
+    gpu.latent_silu(tensor, tensor, Dtype::Bf16, elements)
         .map_err(VaeError::run("silu"))
 }
 
@@ -1083,9 +1100,31 @@ fn assert_config(shard: &Shard) -> Result<(), VaeError> {
             .ok_or_else(|| VaeError::Shape(format!("decoder_blocks.{index} has no name")))?;
         let params = entry.get(1).unwrap_or(&serde_json::Value::Null);
 
+        // Every key the reference reads off a block dict, and nothing else: a
+        // key this port does not build is a different graph, so it is refused
+        // by name rather than ignored. `residual` is the one that matters -
+        // `sampling.py:98-122` turns the upsampler into `x + shuffle(conv(x))`
+        // with a repeat-tile skip, which adds no tensor at all and would
+        // therefore survive every shape check. `inject_noise` adds a
+        // per-channel noise term and `timestep_conditioning` an AdaLN table
+        // (`resnet.py:26-36`).
+        let allowed: &[&str] = match block {
+            Block::Res { .. } => &["num_layers"],
+            Block::Upsample { .. } => &["multiplier"],
+        };
+        if let Some(keys) = params.as_object() {
+            for key in keys.keys() {
+                if !allowed.contains(&key.as_str()) {
+                    return Err(VaeError::Shape(format!(
+                        "decoder_blocks.{index} asks for {key}, which this port does not build"
+                    )));
+                }
+            }
+        }
+
         match block {
             Block::Res { layers } => {
-                if !name.starts_with("res_x") {
+                if name != "res_x" {
                     return Err(VaeError::Shape(format!(
                         "decoder_blocks.{index} is {name}, the table has a res group"
                     )));
