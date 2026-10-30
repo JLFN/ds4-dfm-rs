@@ -133,6 +133,13 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         .clone()
         .ok_or_else(|| usage("--transformer is required"))?;
 
+    // The measurement has to be on before any reader opens the LoRA.
+    if options.lora_deltas {
+        if let Some(lora) = &options.lora {
+            lora.measure_deltas();
+        }
+    }
+
     let code = if let Some(target) = &options.identity {
         identity(&gpu, &transformer, target, &options)?
     } else if options.edges {
@@ -168,6 +175,10 @@ fn report_lora(options: &Options) -> bool {
 
     for (class, count) in lora.classes() {
         println!("LORA-CLASS {class} {count}");
+    }
+
+    for (class, rms, max, weight) in lora.merges() {
+        println!("LORA-DELTA {class} rms={rms:.6e} max={max:.6e} weight_rms={weight:.6e}");
     }
 
     if lora.fused() == 0 {
@@ -2629,7 +2640,7 @@ fn usage(detail: &str) -> String {
          h3_ltx_refiner_gate --lora-probe DIR\n       \
          h3_ltx_refiner_gate --transformer PATH [--blocks K] [--rows R] [--audio-rows A]\n\
          \x20                            [--seed S] [--dump DIR] [--residual DIR]\n\
-         \x20                            [--lora FILE [--lora-strength F]]\n\
+         \x20                            [--lora FILE [--lora-strength F] [--lora-deltas]]\n\
          \x20                            [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --transformer PATH --identity FILE [--blocks K]\n\
          \x20                            [--lora FILE [--lora-strength F]]\n       \
@@ -2661,6 +2672,9 @@ struct Options {
     /// `--lora-probe DIR`: the synthetic fusion probe, which writes its LoRA
     /// into `DIR` and needs no shard.
     lora_probe: Option<PathBuf>,
+    /// `--lora-deltas`: measure each fused delta's size, which costs one
+    /// device read per weight.
+    lora_deltas: bool,
     latent: Option<PathBuf>,
     prompt: Option<PathBuf>,
     layers: Option<usize>,
@@ -2687,6 +2701,7 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut no_self_attention = false;
     let mut lora_path = None;
     let mut lora_probe = None;
+    let mut lora_deltas = false;
     let mut lora_strength = LORA_STRENGTH;
     let mut latent = None;
     let mut prompt = None;
@@ -2718,6 +2733,7 @@ fn split(args: &[String]) -> Result<Options, String> {
             "--signals" => signals = true,
             "--lora" => lora_path = Some(PathBuf::from(take(args, &mut index)?)),
             "--lora-probe" => lora_probe = Some(PathBuf::from(take(args, &mut index)?)),
+            "--lora-deltas" => lora_deltas = true,
             "--lora-strength" => {
                 lora_strength = take(args, &mut index)?
                     .parse::<f32>()
@@ -2801,6 +2817,7 @@ fn split(args: &[String]) -> Result<Options, String> {
         },
         lora,
         lora_probe,
+        lora_deltas,
         latent,
         prompt,
         layers,

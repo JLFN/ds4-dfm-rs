@@ -1441,6 +1441,21 @@ pub struct Lora {
     targets: usize,
     bytes: Cell<u64>,
     fused: RefCell<BTreeSet<String>>,
+    /// Whether to read each delta back and keep its per-class size. Off by
+    /// default: it is a diagnosis of the merge, and it costs one device read
+    /// per weight.
+    measure: Cell<bool>,
+    merges: RefCell<BTreeMap<String, Merge>>,
+}
+
+/// One class's merge: the delta's sum of squares, its largest absolute value,
+/// and the fused weight's sum of squares for the ratio.
+#[derive(Clone, Copy, Default)]
+struct Merge {
+    delta: f64,
+    weight: f64,
+    max: f32,
+    count: u64,
 }
 
 impl Lora {
@@ -1482,6 +1497,8 @@ impl Lora {
             targets,
             bytes: Cell::new(0),
             fused: RefCell::new(BTreeSet::new()),
+            measure: Cell::new(false),
+            merges: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -1518,6 +1535,31 @@ impl Lora {
         }
 
         classes.into_iter().collect()
+    }
+
+    /// Start measuring each fused delta: its RMS, its largest absolute value
+    /// and the fused weight's RMS, per class.
+    pub fn measure_deltas(&self) {
+        self.measure.set(true);
+    }
+
+    /// The measured merges, by class: `(class, delta RMS, delta max, fused
+    /// weight RMS)`. Empty unless [`Lora::measure_deltas`] was called.
+    pub fn merges(&self) -> Vec<(String, f64, f32, f64)> {
+        self.merges
+            .borrow()
+            .iter()
+            .map(|(class, merge)| {
+                let count = merge.count.max(1) as f64;
+
+                (
+                    class.clone(),
+                    (merge.delta / count).sqrt(),
+                    merge.max,
+                    (merge.weight / count).sqrt(),
+                )
+            })
+            .collect()
     }
 
     /// Fuse `name`'s delta into `weight` in place, or `None` when the LoRA has
@@ -1577,7 +1619,56 @@ impl Lora {
 
         self.fused.borrow_mut().insert(name.to_string());
 
+        if self.measure.get() {
+            self.measure_merge(gpu, name, weight, &delta)?;
+        }
+
         Ok(Some(delta))
+    }
+
+    /// Read one merged weight and its delta back and fold them into the class's
+    /// totals. The two tensors are bf16 and element-wise aligned, so one pass
+    /// over each is the whole cost.
+    fn measure_merge(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        weight: &Tensor,
+        delta: &Tensor,
+    ) -> Result<(), RefinerError> {
+        let elements = delta.elements();
+        let mut bytes = vec![0u8; delta.bytes()];
+        gpu.read(delta, &mut bytes).map_err(RefinerError::Run)?;
+
+        let mut merge = Merge {
+            count: elements as u64,
+            ..Merge::default()
+        };
+
+        for pair in bytes.chunks_exact(2) {
+            let value = bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
+
+            merge.delta += f64::from(value) * f64::from(value);
+            merge.max = merge.max.max(value.abs());
+        }
+
+        gpu.read(weight, &mut bytes).map_err(RefinerError::Run)?;
+
+        for pair in bytes.chunks_exact(2) {
+            let value = f64::from(bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])));
+
+            merge.weight += value * value;
+        }
+
+        let mut merges = self.merges.borrow_mut();
+        let class = merges.entry(class_of(name)).or_default();
+
+        class.delta += merge.delta;
+        class.weight += merge.weight;
+        class.count += merge.count;
+        class.max = class.max.max(merge.max);
+
+        Ok(())
     }
 
     /// The one key lookup: both sides drop exactly one leading segment, so the
