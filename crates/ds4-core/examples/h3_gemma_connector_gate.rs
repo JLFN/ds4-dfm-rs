@@ -145,6 +145,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let mut expect_failed = false;
 
+    if let Some(directory) = &options.dump {
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("--dump {}: {error}", directory.display()))?;
+    }
+
     for (name, tensor) in [
         ("scales", &stages.scales),
         ("normed", &stages.normed),
@@ -164,6 +169,11 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
             words(&payload[..16.min(payload.len())]),
             words(&payload[payload.len().saturating_sub(16)..])
         );
+
+        if let Some(directory) = &options.dump {
+            std::fs::write(directory.join(format!("{name}.bf16")), &payload)
+                .map_err(|error| format!("--dump {name}: {error}"))?;
+        }
 
         if let Some(wanted) = options.expect.get(name) {
             if *wanted != hash {
@@ -637,6 +647,7 @@ struct Options {
     seed: Option<u32>,
     probe: bool,
     prompt: Option<String>,
+    dump: Option<PathBuf>,
     expect: HashMap<&'static str, u64>,
 }
 
@@ -648,7 +659,8 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut seed = None;
     let mut probe = false;
     let mut prompt = None;
-    let mut expect = std::collections::HashMap::new();
+    let mut dump = None;
+    let mut expect = HashMap::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -660,7 +672,7 @@ fn split(args: &[String]) -> Result<Options, String> {
                 index += 1;
             }
             "--gemma" | "--connector" | "--rows" | "--padding" | "--seed" | "--prompt"
-            | "--expect" => {
+            | "--dump" | "--expect" => {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| usage(&format!("{argument} needs a value")))?;
@@ -668,6 +680,7 @@ fn split(args: &[String]) -> Result<Options, String> {
                 match argument.as_str() {
                     "--gemma" => gemma = Some(PathBuf::from(value)),
                     "--connector" => connector = Some(PathBuf::from(value)),
+                    "--dump" => dump = Some(PathBuf::from(value)),
                     "--rows" => {
                         rows = Some(
                             value
@@ -732,6 +745,7 @@ fn split(args: &[String]) -> Result<Options, String> {
         seed,
         probe,
         prompt,
+        dump,
         expect,
     })
 }
@@ -740,6 +754,6 @@ fn usage(detail: &str) -> String {
     format!(
         "{detail}\nusage: h3_gemma_connector_gate --gemma PATH --connector PATH \
          [--rows R] [--padding P] [--seed S] [--probe] [--prompt TEXT] \
-         [--expect NAME=HEX ...]"
+         [--dump DIR] [--expect NAME=HEX ...]"
     )
 }
