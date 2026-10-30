@@ -5,7 +5,7 @@ Continues `docs/minimax-h3/ltx-vae-decoder-2026-10-30.md` (unit 12a). Plan
 frame's pixel-step report (`04e3f5ae`), both run on sm_121 at the release
 geometry with a peak-footprint sample.
 
-## 1. The hosts agree bit for bit on everything that has no cuBLAS in it
+## 1. The hosts agree bit for bit on the probed ops
 
 `./tests/h3_ltx_vae_gate --probe` on the Spark (sm_121, 2026-10-30) is
 identical to the workstation's run (sm_89, section 3 of the 12a record), line
@@ -15,6 +15,11 @@ for line: the five elementwise and movement ops at `differ=0`, `conv3d` at
 cuBLASLt and therefore not bit-stable across architectures in general; on this
 probe's three-channel, 96-element sums the transcription and the device agree on
 both hosts anyway, so the probe's verdict is the same either way.
+
+The claim is bounded by the probes' own sizes (24 to 384 values each): this is
+two hosts agreeing on those ops at those sizes, not a cross-host identity claim
+over the whole graph. The whole-graph cross-host statement is the 1-2 ulp one in
+the handoff's section 2, and no hash crosses hosts as a gate.
 
 ## 2. The whole decoder at 121 x 768 x 1344, three latents
 
@@ -47,10 +52,12 @@ that is measured rather than assumed:
   independent Gaussian draws `E|X - Y| = 2 sigma / sqrt(pi) = 1.128 sigma`, so
   the stage-2 latent is within 2% of white noise in every axis and the adapter
   latent is at 0.74-0.82 of that, i.e. only modestly smoother;
-- and the decodes have the right *shape* of wrongness: the adapter's frame is
-  coarse and colourful, the stage-2 frame is fine and grey. That is what the
-  4x4 unpatchify does to decorrelated channels (section 3) on latents whose
-  coarse spatial structure differs.
+- and the decodes are *consistent* with a noise input (a report, not a verdict):
+  the adapter's frame is coarse and colourful, the stage-2 frame is fine and
+  grey, the shape a 4x4 unpatchify gives decorrelated channels (section 3) on
+  latents whose coarse spatial structure differs. A pleasing frame would not
+  have proved the port, and a noise field does not prove it either; only a real
+  latent does.
 
 So this unit still has no value-level reference for the composition, and says
 so: the entry point of the chain (a real source image through the H3 encoder,
@@ -131,8 +138,12 @@ raw BF16 `[128][16][24][42]`, 4,128,768 B.
 ## 7. Owed, in order of what it buys
 
 1. **The LTX VAE's encoder half** (the other 84 tensors in the same artifact):
-   encode a real image, decode it, and the round trip is a value-level proof of
-   the whole pair with no other unit in the path. Cheapest decisive test.
+   encode a real image, decode it, and the round trip checks the pair with no
+   other unit in the path. It is the cheapest decisive test, with one caveat:
+   the two halves could in principle carry a compensating error, so a passing
+   round trip is strong evidence of the pair's end-to-end behaviour rather than
+   a per-half proof. That caveat is why the entry point (item 2) is the path
+   that produces a frame worth looking at.
 2. **The chain's entry point**: a source image through the ported H3 encoder,
    the upscaler and the adapter, then this decoder - the product path, and the
    only one that produces a frame worth looking at.

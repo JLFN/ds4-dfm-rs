@@ -36,9 +36,10 @@ latent, channel-major `[channel][frame][height][width]` BF16 throughout:
 
 Every convolution is `CausalConv3d` with `causal = False`
 (`convolution.py:302-312`): **one replicated frame each side in time, one zero
-frame each side in space**. The temporal halo is the artifact's own choice of
-`spatial_padding_mode: zeros` for the spatial axes (`:299`), so the two are not
-the same policy and the port could not reuse `h3b_pad3d`'s zero pad in time.
+frame each side in space**. The two halos are different policies on purpose:
+the temporal replication follows from `causal = False`, while the spatial zeros
+are the artifact's own `spatial_padding_mode: zeros` (`:299`). A single zero pad
+in time (what `h3b_pad3d` does) would therefore be a different function, so
 `h3b_planar` gained a `replicate_t` argument; the adapter and the ops gate pass
 `0` and their behaviour is unchanged (section 5).
 
@@ -88,8 +89,10 @@ host transcription of the reference's own expression, element by element.
     PROBE conv3d-control differ=95 rel_rms=6.504e-1 verdict=pass
 
 - The five data-movement and elementwise kernels are **bit identical** to their
-  transcriptions, so the channel orders, the temporal drop and every rounding
-  are the reference's, not merely close.
+  host transcriptions, so the device implements the port's transcription of the
+  channel orders, the temporal drop and every rounding. What the transcription
+  follows is the reference's own expression, cited line by line in section 1;
+  the probe compares device to transcription, not transcription to reference.
 - `conv3d` is a residual verdict because the order inside a tap is cuBLASLt's;
   on this draw it came back identical anyway.
 - **Two controls prove the comparisons can fail.** The `denormalize` control is
@@ -160,10 +163,11 @@ probes instead, which is where it belongs.
 (`models.py:20-22`: 128/24 frames, 448/64 and 768/64 pixels) resolved by
 `_prepare_tiles`/`tiled_decode` (`conv_video_decoder.py:359-482`), which at
 `(121, 768, 1344)` is four tiles blended by trapezoidal masks. This port
-computes the same convolution stack over the whole latent, and the arithmetic
-inside every tile is identical; the values in the overlap zones are not, since
-the release averages them there. The tile plan is **not ported** and that is
-this unit's one real deviation.
+computes the same convolution stack over the whole latent; the release computes
+each tile with a halo of its own zero padding, so a tile's values are not the
+untiled values even away from the overlap - the difference is not confined to
+the blended zones. The tile plan is **not ported** and that is this unit's one
+real deviation.
 
 What it costs, computable without a device (`--shapes`, section 3):
 
@@ -185,8 +189,10 @@ tile's worth. This is the number the next unit either pays or removes.
 The second named deviation is the release's own memory-efficient decode
 (`memory_efficient_decode.py`, applied for the conv VAE by
 `blocks.py:1090-1095` with `CHANNELS_LAST_3D_WEIGHTS`): it is a layout and
-in-place policy over the same expression, so its values may differ in the last
-ulp. The port keeps the reference's channel-major expression.
+in-place policy over the same expression, so its values are expected to differ
+only in rounding - **unverified**: no measurement was made against it, so the
+size of that difference is unknown. The port keeps the reference's channel-major
+expression.
 
 ## 5. What else moved, and what did not
 
