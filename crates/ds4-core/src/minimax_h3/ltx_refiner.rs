@@ -1841,7 +1841,7 @@ pub fn unpatchify_video(
     latent: &Tensor,
     rows: u32,
 ) -> Result<(), RefinerError> {
-    gpu.channel_transpose(latent, output, rows, CHANNELS as u32)
+    gpu.channel_transpose(output, latent, rows, CHANNELS as u32)
         .map_err(RefinerError::Run)
 }
 

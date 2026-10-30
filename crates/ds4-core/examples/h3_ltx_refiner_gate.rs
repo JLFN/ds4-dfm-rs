@@ -39,9 +39,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_refiner::{
-    Cross, EdgeScratch, Edges, Geometry, Refiner, RefinerScratch, Request, Signals, AUDIO_BINS,
-    AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM, AUDIO_TOKENS, CHANNELS,
-    CONTEXT_ROWS, HEADS, LAYERS, VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
+    patchify_video, unpatchify_video, Cross, EdgeScratch, Edges, Geometry, Refiner, RefinerScratch,
+    Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM,
+    AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, VIDEO_CONTEXT_DIM, VIDEO_DIM,
+    VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
 use ds4_core::minimax_h3::ltx_stage2::{Generator, Stage2, NOISE_SCALE, SIGMAS, STEPS};
 use ds4_core::minimax_h3::safetensors::{self, Entry, Shard, ShardWriter};
@@ -1021,8 +1022,30 @@ fn probe_sampler(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
     failed |= report("noise_lerp", &got, &want, Verdict::Residual);
 
     failed |= probe_randn(gpu, state)?;
+    failed |= probe_patchify_pair(gpu, state)?;
 
     Ok(failed)
+}
+
+/// The two patchify entry points as inverses: `unpatchify_video` takes the
+/// `[rows, 128]` state to the `[128, rows]` latent grid and `patchify_video`
+/// takes it back. Both are one `h3d_channel_transpose`, whose first two
+/// arguments decide the direction, so this is the check that the pair is not
+/// swapped - and the failure mode of a swap is a silently zeroed state rather
+/// than a crash, which is why it is worth a probe of its own.
+fn probe_patchify_pair(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
+    let rows = 5u32;
+    let drawn = draw(gpu, rows, CHANNELS, state)?;
+    let want = read_bf16(gpu, &drawn)?;
+
+    let grid = alloc(gpu, Device::Bf16, rows as usize * CHANNELS)?;
+    let back = alloc(gpu, Device::Bf16, rows as usize * CHANNELS)?;
+    unpatchify_video(gpu, &grid, &drawn, rows).map_err(|error| error.token())?;
+    patchify_video(gpu, &back, &grid, rows).map_err(|error| error.token())?;
+
+    let got = read_bf16(gpu, &back)?;
+
+    Ok(report("patchify_pair", &got, &want, Verdict::Exact))
 }
 
 /// torch's own CUDA normal draw: it has no host transcription, so the probe
@@ -1062,8 +1085,13 @@ fn probe_randn(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
     let shaped = unfilled == 0
         && moment.abs() < 5.0 / (elements as f64).sqrt()
         && (spread - 1.0).abs() < 0.05;
+    // The hash is what a second host compares: the draw's values are the
+    // device's, so two architectures agreeing here says the two devices'
+    // `curand_normal4` agreed, and disagreeing says only that.
+    let hash = fnv1a(&first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<u8>>());
     println!(
-        "PROBE randn values={elements} unfilled={unfilled} mean={moment:.4} sd={spread:.4} verdict=device {}",
+        "PROBE randn values={elements} unfilled={unfilled} mean={moment:.4} sd={spread:.6} \
+         fnv={hash:016x} verdict=device {}",
         if shaped { "pass" } else { "FAIL" }
     );
     failed |= !shaped;
