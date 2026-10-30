@@ -360,6 +360,104 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    /// `h3d_ltx_rope_pair`: the LTX refiner's A2V/V2A rotary pair, query and
+    /// key rotated by their own tables and row counts.
+    fn h3d_ltx_rope_pair(
+        context: *mut Context,
+        query: *mut CTensor,
+        key: *mut CTensor,
+        q_cos: *const CTensor,
+        q_sin: *const CTensor,
+        k_cos: *const CTensor,
+        k_sin: *const CTensor,
+        q_rows: u32,
+        k_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_ada_add`: a block AdaLN table row plus one modulation row.
+    fn h3d_ada_add(
+        context: *mut Context,
+        output: *mut CTensor,
+        table: *const CTensor,
+        modulation: *const CTensor,
+        rows: u32,
+        width: u32,
+        coefficient: u32,
+        table_row: u32,
+        value_row: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_modulate`: `x * (1 + scale) + shift`.
+    fn h3d_modulate(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        scale: *const CTensor,
+        shift: *const CTensor,
+        rows: u32,
+        width: u32,
+        scale_rows: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_mul_rows`: a broadcast multiply, the right operand one row.
+    fn h3d_mul_rows(
+        context: *mut Context,
+        output: *mut CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        rows: u32,
+        width: u32,
+        right_rows: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_ada_zero`: `rms_norm(x) * (1 + scale) + shift`.
+    fn h3d_ada_zero(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        scale: *const CTensor,
+        shift: *const CTensor,
+        rows: u32,
+        width: u32,
+        scale_rows: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_layer_norm`: the refiner's `elementwise_affine=False` output norm.
+    fn h3d_layer_norm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_channel_transpose`: `[rows, width]` to `[width, rows]`.
+    fn h3d_channel_transpose(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     /// `h3d_sol_words`: the mask words one query block carries at this length.
     fn h3d_sol_words(sequence: u32) -> u32;
     /// VSA's selector: the reference's own sparsity rule for the H3 stage.
@@ -3031,6 +3129,222 @@ impl Gpu {
                 )
             },
             "LTX attention",
+        )
+    }
+
+    /// The LTX refiner's A2V/V2A rotary: `q_cos`/`q_sin` rotate `query` over
+    /// `q_rows`, `k_cos`/`k_sin` rotate `key` over `k_rows`, each table
+    /// `[rows, heads, head_dim / 2]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ltx_rope_pair(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        q_cos: &Tensor,
+        q_sin: &Tensor,
+        k_cos: &Tensor,
+        k_sin: &Tensor,
+        q_rows: u32,
+        k_rows: u32,
+        heads: u32,
+        head_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_ltx_rope_pair(
+                    self.raw.as_ptr(),
+                    query.raw(),
+                    key.raw(),
+                    q_cos.raw(),
+                    q_sin.raw(),
+                    k_cos.raw(),
+                    k_sin.raw(),
+                    q_rows,
+                    k_rows,
+                    heads,
+                    head_dim,
+                    error,
+                    size,
+                )
+            },
+            "LTX RoPE pair",
+        )
+    }
+
+    /// One AdaLN value: `table[table_row] + modulation[row, value_row, :]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ada_add(
+        &self,
+        output: &Tensor,
+        table: &Tensor,
+        modulation: &Tensor,
+        rows: u32,
+        width: u32,
+        coefficient: u32,
+        table_row: u32,
+        value_row: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_ada_add(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    table.raw(),
+                    modulation.raw(),
+                    rows,
+                    width,
+                    coefficient,
+                    table_row,
+                    value_row,
+                    error,
+                    size,
+                )
+            },
+            "AdaLN add",
+        )
+    }
+
+    /// `x * (1 + scale) + shift`, the affine row broadcast when `scale_rows`
+    /// is 1.
+    pub fn modulate(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        rows: u32,
+        width: u32,
+        scale_rows: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_modulate(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    scale.raw(),
+                    shift.raw(),
+                    rows,
+                    width,
+                    scale_rows,
+                    error,
+                    size,
+                )
+            },
+            "modulate",
+        )
+    }
+
+    /// A broadcast multiply: `left[rows, width] * right[right_rows, width]`,
+    /// `right_rows` either 1 or `rows`.
+    pub fn mul_rows(
+        &self,
+        output: &Tensor,
+        left: &Tensor,
+        right: &Tensor,
+        rows: u32,
+        width: u32,
+        right_rows: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_mul_rows(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    left.raw(),
+                    right.raw(),
+                    rows,
+                    width,
+                    right_rows,
+                    error,
+                    size,
+                )
+            },
+            "row broadcast multiply",
+        )
+    }
+
+    /// `rms_norm(x) * (1 + scale) + shift`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ada_zero(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        rows: u32,
+        width: u32,
+        scale_rows: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_ada_zero(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    scale.raw(),
+                    shift.raw(),
+                    rows,
+                    width,
+                    scale_rows,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "AdaLN zero",
+        )
+    }
+
+    /// The refiner's `elementwise_affine=False` output LayerNorm.
+    pub fn layer_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_layer_norm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    rows,
+                    width,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "layer norm",
+        )
+    }
+
+    /// The patchifier's `[rows, width]` to `[width, rows]` transpose, used in
+    /// both directions (patchify and unpatchify at patch size 1).
+    pub fn channel_transpose(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_channel_transpose(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "channel transpose",
         )
     }
 

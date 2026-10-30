@@ -3359,6 +3359,379 @@ int h3d_ltx_attention(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("LTX attention", error, error_size);
 }
 
+/* ---------------------------------------------------------------------------
+ * The LTX-2.5 refiner block's elementwise set (`model/transformer/`, the pin
+ * at `/data/ltx2-pin/packages`).
+ *
+ * Torch computes every BF16 elementwise op in FP32 and rounds once to BF16
+ * (`opmath_type<BFloat16>` is `float`), and each PyTorch expression below is a
+ * chain of separate ops, so the kernels here round where the expression does.
+ * `rms_norm(x) * (1 + scale) + shift` is four ops and four roundings: the
+ * normalization's own, the `1 + scale` tensor, the product, and the sum. A
+ * fused kernel that rounds once is NOT the same function.
+ * ------------------------------------------------------------------------- */
+
+/* `PytorchPreAttention.__call__` (`ops.py:22-36`) applies `apply_rotary_emb`
+ * to the query and to the key with *different* tables when `k_pe` is given
+ * (`transformer.py:359-361`, the A2V and V2A cross-attention). The two sides
+ * also have different row counts, so this is `h3d_ltx_rope` with the tables
+ * and the row counts split. */
+__global__ static void h3d_ltx_rope_pair_kernel(
+        __nv_bfloat16 *query, __nv_bfloat16 *key, const __nv_bfloat16 *q_cos,
+        const __nv_bfloat16 *q_sin, const __nv_bfloat16 *k_cos,
+        const __nv_bfloat16 *k_sin, uint32_t q_rows, uint32_t k_rows,
+        uint32_t heads, uint32_t head_dim) {
+    const uint32_t row = blockIdx.x, head = blockIdx.y;
+    const uint32_t half = head_dim / 2;
+
+    if (row < q_rows) {
+        const size_t base = ((size_t)row * heads + head) * head_dim;
+        const size_t table = ((size_t)row * heads + head) * half;
+        for (uint32_t d = threadIdx.x; d < half; d += blockDim.x) {
+            h3d_ltx_rotate(query, base, half, d,
+                           __bfloat162float(q_cos[table + d]),
+                           __bfloat162float(q_sin[table + d]));
+        }
+    }
+
+    if (row < k_rows) {
+        const size_t base = ((size_t)row * heads + head) * head_dim;
+        const size_t table = ((size_t)row * heads + head) * half;
+        for (uint32_t d = threadIdx.x; d < half; d += blockDim.x) {
+            h3d_ltx_rotate(key, base, half, d,
+                           __bfloat162float(k_cos[table + d]),
+                           __bfloat162float(k_sin[table + d]));
+        }
+    }
+}
+
+int h3d_ltx_rope_pair(h3d_context *context, h3d_tensor *query,
+                      h3d_tensor *key, const h3d_tensor *q_cos,
+                      const h3d_tensor *q_sin, const h3d_tensor *k_cos,
+                      const h3d_tensor *k_sin, uint32_t q_rows, uint32_t k_rows,
+                      uint32_t heads, uint32_t head_dim, char *error,
+                      size_t error_size) {
+    size_t query_elements = 0, key_elements = 0, q_table = 0, k_table = 0;
+    if (!context || !q_rows || !k_rows || !heads || !head_dim ||
+        (head_dim % 2) ||
+        !h3d_mul_size((size_t)q_rows * heads, head_dim, &query_elements) ||
+        !h3d_mul_size((size_t)k_rows * heads, head_dim, &key_elements) ||
+        !h3d_mul_size((size_t)q_rows * heads, head_dim / 2, &q_table) ||
+        !h3d_mul_size((size_t)k_rows * heads, head_dim / 2, &k_table) ||
+        !h3d_is(query, H3D_BF16, query_elements) ||
+        !h3d_is(key, H3D_BF16, key_elements) ||
+        !h3d_is(q_cos, H3D_BF16, q_table) || !h3d_is(q_sin, H3D_BF16, q_table) ||
+        !h3d_is(k_cos, H3D_BF16, k_table) || !h3d_is(k_sin, H3D_BF16, k_table)) {
+        return h3d_set_error(error, error_size, "invalid LTX RoPE pair tensors");
+    }
+    dim3 grid(q_rows > k_rows ? q_rows : k_rows, heads);
+    h3d_ltx_rope_pair_kernel<<<grid, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)query->data, (__nv_bfloat16 *)key->data,
+        (const __nv_bfloat16 *)q_cos->data, (const __nv_bfloat16 *)q_sin->data,
+        (const __nv_bfloat16 *)k_cos->data, (const __nv_bfloat16 *)k_sin->data,
+        q_rows, k_rows, heads, head_dim);
+    return h3d_launch_ok("LTX RoPE pair", error, error_size);
+}
+
+/* `BasicAVTransformerBlock.get_ada_values` (`transformer.py:190-200`): the
+ * block table's row plus the AdaLN MLP's matching coefficient row, one BF16
+ * addition. `modulation` is `[rows, coefficient, width]` - the shape
+ * `timestep.reshape(batch, T, num_ada_params, -1)` produces - so one row of
+ * it is strided and cannot be handed to `h3d_add`. */
+__global__ static void h3d_ada_add_kernel(__nv_bfloat16 *output,
+                                          const __nv_bfloat16 *table,
+                                          const __nv_bfloat16 *modulation,
+                                          uint32_t rows, uint32_t width,
+                                          uint32_t coefficient,
+                                          uint32_t table_row,
+                                          uint32_t value_row) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    const uint32_t row = (uint32_t)(index / width);
+    const uint32_t column = (uint32_t)(index % width);
+    const size_t parameter = ((size_t)row * coefficient + value_row) * width +
+                             column;
+    output[index] = __float2bfloat16(
+        __bfloat162float(table[(size_t)table_row * width + column]) +
+        __bfloat162float(modulation[parameter]));
+}
+
+int h3d_ada_add(h3d_context *context, h3d_tensor *output,
+                const h3d_tensor *table, const h3d_tensor *modulation,
+                uint32_t rows, uint32_t width, uint32_t coefficient,
+                uint32_t table_row, uint32_t value_row, char *error,
+                size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width || !coefficient ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(modulation, H3D_BF16, (size_t)rows * coefficient * width) ||
+        value_row >= coefficient) {
+        return h3d_set_error(error, error_size, "invalid AdaLN add arguments");
+    }
+    h3d_ada_add_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                         context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)table->data,
+        (const __nv_bfloat16 *)modulation->data, rows, width, coefficient,
+        table_row, value_row);
+    return h3d_launch_ok("LTX AdaLN add", error, error_size);
+}
+
+/* `apply_cross_attention_adaln` (`transformer.py:446`) and
+ * `_process_output` (`model.py:487-488`): `x * (1 + scale) + shift`, with the
+ * affine row broadcast when `scale_rows` is 1 (the prompt table and the model
+ * level output table are per request) and per token otherwise. */
+__global__ static void h3d_modulate_kernel(__nv_bfloat16 *output,
+                                           const __nv_bfloat16 *input,
+                                           const __nv_bfloat16 *scale,
+                                           const __nv_bfloat16 *shift,
+                                           uint32_t rows, uint32_t width,
+                                           uint32_t scale_rows) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    const uint32_t row = (uint32_t)(index / width);
+    const uint32_t column = (uint32_t)(index % width);
+    const size_t parameter = (size_t)(scale_rows == 1 ? 0 : row) * width +
+                             column;
+    const float factor = __bfloat162float(
+        __float2bfloat16(1.0f + __bfloat162float(scale[parameter])));
+    const float product = __bfloat162float(
+        __float2bfloat16(__bfloat162float(input[index]) * factor));
+    output[index] =
+        __float2bfloat16(product + __bfloat162float(shift[parameter]));
+}
+
+int h3d_modulate(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, const h3d_tensor *scale,
+                 const h3d_tensor *shift, uint32_t rows, uint32_t width,
+                 uint32_t scale_rows, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        (scale_rows != 1 && scale_rows != rows) ||
+        !h3d_is(scale, H3D_BF16, (size_t)scale_rows * width) ||
+        !h3d_is(shift, H3D_BF16, (size_t)scale_rows * width)) {
+        return h3d_set_error(error, error_size, "invalid BF16 modulate arguments");
+    }
+    h3d_modulate_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                          context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        (const __nv_bfloat16 *)scale->data, (const __nv_bfloat16 *)shift->data,
+        rows, width, scale_rows);
+    return h3d_launch_ok("BF16 modulate", error, error_size);
+}
+
+/* `transformer.py:362`: the A2V/V2A output is multiplied by a per-request
+ * gate `(B, 1, D)` - one row broadcast over every token - where `h3d_mul`
+ * needs equal element counts. */
+__global__ static void h3d_mul_rows_kernel(__nv_bfloat16 *output,
+                                           const __nv_bfloat16 *left,
+                                           const __nv_bfloat16 *right,
+                                           uint32_t rows, uint32_t width,
+                                           uint32_t right_rows) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    const uint32_t row = (uint32_t)(index / width);
+    const size_t factor =
+        (size_t)(right_rows == 1 ? 0 : row) * width + (index % width);
+    output[index] = __float2bfloat16(__bfloat162float(left[index]) *
+                                     __bfloat162float(right[factor]));
+}
+
+int h3d_mul_rows(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *left, const h3d_tensor *right, uint32_t rows,
+                 uint32_t width, uint32_t right_rows, char *error,
+                 size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(left, H3D_BF16, elements) ||
+        (right_rows != 1 && right_rows != rows) ||
+        !h3d_is(right, H3D_BF16, (size_t)right_rows * width)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 row-broadcast multiply arguments");
+    }
+    h3d_mul_rows_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                          context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)left->data,
+        (const __nv_bfloat16 *)right->data, rows, width, right_rows);
+    return h3d_launch_ok("BF16 row broadcast multiply", error, error_size);
+}
+
+/* `PytorchAdaZeroFunction` (`ops.py:50-58`): `rms_norm(x) * (1 + scale) +
+ * shift`. The reduction and `rsqrtf(sum / width + eps)` are
+ * `h3d_rms_norm_kernel`'s own (`:2707`); the epilogue is
+ * `h3d_modulate_kernel`'s, applied to the normalized value. */
+__global__ static void h3d_ada_zero_kernel(__nv_bfloat16 *output,
+                                           const __nv_bfloat16 *input,
+                                           const __nv_bfloat16 *scale,
+                                           const __nv_bfloat16 *shift,
+                                           uint32_t rows, uint32_t width,
+                                           uint32_t scale_rows,
+                                           float epsilon) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    __shared__ float sums[256];
+    float sum = 0.0f;
+    for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        float value = __bfloat162float(input[(size_t)row * width + column]);
+        sum = fmaf(value, value, sum);
+    }
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride /= 2) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(sums[0] / (float)width + epsilon);
+    const uint32_t source = scale_rows == 1 ? 0 : row;
+    for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        size_t index = (size_t)row * width + column;
+        size_t parameter = (size_t)source * width + column;
+        float normalized = __bfloat162float(__float2bfloat16(
+            __bfloat162float(input[index]) * inverse));
+        float factor = __bfloat162float(
+            __float2bfloat16(1.0f + __bfloat162float(scale[parameter])));
+        output[index] = __float2bfloat16(
+            __bfloat162float(__float2bfloat16(normalized * factor)) +
+            __bfloat162float(shift[parameter]));
+    }
+}
+
+int h3d_ada_zero(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, const h3d_tensor *scale,
+                 const h3d_tensor *shift, uint32_t rows, uint32_t width,
+                 uint32_t scale_rows, float epsilon, char *error,
+                 size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width || epsilon < 0.0f ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        (scale_rows != 1 && scale_rows != rows) ||
+        !h3d_is(scale, H3D_BF16, (size_t)scale_rows * width) ||
+        !h3d_is(shift, H3D_BF16, (size_t)scale_rows * width)) {
+        return h3d_set_error(error, error_size, "invalid AdaLN zero arguments");
+    }
+    h3d_ada_zero_kernel<<<rows, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        (const __nv_bfloat16 *)scale->data, (const __nv_bfloat16 *)shift->data,
+        rows, width, scale_rows, epsilon);
+    return h3d_launch_ok("LTX AdaLN zero", error, error_size);
+}
+
+/* `torch.nn.LayerNorm(..., elementwise_affine=False, eps=1e-6)`
+ * (`model.py:232`, `:471-489`, `:520-536`): the mean with plain adds, the
+ * biased variance with `fmaf` on the centered values, `rsqrtf(var + eps)`,
+ * then one rounding - `h3d_layer_norm_f32_kernel`'s arithmetic (`:4697`) at
+ * BF16 without the affine pair. */
+__global__ static void h3d_layer_norm_kernel(__nv_bfloat16 *output,
+                                             const __nv_bfloat16 *input,
+                                             uint32_t rows, uint32_t width,
+                                             float epsilon) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    __shared__ float sums[256];
+    float sum = 0.0f;
+    for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        sum += __bfloat162float(input[(size_t)row * width + column]);
+    }
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride /= 2) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float mean = sums[0] / (float)width;
+    sum = 0.0f;
+    for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        float centered =
+            __bfloat162float(input[(size_t)row * width + column]) - mean;
+        sum = fmaf(centered, centered, sum);
+    }
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride; stride /= 2) {
+        if (threadIdx.x < stride) sums[threadIdx.x] += sums[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float inverse = rsqrtf(sums[0] / (float)width + epsilon);
+    for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
+        size_t index = (size_t)row * width + column;
+        output[index] = __float2bfloat16(
+            (__bfloat162float(input[index]) - mean) * inverse);
+    }
+}
+
+int h3d_layer_norm(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, uint32_t rows, uint32_t width,
+                   float epsilon, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width || epsilon < 0.0f ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(input, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size, "invalid BF16 layer norm arguments");
+    }
+    h3d_layer_norm_kernel<<<rows, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        rows, width, epsilon);
+    return h3d_launch_ok("BF16 layer norm", error, error_size);
+}
+
+/* `VideoLatentPatchifier.patchify`/`unpatchify` at patch size 1
+ * (`components/patchifiers.py:27-64`): `b c (f p1) (h p2) (w p3) -> b (f h w)
+ * (c p1 p2 p3)` is, at `p = 1`, a plain `[channels, tokens]` transpose, and
+ * the inverse is the same transpose. `rows` is the token count and `width`
+ * the channel count; the output is `[width, rows]`. */
+#define H3D_TRANSPOSE_TILE 32
+__global__ static void h3d_channel_transpose_kernel(__nv_bfloat16 *output,
+                                                    const __nv_bfloat16 *input,
+                                                    uint32_t rows,
+                                                    uint32_t width) {
+    __shared__ __nv_bfloat16 tile[H3D_TRANSPOSE_TILE][H3D_TRANSPOSE_TILE + 1];
+    const uint32_t column = blockIdx.x * H3D_TRANSPOSE_TILE + threadIdx.x;
+    const uint32_t row = blockIdx.y * H3D_TRANSPOSE_TILE + threadIdx.y;
+
+    if (column < width && row < rows) {
+        tile[threadIdx.y][threadIdx.x] = input[(size_t)row * width + column];
+    }
+    __syncthreads();
+
+    // The tile is read transposed, so threadIdx.x now walks the input's token
+    // axis and threadIdx.y its channel axis.
+    const uint32_t out_row = blockIdx.x * H3D_TRANSPOSE_TILE + threadIdx.y;
+    const uint32_t out_column = blockIdx.y * H3D_TRANSPOSE_TILE + threadIdx.x;
+
+    if (out_column < rows && out_row < width) {
+        output[(size_t)out_row * rows + out_column] =
+            tile[threadIdx.x][threadIdx.y];
+    }
+}
+
+int h3d_channel_transpose(h3d_context *context, h3d_tensor *output,
+                          const h3d_tensor *input, uint32_t rows,
+                          uint32_t width, char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 channel transpose arguments");
+    }
+    dim3 grid((width + H3D_TRANSPOSE_TILE - 1) / H3D_TRANSPOSE_TILE,
+              (rows + H3D_TRANSPOSE_TILE - 1) / H3D_TRANSPOSE_TILE);
+    dim3 block(H3D_TRANSPOSE_TILE, H3D_TRANSPOSE_TILE);
+    h3d_channel_transpose_kernel<<<grid, block, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        rows, width);
+    return h3d_launch_ok("BF16 channel transpose", error, error_size);
+}
+
 enum {
     H3D_MMA_HD = 128,                 /* head dimension, the one shape served */
     H3D_MMA_KEYS = 64,                /* key rows staged per tile */

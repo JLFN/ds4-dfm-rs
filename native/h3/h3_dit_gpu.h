@@ -588,6 +588,67 @@ int h3d_ltx_attention(h3d_context *context, h3d_tensor *output,
                       uint32_t kv_rows, uint32_t heads, uint32_t head_dim,
                       float scale, char *error, size_t error_size);
 
+/* The LTX-2.5 refiner block's elementwise set. Torch rounds BF16 elementwise
+ * ops once each (`opmath_type<BFloat16>` is `float`) and every expression
+ * below is a chain of separate ops, so these kernels round where the
+ * expression does - a fused single-rounding form is a different function. */
+
+/* `PytorchPreAttention.__call__` (`ops.py:22-36`): `apply_rotary_emb` on the
+ * query and the key with *different* tables and row counts, the A2V/V2A
+ * cross-attention's `pe`/`k_pe` pair (`transformer.py:359-361`). */
+int h3d_ltx_rope_pair(h3d_context *context, h3d_tensor *query,
+                      h3d_tensor *key, const h3d_tensor *q_cos,
+                      const h3d_tensor *q_sin, const h3d_tensor *k_cos,
+                      const h3d_tensor *k_sin, uint32_t q_rows,
+                      uint32_t k_rows, uint32_t heads, uint32_t head_dim,
+                      char *error, size_t error_size);
+
+/* `get_ada_values` (`transformer.py:190-200`): block table row
+ * `table_row` plus `modulation[row, value_row, :]`, one BF16 addition.
+ * `modulation` is `[rows, coefficient, width]`, the shape
+ * `timestep.reshape(batch, T, num_ada_params, -1)` produces. */
+int h3d_ada_add(h3d_context *context, h3d_tensor *output,
+                const h3d_tensor *table, const h3d_tensor *modulation,
+                uint32_t rows, uint32_t width, uint32_t coefficient,
+                uint32_t table_row, uint32_t value_row, char *error,
+                size_t error_size);
+
+/* `x * (1 + scale) + shift` (`transformer.py:446`, `model.py:487-488`) with
+ * the affine row broadcast when `scale_rows` is 1. */
+int h3d_modulate(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, const h3d_tensor *scale,
+                 const h3d_tensor *shift, uint32_t rows, uint32_t width,
+                 uint32_t scale_rows, char *error, size_t error_size);
+
+/* `transformer.py:362`: `attn_out * gate_out`, the gate one row broadcast
+ * over every token. */
+int h3d_mul_rows(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *left, const h3d_tensor *right,
+                 uint32_t rows, uint32_t width, uint32_t right_rows,
+                 char *error, size_t error_size);
+
+/* `PytorchAdaZeroFunction` (`ops.py:50-58`): `rms_norm(x) * (1 + scale) +
+ * shift`. */
+int h3d_ada_zero(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, const h3d_tensor *scale,
+                 const h3d_tensor *shift, uint32_t rows, uint32_t width,
+                 uint32_t scale_rows, float epsilon, char *error,
+                 size_t error_size);
+
+/* `torch.nn.LayerNorm(elementwise_affine=False)` (`model.py:232`, `:520-536`)
+ * at BF16: no affine pair, biased variance. */
+int h3d_layer_norm(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, uint32_t rows, uint32_t width,
+                   float epsilon, char *error, size_t error_size);
+
+/* `VideoLatentPatchifier.patchify`/`unpatchify` at patch size 1
+ * (`components/patchifiers.py:27-64`): a `[rows, width]` to `[width, rows]`
+ * transpose, the patchifier's `b c (f p1) (h p2) (w p3) -> b (f h w)
+ * (c p1 p2 p3)` at `p = 1`. */
+int h3d_channel_transpose(h3d_context *context, h3d_tensor *output,
+                          const h3d_tensor *input, uint32_t rows,
+                          uint32_t width, char *error, size_t error_size);
+
 /* `h3_gpu_add_bf16` (`:2373-2376`) with `h3_binary_bf16_kernel`
  * (`:2347-2357`), `h3_gpu_cast_f32_to_bf16` (`:2287-2296`), and the SiLU
  * branches of `h3_gpu_silu_f32`/`h3_gpu_silu_bf16` (`:2276-2306`, `:2321-2329`)
