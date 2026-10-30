@@ -89,6 +89,12 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
     let options = split(args)?;
+
+    // A dump comparison reads two directories and no device.
+    if let Some((left, right)) = &options.compare {
+        return run_compare(left, right);
+    }
+
     let gpu = Gpu::create().map_err(|detail| format!("device: {detail}"))?;
 
     if options.probe {
@@ -115,6 +121,77 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     }
 
     run_blocks(&gpu, &transformer, &options)
+}
+
+/// `--compare LEFT RIGHT`: every BF16 dump the two directories share, by file
+/// name, with the residual, the cosine and the largest absolute difference.
+///
+/// This is reporting, not a gate. `--residual`'s ceiling is 2e-2 and exists
+/// for a *numerical* difference (BF16 rounding and reduction order); a changed
+/// attention *policy* changes values by design, and what has to be shown is
+/// how much, not that it stayed under a bound meant for arithmetic noise.
+fn run_compare(left: &Path, right: &Path) -> Result<ExitCode, String> {
+    let listing = std::fs::read_dir(left)
+        .map_err(|error| format!("--compare {}: {error}", left.display()))?;
+    let mut names: Vec<String> = listing
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.retain(|name| name.ends_with(".bf16"));
+    names.sort();
+
+    if names.is_empty() {
+        return Err(format!("--compare {}: no .bf16 dumps", left.display()));
+    }
+
+    for name in names {
+        let payload = std::fs::read(left.join(&name))
+            .map_err(|error| format!("--compare {name}: {error}"))?;
+        let reference = match std::fs::read(right.join(&name)) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                println!("COMPARE {name} missing in {}", right.display());
+                continue;
+            }
+        };
+        if payload.len() != reference.len() {
+            return Err(format!(
+                "--compare {name}: {} bytes against {}",
+                payload.len(),
+                reference.len()
+            ));
+        }
+
+        let got = widen_bf16(&payload);
+        let want = widen_bf16(&reference);
+        let (differ, rel_rms) = compare(&got, &want);
+        let (mut dot, mut left_square, mut right_square) = (0.0f64, 0.0f64, 0.0f64);
+        let mut max_abs = 0.0f32;
+
+        for (a, b) in got.iter().zip(want.iter()) {
+            dot += (*a as f64) * (*b as f64);
+            left_square += (*a as f64).powi(2);
+            right_square += (*b as f64).powi(2);
+            max_abs = max_abs.max((*a - *b).abs());
+        }
+
+        let norm = (left_square.sqrt() * right_square.sqrt()).max(1e-30);
+        println!(
+            "COMPARE {name} values={} differ={differ} rel_rms={rel_rms:.3e} cosine={:.6} max_abs={max_abs:.4}",
+            got.len(),
+            dot / norm
+        );
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A BF16 byte payload widened to F32, the read-back both comparisons use.
+fn widen_bf16(payload: &[u8]) -> Vec<f32> {
+    payload
+        .chunks_exact(2)
+        .map(|pair| f32::from_bits((u16::from_le_bytes([pair[0], pair[1]]) as u32) << 16))
+        .collect()
 }
 
 /// The whole stage-2 evaluation (`minimax_h3::ltx_stage2`): one noised state,
@@ -1267,10 +1344,7 @@ fn report_state(
             ));
         }
 
-        let previous: Vec<f32> = reference
-            .chunks_exact(2)
-            .map(|pair| f32::from_bits((u16::from_le_bytes([pair[0], pair[1]]) as u32) << 16))
-            .collect();
+        let previous = widen_bf16(&reference);
         let (differ, rel_rms) = compare(&values, &previous);
 
         println!(
@@ -2123,7 +2197,8 @@ fn usage(detail: &str) -> String {
          h3_ltx_refiner_gate --stage --transformer PATH [--layers K] [--seed S]\n\
          \x20                            [--latent FILE] [--context FILE] [--sol]\n\
          \x20                            [--dump DIR] [--residual DIR]\n\
-         \x20                            [--expect NAME=HEX ...]"
+         \x20                            [--expect NAME=HEX ...]\n       \
+         h3_ltx_refiner_gate --compare LEFT RIGHT"
     )
 }
 
@@ -2146,6 +2221,7 @@ struct Options {
     probe: bool,
     dump: Option<PathBuf>,
     residual: Option<PathBuf>,
+    compare: Option<(PathBuf, PathBuf)>,
     expect: HashMap<String, u64>,
 }
 
@@ -2168,6 +2244,7 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut probe = false;
     let mut dump = None;
     let mut residual = None;
+    let mut compare = None;
     let mut expect = HashMap::new();
     let mut index = 0usize;
 
@@ -2200,6 +2277,11 @@ fn split(args: &[String]) -> Result<Options, String> {
             "--seed" => seed = Some(number(&take(args, &mut index)?)? as u32),
             "--dump" => dump = Some(PathBuf::from(take(args, &mut index)?)),
             "--residual" => residual = Some(PathBuf::from(take(args, &mut index)?)),
+            "--compare" => {
+                let left = PathBuf::from(take(args, &mut index)?);
+                let right = PathBuf::from(take(args, &mut index)?);
+                compare = Some((left, right));
+            }
             "--expect" => {
                 let value = take(args, &mut index)?;
                 let (name, hash) = value
@@ -2244,6 +2326,7 @@ fn split(args: &[String]) -> Result<Options, String> {
         probe,
         dump,
         residual,
+        compare,
         expect,
     })
 }
