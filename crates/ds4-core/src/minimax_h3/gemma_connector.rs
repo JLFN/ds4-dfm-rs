@@ -236,7 +236,7 @@ impl Processor {
             .map_err(|error| ConnectorError::Reader(error.token()))?;
         let mut reader = Reader {
             gpu,
-            buffers: Vec::new(),
+            buffer: Vec::new(),
             tensors: 0,
             bytes: 0,
         };
@@ -650,7 +650,7 @@ impl Scratch {
 /// graph will do with the tensor before anything reaches the device.
 struct Reader<'a> {
     gpu: &'a Gpu,
-    buffers: Vec<Vec<u8>>,
+    buffer: Vec<u8>,
     tensors: usize,
     bytes: u64,
 }
@@ -696,17 +696,19 @@ impl Reader<'_> {
             });
         }
 
-        let mut buffer = vec![0u8; tensor.bytes() as usize];
+        // One host buffer for the whole load: the aggregate embed is 770 MB
+        // and a per-tensor buffer would keep all 6.3 GB resident.
+        self.buffer.clear();
+        self.buffer.resize(tensor.bytes() as usize, 0);
         shard
-            .read_data(tensor, &mut buffer)
+            .read_data(tensor, &mut self.buffer)
             .map_err(|error| ConnectorError::Reader(error.token()))?;
 
         let device = alloc(self.gpu, device_dtype(dtype), elements as usize)?;
         self.gpu
-            .upload(&device, &buffer)
+            .upload(&device, &self.buffer)
             .map_err(ConnectorError::Run)?;
 
-        self.buffers.push(buffer);
         self.tensors += 1;
         self.bytes += tensor.bytes();
 
