@@ -33,16 +33,16 @@
 //! connector's: a second implementation of the reference's own expressions,
 //! cited to `model/transformer/` line by line.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_refiner::{
-    patchify_video, unpatchify_video, Cross, Diagnostic, EdgeScratch, Edges, Geometry, Refiner,
-    RefinerScratch, Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM,
-    AUDIO_HEAD_DIM, AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, SOL_LAYERS, TAU_SCHEDULE,
-    VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
+    patchify_video, unpatchify_video, Cross, Diagnostic, EdgeScratch, Edges, Geometry, Lora,
+    Refiner, RefinerScratch, Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM,
+    AUDIO_DIM, AUDIO_HEAD_DIM, AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, MULTIPLIER,
+    SOL_LAYERS, TAU_SCHEDULE, VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
 use ds4_core::minimax_h3::ltx_stage2::{Generator, Stage2, NOISE_SCALE, SIGMAS, STEPS};
 use ds4_core::minimax_h3::safetensors::{self, Entry, Shard, ShardWriter};
@@ -54,6 +54,27 @@ use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
 /// by a few tenths of a percent; a wiring fault moves every element, by two
 /// orders more.
 const RESIDUAL_CEILING: f64 = 2e-2;
+
+/// The release's LoRA strength (`runtime/stage2_ops/models.py:76`).
+const LORA_STRENGTH: f32 = 0.8;
+
+/// The LoRA file's own rank (`lora_rank` in its header).
+const LORA_RANK: usize = 450;
+
+/// The k rows the probe's factors are nonzero on: the first two and the last,
+/// so a truncated k range or an off-by-one cannot hide.
+const LORA_NONZERO: [usize; 3] = [0, 1, 449];
+
+/// `--lora-probe`'s targets: a square projection and a non-square one whose
+/// input is the wider axis, both the release's real shapes.
+const LORA_TARGETS: [(&str, usize, usize); 2] = [
+    ("transformer_blocks.0.attn1.to_q", VIDEO_DIM, VIDEO_DIM),
+    (
+        "transformer_blocks.0.audio_ff.net.2",
+        AUDIO_DIM,
+        AUDIO_DIM * MULTIPLIER,
+    ),
+];
 
 /// The per-block tensors whose zeroing makes every added term exactly zero:
 /// the six attention output projections and the two feed-forward outputs.
@@ -97,6 +118,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let gpu = Gpu::create().map_err(|detail| format!("device: {detail}"))?;
 
+    if let Some(dir) = &options.lora_probe {
+        return run_lora_probe(&gpu, dir, &options);
+    }
+
     if options.probe {
         let failed = probe(&gpu, options.rows.unwrap_or(8), options.seed.unwrap_or(1))?;
 
@@ -108,19 +133,49 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         .clone()
         .ok_or_else(|| usage("--transformer is required"))?;
 
-    if let Some(target) = &options.identity {
-        return identity(&gpu, &transformer, target, &options);
+    let code = if let Some(target) = &options.identity {
+        identity(&gpu, &transformer, target, &options)?
+    } else if options.edges {
+        run_edges(&gpu, &transformer, &options)?
+    } else if options.stage {
+        run_stage(&gpu, &transformer, &options)?
+    } else {
+        run_blocks(&gpu, &transformer, &options)?
+    };
+
+    Ok(if report_lora(&options) {
+        ExitCode::from(3)
+    } else {
+        code
+    })
+}
+
+/// What the LoRA did, once per run: the modules the file carries, how many the
+/// load fused, for which classes, and what it cost. A run that names a LoRA and
+/// fuses nothing is a mapping failure and is refused here.
+fn report_lora(options: &Options) -> bool {
+    let Some(lora) = &options.lora else {
+        return false;
+    };
+
+    println!(
+        "LORA strength={} targets={} fused={} bytes={}",
+        lora.strength(),
+        lora.targets(),
+        lora.fused(),
+        lora.bytes()
+    );
+
+    for (class, count) in lora.classes() {
+        println!("LORA-CLASS {class} {count}");
     }
 
-    if options.edges {
-        return run_edges(&gpu, &transformer, &options);
+    if lora.fused() == 0 {
+        println!("LORA the file's modules never met a weight the graph loads");
+        return true;
     }
 
-    if options.stage {
-        return run_stage(&gpu, &transformer, &options);
-    }
-
-    run_blocks(&gpu, &transformer, &options)
+    false
 }
 
 /// `--compare LEFT RIGHT`: every BF16 dump the two directories share, by file
@@ -206,6 +261,259 @@ fn widen_bf16(payload: &[u8]) -> Vec<f32> {
 /// evaluation without `--latent` and `--context` is synthetic: it still
 /// exercises every kernel on the release's shapes and prices the step, and it
 /// says nothing about the video.
+/// `--lora-probe DIR`: the fusion's own gate, with no shard and no reference
+/// file.
+///
+/// It writes a LoRA at the release's own rank (450) and the graph's own shapes,
+/// fuses one synthetic weight per target through `Lora::fuse`, and compares
+/// both the delta and the fused weight against a transcription of the
+/// reference's expression, `bf16(bf16(W) + bf16(sum_k bf16(0.8 * B)[o,k] *
+/// A[k,i]))` (`fuse_loras.py:99-116`, `:61-68`).
+///
+/// The transcription is exact on purpose. The factors are drawn from a
+/// three-fractional-bit alphabet and only `LORA_NONZERO`'s k rows are nonzero,
+/// so every product has a 16-bit significand and every partial sum stays inside
+/// 24; the loop visits the nonzero rows and no others, which is the same sum,
+/// the rest of the terms being exact zeros. What is left is the two roundings
+/// the reference has, so a wrong contraction, a dropped strength, an add in the
+/// wrong place or a truncating round is an element that differs rather than a
+/// tolerance.
+///
+/// Two controls prove the comparison can fail: a transcription at strength 1
+/// and one with `A` read on its other axis must both differ from the device's
+/// delta, and a key one block over must fuse nothing.
+fn run_lora_probe(gpu: &Gpu, dir: &Path, options: &Options) -> Result<ExitCode, String> {
+    if options.lora.is_some() {
+        return Err(usage(
+            "--lora-probe writes its own LoRA; --lora is for a real run",
+        ));
+    }
+
+    let path = dir.join("lora-probe.safetensors");
+    let mut state = 0x2545_f491u32;
+    let mut factors = Vec::new();
+
+    for (module, rows, cols) in LORA_TARGETS {
+        factors.push((module, rows, cols, lora_factors(rows, cols, &mut state)));
+    }
+
+    write_lora(&path, &factors)?;
+
+    let lora = Lora::open(&path, LORA_STRENGTH).map_err(|error| error.token())?;
+
+    println!(
+        "LORA-PROBE file={} targets={} rank={} strength={}",
+        path.display(),
+        lora.targets(),
+        LORA_RANK,
+        LORA_STRENGTH
+    );
+
+    let mut failed = lora.targets() != LORA_TARGETS.len();
+
+    for (module, rows, cols, (a_bytes, b_bytes)) in &factors {
+        let (rows, cols) = (*rows, *cols);
+        let a = widen_bf16(a_bytes);
+        let b = widen_bf16(b_bytes);
+        let values = lora_weight(rows, cols, &mut state);
+        let weight = upload_bf16(gpu, &pack_bf16(&values))?;
+        let key = format!("model.diffusion_model.{module}.weight");
+
+        let delta = lora
+            .fuse(gpu, &key, &weight, rows as u32, cols as u32)
+            .map_err(|error| error.token())?
+            .ok_or_else(|| format!("{key} was not fused"))?;
+
+        let want_delta = transcribe_delta(&a, &b, rows, cols, LORA_STRENGTH, Orientation::Released);
+        let (delta_differ, delta_rms) = compare(&read_bf16(gpu, &delta)?, &want_delta);
+        let want = transcribe_weight(&values, &want_delta);
+        let (differ, rel_rms) = compare(&read_bf16(gpu, &weight)?, &want);
+        let pass = delta_differ == 0 && differ == 0;
+
+        println!(
+            "LORA-PROBE {module} rows={rows} cols={cols} delta_differ={delta_differ} \
+             fused_differ={differ} rel_rms={rel_rms:.3e} delta_rms={delta_rms:.3e} {}",
+            if pass { "pass" } else { "FAIL" }
+        );
+
+        failed |= !pass;
+
+        for (label, wrong) in [
+            (
+                "strength=1",
+                transcribe_delta(&a, &b, rows, cols, 1.0, Orientation::Released),
+            ),
+            (
+                "other-axis",
+                transcribe_delta(&a, &b, rows, cols, LORA_STRENGTH, Orientation::Transposed),
+            ),
+        ] {
+            let (control, _) = compare(&want_delta, &wrong);
+
+            println!(
+                "LORA-PROBE-CONTROL {module} {label} differ={control} {}",
+                if control > 0 { "pass" } else { "FAIL" }
+            );
+
+            failed |= control == 0;
+        }
+    }
+
+    // A key the file does not carry: the same class, one block over. The
+    // mapping has to be exact, not a suffix match.
+    let (module, rows, cols) = LORA_TARGETS[0];
+    let stray = module.replacen(".0.", ".1.", 1);
+    let weight = upload_bf16(gpu, &pack_bf16(&lora_weight(rows, cols, &mut state)))?;
+    let before = read_bf16(gpu, &weight)?;
+    let fused = lora
+        .fuse(
+            gpu,
+            &format!("model.diffusion_model.{stray}.weight"),
+            &weight,
+            rows as u32,
+            cols as u32,
+        )
+        .map_err(|error| error.token())?
+        .is_some();
+    let (differ, _) = compare(&before, &read_bf16(gpu, &weight)?);
+    let pass = !fused && differ == 0;
+
+    println!(
+        "LORA-PROBE-UNTOUCHED {stray} fused={fused} differ={differ} {}",
+        if pass { "pass" } else { "FAIL" }
+    );
+
+    failed |= !pass;
+
+    println!(
+        "LORA-PROBE-MODULES targets={} fused={} bytes={}",
+        lora.targets(),
+        lora.fused(),
+        lora.bytes()
+    );
+
+    for (class, count) in lora.classes() {
+        println!("LORA-PROBE-CLASS {class} {count}");
+    }
+
+    Ok(ExitCode::from(if failed { 3 } else { 0 }))
+}
+
+/// Which axis of `A` the sum contracts. `Released` is the reference's `B @ A`;
+/// `Transposed` is the control, `A` read on the other axis.
+#[derive(Clone, Copy)]
+enum Orientation {
+    Released,
+    Transposed,
+}
+
+/// A BF16 value from a three-bit alphabet, `(-6..=6) / 4`: exact in BF16, so
+/// every product of two of them has a 16-bit significand.
+fn alphabet(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+
+    f32::from(((*state >> 16) % 13) as u16) / 4.0 - 1.5
+}
+
+/// One target's factors: `A` `[rank, cols]` and `B` `[rows, rank]`, zero
+/// outside `LORA_NONZERO`.
+fn lora_factors(rows: usize, cols: usize, state: &mut u32) -> (Vec<u8>, Vec<u8>) {
+    let mut a = vec![0f32; LORA_RANK * cols];
+    let mut b = vec![0f32; rows * LORA_RANK];
+
+    for k in LORA_NONZERO {
+        for i in 0..cols {
+            a[k * cols + i] = alphabet(state);
+        }
+
+        for o in 0..rows {
+            b[o * LORA_RANK + k] = alphabet(state);
+        }
+    }
+
+    (pack_bf16(&a), pack_bf16(&b))
+}
+
+/// The probe's weight, from the same alphabet.
+fn lora_weight(rows: usize, cols: usize, state: &mut u32) -> Vec<f32> {
+    (0..rows * cols).map(|_| alphabet(state)).collect()
+}
+
+/// Write the probe's LoRA keyed the way the reference's own file is: one
+/// `diffusion_model.` segment fewer than the model's key (`sd_ops.py:135-137`).
+fn write_lora(
+    path: &Path,
+    factors: &[(&str, usize, usize, (Vec<u8>, Vec<u8>))],
+) -> Result<(), String> {
+    let mut entries = Vec::new();
+
+    for (module, rows, cols, _) in factors {
+        entries.push(Entry {
+            name: format!("diffusion_model.{module}.lora_A.weight"),
+            dtype: safetensors::Dtype::Bf16,
+            shape: vec![LORA_RANK as u64, *cols as u64],
+        });
+        entries.push(Entry {
+            name: format!("diffusion_model.{module}.lora_B.weight"),
+            dtype: safetensors::Dtype::Bf16,
+            shape: vec![*rows as u64, LORA_RANK as u64],
+        });
+    }
+
+    let writer =
+        ShardWriter::create(path, &entries, &BTreeMap::new()).map_err(|error| error.token())?;
+
+    for (index, (_, _, _, (a, b))) in factors.iter().enumerate() {
+        writer.write(index * 2, a).map_err(|error| error.token())?;
+        writer
+            .write(index * 2 + 1, b)
+            .map_err(|error| error.token())?;
+    }
+
+    Ok(())
+}
+
+/// `bf16(sum_k bf16(strength * B)[o,k] * A[k,i])`: the reference's GEMM output
+/// (`aggregate_lora_products`, `:113`), the k loop over the nonzero rows.
+fn transcribe_delta(
+    a: &[f32],
+    b: &[f32],
+    rows: usize,
+    cols: usize,
+    strength: f32,
+    orientation: Orientation,
+) -> Vec<f32> {
+    let scaled: Vec<f32> = b.iter().map(|value| bf16(value * strength)).collect();
+    let mut out = vec![0f32; rows * cols];
+
+    for o in 0..rows {
+        for i in 0..cols {
+            let mut sum = 0f64;
+
+            for k in LORA_NONZERO {
+                let factor = match orientation {
+                    Orientation::Released => a[k * cols + i],
+                    Orientation::Transposed => a[i * LORA_RANK + k],
+                };
+                sum += f64::from(scaled[o * LORA_RANK + k]) * f64::from(factor);
+            }
+
+            out[o * cols + i] = bf16(sum as f32);
+        }
+    }
+
+    out
+}
+
+/// `bf16(bf16(W) + delta)` (`_bf16_fuse`, `:61-68`): the fused weight.
+fn transcribe_weight(weight: &[f32], delta: &[f32]) -> Vec<f32> {
+    weight
+        .iter()
+        .zip(delta.iter())
+        .map(|(value, add)| bf16(bf16(*value) + *add))
+        .collect()
+}
+
 fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, String> {
     let geometry = Geometry::release();
     let rows = geometry.video_tokens();
@@ -213,8 +521,8 @@ fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
     let seed = options.seed.unwrap_or(1);
 
     let started = Instant::now();
-    let mut stage =
-        Stage2::open(gpu, path, path, geometry, &layers).map_err(|error| error.token())?;
+    let mut stage = Stage2::open(gpu, path, path, geometry, &layers, options.lora.as_ref())
+        .map_err(|error| error.token())?;
     let load = started.elapsed().as_secs_f64();
 
     // The release's Sol-Attn policy: layers 1..47 route, layer 0 stays dense,
@@ -381,7 +689,8 @@ fn run_blocks(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Str
     let seed = options.seed.unwrap_or(1);
 
     let started = Instant::now();
-    let refiner = Refiner::open(gpu, path, &layers).map_err(|error| error.token())?;
+    let refiner =
+        Refiner::open(gpu, path, &layers, options.lora.as_ref()).map_err(|error| error.token())?;
     let load = started.elapsed().as_secs_f64();
     let (tensors, bytes) = refiner.loaded();
 
@@ -472,7 +781,8 @@ fn identity(gpu: &Gpu, path: &Path, target: &Path, options: &Options) -> Result<
     let zeroed = zero_shard(path, target, blocks)?;
     println!("IDENTITY shard={} zeroed={zeroed}", target.display());
 
-    let refiner = Refiner::open(gpu, target, &layers).map_err(|error| error.token())?;
+    let refiner = Refiner::open(gpu, target, &layers, options.lora.as_ref())
+        .map_err(|error| error.token())?;
     let scratch =
         RefinerScratch::new(gpu, rows, audio_rows, CONTEXT_ROWS).map_err(|error| error.token())?;
 
@@ -596,7 +906,7 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
     let geometry = geometry_for(rows, audio_rows)?;
 
     let started = Instant::now();
-    let edges = Edges::open(gpu, path).map_err(|error| error.token())?;
+    let edges = Edges::open(gpu, path, options.lora.as_ref()).map_err(|error| error.token())?;
     let (tensors, bytes) = edges.loaded();
     let load = started.elapsed().as_secs_f64();
     let scratch = EdgeScratch::new(gpu, &geometry).map_err(|error| error.token())?;
@@ -655,7 +965,14 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
     if let Some(zeroed) = &options.keyframe {
         let count = edge_shard(path, zeroed)?;
         println!("KEYFRAME shard={} zeroed={count}", zeroed.display());
-        failed |= keyframe(&gpu, path, zeroed, &request, &prepared.video)?;
+        failed |= keyframe(
+            &gpu,
+            path,
+            zeroed,
+            &request,
+            &prepared.video,
+            options.lora.as_ref(),
+        )?;
     }
 
     if options.signals {
@@ -690,8 +1007,13 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
 
     // The blocks over the prepared states, one report per block.
     let blocks = options.blocks.unwrap_or(1);
-    let mut refiner = Refiner::open(gpu, path, &(0..blocks).collect::<Vec<usize>>())
-        .map_err(|error| error.token())?;
+    let mut refiner = Refiner::open(
+        gpu,
+        path,
+        &(0..blocks).collect::<Vec<usize>>(),
+        options.lora.as_ref(),
+    )
+    .map_err(|error| error.token())?;
     let refiner_scratch =
         RefinerScratch::new(gpu, rows, audio_rows, CONTEXT_ROWS).map_err(|error| error.token())?;
     let started = Instant::now();
@@ -1008,8 +1330,9 @@ fn keyframe(
     zeroed: &Path,
     request: &Request<'_>,
     real: &Tensor,
+    lora: Option<&Lora>,
 ) -> Result<bool, String> {
-    let edges = Edges::open(gpu, zeroed).map_err(|error| error.token())?;
+    let edges = Edges::open(gpu, zeroed, lora).map_err(|error| error.token())?;
     let scratch = EdgeScratch::new(gpu, &request.geometry).map_err(|error| error.token())?;
     let plain = edges
         .prepare(gpu, request, &scratch)
@@ -2275,18 +2598,23 @@ fn alloc(gpu: &Gpu, dtype: Device, elements: usize) -> Result<Tensor, String> {
 fn usage(detail: &str) -> String {
     format!(
         "{detail}\nusage: h3_ltx_refiner_gate --probe [--rows R] [--seed S]\n       \
+         h3_ltx_refiner_gate --lora-probe DIR\n       \
          h3_ltx_refiner_gate --transformer PATH [--blocks K] [--rows R] [--audio-rows A]\n\
          \x20                            [--seed S] [--dump DIR] [--residual DIR]\n\
+         \x20                            [--lora FILE [--lora-strength F]]\n\
          \x20                            [--expect NAME=HEX ...]\n       \
-         h3_ltx_refiner_gate --transformer PATH --identity FILE [--blocks K]\n       \
+         h3_ltx_refiner_gate --transformer PATH --identity FILE [--blocks K]\n\
+         \x20                            [--lora FILE [--lora-strength F]]\n       \
          h3_ltx_refiner_gate --edges --transformer PATH [--blocks K] [--rows R]\n\
          \x20                            [--audio-rows A] [--sigma S] [--signals]\n\
          \x20                            [--keyframe-zeroed PATH] [--no-self-attention]\n\
+         \x20                            [--lora FILE [--lora-strength F]]\n\
          \x20                            [--dump DIR] [--residual DIR]\n\
          \x20                            [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --stage --transformer PATH [--layers K] [--seed S]\n\
          \x20                            [--latent FILE] [--context FILE] [--sol]\n\
-         \x20                            [--no-self-attention] [--dump DIR]\n\
+         \x20                            [--no-self-attention] [--lora FILE]\n\
+         \x20                            [--lora-strength F] [--dump DIR]\n\
          \x20                            [--residual DIR] [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --compare LEFT RIGHT"
     )
@@ -2299,6 +2627,12 @@ struct Options {
     stage: bool,
     sol: bool,
     diagnostic: Diagnostic,
+    /// The release's distilled adapter, fused as each weight is read
+    /// (`runtime/stage2_ops/models.py:76-79`).
+    lora: Option<Lora>,
+    /// `--lora-probe DIR`: the synthetic fusion probe, which writes its LoRA
+    /// into `DIR` and needs no shard.
+    lora_probe: Option<PathBuf>,
     latent: Option<PathBuf>,
     prompt: Option<PathBuf>,
     layers: Option<usize>,
@@ -2323,6 +2657,9 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut stage = false;
     let mut sol = false;
     let mut no_self_attention = false;
+    let mut lora_path = None;
+    let mut lora_probe = None;
+    let mut lora_strength = LORA_STRENGTH;
     let mut latent = None;
     let mut prompt = None;
     let mut layers = None;
@@ -2351,6 +2688,13 @@ fn split(args: &[String]) -> Result<Options, String> {
             "--sol" => sol = true,
             "--no-self-attention" => no_self_attention = true,
             "--signals" => signals = true,
+            "--lora" => lora_path = Some(PathBuf::from(take(args, &mut index)?)),
+            "--lora-probe" => lora_probe = Some(PathBuf::from(take(args, &mut index)?)),
+            "--lora-strength" => {
+                lora_strength = take(args, &mut index)?
+                    .parse::<f32>()
+                    .map_err(|_| usage("--lora-strength is not a number"))?
+            }
             "--latent" => latent = Some(PathBuf::from(take(args, &mut index)?)),
             "--context" => prompt = Some(PathBuf::from(take(args, &mut index)?)),
             "--layers" => layers = Some(number(&take(args, &mut index)?)?),
@@ -2400,6 +2744,13 @@ fn split(args: &[String]) -> Result<Options, String> {
         }
     }
 
+    // The LoRA is opened here, not inside a mode: it is a file read and the
+    // release names it once for the whole stage (`models.py:76-79`).
+    let lora = match lora_path {
+        Some(path) => Some(Lora::open(&path, lora_strength).map_err(|error| error.token())?),
+        None => None,
+    };
+
     Ok(Options {
         transformer,
         identity,
@@ -2411,6 +2762,8 @@ fn split(args: &[String]) -> Result<Options, String> {
         } else {
             Diagnostic::Off
         },
+        lora,
+        lora_probe,
         latent,
         prompt,
         layers,

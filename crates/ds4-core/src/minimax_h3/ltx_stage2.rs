@@ -32,7 +32,7 @@
 use ds4_sys::h3_dit::{Dtype, Gpu, SolPlanBuffers, Tensor};
 
 use super::ltx_refiner::{
-    patchify_video, unpatchify_video, Diagnostic, EdgeScratch, Edges, Geometry, Refiner,
+    patchify_video, unpatchify_video, Diagnostic, EdgeScratch, Edges, Geometry, Lora, Refiner,
     RefinerError, RefinerScratch, Request, Sol, CHANNELS, CONTEXT_ROWS, HEADS, TAU_SCHEDULE,
 };
 
@@ -175,15 +175,18 @@ pub struct Stage2 {
 
 impl Stage2 {
     /// Load the shipped transformer shard (`layers`) and the edges shard.
+    /// `lora` is the release's distilled adapter, fused as each weight is
+    /// read (`models.py:76-79`); `None` is the plain `dev` transformer.
     pub fn open(
         gpu: &Gpu,
         refiner_path: &std::path::Path,
         edges_path: &std::path::Path,
         geometry: Geometry,
         layers: &[usize],
+        lora: Option<&Lora>,
     ) -> Result<Stage2, RefinerError> {
-        let edges = Edges::open(gpu, edges_path)?;
-        let refiner = Refiner::open(gpu, refiner_path, layers)?;
+        let edges = Edges::open(gpu, edges_path, lora)?;
+        let refiner = Refiner::open(gpu, refiner_path, layers, lora)?;
 
         Ok(Stage2 {
             edges,

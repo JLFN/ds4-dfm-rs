@@ -67,6 +67,8 @@
 //! blend, the noiser), the Sol-Attn policy, the cache plumbing and the audio
 //! unpatchify.
 
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -74,6 +76,7 @@ use ds4_sys::h3_dit::{Dtype as Device, Gpu, SolPlanBuffers, Tensor};
 
 use crate::minimax_h3::gemma::bf16_round;
 use crate::minimax_h3::safetensors::{self, Dtype, Shard};
+use crate::minimax_h3::vision::{bf16_to_f32, f32_to_bf16};
 
 /// `num_layers` (`model.py:56`, `model_configurator.py:52`).
 pub const LAYERS: usize = 48;
@@ -345,8 +348,15 @@ pub struct Refiner {
 
 impl Refiner {
     /// Read the transformer shard's `layers`, in the order given. The pipeline
-    /// loads `0..LAYERS`; a gate loads one block and pays for one.
-    pub fn open(gpu: &Gpu, path: &Path, layers: &[usize]) -> Result<Refiner, RefinerError> {
+    /// loads `0..LAYERS`; a gate loads one block and pays for one. `lora` is
+    /// the release's distilled adapter, fused as each weight is read; `None`
+    /// is the plain `dev` transformer.
+    pub fn open(
+        gpu: &Gpu,
+        path: &Path,
+        layers: &[usize],
+        lora: Option<&Lora>,
+    ) -> Result<Refiner, RefinerError> {
         let shard =
             safetensors::read_shard(path).map_err(|error| RefinerError::Reader(error.token()))?;
 
@@ -359,6 +369,7 @@ impl Refiner {
             buffer: Vec::new(),
             tensors: 0,
             bytes: 0,
+            lora,
         };
         let mut blocks = Vec::with_capacity(layers.len());
 
@@ -1393,6 +1404,263 @@ impl AttentionScratch {
     }
 }
 
+/// The release's distilled refiner LoRA, fused into every weight the reader
+/// pulls, exactly as `DiffusionStage.from_checkpoint` fuses it before the
+/// stage is built (`runtime/stage2_ops/models.py:76-79`; the fusion itself is
+/// `loader/fuse_loras.py:119-151`).
+///
+/// The reference's arithmetic, in the order it runs:
+///
+/// - **Which keys meet.** A model key `model.diffusion_model.<X>.weight` and a
+///   LoRA key `diffusion_model.<X>.lora_A.weight` each drop one leading
+///   segment - `LTXV_MODEL_COMFY_RENAMING_MAP` (`model_configurator.py:222-226`)
+///   and `LTXV_LORA_COMFY_RENAMING_MAP` (`sd_ops.py:135-137`) - and
+///   `_products_for_sd_key` (`:189-208`) then reads `<X>.lora_A.weight` and
+///   `<X>.lora_B.weight` off the LoRA. [`Lora::factors`] is that lookup.
+/// - **The scale.** `product.b * product.strength` is a BF16 multiply: `mul`
+///   dispatches on the BF16 common dtype (`BinaryMulKernel.cu`,
+///   `mul_kernel_cuda`) into `opmath_symmetric_gpu_kernel_with_scalars`, whose
+///   `AUnaryFunctor` holds the scalar at the functor's own F32 precision ("NB:
+///   scalar is stored in higher precision!", `Loops.cuh`), so the product is
+///   `0.8f32 * b` in F32, rounded once to BF16.
+/// - **The product.** `aggregate_lora_products` (`:99-116`) materializes the
+///   first product as `matmul(B * strength, A).to(bf16)`: a BF16 GEMM with F32
+///   accumulation, one rounding of the output, `A` being `[rank, in]`.
+/// - **The add.** `_bf16_fuse` (`:61-68`) is `deltas.add_(weight)` - a BF16
+///   add, one rounding of the sum - and `.to(weight.dtype)` is a no-op: every
+///   weight this LoRA targets is BF16 (the transformer's 290 F32 tensors are
+///   all `scale_shift_table`s and no LoRA key names one).
+///
+/// One step cannot be copied exactly: the reduction order inside
+/// `torch.matmul` is cuBLAS's and this port's is cuBLASLt's, so a merged
+/// weight can differ from the reference's by one ulp of the delta. Both are an
+/// F32 accumulation of exact BF16 products, rounded once.
+pub struct Lora {
+    shard: Shard,
+    strength: f32,
+    targets: usize,
+    fused: Cell<usize>,
+    bytes: Cell<u64>,
+    classes: RefCell<BTreeMap<String, usize>>,
+}
+
+impl Lora {
+    /// Open `path` and count the modules it carries factors for.
+    pub fn open(path: &Path, strength: f32) -> Result<Lora, RefinerError> {
+        let shard =
+            safetensors::read_shard(path).map_err(|error| RefinerError::Reader(error.token()))?;
+        let mut targets = 0;
+
+        for tensor in &shard.tensors {
+            let Some(module) = tensor.name.strip_suffix(".lora_A.weight") else {
+                continue;
+            };
+
+            if tensor.shape.len() != 2 {
+                return Err(RefinerError::Shape {
+                    name: tensor.name.clone(),
+                    detail: format!("lora_A is {:?}, not a rank by input matrix", tensor.shape),
+                });
+            }
+
+            if shard.find(&format!("{module}.lora_B.weight")).is_none() {
+                return Err(RefinerError::Missing(format!("{module}.lora_B.weight")));
+            }
+
+            targets += 1;
+        }
+
+        if targets == 0 {
+            return Err(RefinerError::Reader(format!(
+                "{} carries no lora_A/lora_B pair",
+                path.display()
+            )));
+        }
+
+        Ok(Lora {
+            shard,
+            strength,
+            targets,
+            fused: Cell::new(0),
+            bytes: Cell::new(0),
+            classes: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    /// The strength the release fuses at, 0.8.
+    pub fn strength(&self) -> f32 {
+        self.strength
+    }
+
+    /// The modules the file carries factors for.
+    pub fn targets(&self) -> usize {
+        self.targets
+    }
+
+    /// The tensors fused so far.
+    pub fn fused(&self) -> usize {
+        self.fused.get()
+    }
+
+    /// The LoRA bytes read.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    /// The classes fused, and how many tensors of each. A class drops the
+    /// model's prefix and the block index (`transformer_blocks.7.attn1.to_q`
+    /// becomes `attn1.to_q`), which is the granularity a delta is worth
+    /// quoting at: 48 of the modules are the same module 48 times.
+    pub fn classes(&self) -> Vec<(String, usize)> {
+        self.classes
+            .borrow()
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect()
+    }
+
+    /// Fuse `name`'s delta into `weight` in place, or `None` when the LoRA has
+    /// no factors for it. The delta is returned so a caller can price it.
+    pub fn fuse(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        weight: &Tensor,
+        rows: u32,
+        cols: u32,
+    ) -> Result<Option<Tensor>, RefinerError> {
+        let Some((a, b)) = self.factors(name) else {
+            return Ok(None);
+        };
+        let rank = a.shape[0];
+
+        if a.shape != [rank, cols as u64]
+            || b.shape != [rows as u64, rank]
+            || a.dtype != Dtype::Bf16
+            || b.dtype != Dtype::Bf16
+        {
+            return Err(RefinerError::Shape {
+                name: name.to_string(),
+                detail: format!(
+                    "the LoRA has A {} {:?} and B {} {:?} for [{rows}, {cols}]",
+                    a.dtype.name(),
+                    a.shape,
+                    b.dtype.name(),
+                    b.shape
+                ),
+            });
+        }
+
+        let a_transposed = self.transposed(a)?;
+        let b_scaled = self.scaled(b)?;
+        let a_device = upload(gpu, &a_transposed)?;
+        let b_device = upload(gpu, &b_scaled)?;
+        let delta = alloc(gpu, rows as usize * cols as usize)?;
+
+        // `matmul(B * strength, A)` (`:113`): B is the input, A^T the weight,
+        // so the port's GEMM contracts the same rank axis.
+        gpu.linear(
+            &delta,
+            &b_device,
+            &a_device,
+            None,
+            rows,
+            rank as u32,
+            cols,
+            Device::Bf16,
+        )
+        .map_err(RefinerError::Run)?;
+
+        // `deltas.add_(weight)` (`:67`): one BF16 rounding of the sum.
+        gpu.add(weight, weight, &delta).map_err(RefinerError::Run)?;
+
+        self.fused.set(self.fused.get() + 1);
+        *self.classes.borrow_mut().entry(class_of(name)).or_insert(0) += 1;
+
+        Ok(Some(delta))
+    }
+
+    /// The one key lookup: both sides drop exactly one leading segment, so the
+    /// LoRA keeps the `diffusion_model.` the model does not.
+    fn factors(&self, name: &str) -> Option<(&safetensors::Tensor, &safetensors::Tensor)> {
+        let module = name.strip_prefix("model.")?.strip_suffix(".weight")?;
+
+        Some((
+            self.shard.find(&format!("{module}.lora_A.weight"))?,
+            self.shard.find(&format!("{module}.lora_B.weight"))?,
+        ))
+    }
+
+    /// A factor's bytes, off the LoRA's own shard.
+    fn read(&self, tensor: &safetensors::Tensor) -> Result<Vec<u8>, RefinerError> {
+        let mut bytes = vec![0u8; tensor.bytes() as usize];
+        self.shard
+            .read_data(tensor, &mut bytes)
+            .map_err(|error| RefinerError::Reader(error.token()))?;
+
+        self.bytes.set(self.bytes.get() + tensor.bytes());
+
+        Ok(bytes)
+    }
+
+    /// `A`'s transpose, `[rank, cols]` to `[cols, rank]`. The port's GEMM
+    /// contracts its operands' last axis (`h3d_linear`) while the reference's
+    /// `B @ A` contracts A's first, so the permutation happens here, while the
+    /// bytes are in hand and A is a few megabytes.
+    fn transposed(&self, a: &safetensors::Tensor) -> Result<Vec<u8>, RefinerError> {
+        let raw = self.read(a)?;
+        let (rank, cols) = (a.shape[0] as usize, a.shape[1] as usize);
+        let mut out = vec![0u8; raw.len()];
+
+        for k in 0..rank {
+            for i in 0..cols {
+                let from = (k * cols + i) * 2;
+                let to = (i * rank + k) * 2;
+                out[to..to + 2].copy_from_slice(&raw[from..from + 2]);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// `B * strength` (`:113`) as BF16: the scalar keeps its F32 precision and
+    /// only the product rounds.
+    fn scaled(&self, b: &safetensors::Tensor) -> Result<Vec<u8>, RefinerError> {
+        let raw = self.read(b)?;
+        let mut out = Vec::with_capacity(raw.len());
+
+        for pair in raw.chunks_exact(2) {
+            let value = bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])) * self.strength;
+            out.extend_from_slice(&f32_to_bf16(value).to_le_bytes());
+        }
+
+        Ok(out)
+    }
+}
+
+/// The class a weight key is reported under.
+fn class_of(name: &str) -> String {
+    let rest = name.strip_prefix("model.diffusion_model.").unwrap_or(name);
+    let rest = rest.strip_suffix(".weight").unwrap_or(rest);
+
+    match rest.strip_prefix("transformer_blocks.") {
+        Some(tail) => tail
+            .split_once('.')
+            .map_or_else(|| tail.to_string(), |(_, module)| module.to_string()),
+        None => rest.to_string(),
+    }
+}
+
+/// A BF16 device tensor holding `bytes`.
+fn upload(gpu: &Gpu, bytes: &[u8]) -> Result<Tensor, RefinerError> {
+    let tensor = gpu
+        .alloc(Device::Bf16, bytes.len() / 2)
+        .map_err(RefinerError::Run)?;
+    gpu.upload(&tensor, bytes).map_err(RefinerError::Run)?;
+
+    Ok(tensor)
+}
+
 /// The shard's reader: one reusable host buffer, and the counters a gate
 /// reports. Every read checks the checkpoint's own descriptor against what the
 /// graph will do with the tensor before anything reaches the device.
@@ -1401,6 +1669,9 @@ struct Reader<'a> {
     buffer: Vec<u8>,
     tensors: usize,
     bytes: u64,
+    /// The distilled LoRA, fused into every weight the file names
+    /// (`fuse_loras.py:119-151`).
+    lora: Option<&'a Lora>,
 }
 
 impl Reader<'_> {
@@ -1459,6 +1730,17 @@ impl Reader<'_> {
 
         self.tensors += 1;
         self.bytes += tensor.bytes();
+
+        // The distilled LoRA, when one is loaded, is fused into the weight
+        // here: the reference merges it into the state dict before the stage
+        // is built (`fuse_loras.py:119-151`), so nothing downstream ever sees
+        // the unfused tensor. The reader's own counters stay the checkpoint's;
+        // the LoRA counts its own reads.
+        if let Some(lora) = self.lora {
+            if shape.len() == 2 && dtype == Dtype::Bf16 {
+                lora.fuse(self.gpu, name, &device, shape[0] as u32, shape[1] as u32)?;
+            }
+        }
 
         Ok(device)
     }
@@ -2224,7 +2506,7 @@ pub struct Edges {
 impl Edges {
     /// Read the 59 tensors outside the blocks: the two patchify projections,
     /// the keyframe embedding, the eight AdaLN singles and the head.
-    pub fn open(gpu: &Gpu, path: &Path) -> Result<Edges, RefinerError> {
+    pub fn open(gpu: &Gpu, path: &Path, lora: Option<&Lora>) -> Result<Edges, RefinerError> {
         let shard =
             safetensors::read_shard(path).map_err(|error| RefinerError::Reader(error.token()))?;
         let at = "model.diffusion_model";
@@ -2233,6 +2515,7 @@ impl Edges {
             buffer: Vec::new(),
             tensors: 0,
             bytes: 0,
+            lora,
         };
 
         let video_patchify = reader.linear(
