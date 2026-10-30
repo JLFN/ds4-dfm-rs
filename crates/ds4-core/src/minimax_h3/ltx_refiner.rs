@@ -233,6 +233,17 @@ struct Attention {
     head_dim: u32,
 }
 
+/// One modality's AV cross-attention inputs. All four exist together or not at
+/// all: `MultiModalTransformerArgsPreprocessor.prepare` returns the simple
+/// args untouched for `cross_modality=None` (`transformer_args.py:352-355`),
+/// which is the whole cross group.
+pub struct Cross {
+    pub scale_shift: Tensor,
+    pub gate: Tensor,
+    pub cos: Tensor,
+    pub sin: Tensor,
+}
+
 /// Everything one modality contributes to a block besides its weights: the
 /// AdaLN modulation rows the preprocessing computed, the text context and the
 /// positional tables. `modulation` is `[rows, 9, dim]` and `cross_scale_shift`
@@ -244,8 +255,11 @@ pub struct Signals<'a> {
     pub rows: u32,
     pub dim: u32,
     pub modulation: Tensor,
-    pub cross_scale_shift: Tensor,
-    pub cross_gate: Tensor,
+    /// The AV cross group, present exactly when this modality has a partner:
+    /// the release's stage-2 denoise passes `audio_state=None`
+    /// (`refiner_encoder_ablation_single_gpu.py:706-712`), so on that route
+    /// none of it is computed and none of it is read.
+    pub cross: Option<Cross>,
     pub prompt_modulation: Tensor,
     /// Borrowed: `_prepare_context` only reshapes the prompt encoder's own
     /// tensor (`transformer_args.py:186-196`), it does not copy it.
@@ -253,11 +267,6 @@ pub struct Signals<'a> {
     pub context_rows: u32,
     pub self_cos: Tensor,
     pub self_sin: Tensor,
-    /// One `[rows, 32, head_dim / 2]` pair per modality for the cross RoPE:
-    /// the time axis at `audio_cross_attention_dim` 2048 with one position
-    /// dimension (`transformer_args.py:365-370`).
-    pub cross_cos: Tensor,
-    pub cross_sin: Tensor,
 }
 
 /// The model's body: the blocks this run loaded, in shard order.
@@ -315,33 +324,33 @@ impl Refiner {
 
     /// `LTXModel._process_transformer_blocks` (`model.py:434-470`) over the
     /// blocks this run loaded. `video` and `audio` are the modality states,
-    /// read and written in place.
+    /// read and written in place. `audio: None` is `audio=None` at
+    /// `LTXModel.forward` (`model.py:504-509`): the audio branch, the AV
+    /// cross-attention and the audio feed-forward do not run
+    /// (`transformer.py:261-269`).
     pub fn apply(
         &self,
         gpu: &Gpu,
         video: &Tensor,
-        audio: &Tensor,
         video_signals: &Signals<'_>,
-        audio_signals: &Signals<'_>,
+        audio: Option<(&Tensor, &Signals<'_>)>,
         scratch: &RefinerScratch,
     ) -> Result<(), RefinerError> {
         for block in &self.blocks {
-            block.apply(gpu, video, audio, video_signals, audio_signals, scratch)?;
+            block.apply(gpu, video, video_signals, audio, scratch)?;
         }
 
         Ok(())
     }
 
     /// One block, by index into the loaded set.
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_one(
         &self,
         index: usize,
         gpu: &Gpu,
         video: &Tensor,
-        audio: &Tensor,
         video_signals: &Signals<'_>,
-        audio_signals: &Signals<'_>,
+        audio: Option<(&Tensor, &Signals<'_>)>,
         scratch: &RefinerScratch,
     ) -> Result<(), RefinerError> {
         let block = self
@@ -349,7 +358,7 @@ impl Refiner {
             .get(index)
             .ok_or_else(|| RefinerError::Run(format!("no block {index} is loaded")))?;
 
-        block.apply(gpu, video, audio, video_signals, audio_signals, scratch)
+        block.apply(gpu, video, video_signals, audio, scratch)
     }
 }
 
@@ -496,17 +505,19 @@ impl Block {
     /// `BasicAVTransformerBlock.forward` (`transformer.py:253-417`). `video`
     /// and `audio` are `vx` and `ax`, read and written in place.
     ///
-    /// Every branch runs: `run_vx` and `run_ax` are always true on this route
-    /// (the release builds an `AudioVideo` model with both latents non-empty,
-    /// `runtime/stage2_ops/models.py:47-134`), and `cross_attn_skip_all` is
-    /// false because the perturbation config is empty.
+    /// The four guards are `transformer.py:261-269`: `run_vx`, `run_ax`,
+    /// `run_a2v` and `run_v2a`. With both latents present and enabled all four
+    /// hold; with `audio = None` - the release's stage-2 denoise
+    /// (`refiner_encoder_ablation_single_gpu.py:706-712`) - only `run_vx`
+    /// does, so steps 3 and 4 and the audio feed-forward are skipped and the
+    /// video self-attention, its text cross-attention and its feed-forward are
+    /// all that runs.
     fn apply(
         &self,
         gpu: &Gpu,
         video: &Tensor,
-        audio: &Tensor,
         v: &Signals<'_>,
-        a: &Signals<'_>,
+        audio: Option<(&Tensor, &Signals<'_>)>,
         s: &RefinerScratch,
     ) -> Result<(), RefinerError> {
         // 1-2. Video self-attention, then the text cross-attention
@@ -523,82 +534,110 @@ impl Block {
         )?;
 
         // 3. Audio self-attention and text cross-attention (`:300-326`).
-        self_and_text(
-            gpu,
-            audio,
-            &self.audio_self,
-            &self.audio_cross,
-            &self.audio_table,
-            &self.audio_prompt_table,
-            a,
-            &s.audio,
-        )?;
+        if let Some((state, a)) = audio {
+            self_and_text(
+                gpu,
+                state,
+                &self.audio_self,
+                &self.audio_cross,
+                &self.audio_table,
+                &self.audio_prompt_table,
+                a,
+                &s.audio,
+            )?;
+        }
 
         // 4. A2V then V2A (`:328-397`): all four modulated operands are formed
         // from the pre-A2V state, before either attention runs.
-        av_modulate(
-            gpu,
-            video,
-            v,
-            &self.av_video_table,
-            A2V_ROWS,
-            Side::Query,
-            &s.video,
-        )?;
-        av_modulate(
-            gpu,
-            audio,
-            a,
-            &self.av_audio_table,
-            A2V_ROWS,
-            Side::Context,
-            &s.audio,
-        )?;
-        av_modulate(
-            gpu,
-            audio,
-            a,
-            &self.av_audio_table,
-            V2A_ROWS,
-            Side::Query,
-            &s.audio,
-        )?;
-        av_modulate(
-            gpu,
-            video,
-            v,
-            &self.av_video_table,
-            V2A_ROWS,
-            Side::Context,
-            &s.video,
-        )?;
+        if let Some((state, a)) = audio {
+            let (vc, ac) = (cross(v)?, cross(a)?);
 
-        av_direction(
-            gpu,
-            &self.audio_to_video,
-            &self.av_video_table,
-            v,
-            video,
-            &s.video,
-            a,
-            &s.audio,
-        )?;
-        av_direction(
-            gpu,
-            &self.video_to_audio,
-            &self.av_audio_table,
-            a,
-            audio,
-            &s.audio,
-            v,
-            &s.video,
-        )?;
+            av_modulate(
+                gpu,
+                video,
+                v,
+                vc,
+                &self.av_video_table,
+                A2V_ROWS,
+                Side::Query,
+                &s.video,
+            )?;
+            av_modulate(
+                gpu,
+                state,
+                a,
+                ac,
+                &self.av_audio_table,
+                A2V_ROWS,
+                Side::Context,
+                &s.audio,
+            )?;
+            av_modulate(
+                gpu,
+                state,
+                a,
+                ac,
+                &self.av_audio_table,
+                V2A_ROWS,
+                Side::Query,
+                &s.audio,
+            )?;
+            av_modulate(
+                gpu,
+                video,
+                v,
+                vc,
+                &self.av_video_table,
+                V2A_ROWS,
+                Side::Context,
+                &s.video,
+            )?;
+
+            av_direction(
+                gpu,
+                &self.audio_to_video,
+                &self.av_video_table,
+                v,
+                vc,
+                video,
+                &s.video,
+                a,
+                ac,
+                &s.audio,
+            )?;
+            av_direction(
+                gpu,
+                &self.video_to_audio,
+                &self.av_audio_table,
+                a,
+                ac,
+                state,
+                &s.audio,
+                v,
+                vc,
+                &s.video,
+            )?;
+        }
 
         // 5. The two feed-forwards (`:399-414`), rows 3..5, re-formed here
         // because the AV gate borrowed the same buffers.
         feed_forward(gpu, video, &self.video_ff, &self.video_table, v, &s.video)?;
-        feed_forward(gpu, audio, &self.audio_ff, &self.audio_table, a, &s.audio)
+        if let Some((state, a)) = audio {
+            feed_forward(gpu, state, &self.audio_ff, &self.audio_table, a, &s.audio)?;
+        }
+
+        Ok(())
     }
+}
+
+/// A modality's AV cross group, or the reason the AV step must not have been
+/// reached: `BasicAVTransformerBlock` reads it only under `run_a2v`/`run_v2a`
+/// (`transformer.py:330-397`), which `audio = None` clears.
+fn cross<'a>(signals: &'a Signals<'_>) -> Result<&'a Cross, RefinerError> {
+    signals
+        .cross
+        .as_ref()
+        .ok_or_else(|| RefinerError::Run("the AV step needs both modalities".into()))
 }
 
 /// `transformer.py:270-298` (video) and `:300-326` (audio): the self-attention
@@ -746,6 +785,7 @@ fn av_modulate(
     gpu: &Gpu,
     state: &Tensor,
     signals: &Signals<'_>,
+    cross: &Cross,
     table: &Tensor,
     pair: u32,
     side: Side,
@@ -762,7 +802,7 @@ fn av_modulate(
             gpu,
             m.ada(offset),
             table,
-            &signals.cross_scale_shift,
+            &cross.scale_shift,
             rows,
             dim,
             CROSS_COEFFICIENT as u32,
@@ -793,9 +833,11 @@ fn av_direction(
     attention: &Attention,
     table: &Tensor,
     own_signals: &Signals<'_>,
+    own_cross: &Cross,
     own_state: &Tensor,
     own: &ModalityScratch,
     other_signals: &Signals<'_>,
+    other_cross: &Cross,
     other: &ModalityScratch,
 ) -> Result<(), RefinerError> {
     // The gate is the table's fifth row plus the gate modulation's own first
@@ -804,7 +846,7 @@ fn av_direction(
     gpu.ada_add(
         &own.gate,
         table,
-        &own_signals.cross_gate,
+        &own_cross.gate,
         1,
         own_signals.dim,
         GATE_COEFFICIENT as u32,
@@ -822,10 +864,10 @@ fn av_direction(
         own_signals.rows,
         other_signals.rows,
         Some((
-            &own_signals.cross_cos,
-            &own_signals.cross_sin,
-            &other_signals.cross_cos,
-            &other_signals.cross_sin,
+            &own_cross.cos,
+            &own_cross.sin,
+            &other_cross.cos,
+            &other_cross.sin,
         )),
     )?;
 
@@ -1803,6 +1845,33 @@ pub fn unpatchify_video(
         .map_err(RefinerError::Run)
 }
 
+/// `VideoLatentPatchifier.patchify` at patch size 1 (`patchifiers.py:27-64`):
+/// the `(1, 128, f, h, w)` latent to the `[tokens, 128]` state the blocks move.
+/// Its caller is the state's creation (`tools.py:176-183`), not a forward.
+pub fn patchify_video(
+    gpu: &Gpu,
+    output: &Tensor,
+    latent: &Tensor,
+    rows: u32,
+) -> Result<(), RefinerError> {
+    gpu.channel_transpose(output, latent, CHANNELS as u32, rows)
+        .map_err(RefinerError::Run)
+}
+
+/// `AudioPatchifier.patchify` (`patchifiers.py:288-304`): the
+/// `(1, 8, frames, 16)` audio latent to the `[frames, 128]` state. The video
+/// patchify above is a transpose; this one keeps `bins` innermost and so is a
+/// gather, which is why it is a kernel of its own.
+pub fn patchify_audio(
+    gpu: &Gpu,
+    output: &Tensor,
+    latent: &Tensor,
+    frames: u32,
+) -> Result<(), RefinerError> {
+    gpu.audio_patchify(output, latent, 1, AUDIO_CHANNELS, frames, AUDIO_BINS)
+        .map_err(RefinerError::Run)
+}
+
 /// The head's working set for one modality: the LayerNorm output, the two
 /// modulation rows and the `[rows, 128]` projection.
 struct HeadScratch {
@@ -1861,8 +1930,6 @@ impl AdaScratch {
 /// unconditionally (`tools.py:186-200`) - and the rest is overwritten on every
 /// call.
 pub struct EdgeScratch {
-    video_latent: Tensor,
-    audio_latent: Tensor,
     keyframe_mask: Tensor,
     video_sinusoid: Tensor,
     audio_sinusoid: Tensor,
@@ -1883,8 +1950,6 @@ impl EdgeScratch {
         mask[..geometry.frame_tokens() as usize].fill(1.0);
 
         Ok(EdgeScratch {
-            video_latent: alloc(gpu, CHANNELS * video_rows as usize)?,
-            audio_latent: alloc(gpu, geometry.audio_width() as usize * audio_rows as usize)?,
             keyframe_mask: tensor_of(gpu, &sinusoid_bytes(&mask, 1))?,
             video_sinusoid: alloc(gpu, video_rows as usize * SINUSOID_WIDTH)?,
             audio_sinusoid: alloc(gpu, audio_rows as usize * SINUSOID_WIDTH)?,
@@ -1906,25 +1971,34 @@ fn tensor_of(gpu: &Gpu, bytes: &[u8]) -> Result<Tensor, RefinerError> {
 }
 
 /// One denoising step's inputs: the sigma the schedule gives all of the step's
-/// tokens (`denoisers.py:236-246`, `:298-310`), the geometry, the raw latents
-/// and the two text contexts.
+/// tokens (`denoisers.py:236-246`, `:298-310`), the geometry, the states and
+/// the text contexts. `video` is the *patchified* state `[rows, 128]`, which is
+/// what `patchify_proj` reads (`transformer_args.py:268`); the patchify that
+/// produces it belongs to the state's creation, not to the forward
+/// (`VideoLatentTools.create_initial_state`, `tools.py:139-184`), so it is
+/// [`patchify_video`]'s and runs once per evaluation.
+///
+/// `audio` is `None` on the release's stage-2 route
+/// (`refiner_encoder_ablation_single_gpu.py:706-712`), which reaches
+/// `LTXModel.forward` as `audio=None` and is what makes the branch set
+/// video-only; `audio` and `audio_context` are present or absent together.
 pub struct Request<'a> {
     pub sigma: f32,
     pub geometry: Geometry,
     pub video: &'a Tensor,
-    pub audio: &'a Tensor,
+    pub audio: Option<&'a Tensor>,
     pub video_context: &'a Tensor,
-    pub audio_context: &'a Tensor,
+    pub audio_context: Option<&'a Tensor>,
 }
 
 /// What the preprocessing produces: the states the 48 blocks move, the signals
 /// they read besides their weights, and the embedded timesteps the head takes
-/// (`model.py:520-536`).
+/// (`model.py:520-536`). The audio half mirrors the request's.
 pub struct Prepared<'a> {
     pub video: Tensor,
-    pub audio: Tensor,
     pub video_signals: Signals<'a>,
-    pub audio_signals: Signals<'a>,
+    pub audio: Option<Tensor>,
+    pub audio_signals: Option<Signals<'a>>,
 }
 
 /// The refiner's edges: the preprocessing and the output head, over the 59
@@ -2079,28 +2153,11 @@ impl Edges {
         let scaled = request.sigma * TIMESTEP_SCALE;
         let video_time = time_axis(&video_positions(&geometry));
 
-        // The states: patchify (`transformer_args.py:268`), project
-        // (`:268`) and mark the keyframe rows (`:269`).
+        // The video state: project the patchified rows (`transformer_args.py:268`)
+        // and mark the keyframe rows (`:269`).
         let video = alloc(gpu, video_rows as usize * VIDEO_DIM)?;
-        let audio = alloc(gpu, audio_rows as usize * AUDIO_DIM)?;
-        gpu.channel_transpose(
-            &scratch.video_latent,
-            request.video,
-            CHANNELS as u32,
-            video_rows,
-        )
-        .map_err(RefinerError::Run)?;
-        gpu.audio_patchify(
-            &scratch.audio_latent,
-            request.audio,
-            1,
-            AUDIO_CHANNELS,
-            audio_rows,
-            AUDIO_BINS,
-        )
-        .map_err(RefinerError::Run)?;
         self.video_patchify
-            .apply(gpu, &video, &scratch.video_latent, video_rows)?;
+            .apply(gpu, &video, request.video, video_rows)?;
         gpu.keyframe_add(
             &video,
             &video,
@@ -2110,8 +2167,6 @@ impl Edges {
             VIDEO_DIM as u32,
         )
         .map_err(RefinerError::Run)?;
-        self.audio_patchify
-            .apply(gpu, &audio, &scratch.audio_latent, audio_rows)?;
 
         // The timesteps (`transformer_args.py:174-185`): `timestep * 1000`
         // through the 256-wide sinusoid, then `adaln_single` - `_prepare_timestep`
@@ -2121,31 +2176,11 @@ impl Edges {
             gpu,
             video_rows as usize * self.video_adaln.width(VIDEO_DIM as u32) as usize,
         )?;
-        let audio_modulation = alloc(
-            gpu,
-            audio_rows as usize * self.audio_adaln.width(AUDIO_DIM as u32) as usize,
-        )?;
         let video_prompt = alloc(gpu, self.video_prompt.width(VIDEO_DIM as u32) as usize)?;
-        let audio_prompt = alloc(gpu, self.audio_prompt.width(AUDIO_DIM as u32) as usize)?;
-        let cross_scale_shift = alloc(
-            gpu,
-            video_rows as usize * self.video_cross.width(VIDEO_DIM as u32) as usize,
-        )?;
-        let audio_cross_scale_shift = alloc(
-            gpu,
-            audio_rows as usize * self.audio_cross.width(AUDIO_DIM as u32) as usize,
-        )?;
-        let cross_gate = alloc(gpu, self.a2v_gate.width(VIDEO_DIM as u32) as usize)?;
-        let audio_cross_gate = alloc(gpu, self.v2a_gate.width(AUDIO_DIM as u32) as usize)?;
 
         gpu.upload(
             &scratch.video_sinusoid,
             &sinusoid_bytes(&values, video_rows as usize),
-        )
-        .map_err(RefinerError::Run)?;
-        gpu.upload(
-            &scratch.audio_sinusoid,
-            &sinusoid_bytes(&values, audio_rows as usize),
         )
         .map_err(RefinerError::Run)?;
         gpu.upload(&scratch.single_sinusoid, &sinusoid_bytes(&values, 1))
@@ -2158,14 +2193,6 @@ impl Edges {
             &scratch.video.hidden,
             &modulation,
         )?;
-        self.audio_adaln.apply(
-            gpu,
-            &scratch.audio_sinusoid,
-            audio_rows,
-            &scratch.audio.embedded,
-            &scratch.audio.hidden,
-            &audio_modulation,
-        )?;
 
         // The prompt AdaLN runs on the raw sigma (`:274-279`) and its embedded
         // timestep is discarded.
@@ -2177,76 +2204,147 @@ impl Edges {
             &scratch.video.single_hidden,
             &video_prompt,
         )?;
-        self.audio_prompt.apply(
-            gpu,
-            &scratch.single_sinusoid,
-            1,
-            &scratch.audio.single_embedded,
-            &scratch.audio.single_hidden,
-            &audio_prompt,
-        )?;
 
-        // The A-V cross AdaLN: this modality's per-token timesteps scale and
-        // shift its own attention input, and the *other* modality's sigma
-        // (`cross_modality_sigma`) gates its output
-        // (`transformer_args.py:388-410`, `:207-220`).
-        self.video_cross.apply(
-            gpu,
-            &scratch.video_sinusoid,
-            video_rows,
-            &scratch.video.wide,
-            &scratch.video.hidden,
-            &cross_scale_shift,
-        )?;
-        self.audio_cross.apply(
-            gpu,
-            &scratch.audio_sinusoid,
-            audio_rows,
-            &scratch.audio.wide,
-            &scratch.audio.hidden,
-            &audio_cross_scale_shift,
-        )?;
-        self.a2v_gate.apply(
-            gpu,
-            &scratch.single_sinusoid,
-            1,
-            &scratch.video.single_embedded,
-            &scratch.video.single_hidden,
-            &cross_gate,
-        )?;
-        self.v2a_gate.apply(
-            gpu,
-            &scratch.single_sinusoid,
-            1,
-            &scratch.audio.single_embedded,
-            &scratch.audio.single_hidden,
-            &audio_cross_gate,
-        )?;
+        // The AV cross group exists only with a partner: `prepare` returns the
+        // simple args untouched for `cross_modality=None`
+        // (`transformer_args.py:352-355`), so a video-only forward computes no
+        // cross AdaLN, no gate and no cross RoPE at all - and the audio state
+        // does not exist either.
+        let mut video_cross = None;
+        let mut audio = None;
+        let mut audio_signals = None;
 
-        // The positional tables (`:239-260`, `:365-370`): the self-attention
-        // over every axis, the cross over the time axis at
-        // `audio_cross_attention_dim`.
+        if let Some(audio_latent) = request.audio {
+            let audio_context = request.audio_context.ok_or_else(|| {
+                RefinerError::Run("the audio half needs its prompt context".into())
+            })?;
+            let audio_positions = audio_positions(&geometry);
+
+            let state = alloc(gpu, audio_rows as usize * AUDIO_DIM)?;
+            self.audio_patchify
+                .apply(gpu, &state, audio_latent, audio_rows)?;
+
+            let audio_modulation = alloc(
+                gpu,
+                audio_rows as usize * self.audio_adaln.width(AUDIO_DIM as u32) as usize,
+            )?;
+            let audio_prompt = alloc(gpu, self.audio_prompt.width(AUDIO_DIM as u32) as usize)?;
+            let audio_scale_shift = alloc(
+                gpu,
+                audio_rows as usize * self.audio_cross.width(AUDIO_DIM as u32) as usize,
+            )?;
+            let audio_gate = alloc(gpu, self.v2a_gate.width(AUDIO_DIM as u32) as usize)?;
+            let video_scale_shift = alloc(
+                gpu,
+                video_rows as usize * self.video_cross.width(VIDEO_DIM as u32) as usize,
+            )?;
+            let video_gate = alloc(gpu, self.a2v_gate.width(VIDEO_DIM as u32) as usize)?;
+
+            gpu.upload(
+                &scratch.audio_sinusoid,
+                &sinusoid_bytes(&values, audio_rows as usize),
+            )
+            .map_err(RefinerError::Run)?;
+            self.audio_adaln.apply(
+                gpu,
+                &scratch.audio_sinusoid,
+                audio_rows,
+                &scratch.audio.embedded,
+                &scratch.audio.hidden,
+                &audio_modulation,
+            )?;
+            self.audio_prompt.apply(
+                gpu,
+                &scratch.single_sinusoid,
+                1,
+                &scratch.audio.single_embedded,
+                &scratch.audio.single_hidden,
+                &audio_prompt,
+            )?;
+
+            // The A-V cross AdaLN: this modality's per-token timesteps scale
+            // and shift its own attention input, and the *other* modality's
+            // sigma (`cross_modality_sigma`) gates its output
+            // (`transformer_args.py:388-410`, `:207-220`).
+            self.video_cross.apply(
+                gpu,
+                &scratch.video_sinusoid,
+                video_rows,
+                &scratch.video.wide,
+                &scratch.video.hidden,
+                &video_scale_shift,
+            )?;
+            self.audio_cross.apply(
+                gpu,
+                &scratch.audio_sinusoid,
+                audio_rows,
+                &scratch.audio.wide,
+                &scratch.audio.hidden,
+                &audio_scale_shift,
+            )?;
+            self.a2v_gate.apply(
+                gpu,
+                &scratch.single_sinusoid,
+                1,
+                &scratch.video.single_embedded,
+                &scratch.video.single_hidden,
+                &video_gate,
+            )?;
+            self.v2a_gate.apply(
+                gpu,
+                &scratch.single_sinusoid,
+                1,
+                &scratch.audio.single_embedded,
+                &scratch.audio.single_hidden,
+                &audio_gate,
+            )?;
+
+            // The cross RoPE is the time axis at `audio_cross_attention_dim`
+            // (`:365-370`), on each modality's own positions.
+            let (video_cos, video_sin) =
+                rope_tables(&video_time, 1, AUDIO_CONTEXT_DIM, &[CROSS_MAX_POS], HEADS)?;
+            let (audio_cos, audio_sin) = rope_tables(
+                &audio_positions,
+                1,
+                AUDIO_CONTEXT_DIM,
+                &[CROSS_MAX_POS],
+                HEADS,
+            )?;
+            let (self_cos, self_sin) =
+                rope_tables(&audio_positions, 1, AUDIO_DIM, &AUDIO_MAX_POS, HEADS)?;
+
+            video_cross = Some(Cross {
+                scale_shift: video_scale_shift,
+                gate: video_gate,
+                cos: tensor_of(gpu, &video_cos)?,
+                sin: tensor_of(gpu, &video_sin)?,
+            });
+            audio_signals = Some(Signals {
+                rows: audio_rows,
+                dim: AUDIO_DIM as u32,
+                modulation: audio_modulation,
+                cross: Some(Cross {
+                    scale_shift: audio_scale_shift,
+                    gate: audio_gate,
+                    cos: tensor_of(gpu, &audio_cos)?,
+                    sin: tensor_of(gpu, &audio_sin)?,
+                }),
+                prompt_modulation: audio_prompt,
+                context: audio_context,
+                context_rows: CONTEXT_ROWS,
+                self_cos: tensor_of(gpu, &self_cos)?,
+                self_sin: tensor_of(gpu, &self_sin)?,
+            });
+            audio = Some(state);
+        }
+
+        // The self-attention tables over every axis at the video's width
+        // (`:239-260`).
         let (self_cos, self_sin) = rope_tables(
             &video_positions(&geometry),
             3,
             VIDEO_DIM,
             &VIDEO_MAX_POS,
-            HEADS,
-        )?;
-        let (audio_self_cos, audio_self_sin) = rope_tables(
-            &audio_positions(&geometry),
-            1,
-            AUDIO_DIM,
-            &AUDIO_MAX_POS,
-            HEADS,
-        )?;
-        let (cross_cos, cross_sin) =
-            rope_tables(&video_time, 1, AUDIO_CONTEXT_DIM, &[CROSS_MAX_POS], HEADS)?;
-        let (audio_cross_cos, audio_cross_sin) = rope_tables(
-            &audio_positions(&geometry),
-            1,
-            AUDIO_CONTEXT_DIM,
-            &[CROSS_MAX_POS],
             HEADS,
         )?;
 
@@ -2255,39 +2353,24 @@ impl Edges {
                 rows: video_rows,
                 dim: VIDEO_DIM as u32,
                 modulation,
-                cross_scale_shift,
-                cross_gate,
+                cross: video_cross,
                 prompt_modulation: video_prompt,
                 context: request.video_context,
                 context_rows: CONTEXT_ROWS,
                 self_cos: tensor_of(gpu, &self_cos)?,
                 self_sin: tensor_of(gpu, &self_sin)?,
-                cross_cos: tensor_of(gpu, &cross_cos)?,
-                cross_sin: tensor_of(gpu, &cross_sin)?,
             },
-            audio_signals: Signals {
-                rows: audio_rows,
-                dim: AUDIO_DIM as u32,
-                modulation: audio_modulation,
-                cross_scale_shift: audio_cross_scale_shift,
-                cross_gate: audio_cross_gate,
-                prompt_modulation: audio_prompt,
-                context: request.audio_context,
-                context_rows: CONTEXT_ROWS,
-                self_cos: tensor_of(gpu, &audio_self_cos)?,
-                self_sin: tensor_of(gpu, &audio_self_sin)?,
-                cross_cos: tensor_of(gpu, &audio_cross_cos)?,
-                cross_sin: tensor_of(gpu, &audio_cross_sin)?,
-            },
+            audio_signals,
             video,
             audio,
         })
     }
 
-    /// `LTXModel._process_output` on both modalities (`model.py:520-536`),
-    /// after the blocks: the head's `[rows, 128]` output lands in
-    /// [`EdgeScratch`]'s head buffer, and `unpatchify_video` takes the video's
-    /// back to a latent grid.
+    /// `LTXModel._process_output` on every present modality
+    /// (`model.py:520-536`), after the blocks: the head's `[rows, 128]` output
+    /// lands in [`EdgeScratch`]'s head buffer, and `unpatchify_video` takes the
+    /// video's back to a latent grid. A video-only prepare runs the video head
+    /// alone, exactly as `LTXModel.forward` does for `audio_out is None`.
     pub fn head(
         &self,
         gpu: &Gpu,
@@ -2302,14 +2385,19 @@ impl Edges {
             &scratch.video.embedded,
             &scratch.video_head,
         )?;
-        process_output(
-            gpu,
-            &self.head.audio_table,
-            &self.head.audio_proj,
-            &prepared.audio,
-            &scratch.audio.embedded,
-            &scratch.audio_head,
-        )
+
+        if let Some(state) = &prepared.audio {
+            process_output(
+                gpu,
+                &self.head.audio_table,
+                &self.head.audio_proj,
+                state,
+                &scratch.audio.embedded,
+                &scratch.audio_head,
+            )?;
+        }
+
+        Ok(())
     }
 
     /// The audio head's `[frames, 128]`, for a caller that dumps or decodes it.

@@ -37,6 +37,7 @@ pub mod local_api;
 pub mod lora;
 pub mod ltx_adapter;
 pub mod ltx_refiner;
+pub mod ltx_stage2;
 pub mod media;
 pub mod multimodal;
 pub mod nvfp4;

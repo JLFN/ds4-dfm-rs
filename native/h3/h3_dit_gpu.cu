@@ -19,6 +19,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -3817,6 +3818,312 @@ int h3d_keyframe_add(h3d_context *context, h3d_tensor *output,
         (const __nv_bfloat16 *)mask->data,
         (const __nv_bfloat16 *)embedding->data, rows, width);
     return h3d_launch_ok("BF16 keyframe add", error, error_size);
+}
+
+/* torch's own CUDA normal draw, transcribed so the port gets the reference's
+ * values rather than a lookalike sequence.
+ *
+ * `torch.randn(x.shape, generator=g, dtype=x.dtype)` reaches
+ * `normal_kernel<BFloat16>` (`ATen/native/cuda/DistributionTemplates.h:461-476`)
+ * with `accscalar_t = float`, which calls `normal_and_transform<BFloat16,
+ * float>` (`:443-455`) - `curand_normal4` and `unroll_factor =
+ * sizeof(float4)/sizeof(float) = 4` (`:116`). The launch is
+ * `distribution_elementwise_grid_stride_kernel<accscalar_t, 4>` (`:66-89`): one
+ * Philox state per thread seeded from the generator's `(seed, offset)` pair at
+ * subsequence `idx`, a `float4` per iteration, component `ii` stored to element
+ * `linear_index + blockDim.x * gridDim.x * ii`. `transformation::normal<float>(v,
+ * 0, 1)` is `v * 1 + 0` (`ATen/core/TransformationHelper.h:96-99`) and the
+ * store is `static_cast<BFloat16>(float)` = `__float2bfloat16`
+ * (`c10/util/BFloat16-inl.h` -> `torch/headeronly/util/BFloat16.h:125-130`).
+ *
+ * The grid is `calc_execution_policy`'s (`:50-62`): 256-thread blocks capped at
+ * `multiProcessorCount * (maxThreadsPerMultiProcessor / 256)`, and the host then
+ * advances the generator by `((elements-1)/(256*grid*4)+1)*4`. That increment
+ * is what `h3d_randn_bf16` hands back, so the caller keeps torch's
+ * `philox_offset_per_thread_` bookkeeping (`CUDAGeneratorImpl.cpp`,
+ * `philox_cuda_state`).
+ *
+ * `curand_normal4` is `curand_box_muller4` (`curand_normal.h:165-179`) over
+ * `curand4`: `sqrtf`, `logf` and `__sincosf` run on the device's own units.
+ * That is why these values are reproducible only on the architecture the
+ * reference ran on - a host reimplementation of Box-Muller with libm would
+ * differ in the last bits of every value. */
+__global__ static void __launch_bounds__(256, 4)
+    h3d_randn_bf16_kernel(__nv_bfloat16 *output, uint64_t elements,
+                          unsigned long long seed, unsigned long long offset) {
+    const uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
+    const uint64_t rounded = ((elements - 1) / (stride * 4) + 1) * stride * 4;
+    const int64_t index = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    curandStatePhilox4_32_10_t state;
+
+    curand_init(seed, (unsigned long long)index, offset, &state);
+    for (uint64_t linear = (uint64_t)index; linear < rounded;
+         linear += stride * 4) {
+        const float4 rand = curand_normal4(&state);
+
+#pragma unroll
+        for (int ii = 0; ii < 4; ii++) {
+            const uint64_t at = linear + stride * (uint64_t)ii;
+            if (at < elements) {
+                output[at] = __float2bfloat16((&rand.x)[ii]);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+int h3d_randn_bf16(h3d_context *context, h3d_tensor *output, size_t elements,
+                   uint64_t seed, uint64_t offset, uint64_t *increment,
+                   char *error, size_t error_size) {
+    int device = 0;
+    int threads_per_sm = 0;
+    int multiprocessors = 0;
+    uint64_t grid = 0;
+    uint64_t whole = 0;
+
+    if (!context || !elements || !increment ||
+        !h3d_is(output, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size, "invalid BF16 randn arguments");
+    }
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&threads_per_sm,
+                               cudaDevAttrMaxThreadsPerMultiProcessor,
+                               device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
+                               device) != cudaSuccess) {
+        return h3d_set_error(error, error_size,
+                             "randn: device attributes unavailable");
+    }
+
+    /* `calc_execution_policy` (`DistributionTemplates.h:50-62`). */
+    whole = (elements + 255) / 256;
+    grid = (uint64_t)multiprocessors * ((uint32_t)threads_per_sm / 256);
+    if (grid > whole) grid = whole;
+    if (!grid) grid = 1;
+    *increment = ((elements - 1) / (256 * grid * 4) + 1) * 4;
+
+    h3d_randn_bf16_kernel<<<(unsigned)grid, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (uint64_t)elements, seed, offset);
+    return h3d_launch_ok("BF16 randn", error, error_size);
+}
+
+/* `torch.lerp` (`aten/src/ATen/native/Lerp.h:22-33`) is not `a + w*(b-a)`
+ * unconditionally: `|w| < 0.5` takes `self + w*(end - self)` and any other
+ * weight takes `end - (end - self)*(1 - w)`. Both branches are in float32 with
+ * an `opmath_t` weight, and the branch is part of the value. */
+__device__ static float h3d_lerp(float self, float end, float weight) {
+    return fabsf(weight) < 0.5f ? self + weight * (end - self)
+                                : end - (end - self) * (1.0f - weight);
+}
+
+/* `GaussianNoiser.__call__` (`components/noisers.py:30-37`): two float32
+ * `torch.lerp`s - the latent toward the noise at `noise_scale`, then the clean
+ * latent toward that at the patched denoise mask - and one cast back to the
+ * latent's dtype. `noise_scale` is `STAGE2_SIGMAS[0]` = 0.909375
+ * (`refiner_encoder_ablation_single_gpu.py:699`), and the mask is one value per
+ * token, so `mask` is indexed by row. */
+__global__ static void h3d_noise_lerp_kernel(__nv_bfloat16 *output,
+                                             const __nv_bfloat16 *latent,
+                                             const __nv_bfloat16 *noise,
+                                             const __nv_bfloat16 *clean,
+                                             const float *mask, uint32_t rows,
+                                             uint32_t width, float weight) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    const float noisy =
+        h3d_lerp(__bfloat162float(latent[index]), __bfloat162float(noise[index]),
+                 weight);
+    output[index] = __float2bfloat16(
+        h3d_lerp(__bfloat162float(clean[index]), noisy, mask[index / width]));
+}
+
+int h3d_noise_lerp(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *latent, const h3d_tensor *noise,
+                   const h3d_tensor *clean, const h3d_tensor *mask,
+                   uint32_t rows, uint32_t width, float weight, char *error,
+                   size_t error_size) {
+    size_t elements = 0;
+
+    if (!context || !rows || !width || !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(latent, H3D_BF16, elements) ||
+        !h3d_is(noise, H3D_BF16, elements) ||
+        !h3d_is(clean, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(mask, H3D_F32, rows)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 noise lerp arguments");
+    }
+    h3d_noise_lerp_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                            context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)latent->data,
+        (const __nv_bfloat16 *)noise->data, (const __nv_bfloat16 *)clean->data,
+        (const float *)mask->data, rows, width, weight);
+    return h3d_launch_ok("BF16 noise lerp", error, error_size);
+}
+
+/* `timesteps_from_mask` (`ltx_pipelines/utils/helpers.py:494-501`):
+ * `denoise_mask * sigma`, the per-token timestep the block AdaLN
+ * (`transformer_args.py:176-185`) and `X0Model`'s `to_denoised` read. */
+__global__ static void h3d_timesteps_kernel(float *output, const float *mask,
+                                            uint32_t rows, float sigma) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    output[row] = mask[row] * sigma;
+}
+
+int h3d_timesteps(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *mask, uint32_t rows, float sigma,
+                  char *error, size_t error_size) {
+    if (!context || !rows || !h3d_is(output, H3D_F32, rows) ||
+        !h3d_is(mask, H3D_F32, rows)) {
+        return h3d_set_error(error, error_size, "invalid F32 timesteps arguments");
+    }
+    h3d_timesteps_kernel<<<(rows + 255) / 256, 256, 0, context->stream>>>(
+        (float *)output->data, (const float *)mask->data, rows, sigma);
+    return h3d_launch_ok("F32 timesteps", error, error_size);
+}
+
+/* `to_denoised` (`ltx-core/src/ltx_core/utils.py:39-52`):
+ * `(sample - velocity * sigma).to(sample.dtype)` in float32. `sigma` is the
+ * per-token timestep `X0Model.forward` passes (`model.py:590-605`), not the
+ * scalar the block AdaLN takes. */
+__global__ static void h3d_to_denoised_kernel(__nv_bfloat16 *output,
+                                              const __nv_bfloat16 *latent,
+                                              const __nv_bfloat16 *velocity,
+                                              const float *timestep,
+                                              uint32_t rows, uint32_t width) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    output[index] = __float2bfloat16(
+        __bfloat162float(latent[index]) -
+        __bfloat162float(velocity[index]) * timestep[index / width]);
+}
+
+int h3d_to_denoised(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *latent, const h3d_tensor *velocity,
+                    const h3d_tensor *timestep, uint32_t rows, uint32_t width,
+                    char *error, size_t error_size) {
+    size_t elements = 0;
+
+    if (!context || !rows || !width || !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(latent, H3D_BF16, elements) ||
+        !h3d_is(velocity, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(timestep, H3D_F32, rows)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 to-denoised arguments");
+    }
+    h3d_to_denoised_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                             context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)latent->data,
+        (const __nv_bfloat16 *)velocity->data, (const float *)timestep->data,
+        rows, width);
+    return h3d_launch_ok("BF16 to-denoised", error, error_size);
+}
+
+/* `to_velocity` (`utils.py:21-35`): `((sample - denoised) / sigma).to(sample.dtype)`
+ * in float32. `EulerDiffusionStep.step` calls it once per step and then rounds
+ * again, so the two roundings are separate: this kernel writes the bf16
+ * velocity, `h3d_euler_step` reads it back as float32
+ * (`components/diffusion_steps.py:31-40`). */
+__global__ static void h3d_to_velocity_kernel(__nv_bfloat16 *output,
+                                              const __nv_bfloat16 *sample,
+                                              const __nv_bfloat16 *denoised,
+                                              float sigma, size_t elements) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] =
+        __float2bfloat16((__bfloat162float(sample[index]) -
+                          __bfloat162float(denoised[index])) /
+                         sigma);
+}
+
+int h3d_to_velocity(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *sample, const h3d_tensor *denoised,
+                    float sigma, size_t elements, char *error,
+                    size_t error_size) {
+    if (!context || !elements || sigma == 0.0f ||
+        !h3d_is(sample, H3D_BF16, elements) ||
+        !h3d_is(denoised, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 to-velocity arguments");
+    }
+    h3d_to_velocity_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                             context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)sample->data,
+        (const __nv_bfloat16 *)denoised->data, sigma, elements);
+    return h3d_launch_ok("BF16 to-velocity", error, error_size);
+}
+
+/* `EulerDiffusionStep.step` (`diffusion_steps.py:31-40`):
+ * `sample + velocity * (sigma_next - sigma)` in float32, then one cast back to
+ * the sample's dtype. `delta` is `sigma_next - sigma` computed in float32 by
+ * the caller, which is how the reference forms `dt`. */
+__global__ static void h3d_euler_step_kernel(__nv_bfloat16 *output,
+                                             const __nv_bfloat16 *sample,
+                                             const __nv_bfloat16 *velocity,
+                                             float delta, size_t elements) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = __float2bfloat16(__bfloat162float(sample[index]) +
+                                     __bfloat162float(velocity[index]) * delta);
+}
+
+int h3d_euler_step(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *sample, const h3d_tensor *velocity,
+                   float delta, size_t elements, char *error,
+                   size_t error_size) {
+    if (!context || !elements || !h3d_is(sample, H3D_BF16, elements) ||
+        !h3d_is(velocity, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 Euler step arguments");
+    }
+    h3d_euler_step_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                            context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)sample->data,
+        (const __nv_bfloat16 *)velocity->data, delta, elements);
+    return h3d_launch_ok("BF16 Euler step", error, error_size);
+}
+
+/* `post_process_latent` (`helpers.py:461-464`):
+ * `(denoised * denoise_mask + clean.float() * (1 - denoise_mask)).to(denoised.dtype)`.
+ * `bf16 * f32` promotes to f32, so both products are float32 and the mask is
+ * read once per row. With the release's all-ones mask this is the identity,
+ * which is why it must be transcribed rather than dropped. */
+__global__ static void h3d_post_latent_kernel(__nv_bfloat16 *output,
+                                              const __nv_bfloat16 *denoised,
+                                              const float *mask,
+                                              const __nv_bfloat16 *clean,
+                                              uint32_t rows, uint32_t width) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    const float row = mask[index / width];
+    output[index] = __float2bfloat16(__bfloat162float(denoised[index]) * row +
+                                     __bfloat162float(clean[index]) * (1.0f - row));
+}
+
+int h3d_post_latent(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *denoised, const h3d_tensor *mask,
+                    const h3d_tensor *clean, uint32_t rows, uint32_t width,
+                    char *error, size_t error_size) {
+    size_t elements = 0;
+
+    if (!context || !rows || !width || !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(denoised, H3D_BF16, elements) ||
+        !h3d_is(clean, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(mask, H3D_F32, rows)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 post-process arguments");
+    }
+    h3d_post_latent_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                             context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)denoised->data,
+        (const float *)mask->data, (const __nv_bfloat16 *)clean->data, rows,
+        width);
+    return h3d_launch_ok("BF16 post-process", error, error_size);
 }
 
 enum {

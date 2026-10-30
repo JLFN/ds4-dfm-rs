@@ -484,6 +484,95 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    /// `h3d_randn_bf16`: torch's CUDA normal draw at the generator's own
+    /// `(seed, offset)`, reporting the offset advance the caller applies.
+    fn h3d_randn_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        elements: usize,
+        seed: u64,
+        offset: u64,
+        increment: *mut u64,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_noise_lerp`: `GaussianNoiser.__call__`'s two float32 lerps.
+    fn h3d_noise_lerp(
+        context: *mut Context,
+        output: *mut CTensor,
+        latent: *const CTensor,
+        noise: *const CTensor,
+        clean: *const CTensor,
+        mask: *const CTensor,
+        rows: u32,
+        width: u32,
+        weight: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_timesteps`: the F32 `[rows]` `denoise_mask * sigma`.
+    fn h3d_timesteps(
+        context: *mut Context,
+        output: *mut CTensor,
+        mask: *const CTensor,
+        rows: u32,
+        sigma: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_to_denoised`: `X0Model`'s `to_denoised` at the per-token timestep.
+    fn h3d_to_denoised(
+        context: *mut Context,
+        output: *mut CTensor,
+        latent: *const CTensor,
+        velocity: *const CTensor,
+        timestep: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_to_velocity`: `to_velocity`, whose BF16 round the step reads back.
+    fn h3d_to_velocity(
+        context: *mut Context,
+        output: *mut CTensor,
+        sample: *const CTensor,
+        denoised: *const CTensor,
+        sigma: f32,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_euler_step`: `EulerDiffusionStep.step`'s `sample + velocity*dt`.
+    fn h3d_euler_step(
+        context: *mut Context,
+        output: *mut CTensor,
+        sample: *const CTensor,
+        velocity: *const CTensor,
+        delta: f32,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_post_latent`: `post_process_latent`'s mask blend.
+    fn h3d_post_latent(
+        context: *mut Context,
+        output: *mut CTensor,
+        denoised: *const CTensor,
+        mask: *const CTensor,
+        clean: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     /// `h3d_sol_words`: the mask words one query block carries at this length.
     fn h3d_sol_words(sequence: u32) -> u32;
     /// VSA's selector: the reference's own sparsity rule for the H3 stage.
@@ -3430,6 +3519,211 @@ impl Gpu {
                 )
             },
             "keyframe add",
+        )
+    }
+
+    // ---- the stage-2 sampler (`minimax_h3::ltx_stage2`). One wrapper per
+    // reference expression; the Rust side keeps the schedule and the
+    // generator's offset, the device keeps every float32 rounding.
+
+    /// torch's own CUDA normal draw at `dtype=bfloat16`: the grid-stride
+    /// kernel of `ATen/native/cuda/DistributionTemplates.h:66-89`, one Philox
+    /// subsequence per thread, `curand_normal4` and a `__float2bfloat16`
+    /// store. The returned value is the offset advance
+    /// `calc_execution_policy` (`:50-62`) gives the caller, so the caller's
+    /// generator keeps torch's `philox_offset_per_thread_` itself.
+    pub fn randn_bf16(&self, output: &Tensor, seed: u64, offset: u64) -> Result<u64, String> {
+        let elements = output.elements();
+        let mut increment = 0u64;
+
+        self.call(
+            |error, size| unsafe {
+                h3d_randn_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    elements,
+                    seed,
+                    offset,
+                    &mut increment,
+                    error,
+                    size,
+                )
+            },
+            "bf16 randn",
+        )?;
+
+        Ok(increment)
+    }
+
+    /// `GaussianNoiser.__call__` (`components/noisers.py:30-37`): two float32
+    /// `torch.lerp`s and one cast back to the latent's dtype.
+    pub fn noise_lerp(
+        &self,
+        output: &Tensor,
+        latent: &Tensor,
+        noise: &Tensor,
+        clean: &Tensor,
+        mask: &Tensor,
+        rows: u32,
+        width: u32,
+        weight: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_noise_lerp(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    latent.raw(),
+                    noise.raw(),
+                    clean.raw(),
+                    mask.raw(),
+                    rows,
+                    width,
+                    weight,
+                    error,
+                    size,
+                )
+            },
+            "bf16 noise lerp",
+        )
+    }
+
+    /// `timesteps_from_mask` (`helpers.py:494-501`): the F32 `[rows]`
+    /// `denoise_mask * sigma` the block AdaLN and `to_denoised` read.
+    pub fn timesteps(
+        &self,
+        output: &Tensor,
+        mask: &Tensor,
+        rows: u32,
+        sigma: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_timesteps(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    mask.raw(),
+                    rows,
+                    sigma,
+                    error,
+                    size,
+                )
+            },
+            "f32 timesteps",
+        )
+    }
+
+    /// `to_denoised` (`utils.py:39-52`) at the per-token timestep that
+    /// `X0Model.forward` (`model.py:590-605`) passes.
+    pub fn to_denoised(
+        &self,
+        output: &Tensor,
+        latent: &Tensor,
+        velocity: &Tensor,
+        timestep: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_to_denoised(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    latent.raw(),
+                    velocity.raw(),
+                    timestep.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "bf16 to-denoised",
+        )
+    }
+
+    /// `to_velocity` (`utils.py:21-35`), kept separate from the step because
+    /// the reference rounds to BF16 between them.
+    pub fn to_velocity(
+        &self,
+        output: &Tensor,
+        sample: &Tensor,
+        denoised: &Tensor,
+        sigma: f32,
+    ) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_to_velocity(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    sample.raw(),
+                    denoised.raw(),
+                    sigma,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 to-velocity",
+        )
+    }
+
+    /// `EulerDiffusionStep.step` (`diffusion_steps.py:31-40`) with
+    /// `delta = sigma_next - sigma`.
+    pub fn euler_step(
+        &self,
+        output: &Tensor,
+        sample: &Tensor,
+        velocity: &Tensor,
+        delta: f32,
+    ) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_euler_step(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    sample.raw(),
+                    velocity.raw(),
+                    delta,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 Euler step",
+        )
+    }
+
+    /// `post_process_latent` (`helpers.py:461-464`): the denoised prediction
+    /// blended with the clean latent under the F32 `[rows]` mask.
+    pub fn post_latent(
+        &self,
+        output: &Tensor,
+        denoised: &Tensor,
+        mask: &Tensor,
+        clean: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_post_latent(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    denoised.raw(),
+                    mask.raw(),
+                    clean.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "bf16 post-process",
         )
     }
 

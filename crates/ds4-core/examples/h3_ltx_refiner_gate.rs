@@ -39,10 +39,11 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_refiner::{
-    EdgeScratch, Edges, Geometry, Refiner, RefinerScratch, Request, Signals, AUDIO_BINS,
+    Cross, EdgeScratch, Edges, Geometry, Refiner, RefinerScratch, Request, Signals, AUDIO_BINS,
     AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM, AUDIO_TOKENS, CHANNELS,
-    CONTEXT_ROWS, HEADS, VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
+    CONTEXT_ROWS, HEADS, LAYERS, VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
+use ds4_core::minimax_h3::ltx_stage2::{Generator, Stage2, NOISE_SCALE, SIGMAS, STEPS};
 use ds4_core::minimax_h3::safetensors::{self, Entry, Shard, ShardWriter};
 use ds4_core::minimax_h3::text_forward::fnv1a;
 use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
@@ -108,7 +109,148 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         return run_edges(&gpu, &transformer, &options);
     }
 
+    if options.stage {
+        return run_stage(&gpu, &transformer, &options);
+    }
+
     run_blocks(&gpu, &transformer, &options)
+}
+
+/// The whole stage-2 evaluation (`minimax_h3::ltx_stage2`): one noised state,
+/// the release's three intervals, and the final latent, with a hash per step
+/// for the golden diff.
+///
+/// The two inputs are the route's own and are not this gate's to produce. The
+/// initial latent is the H3 latent through the adapter and the latent
+/// upsampler (`runtime/stage2_ops/h3_upscale.py`), which is not ported, so it
+/// is synthetic unless `--latent` names a dumped one; the prompt context is the
+/// Gemma4 tower plus the LTX connector's output, so it is synthetic unless
+/// `--context` names the connector gate's dump. A synthetic pair still
+/// exercises every kernel on the release's shapes and prices the step; it says
+/// nothing about the video.
+fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, String> {
+    let geometry = Geometry::release();
+    let rows = geometry.video_tokens();
+    let layers: Vec<usize> = (0..options.layers.unwrap_or(LAYERS)).collect();
+    let seed = options.seed.unwrap_or(1);
+
+    let started = Instant::now();
+    let mut stage =
+        Stage2::open(gpu, path, path, geometry, &layers).map_err(|error| error.token())?;
+    let load = started.elapsed().as_secs_f64();
+
+    let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let latent = match &options.latent {
+        Some(file) => read_tensor_file(gpu, file, CHANNELS * rows as usize)?,
+        None => draw(gpu, CHANNELS as u32, rows as usize, &mut lcg)?,
+    };
+    let context = match &options.prompt {
+        Some(file) => read_tensor_file(gpu, file, CONTEXT_ROWS as usize * VIDEO_CONTEXT_DIM)?,
+        None => draw(gpu, CONTEXT_ROWS, VIDEO_CONTEXT_DIM, &mut lcg)?,
+    };
+
+    println!(
+        "STAGE layers={} rows={rows} seed={seed} noise_scale={NOISE_SCALE} schedule={SIGMAS:?} \
+         latent={} context={} load={load:.3}",
+        layers.len(),
+        if options.latent.is_some() {
+            "file"
+        } else {
+            "synthetic"
+        },
+        if options.prompt.is_some() {
+            "file"
+        } else {
+            "synthetic"
+        },
+    );
+
+    stage.seed(seed as u64);
+
+    let mut failed = false;
+    let mut expect = options.expect.clone();
+    let started = Instant::now();
+    stage
+        .noised_state(gpu, &latent)
+        .map_err(|error| error.token())?;
+    println!(
+        "STAGE-TIMING prepare={:.3}",
+        started.elapsed().as_secs_f64()
+    );
+
+    // The noise is the only place the RNG enters, so its hash is the one that
+    // a fixed seed makes comparable across hosts.
+    let generator = stage.generator();
+    println!(
+        "STAGE-GENERATOR seed={} offset={}",
+        generator.seed(),
+        generator.offset()
+    );
+    failed |= report_state(
+        gpu,
+        "stage-noise",
+        stage.noise(),
+        &mut expect,
+        options.dump.as_deref(),
+        None,
+        0.0,
+    )?;
+    failed |= report_state(
+        gpu,
+        "stage-state0",
+        stage.latent(),
+        &mut expect,
+        options.dump.as_deref(),
+        options.residual.as_deref(),
+        0.0,
+    )?;
+
+    let mut steps = [0.0f64; STEPS];
+    let started = Instant::now();
+
+    for index in 0..STEPS {
+        let step_started = Instant::now();
+        stage
+            .step(gpu, index, &context)
+            .map_err(|error| error.token())?;
+        steps[index] = step_started.elapsed().as_secs_f64();
+
+        failed |= report_state(
+            gpu,
+            &format!("stage-step{index}"),
+            stage.latent(),
+            &mut expect,
+            options.dump.as_deref(),
+            options.residual.as_deref(),
+            steps[index],
+        )?;
+    }
+
+    let denoise = started.elapsed().as_secs_f64();
+    failed |= report_state(
+        gpu,
+        "stage-latent",
+        stage.latent_grid(gpu).map_err(|error| error.token())?,
+        &mut expect,
+        options.dump.as_deref(),
+        options.residual.as_deref(),
+        0.0,
+    )?;
+
+    for name in expect.keys() {
+        println!("STAGE {name} expected but never produced");
+        failed = true;
+    }
+
+    println!("STAGE-TIMING steps={steps:?} denoise={denoise:.3} load={load:.3}");
+
+    if failed {
+        return Ok(ExitCode::from(3));
+    }
+
+    println!("LTX-REFINER-STAGE-OK");
+
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The first `blocks` blocks over the shard's weights, with synthetic
@@ -157,7 +299,7 @@ fn run_blocks(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Str
     for block in 0..refiner.blocks() {
         let started = Instant::now();
         refiner
-            .apply_one(block, gpu, &video, &audio, &v, &a, &scratch)
+            .apply_one(block, gpu, &video, &v, Some((&audio, &a)), &scratch)
             .map_err(|error| error.token())?;
         let seconds = started.elapsed().as_secs_f64();
 
@@ -232,7 +374,7 @@ fn identity(gpu: &Gpu, path: &Path, target: &Path, options: &Options) -> Result<
     )?;
 
     refiner
-        .apply(gpu, &video, &audio, &v, &a, &scratch)
+        .apply(gpu, &video, &v, Some((&audio, &a)), &scratch)
         .map_err(|error| error.token())?;
 
     let got_video = read_bf16(gpu, &video)?;
@@ -342,16 +484,11 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
     let scratch = EdgeScratch::new(gpu, &geometry).map_err(|error| error.token())?;
 
     let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
-    let video = draw(
-        gpu,
-        CHANNELS as u32,
-        geometry.video_tokens() as usize,
-        &mut lcg,
-    )?;
+    let video = draw(gpu, geometry.video_tokens(), CHANNELS, &mut lcg)?;
     let audio = draw(
         gpu,
-        AUDIO_CHANNELS,
-        audio_rows as usize * AUDIO_BINS as usize,
+        audio_rows,
+        AUDIO_CHANNELS as usize * AUDIO_BINS as usize,
         &mut lcg,
     )?;
     let v_context = context(gpu, VIDEO_DIM, &mut lcg)?;
@@ -366,9 +503,9 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
         sigma,
         geometry,
         video: &video,
-        audio: &audio,
+        audio: Some(&audio),
         video_context: &v_context,
-        audio_context: &a_context,
+        audio_context: Some(&a_context),
     };
 
     let started = Instant::now();
@@ -376,6 +513,23 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
         .prepare(gpu, &request, &scratch)
         .map_err(|error| error.token())?;
     let prepare_seconds = started.elapsed().as_secs_f64();
+    let audio_state = prepared
+        .audio
+        .as_ref()
+        .ok_or_else(|| "the edges run asked for an audio state".to_string())?;
+    let audio_signals = prepared
+        .audio_signals
+        .as_ref()
+        .ok_or_else(|| "the edges run asked for audio signals".to_string())?;
+    let video_cross = prepared
+        .video_signals
+        .cross
+        .as_ref()
+        .ok_or_else(|| "the edges run asked for the video cross group".to_string())?;
+    let audio_cross = audio_signals
+        .cross
+        .as_ref()
+        .ok_or_else(|| "the edges run asked for the audio cross group".to_string())?;
 
     let mut failed = false;
     let mut expect = options.expect.clone();
@@ -389,26 +543,20 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
     if options.signals {
         for (name, tensor) in [
             ("edges-video-state", &prepared.video),
-            ("edges-audio-state", &prepared.audio),
+            ("edges-audio-state", audio_state),
             ("edges-video-modulation", &prepared.video_signals.modulation),
-            (
-                "edges-video-cross-scale-shift",
-                &prepared.video_signals.cross_scale_shift,
-            ),
-            ("edges-video-cross-gate", &prepared.video_signals.cross_gate),
+            ("edges-video-cross-scale-shift", &video_cross.scale_shift),
+            ("edges-video-cross-gate", &video_cross.gate),
             (
                 "edges-video-prompt-modulation",
                 &prepared.video_signals.prompt_modulation,
             ),
             ("edges-video-self-cos", &prepared.video_signals.self_cos),
             ("edges-video-self-sin", &prepared.video_signals.self_sin),
-            ("edges-video-cross-cos", &prepared.video_signals.cross_cos),
-            ("edges-audio-modulation", &prepared.audio_signals.modulation),
-            ("edges-audio-self-cos", &prepared.audio_signals.self_cos),
-            (
-                "edges-audio-cross-scale-shift",
-                &prepared.audio_signals.cross_scale_shift,
-            ),
+            ("edges-video-cross-cos", &video_cross.cos),
+            ("edges-audio-modulation", &audio_signals.modulation),
+            ("edges-audio-self-cos", &audio_signals.self_cos),
+            ("edges-audio-cross-scale-shift", &audio_cross.scale_shift),
         ] {
             failed |= report_state(
                 gpu,
@@ -437,9 +585,8 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
                 block,
                 gpu,
                 &prepared.video,
-                &prepared.audio,
                 &prepared.video_signals,
-                &prepared.audio_signals,
+                Some((audio_state, audio_signals)),
                 &refiner_scratch,
             )
             .map_err(|error| error.token())?;
@@ -507,7 +654,7 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
                 AUDIO_DIM,
                 "audio_scale_shift_table",
                 "audio_proj_out",
-                &prepared.audio,
+                audio_state,
                 edges.audio_embedded(&scratch),
                 edges.audio_output(&scratch),
             ),
@@ -739,6 +886,251 @@ fn keyframe(
     );
 
     Ok(differ != 0)
+}
+
+/// The stage-2 sampler's device steps (`minimax_h3::ltx_stage2`), each against
+/// a host transcription of its reference expression.
+///
+/// The noise draw has no transcription and is not given one:
+/// `curand_normal4` is `sqrtf`, `logf` and `__sincosf` on the device's own
+/// units, so a host reimplementation of Box-Muller would disagree in the last
+/// bits of every value - which is the whole reason the port runs the draw on
+/// the device. What is checkable here is the three things a wiring fault would
+/// break: every element is written, the same generator state draws the same
+/// values, and a draw at the advanced offset draws different ones.
+///
+/// The four steps whose reference reads `a + b*c` (`noise_lerp`,
+/// `to_denoised`, `euler_step`, `post_latent`) are reported as **residues**:
+/// nvcc contracts to FMA by default and the host transcription does not, so a
+/// one-ulp difference is expected, and a swapped operand or a dropped mask
+/// moves the value by orders more. The two whose reference has no such product
+/// (`timesteps`, `to_velocity`) must be bit-identical.
+fn probe_sampler(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
+    let rows = 5u32;
+    let width = 8usize;
+    let elements = rows as usize * width;
+    let sigma = SIGMAS[0];
+    let delta = SIGMAS[1] - SIGMAS[0];
+    let mut failed = false;
+
+    let noise = draw(gpu, rows, width, state)?;
+    let clean = draw(gpu, rows, width, state)?;
+    let latent = draw(gpu, rows, width, state)?;
+    let velocity = draw(gpu, rows, width, state)?;
+    let denoised = draw(gpu, rows, width, state)?;
+    let (noise_values, clean_values, latent_values) = (
+        read_bf16(gpu, &noise)?,
+        read_bf16(gpu, &clean)?,
+        read_bf16(gpu, &latent)?,
+    );
+    let (velocity_values, denoised_values) =
+        (read_bf16(gpu, &velocity)?, read_bf16(gpu, &denoised)?);
+
+    // The mask: the release's is all ones, but a probe that only ever ran it
+    // at 1 could not tell a transcribed mask from a dropped one.
+    let mask_values: Vec<f32> = (0..rows)
+        .map(|row| match row {
+            0 => 1.0,
+            1 => 0.0,
+            2 => 0.5,
+            3 => 0.25,
+            _ => 0.75,
+        })
+        .collect();
+    let mask = upload_f32(gpu, &mask_values)?;
+
+    // `timesteps_from_mask` (`helpers.py:494-501`).
+    let timestep = alloc(gpu, Device::F32, rows as usize)?;
+    gpu.timesteps(&timestep, &mask, rows, sigma)
+        .map_err(|detail| format!("timesteps: {detail}"))?;
+    let got = read_f32_tensor(gpu, &timestep)?;
+    let timestep_values: Vec<f32> = mask_values.iter().map(|value| value * sigma).collect();
+    failed |= report("timesteps", &got, &timestep_values, Verdict::Exact);
+
+    // `to_velocity` (`utils.py:21-35`): `((sample - denoised)/sigma)` in F32,
+    // one BF16 round.
+    let output = alloc(gpu, Device::Bf16, elements)?;
+    gpu.to_velocity(&output, &latent, &denoised, sigma)
+        .map_err(|detail| format!("to_velocity: {detail}"))?;
+    let got = read_bf16(gpu, &output)?;
+    let want: Vec<f32> = latent_values
+        .iter()
+        .zip(denoised_values.iter())
+        .map(|(sample, denoised)| bf16((sample - denoised) / sigma))
+        .collect();
+    failed |= report("to_velocity", &got, &want, Verdict::Exact);
+
+    // `to_denoised` (`utils.py:39-52`) at the per-token timestep.
+    let output = alloc(gpu, Device::Bf16, elements)?;
+    gpu.to_denoised(&output, &latent, &velocity, &timestep, rows, width as u32)
+        .map_err(|detail| format!("to_denoised: {detail}"))?;
+    let got = read_bf16(gpu, &output)?;
+    let want: Vec<f32> = (0..elements)
+        .map(|index| {
+            bf16(latent_values[index] - velocity_values[index] * timestep_values[index / width])
+        })
+        .collect();
+    failed |= report("to_denoised", &got, &want, Verdict::Residual);
+
+    // `EulerDiffusionStep.step` (`diffusion_steps.py:31-40`).
+    let output = alloc(gpu, Device::Bf16, elements)?;
+    gpu.euler_step(&output, &latent, &velocity, delta)
+        .map_err(|detail| format!("euler_step: {detail}"))?;
+    let got = read_bf16(gpu, &output)?;
+    let want: Vec<f32> = latent_values
+        .iter()
+        .zip(velocity_values.iter())
+        .map(|(sample, velocity)| bf16(sample + velocity * delta))
+        .collect();
+    failed |= report("euler_step", &got, &want, Verdict::Residual);
+
+    // `post_process_latent` (`helpers.py:461-464`).
+    let output = alloc(gpu, Device::Bf16, elements)?;
+    gpu.post_latent(&output, &denoised, &mask, &clean, rows, width as u32)
+        .map_err(|detail| format!("post_latent: {detail}"))?;
+    let got = read_bf16(gpu, &output)?;
+    let want: Vec<f32> = (0..elements)
+        .map(|index| {
+            let row = mask_values[index / width];
+            bf16(denoised_values[index] * row + clean_values[index] * (1.0 - row))
+        })
+        .collect();
+    failed |= report("post_latent", &got, &want, Verdict::Residual);
+
+    // `GaussianNoiser.__call__` (`noisers.py:30-37`) at `noise_scale`.
+    let output = alloc(gpu, Device::Bf16, elements)?;
+    gpu.noise_lerp(
+        &output,
+        &latent,
+        &noise,
+        &clean,
+        &mask,
+        rows,
+        width as u32,
+        NOISE_SCALE,
+    )
+    .map_err(|detail| format!("noise_lerp: {detail}"))?;
+    let got = read_bf16(gpu, &output)?;
+    let want: Vec<f32> = (0..elements)
+        .map(|index| {
+            let weight = mask_values[index / width];
+            let noisy = lerp(latent_values[index], noise_values[index], NOISE_SCALE);
+            bf16(lerp(clean_values[index], noisy, weight))
+        })
+        .collect();
+    failed |= report("noise_lerp", &got, &want, Verdict::Residual);
+
+    failed |= probe_randn(gpu, state)?;
+
+    Ok(failed)
+}
+
+/// torch's own CUDA normal draw: it has no host transcription, so the probe
+/// pins the invariants instead - a full fill, determinism at one generator
+/// state, and a different draw once the offset has advanced.
+fn probe_randn(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
+    let elements = 4_097usize;
+    let sentinel = 1.0e30f32;
+    let mut failed = false;
+
+    // An unfilled element would keep the sentinel: `elements` is deliberately
+    // not a multiple of the 256 * grid * 4 grid-stride width.
+    let output = upload_bf16(
+        gpu,
+        &vec![(bf16(sentinel).to_bits() >> 16) as u8; elements * 2],
+    )?;
+    let mut generator = Generator::seeded(20_251_025);
+    generator
+        .randn(gpu, &output)
+        .map_err(|error| error.token())?;
+
+    let first = read_bf16(gpu, &output)?;
+    let unfilled = first
+        .iter()
+        .filter(|value| **value == bf16(sentinel))
+        .count();
+    let moment = first.iter().map(|value| *value as f64).sum::<f64>() / elements as f64;
+    let spread = (first
+        .iter()
+        .map(|value| (*value as f64 - moment).powi(2))
+        .sum::<f64>()
+        / elements as f64)
+        .sqrt();
+
+    // A 4k sample of a standard normal: the mean is within 5 standard errors
+    // and the deviation within a few percent.
+    let shaped = unfilled == 0
+        && moment.abs() < 5.0 / (elements as f64).sqrt()
+        && (spread - 1.0).abs() < 0.05;
+    println!(
+        "PROBE randn values={elements} unfilled={unfilled} mean={moment:.4} sd={spread:.4} verdict=device {}",
+        if shaped { "pass" } else { "FAIL" }
+    );
+    failed |= !shaped;
+
+    // The offset after one draw is torch's `calc_execution_policy` increment:
+    // positive and a multiple of four.
+    let increment = generator.offset();
+    let advanced = increment > 0 && increment % 4 == 0;
+    println!(
+        "PROBE randn-offset increment={increment} verdict=multiple-of-four {}",
+        if advanced { "pass" } else { "FAIL" }
+    );
+    failed |= !advanced;
+
+    // The same generator state draws the same values; the advanced offset
+    // draws different ones.
+    let repeat = alloc(gpu, Device::Bf16, elements)?;
+    let mut again = Generator::seeded(20_251_025);
+    again.randn(gpu, &repeat).map_err(|error| error.token())?;
+    let same = read_bf16(gpu, &repeat)?;
+    let identical = same
+        .iter()
+        .zip(first.iter())
+        .filter(|(left, right)| left.to_bits() == right.to_bits())
+        .count();
+    println!(
+        "PROBE randn-repeat identical={identical}/{elements} verdict=deterministic {}",
+        if identical == elements {
+            "pass"
+        } else {
+            "FAIL"
+        }
+    );
+    failed |= identical != elements;
+
+    generator
+        .randn(gpu, &output)
+        .map_err(|error| error.token())?;
+    let second = read_bf16(gpu, &output)?;
+    let overlaps = second
+        .iter()
+        .zip(first.iter())
+        .filter(|(left, right)| left.to_bits() == right.to_bits())
+        .count();
+    println!(
+        "PROBE randn-advance identical={overlaps}/{elements} verdict=offset-advances {}",
+        if overlaps < elements / 100 {
+            "pass"
+        } else {
+            "FAIL"
+        }
+    );
+    failed |= overlaps >= elements / 100;
+
+    // Keep the lcg moving for the callers after this probe.
+    *state = state.wrapping_add(elements as u32);
+
+    Ok(failed)
+}
+
+/// `aten/src/ATen/native/Lerp.h:22-33` in F32: the arm depends on `|w| < 0.5`.
+fn lerp(self_: f32, end: f32, weight: f32) -> f32 {
+    if weight.abs() < 0.5 {
+        self_ + weight * (end - self_)
+    } else {
+        end - (end - self_) * (1.0 - weight)
+    }
 }
 
 /// The gate's geometry: the release's own at its token count, and a small
@@ -1044,6 +1436,9 @@ fn probe(gpu: &Gpu, rows: usize, seed: u32) -> Result<bool, String> {
     // BF16 add of the `[width]` embedding on the rows the mask marks.
     failed |= probe_keyframe(gpu, &mut state)?;
 
+    // The stage-2 sampler's seven steps.
+    failed |= probe_sampler(gpu, &mut state)?;
+
     Ok(failed)
 }
 
@@ -1276,15 +1671,17 @@ fn signals<'a>(
         rows,
         dim: dim as u32,
         modulation,
-        cross_scale_shift,
-        cross_gate,
+        cross: Some(Cross {
+            scale_shift: cross_scale_shift,
+            gate: cross_gate,
+            cos: cross_cos,
+            sin: cross_sin,
+        }),
         prompt_modulation,
         context,
         context_rows: CONTEXT_ROWS,
         self_cos,
         self_sin,
-        cross_cos,
-        cross_sin,
     })
 }
 
@@ -1434,6 +1831,46 @@ fn read_bf16(gpu: &Gpu, tensor: &Tensor) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+fn upload_f32(gpu: &Gpu, values: &[f32]) -> Result<Tensor, String> {
+    let tensor = alloc(gpu, Device::F32, values.len())?;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    gpu.upload(&tensor, &bytes)
+        .map_err(|detail| format!("upload f32: {detail}"))?;
+
+    Ok(tensor)
+}
+
+fn read_f32_tensor(gpu: &Gpu, tensor: &Tensor) -> Result<Vec<f32>, String> {
+    let mut values = vec![0.0f32; tensor.elements()];
+
+    gpu.read_f32(tensor, &mut values)
+        .map_err(|detail| format!("read f32: {detail}"))?;
+
+    Ok(values)
+}
+
+/// One BF16 file dumped by another gate, as a tensor of `rows * width`
+/// elements: the stage mode's real inputs come from the connector's dump.
+fn read_tensor_file(gpu: &Gpu, path: &Path, elements: usize) -> Result<Tensor, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+
+    if bytes.len() != elements * 2 {
+        return Err(format!(
+            "{} holds {} bytes, expected {}",
+            path.display(),
+            bytes.len(),
+            elements * 2
+        ));
+    }
+
+    upload_bf16(gpu, &bytes)
+}
+
 fn alloc(gpu: &Gpu, dtype: Device, elements: usize) -> Result<Tensor, String> {
     gpu.alloc(dtype, elements)
         .map_err(|detail| format!("alloc: {detail}"))
@@ -1449,6 +1886,9 @@ fn usage(detail: &str) -> String {
          h3_ltx_refiner_gate --edges --transformer PATH [--blocks K] [--rows R]\n\
          \x20                            [--audio-rows A] [--sigma S] [--signals]\n\
          \x20                            [--keyframe-zeroed PATH] [--dump DIR]\n\
+         \x20                            [--residual DIR] [--expect NAME=HEX ...]\n       \
+         h3_ltx_refiner_gate --stage --transformer PATH [--layers K] [--seed S]\n\
+         \x20                            [--latent FILE] [--context FILE] [--dump DIR]\n\
          \x20                            [--residual DIR] [--expect NAME=HEX ...]"
     )
 }
@@ -1457,6 +1897,10 @@ struct Options {
     transformer: Option<PathBuf>,
     identity: Option<PathBuf>,
     edges: bool,
+    stage: bool,
+    latent: Option<PathBuf>,
+    prompt: Option<PathBuf>,
+    layers: Option<usize>,
     keyframe: Option<PathBuf>,
     signals: bool,
     sigma: Option<f32>,
@@ -1474,6 +1918,10 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut transformer = None;
     let mut identity = None;
     let mut edges = false;
+    let mut stage = false;
+    let mut latent = None;
+    let mut prompt = None;
+    let mut layers = None;
     let mut keyframe = None;
     let mut signals = false;
     let mut sigma = None;
@@ -1494,7 +1942,11 @@ fn split(args: &[String]) -> Result<Options, String> {
         match flag {
             "--probe" => probe = true,
             "--edges" => edges = true,
+            "--stage" => stage = true,
             "--signals" => signals = true,
+            "--latent" => latent = Some(PathBuf::from(take(args, &mut index)?)),
+            "--context" => prompt = Some(PathBuf::from(take(args, &mut index)?)),
+            "--layers" => layers = Some(number(&take(args, &mut index)?)?),
             "--keyframe-zeroed" => keyframe = Some(PathBuf::from(take(args, &mut index)?)),
             "--sigma" => {
                 sigma = Some(
@@ -1530,10 +1982,20 @@ fn split(args: &[String]) -> Result<Options, String> {
         }
     }
 
+    if let Some(layers) = layers {
+        if layers == 0 {
+            return Err(usage("--layers must be at least 1"));
+        }
+    }
+
     Ok(Options {
         transformer,
         identity,
         edges,
+        stage,
+        latent,
+        prompt,
+        layers,
         keyframe,
         signals,
         sigma,
