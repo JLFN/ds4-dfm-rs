@@ -690,11 +690,21 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
 
     // The blocks over the prepared states, one report per block.
     let blocks = options.blocks.unwrap_or(1);
-    let refiner = Refiner::open(gpu, path, &(0..blocks).collect::<Vec<usize>>())
+    let mut refiner = Refiner::open(gpu, path, &(0..blocks).collect::<Vec<usize>>())
         .map_err(|error| error.token())?;
     let refiner_scratch =
         RefinerScratch::new(gpu, rows, audio_rows, CONTEXT_ROWS).map_err(|error| error.token())?;
     let started = Instant::now();
+
+    // The input, kept for the diagnostic's arm below: it must run from the
+    // same state the released arm started from.
+    let mut diagnostic_input = None;
+    if options.diagnostic != Diagnostic::Off {
+        let mut bytes = vec![0u8; prepared.video.bytes()];
+        gpu.read(&prepared.video, &mut bytes)
+            .map_err(|error| format!("diagnostic input: {error}"))?;
+        diagnostic_input = Some(bytes);
+    }
 
     for block in 0..refiner.blocks() {
         let started = Instant::now();
@@ -748,6 +758,50 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
         options.residual.as_deref(),
         0.0,
     )?;
+
+    // The diagnostic's own guard. A sum left in a scratch buffer whose reader
+    // was never written is a block whose attention the state never sees, and no
+    // self-consistency comparison can see a term that never arrives - which is
+    // how this path ran inert until unit 10's probe. The diagnostic's arm is
+    // run from the same input, after the released arm's reports above, and it
+    // has to differ.
+    if let Some(bytes) = diagnostic_input {
+        let released = read_bf16(gpu, &prepared.video)?;
+        gpu.upload(&prepared.video, &bytes)
+            .map_err(|error| format!("diagnostic input: {error}"))?;
+        refiner.set_diagnostic(options.diagnostic);
+
+        for block in 0..refiner.blocks() {
+            let _ = refiner
+                .apply_one(
+                    block,
+                    gpu,
+                    &prepared.video,
+                    &prepared.video_signals,
+                    Some((audio_state, audio_signals)),
+                    &refiner_scratch,
+                    None,
+                )
+                .map_err(|error| error.token())?;
+        }
+
+        let diagnostic = read_bf16(gpu, &prepared.video)?;
+        let (differ, rel_rms) = compare(&released, &diagnostic);
+        println!(
+            "DIAGNOSTIC {:?} values={} differ={differ} rel_rms={rel_rms:.3e} {}",
+            options.diagnostic,
+            released.len(),
+            if differ == 0 { "FAIL" } else { "pass" }
+        );
+
+        if differ == 0 {
+            println!(
+                "DIAGNOSTIC {:?} the term does not reach the state",
+                options.diagnostic
+            );
+            failed = true;
+        }
+    }
 
     for name in expect.keys() {
         println!("STAGE {name} expected but never produced");
@@ -2227,8 +2281,9 @@ fn usage(detail: &str) -> String {
          h3_ltx_refiner_gate --transformer PATH --identity FILE [--blocks K]\n       \
          h3_ltx_refiner_gate --edges --transformer PATH [--blocks K] [--rows R]\n\
          \x20                            [--audio-rows A] [--sigma S] [--signals]\n\
-         \x20                            [--keyframe-zeroed PATH] [--dump DIR]\n\
-         \x20                            [--residual DIR] [--expect NAME=HEX ...]\n       \
+         \x20                            [--keyframe-zeroed PATH] [--no-self-attention]\n\
+         \x20                            [--dump DIR] [--residual DIR]\n\
+         \x20                            [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --stage --transformer PATH [--layers K] [--seed S]\n\
          \x20                            [--latent FILE] [--context FILE] [--sol]\n\
          \x20                            [--no-self-attention] [--dump DIR]\n\

@@ -917,6 +917,13 @@ fn self_and_text(
     gpu.mul_rows(&m.gated, &m.attention, &m.gate, rows, dim, rows)
         .map_err(RefinerError::Run)?;
     gpu.add(&m.crossed, &m.residual, &m.gated)
+        .map_err(RefinerError::Run)?;
+
+    // `vx = vx + ...` (`transformer.py:285`, `:289-292`) rebinds the modality
+    // state, so the running sum has to land back in `state` itself: the AV
+    // operands and the feed-forward both read it, and a sum that stays in a
+    // scratch buffer is a block with no attention in it at all.
+    gpu.copy(state, 0, &m.crossed, 0, (rows * dim) as usize)
         .map_err(RefinerError::Run)
 }
 
