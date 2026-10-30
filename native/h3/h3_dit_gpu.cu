@@ -3732,6 +3732,93 @@ int h3d_channel_transpose(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("BF16 channel transpose", error, error_size);
 }
 
+/* `AudioPatchifier.patchify` (`components/patchifiers.py:288-304`): one audio
+ * latent `[batch, channels, frames, bins]` to `[batch, frames, channels*bins]`.
+ * The audio grid keeps `bins` as an axis, so this is not the channel
+ * transpose above: output `(t, c, f)` reads input `(c, t, f)`, the `bins` axis
+ * innermost on both sides. */
+__global__ static void h3d_audio_patchify_kernel(__nv_bfloat16 *output,
+                                                 const __nv_bfloat16 *input,
+                                                 uint32_t batch,
+                                                 uint32_t channels,
+                                                 uint32_t frames,
+                                                 uint32_t bins) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t rows = (size_t)batch * frames;
+    const size_t width = (size_t)channels * bins;
+    if (index >= rows * width) return;
+    const size_t row = index / width;
+    const size_t column = index % width;
+    const size_t frame = row % frames;
+    const size_t item = row / frames;
+    const size_t channel = column / bins;
+    const size_t bin = column % bins;
+    output[index] = input[((item * channels + channel) * frames + frame) * bins +
+                          bin];
+}
+
+int h3d_audio_patchify(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *input, uint32_t batch,
+                       uint32_t channels, uint32_t frames, uint32_t bins,
+                       char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !batch || !channels || !frames || !bins ||
+        !h3d_mul_size((size_t)batch * frames, (size_t)channels * bins,
+                      &elements) ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 audio patchify arguments");
+    }
+    h3d_audio_patchify_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                                context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        batch, channels, frames, bins);
+    return h3d_launch_ok("BF16 audio patchify", error, error_size);
+}
+
+/* `apply_keyframes_absolute_embedding` (`transformer_args.py:22-43`):
+ * `hidden_states + mask * embedding`, one `[1, width]` row broadcast over the
+ * rows the `[rows, 1]` mask marks. The mask is `(keyframes_mask > 0).to(dtype)`,
+ * exactly 0 or 1, so `mask * embedding` is exact and the whole expression is
+ * one BF16 add: the kernel adds the row where the mask is set and 0 where it
+ * is not. */
+__global__ static void h3d_keyframe_add_kernel(__nv_bfloat16 *output,
+                                               const __nv_bfloat16 *input,
+                                               const __nv_bfloat16 *mask,
+                                               const __nv_bfloat16 *embedding,
+                                               uint32_t rows, uint32_t width) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (size_t)rows * width) return;
+    const uint32_t row = (uint32_t)(index / width);
+    const uint32_t column = (uint32_t)(index % width);
+    const float marked = __bfloat162float(mask[row]) != 0.0f
+                             ? __bfloat162float(embedding[column])
+                             : 0.0f;
+    output[index] = __float2bfloat16(__bfloat162float(input[index]) + marked);
+}
+
+int h3d_keyframe_add(h3d_context *context, h3d_tensor *output,
+                     const h3d_tensor *input, const h3d_tensor *mask,
+                     const h3d_tensor *embedding, uint32_t rows, uint32_t width,
+                     char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width ||
+        !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(input, H3D_BF16, elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(mask, H3D_BF16, rows) || !h3d_is(embedding, H3D_BF16, width)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 keyframe add arguments");
+    }
+    h3d_keyframe_add_kernel<<<(unsigned)((elements + 255) / 256), 256, 0,
+                              context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+        (const __nv_bfloat16 *)mask->data,
+        (const __nv_bfloat16 *)embedding->data, rows, width);
+    return h3d_launch_ok("BF16 keyframe add", error, error_size);
+}
+
 enum {
     H3D_MMA_HD = 128,                 /* head dimension, the one shape served */
     H3D_MMA_KEYS = 64,                /* key rows staged per tile */

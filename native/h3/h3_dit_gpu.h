@@ -649,6 +649,22 @@ int h3d_channel_transpose(h3d_context *context, h3d_tensor *output,
                           const h3d_tensor *input, uint32_t rows,
                           uint32_t width, char *error, size_t error_size);
 
+/* `AudioPatchifier.patchify` (`components/patchifiers.py:288-304`): one audio
+ * latent `[batch, channels, frames, bins]` to `[batch, frames,
+ * channels*bins]`. */
+int h3d_audio_patchify(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *input, uint32_t batch,
+                       uint32_t channels, uint32_t frames, uint32_t bins,
+                       char *error, size_t error_size);
+
+/* `apply_keyframes_absolute_embedding` (`transformer_args.py:22-43`):
+ * `hidden_states + mask * embedding` with the `[rows]` mask exactly 0 or 1 and
+ * the `[width]` embedding broadcast over the rows. */
+int h3d_keyframe_add(h3d_context *context, h3d_tensor *output,
+                     const h3d_tensor *input, const h3d_tensor *mask,
+                     const h3d_tensor *embedding, uint32_t rows, uint32_t width,
+                     char *error, size_t error_size);
+
 /* `h3_gpu_add_bf16` (`:2373-2376`) with `h3_binary_bf16_kernel`
  * (`:2347-2357`), `h3_gpu_cast_f32_to_bf16` (`:2287-2296`), and the SiLU
  * branches of `h3_gpu_silu_f32`/`h3_gpu_silu_bf16` (`:2276-2306`, `:2321-2329`)

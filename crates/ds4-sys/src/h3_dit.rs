@@ -458,6 +458,32 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    /// `h3d_audio_patchify`: one audio latent to its patchified rows.
+    fn h3d_audio_patchify(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        batch: u32,
+        channels: u32,
+        frames: u32,
+        bins: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_keyframe_add`: the keyframe embedding row on the masked rows.
+    fn h3d_keyframe_add(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        mask: *const CTensor,
+        embedding: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     /// `h3d_sol_words`: the mask words one query block carries at this length.
     fn h3d_sol_words(sequence: u32) -> u32;
     /// VSA's selector: the reference's own sparsity rule for the H3 stage.
@@ -3345,6 +3371,65 @@ impl Gpu {
                 )
             },
             "channel transpose",
+        )
+    }
+
+    /// `AudioPatchifier.patchify` (`components/patchifiers.py:293-304`):
+    /// `[batch, channels, frames, bins]` to `[batch, frames,
+    /// channels*bins]`.
+    pub fn audio_patchify(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        batch: u32,
+        channels: u32,
+        frames: u32,
+        bins: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_audio_patchify(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    batch,
+                    channels,
+                    frames,
+                    bins,
+                    error,
+                    size,
+                )
+            },
+            "audio patchify",
+        )
+    }
+
+    /// `apply_keyframes_absolute_embedding` (`transformer_args.py:36-43`): the
+    /// learned `[width]` row added to the rows the `[rows]` mask marks.
+    pub fn keyframe_add(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        mask: &Tensor,
+        embedding: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_keyframe_add(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    mask.raw(),
+                    embedding.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "keyframe add",
         )
     }
 

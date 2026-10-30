@@ -39,10 +39,11 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_refiner::{
-    Refiner, RefinerScratch, Signals, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM, CONTEXT_ROWS,
-    HEADS, VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM,
+    EdgeScratch, Edges, Geometry, Refiner, RefinerScratch, Request, Signals, AUDIO_BINS,
+    AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM, AUDIO_TOKENS, CHANNELS,
+    CONTEXT_ROWS, HEADS, VIDEO_CONTEXT_DIM, VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
-use ds4_core::minimax_h3::safetensors::{self, Entry, ShardWriter};
+use ds4_core::minimax_h3::safetensors::{self, Entry, Shard, ShardWriter};
 use ds4_core::minimax_h3::text_forward::fnv1a;
 use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
 
@@ -103,6 +104,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         return identity(&gpu, &transformer, target, &options);
     }
 
+    if options.edges {
+        return run_edges(&gpu, &transformer, &options);
+    }
+
     run_blocks(&gpu, &transformer, &options)
 }
 
@@ -125,8 +130,17 @@ fn run_blocks(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Str
     let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
     let (video, _) = synthetic(gpu, rows, VIDEO_DIM, &mut lcg)?;
     let (audio, _) = synthetic(gpu, audio_rows, AUDIO_DIM, &mut lcg)?;
-    let v = signals(gpu, rows, VIDEO_DIM, VIDEO_HEAD_DIM, &mut lcg)?;
-    let a = signals(gpu, audio_rows, AUDIO_DIM, AUDIO_HEAD_DIM, &mut lcg)?;
+    let v_context = context(gpu, VIDEO_DIM, &mut lcg)?;
+    let v = signals(gpu, rows, VIDEO_DIM, VIDEO_HEAD_DIM, &v_context, &mut lcg)?;
+    let a_context = context(gpu, AUDIO_DIM, &mut lcg)?;
+    let a = signals(
+        gpu,
+        audio_rows,
+        AUDIO_DIM,
+        AUDIO_HEAD_DIM,
+        &a_context,
+        &mut lcg,
+    )?;
 
     println!(
         "REFINER blocks={} video_rows={} audio_rows={} tensors={} bytes={} load={load:.3}",
@@ -205,8 +219,17 @@ fn identity(gpu: &Gpu, path: &Path, target: &Path, options: &Options) -> Result<
     let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
     let (video, video_values) = synthetic(gpu, rows, VIDEO_DIM, &mut lcg)?;
     let (audio, audio_values) = synthetic(gpu, audio_rows, AUDIO_DIM, &mut lcg)?;
-    let v = signals(gpu, rows, VIDEO_DIM, VIDEO_HEAD_DIM, &mut lcg)?;
-    let a = signals(gpu, audio_rows, AUDIO_DIM, AUDIO_HEAD_DIM, &mut lcg)?;
+    let v_context = context(gpu, VIDEO_DIM, &mut lcg)?;
+    let v = signals(gpu, rows, VIDEO_DIM, VIDEO_HEAD_DIM, &v_context, &mut lcg)?;
+    let a_context = context(gpu, AUDIO_DIM, &mut lcg)?;
+    let a = signals(
+        gpu,
+        audio_rows,
+        AUDIO_DIM,
+        AUDIO_HEAD_DIM,
+        &a_context,
+        &mut lcg,
+    )?;
 
     refiner
         .apply(gpu, &video, &audio, &v, &a, &scratch)
@@ -295,6 +318,451 @@ fn zero_shard(path: &Path, target: &Path, blocks: usize) -> Result<usize, String
     }
 
     Ok(zeroed)
+}
+
+/// `STAGE2_SIGMAS[0]`, the release's own first step
+/// (`runtime/stage2_ops/models.py:19`).
+const SIGMA: f32 = 0.909375;
+
+/// The whole per-step graph: `prepare` over synthetic latents, the blocks, and
+/// the head. The preprocessing's own buffers are reported under `--signals`
+/// (they are the largest tensors in the graph) and dumped like the states, so a
+/// golden from the reference is a diff and a cross host is a residual.
+fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, String> {
+    let rows = options.rows.unwrap_or(VIDEO_TOKENS as usize) as u32;
+    let audio_rows = options.audio_rows.unwrap_or(AUDIO_TOKENS as usize) as u32;
+    let seed = options.seed.unwrap_or(1);
+    let sigma = options.sigma.unwrap_or(SIGMA);
+    let geometry = geometry_for(rows, audio_rows)?;
+
+    let started = Instant::now();
+    let edges = Edges::open(gpu, path).map_err(|error| error.token())?;
+    let (tensors, bytes) = edges.loaded();
+    let load = started.elapsed().as_secs_f64();
+    let scratch = EdgeScratch::new(gpu, &geometry).map_err(|error| error.token())?;
+
+    let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let video = draw(
+        gpu,
+        CHANNELS as u32,
+        geometry.video_tokens() as usize,
+        &mut lcg,
+    )?;
+    let audio = draw(
+        gpu,
+        AUDIO_CHANNELS,
+        audio_rows as usize * AUDIO_BINS as usize,
+        &mut lcg,
+    )?;
+    let v_context = context(gpu, VIDEO_DIM, &mut lcg)?;
+    let a_context = context(gpu, AUDIO_DIM, &mut lcg)?;
+
+    println!(
+        "EDGES tensors={tensors} bytes={bytes} video_rows={} audio_rows={audio_rows} sigma={sigma} load={load:.3}",
+        geometry.video_tokens()
+    );
+
+    let request = Request {
+        sigma,
+        geometry,
+        video: &video,
+        audio: &audio,
+        video_context: &v_context,
+        audio_context: &a_context,
+    };
+
+    let started = Instant::now();
+    let prepared = edges
+        .prepare(gpu, &request, &scratch)
+        .map_err(|error| error.token())?;
+    let prepare_seconds = started.elapsed().as_secs_f64();
+
+    let mut failed = false;
+    let mut expect = options.expect.clone();
+
+    if let Some(zeroed) = &options.keyframe {
+        let count = edge_shard(path, zeroed)?;
+        println!("KEYFRAME shard={} zeroed={count}", zeroed.display());
+        failed |= keyframe(&gpu, path, zeroed, &request, &prepared.video)?;
+    }
+
+    if options.signals {
+        for (name, tensor) in [
+            ("edges-video-state", &prepared.video),
+            ("edges-audio-state", &prepared.audio),
+            ("edges-video-modulation", &prepared.video_signals.modulation),
+            (
+                "edges-video-cross-scale-shift",
+                &prepared.video_signals.cross_scale_shift,
+            ),
+            ("edges-video-cross-gate", &prepared.video_signals.cross_gate),
+            (
+                "edges-video-prompt-modulation",
+                &prepared.video_signals.prompt_modulation,
+            ),
+            ("edges-video-self-cos", &prepared.video_signals.self_cos),
+            ("edges-video-self-sin", &prepared.video_signals.self_sin),
+            ("edges-video-cross-cos", &prepared.video_signals.cross_cos),
+            ("edges-audio-modulation", &prepared.audio_signals.modulation),
+            ("edges-audio-self-cos", &prepared.audio_signals.self_cos),
+            (
+                "edges-audio-cross-scale-shift",
+                &prepared.audio_signals.cross_scale_shift,
+            ),
+        ] {
+            failed |= report_state(
+                gpu,
+                name,
+                tensor,
+                &mut expect,
+                options.dump.as_deref(),
+                options.residual.as_deref(),
+                0.0,
+            )?;
+        }
+    }
+
+    // The blocks over the prepared states, one report per block.
+    let blocks = options.blocks.unwrap_or(1);
+    let refiner = Refiner::open(gpu, path, &(0..blocks).collect::<Vec<usize>>())
+        .map_err(|error| error.token())?;
+    let refiner_scratch =
+        RefinerScratch::new(gpu, rows, audio_rows, CONTEXT_ROWS).map_err(|error| error.token())?;
+    let started = Instant::now();
+
+    for block in 0..refiner.blocks() {
+        let started = Instant::now();
+        refiner
+            .apply_one(
+                block,
+                gpu,
+                &prepared.video,
+                &prepared.audio,
+                &prepared.video_signals,
+                &prepared.audio_signals,
+                &refiner_scratch,
+            )
+            .map_err(|error| error.token())?;
+        let seconds = started.elapsed().as_secs_f64();
+
+        failed |= report_state(
+            gpu,
+            &format!("edges-block{block}-video"),
+            &prepared.video,
+            &mut expect,
+            options.dump.as_deref(),
+            options.residual.as_deref(),
+            seconds,
+        )?;
+    }
+
+    let blocks_seconds = started.elapsed().as_secs_f64();
+
+    let started = Instant::now();
+    edges
+        .head(gpu, &prepared, &scratch)
+        .map_err(|error| error.token())?;
+    let head_seconds = started.elapsed().as_secs_f64();
+
+    failed |= report_state(
+        gpu,
+        "edges-head-video",
+        edges.video_output(&scratch),
+        &mut expect,
+        options.dump.as_deref(),
+        options.residual.as_deref(),
+        head_seconds,
+    )?;
+    failed |= report_state(
+        gpu,
+        "edges-head-audio",
+        edges.audio_output(&scratch),
+        &mut expect,
+        options.dump.as_deref(),
+        options.residual.as_deref(),
+        0.0,
+    )?;
+
+    for name in expect.keys() {
+        println!("STAGE {name} expected but never produced");
+        failed = true;
+    }
+
+    // The head's wiring, against a host transcription of the same expression.
+    // Only at the small geometries: the transcription reads 1.19 GB back at the
+    // release's own.
+    if rows < VIDEO_TOKENS {
+        for (name, dim, table, proj, state, embedded, output) in [
+            (
+                "video",
+                VIDEO_DIM,
+                "scale_shift_table",
+                "proj_out",
+                &prepared.video,
+                edges.video_embedded(&scratch),
+                edges.video_output(&scratch),
+            ),
+            (
+                "audio",
+                AUDIO_DIM,
+                "audio_scale_shift_table",
+                "audio_proj_out",
+                &prepared.audio,
+                edges.audio_embedded(&scratch),
+                edges.audio_output(&scratch),
+            ),
+        ] {
+            failed |= head_check(gpu, path, name, dim, table, proj, state, embedded, output)?;
+        }
+    }
+
+    println!(
+        "EDGES-TIMING prepare={prepare_seconds:.3} blocks={blocks_seconds:.3} head={head_seconds:.3} load={load:.3}"
+    );
+
+    if failed {
+        return Ok(ExitCode::from(3));
+    }
+
+    println!("LTX-REFINER-EDGES-OK");
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One modality's head against a host transcription of `_process_output`
+/// (`model.py:484-489`): the table and the embedded timestep, the LayerNorm,
+/// the modulation and the projection.
+///
+/// The transcription stops before `proj_out` and hands its own modulated values
+/// to the *device's* linear with the same weights, so both sides run one
+/// `h3d_linear` and the comparison is bit-level apart from the LayerNorm's
+/// `rsqrtf`. That is what makes a wiring fault visible: a swapped table row, a
+/// projection fed the pre-modulation tensor or a missing norm moves the output
+/// by order 1, two orders above the residue.
+#[allow(clippy::too_many_arguments)]
+fn head_check(
+    gpu: &Gpu,
+    path: &Path,
+    name: &str,
+    dim: usize,
+    table_name: &str,
+    proj_name: &str,
+    state: &Tensor,
+    embedded: &Tensor,
+    output: &Tensor,
+) -> Result<bool, String> {
+    let shard = safetensors::read_shard(path).map_err(|error| error.token())?;
+    let at = "model.diffusion_model";
+    let table = read_f32(&shard, &format!("{at}.{table_name}"))?;
+    let weight = read_tensor(&shard, &format!("{at}.{proj_name}.weight"))?;
+    let bias = read_tensor(&shard, &format!("{at}.{proj_name}.bias"))?;
+    let state = read_bf16(gpu, state)?;
+    let embedded = read_bf16(gpu, embedded)?;
+    let rows = state.len() / dim;
+    let mut modulated = Vec::with_capacity(state.len());
+
+    for row in 0..rows {
+        let (x, e) = (&state[row * dim..][..dim], &embedded[row * dim..][..dim]);
+        let mean = x.iter().sum::<f32>() / dim as f32;
+        let variance = x
+            .iter()
+            .map(|value| (value - mean).mul_add(value - mean, 0.0))
+            .sum::<f32>()
+            / dim as f32;
+        let inverse = (variance + 1e-6).sqrt().recip();
+
+        for column in 0..dim {
+            let shift = bf16(table[column] + e[column]);
+            let scale = bf16(table[dim + column] + e[column]);
+            let normed = bf16((x[column] - mean) * inverse);
+
+            modulated.push(bf16(bf16(normed * bf16(1.0 + scale)) + shift));
+        }
+    }
+
+    let input = upload_bf16(gpu, &pack_bf16(&modulated))?;
+    let want = alloc(gpu, Device::Bf16, rows * CHANNELS)?;
+    gpu.linear(
+        &want,
+        &input,
+        &upload_bf16(gpu, &weight)?,
+        Some(&upload_bf16(gpu, &bias)?),
+        rows as u32,
+        dim as u32,
+        CHANNELS as u32,
+        Device::Bf16,
+    )
+    .map_err(|detail| format!("head linear: {detail}"))?;
+
+    let want = read_bf16(gpu, &want)?;
+
+    Ok(report(
+        &format!("head_{name}"),
+        &read_bf16(gpu, output)?,
+        &want,
+        Verdict::Residual,
+    ))
+}
+
+/// One tensor's bytes from the shard, by name.
+fn read_tensor(shard: &Shard, name: &str) -> Result<Vec<u8>, String> {
+    let tensor = shard
+        .find(name)
+        .ok_or_else(|| format!("the shard carries no {name}"))?;
+    let mut bytes = vec![0u8; tensor.bytes() as usize];
+
+    shard
+        .read_data(tensor, &mut bytes)
+        .map_err(|error| error.token())?;
+
+    Ok(bytes)
+}
+
+/// One F32 table from the shard, by name.
+fn read_f32(shard: &Shard, name: &str) -> Result<Vec<f32>, String> {
+    Ok(read_tensor(shard, name)?
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect())
+}
+
+/// Write `path`'s tensors outside the 48 blocks to `target` with the keyframe
+/// embedding zeroed, and return how many tensors were zeroed.
+fn edge_shard(path: &Path, target: &Path) -> Result<usize, String> {
+    let shard = safetensors::read_shard(path).map_err(|error| error.token())?;
+    let mut entries = Vec::new();
+    let mut selected = Vec::new();
+
+    for tensor in &shard.tensors {
+        // The connector's own towers are another unit's; only the refiner's
+        // edges belong in this shard.
+        if tensor
+            .name
+            .starts_with("model.diffusion_model.transformer_blocks.")
+            || tensor.name.contains("embeddings_connector")
+        {
+            continue;
+        }
+
+        entries.push(Entry {
+            name: tensor.name.clone(),
+            dtype: tensor.dtype,
+            shape: tensor.shape.clone(),
+        });
+        selected.push(tensor);
+    }
+
+    if selected.is_empty() {
+        return Err(format!("no edge tensors in {}", path.display()));
+    }
+
+    let metadata = shard.metadata.clone();
+    let writer = ShardWriter::create(target, &entries, &metadata).map_err(|error| error.token())?;
+    let mut zeroed = 0;
+
+    for (index, tensor) in selected.iter().enumerate() {
+        let zero = tensor.name.ends_with("keyframes_abs_pos_embedding");
+        let mut bytes = vec![0u8; tensor.bytes() as usize];
+
+        if !zero {
+            shard
+                .read_data(tensor, &mut bytes)
+                .map_err(|error| error.token())?;
+        } else {
+            zeroed += 1;
+        }
+
+        writer.write(index, &bytes).map_err(|error| error.token())?;
+    }
+
+    Ok(zeroed)
+}
+
+/// The keyframe term, isolated and oracle-free: against a shard whose
+/// `keyframes_abs_pos_embedding` is zero the state *is* the projected latent,
+/// so the real state must differ from it by exactly the embedding row, on
+/// exactly the rows `_first_frame_keyframes_mask` marks and nowhere else.
+fn keyframe(
+    gpu: &Gpu,
+    path: &Path,
+    zeroed: &Path,
+    request: &Request<'_>,
+    real: &Tensor,
+) -> Result<bool, String> {
+    let edges = Edges::open(gpu, zeroed).map_err(|error| error.token())?;
+    let scratch = EdgeScratch::new(gpu, &request.geometry).map_err(|error| error.token())?;
+    let plain = edges
+        .prepare(gpu, request, &scratch)
+        .map_err(|error| error.token())?;
+
+    let shard = safetensors::read_shard(path).map_err(|error| error.token())?;
+    let entry = shard
+        .find("model.diffusion_model.keyframes_abs_pos_embedding")
+        .ok_or_else(|| "the shard carries no keyframe embedding".to_string())?;
+    let mut bytes = vec![0u8; entry.bytes() as usize];
+
+    shard
+        .read_data(entry, &mut bytes)
+        .map_err(|error| error.token())?;
+
+    let embedding: Vec<f32> = bytes
+        .chunks_exact(2)
+        .map(|pair| f32::from_bits((u16::from_le_bytes([pair[0], pair[1]]) as u32) << 16))
+        .collect();
+    let marked = request.geometry.frame_tokens() as usize;
+    let got = read_bf16(gpu, real)?;
+    let base = read_bf16(gpu, &plain.video)?;
+    let mut differ = 0usize;
+
+    for (row, (got_row, base_row)) in got
+        .chunks_exact(VIDEO_DIM)
+        .zip(base.chunks_exact(VIDEO_DIM))
+        .enumerate()
+    {
+        for column in 0..VIDEO_DIM {
+            let want = if row < marked {
+                bf16(base_row[column] + embedding[column])
+            } else {
+                base_row[column]
+            };
+
+            if got_row[column].to_bits() != want.to_bits() {
+                differ += 1;
+            }
+        }
+    }
+
+    println!(
+        "KEYFRAME marked_rows={marked} rows={} differ={differ} {}",
+        got.len() / VIDEO_DIM,
+        if differ == 0 { "pass" } else { "FAIL" }
+    );
+
+    Ok(differ != 0)
+}
+
+/// The gate's geometry: the release's own at its token count, and a small
+/// synthetic one otherwise, `--rows` video tokens split into two-token frames
+/// so the keyframe mask covers a strict prefix.
+fn geometry_for(rows: u32, audio_rows: u32) -> Result<Geometry, String> {
+    let mut geometry = if rows == VIDEO_TOKENS {
+        Geometry::release()
+    } else {
+        if rows % 2 != 0 {
+            return Err(usage("--rows must be even off the release geometry"));
+        }
+
+        Geometry {
+            frames: rows / 2,
+            height: 1,
+            width: 2,
+            audio_frames: audio_rows,
+        }
+    };
+
+    geometry.audio_frames = audio_rows;
+
+    Ok(geometry)
 }
 
 /// Read one state back, hash it, and check it against `--expect` and a
@@ -569,7 +1037,95 @@ fn probe(gpu: &Gpu, rows: usize, seed: u32) -> Result<bool, String> {
     // the tile.
     failed |= probe_transpose(gpu, &mut state)?;
 
+    // The audio patchifier's own gather (`:293-304`), also a permutation.
+    failed |= probe_audio_patchify(gpu, &mut state)?;
+
+    // `apply_keyframes_absolute_embedding` (`transformer_args.py:36-43`): one
+    // BF16 add of the `[width]` embedding on the rows the mask marks.
+    failed |= probe_keyframe(gpu, &mut state)?;
+
     Ok(failed)
+}
+
+fn probe_audio_patchify(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
+    let (channels, frames, bins) = (2usize, 3usize, 5usize);
+    let (values, bytes) = seq(channels * frames * bins, state);
+    let input = upload_bf16(gpu, &bytes)?;
+    let output = alloc(gpu, Device::Bf16, frames * channels * bins)?;
+
+    gpu.audio_patchify(
+        &output,
+        &input,
+        1,
+        channels as u32,
+        frames as u32,
+        bins as u32,
+    )
+    .map_err(|detail| format!("audio patchify: {detail}"))?;
+
+    let got = read_bf16(gpu, &output)?;
+    let mut want = Vec::with_capacity(got.len());
+
+    for frame in 0..frames {
+        for channel in 0..channels {
+            for bin in 0..bins {
+                want.push(values[(channel * frames + frame) * bins + bin]);
+            }
+        }
+    }
+
+    Ok(report("audio_patchify", &got, &want, Verdict::Exact))
+}
+
+fn probe_keyframe(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
+    let (rows, width) = (6usize, 4usize);
+    let (input_values, input_bytes) = seq(rows * width, state);
+    let (embedding_values, embedding_bytes) = seq(width, state);
+    let mut mask_values = vec![0.0f32; rows];
+
+    mask_values[..3].fill(1.0);
+
+    let input = upload_bf16(gpu, &input_bytes)?;
+    let embedding = upload_bf16(gpu, &embedding_bytes)?;
+    let mask = upload_bf16(gpu, &pack_bf16(&mask_values))?;
+    let output = alloc(gpu, Device::Bf16, rows * width)?;
+
+    gpu.keyframe_add(
+        &output,
+        &input,
+        &mask,
+        &embedding,
+        rows as u32,
+        width as u32,
+    )
+    .map_err(|detail| format!("keyframe add: {detail}"))?;
+
+    let got = read_bf16(gpu, &output)?;
+    let want: Vec<f32> = (0..rows * width)
+        .map(|index| {
+            let (row, column) = (index / width, index % width);
+            let marked = if mask_values[row] != 0.0 {
+                embedding_values[column]
+            } else {
+                0.0
+            };
+
+            bf16(input_values[index] + marked)
+        })
+        .collect();
+
+    Ok(report("keyframe_add", &got, &want, Verdict::Exact))
+}
+
+/// A BF16 byte block from values the caller already rounded.
+fn pack_bf16(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+
+    for value in values {
+        bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+    }
+
+    bytes
 }
 
 fn probe_rope_pair(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
@@ -693,28 +1249,24 @@ fn probe_transpose(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
 }
 
 /// A modality's synthetic modulation and positional tables: the shapes the
-/// preprocessing will produce, drawn from the gate's LCG. The values are not
-/// the reference's; the point is that the block consumes them exactly as the
-/// reference's own `TransformerArgs` does.
-fn signals(
+/// preprocessing produces, drawn from the gate's LCG. The values are not the
+/// reference's; the point is that the block consumes them exactly as the
+/// reference's own `TransformerArgs` does. The context is the caller's, since
+/// the signals borrow it - `prepare` copies nothing.
+fn signals<'a>(
     gpu: &Gpu,
     rows: u32,
     dim: usize,
     head_dim: usize,
+    context: &'a Tensor,
     state: &mut u32,
-) -> Result<Signals, String> {
-    let context_dim = if dim == VIDEO_DIM {
-        VIDEO_CONTEXT_DIM
-    } else {
-        AUDIO_CONTEXT_DIM
-    };
+) -> Result<Signals<'a>, String> {
     let cross_half = AUDIO_DIM / HEADS / 2;
 
     let modulation = draw(gpu, rows, dim * 9, state)?;
     let cross_scale_shift = draw(gpu, rows, dim * 4, state)?;
     let cross_gate = draw(gpu, 1, dim, state)?;
     let prompt_modulation = draw(gpu, 1, dim * 2, state)?;
-    let context = draw(gpu, CONTEXT_ROWS, context_dim, state)?;
     let self_cos = draw(gpu, rows * HEADS as u32, head_dim / 2, state)?;
     let self_sin = draw(gpu, rows * HEADS as u32, head_dim / 2, state)?;
     let cross_cos = draw(gpu, rows * HEADS as u32, cross_half, state)?;
@@ -734,6 +1286,18 @@ fn signals(
         cross_cos,
         cross_sin,
     })
+}
+
+/// The prompt context a modality's text cross-attention reads, at the
+/// modality's own width.
+fn context(gpu: &Gpu, dim: usize, state: &mut u32) -> Result<Tensor, String> {
+    let width = if dim == VIDEO_DIM {
+        VIDEO_CONTEXT_DIM
+    } else {
+        AUDIO_CONTEXT_DIM
+    };
+
+    draw(gpu, CONTEXT_ROWS, width, state)
 }
 
 /// Whether a probe's reference expression contains a libm call.
@@ -881,13 +1445,21 @@ fn usage(detail: &str) -> String {
          h3_ltx_refiner_gate --transformer PATH [--blocks K] [--rows R] [--audio-rows A]\n\
          \x20                            [--seed S] [--dump DIR] [--residual DIR]\n\
          \x20                            [--expect NAME=HEX ...]\n       \
-         h3_ltx_refiner_gate --transformer PATH --identity FILE [--blocks K]"
+         h3_ltx_refiner_gate --transformer PATH --identity FILE [--blocks K]\n       \
+         h3_ltx_refiner_gate --edges --transformer PATH [--blocks K] [--rows R]\n\
+         \x20                            [--audio-rows A] [--sigma S] [--signals]\n\
+         \x20                            [--keyframe-zeroed PATH] [--dump DIR]\n\
+         \x20                            [--residual DIR] [--expect NAME=HEX ...]"
     )
 }
 
 struct Options {
     transformer: Option<PathBuf>,
     identity: Option<PathBuf>,
+    edges: bool,
+    keyframe: Option<PathBuf>,
+    signals: bool,
+    sigma: Option<f32>,
     blocks: Option<usize>,
     rows: Option<usize>,
     audio_rows: Option<usize>,
@@ -901,6 +1473,10 @@ struct Options {
 fn split(args: &[String]) -> Result<Options, String> {
     let mut transformer = None;
     let mut identity = None;
+    let mut edges = false;
+    let mut keyframe = None;
+    let mut signals = false;
+    let mut sigma = None;
     let mut blocks = None;
     let mut rows = None;
     let mut audio_rows = None;
@@ -917,6 +1493,16 @@ fn split(args: &[String]) -> Result<Options, String> {
 
         match flag {
             "--probe" => probe = true,
+            "--edges" => edges = true,
+            "--signals" => signals = true,
+            "--keyframe-zeroed" => keyframe = Some(PathBuf::from(take(args, &mut index)?)),
+            "--sigma" => {
+                sigma = Some(
+                    take(args, &mut index)?
+                        .parse::<f32>()
+                        .map_err(|_| usage("--sigma is not a number"))?,
+                )
+            }
             "--transformer" => transformer = Some(PathBuf::from(take(args, &mut index)?)),
             "--identity" => identity = Some(PathBuf::from(take(args, &mut index)?)),
             "--blocks" => blocks = Some(number(&take(args, &mut index)?)?),
@@ -947,6 +1533,10 @@ fn split(args: &[String]) -> Result<Options, String> {
     Ok(Options {
         transformer,
         identity,
+        edges,
+        keyframe,
+        signals,
+        sigma,
         blocks,
         rows,
         audio_rows,
