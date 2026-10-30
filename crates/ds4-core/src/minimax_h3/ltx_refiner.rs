@@ -70,7 +70,7 @@
 use std::fmt;
 use std::path::Path;
 
-use ds4_sys::h3_dit::{Dtype as Device, Gpu, Tensor};
+use ds4_sys::h3_dit::{Dtype as Device, Gpu, SolPlanBuffers, Tensor};
 
 use crate::minimax_h3::gemma::bf16_round;
 use crate::minimax_h3::safetensors::{self, Dtype, Shard};
@@ -121,6 +121,57 @@ pub const AUDIO_TOKENS: u32 = 126;
 /// The tokenizer's fixed prompt length (`gemma_assets.py:161`), the prompt
 /// context's row count.
 pub const CONTEXT_ROWS: u32 = 1024;
+
+/// `STAGE2_TRANSFORMER_LAYERS` (`super_acceleration/stage2/sol_attention.py:19`):
+/// the block count the fixed Stage 2 Sol-Attn policy requires, and refuses to
+/// build for any other.
+pub const SOL_LAYERS: usize = 48;
+/// `STAGE2_TAUS` (`sol_attention.py:18`): one tau per denoise step, in step
+/// order, for the three intervals `SIGMAS` defines. The routing changes
+/// between steps because tau does.
+pub const TAU_SCHEDULE: [f32; 3] = [1.0, 1.25, 1.5];
+/// Sol-Attn's fixed head dimension (`sol_attn/interface.py:29-30`: "head
+/// dimension 128"), which the refiner's video self-attention has
+/// (`VIDEO_HEAD_DIM`). The other five attention modules are 64 and never
+/// route.
+pub const SOL_HEAD_DIM: u32 = 128;
+/// The first layer that routes. The reference leaves layer 0 completely
+/// untouched and redirects layers 1 through 47 (`sol_attention.py:4-5`,
+/// `:114-117`), so the split is one dense layer and `SOL_LAYERS - 1` routing.
+pub const SOL_FIRST_LAYER: usize = 1;
+
+/// The release's Stage 2 Sol-Attn policy for one denoise step
+/// (`super_acceleration/stage2/sol_attention.py:62-193`): the transformer's
+/// layer 0 stays dense and layers 1 through 47 replace only `attn1`'s local
+/// head callable, so their video self-attention routes through the plan while
+/// the text cross-attention stays dense (`:205-209`). `tau` is the step's,
+/// from `TAU_SCHEDULE`.
+///
+/// The plan is one per (sequence, heads): the reference's `prepare` runs per
+/// attention call (`sol_attn/interface.py:270-277`), so the plan's buffers are
+/// overwritten once per layer, the search before the forward.
+pub struct Sol<'a> {
+    plan: &'a SolPlanBuffers,
+    tau: f32,
+    first_layer: usize,
+}
+
+impl<'a> Sol<'a> {
+    /// The release's split: layer 0 dense, every later layer Sol
+    /// (`sol_attention.py:114-117`).
+    pub fn new(plan: &'a SolPlanBuffers, tau: f32) -> Sol<'a> {
+        Sol {
+            plan,
+            tau,
+            first_layer: SOL_FIRST_LAYER,
+        }
+    }
+
+    /// The step's tau, which the caller takes from `TAU_SCHEDULE`.
+    pub fn tau(&self) -> f32 {
+        self.tau
+    }
+}
 
 /// The AV pair's table rows: `slice(0, 2)` for A2V and `slice(2, 4)` for V2A
 /// (`transformer.py:341`, `:369`).
@@ -335,9 +386,14 @@ impl Refiner {
         video_signals: &Signals<'_>,
         audio: Option<(&Tensor, &Signals<'_>)>,
         scratch: &RefinerScratch,
+        sol: Option<&Sol<'_>>,
     ) -> Result<(), RefinerError> {
         for block in &self.blocks {
-            block.apply(gpu, video, video_signals, audio, scratch)?;
+            // Layer 0 does not route (`sol_attention.py:4-5`); the policy
+            // reaches a block only from layer 1 up.
+            let routed = sol.filter(|policy| block.layer >= policy.first_layer);
+
+            block.apply(gpu, video, video_signals, audio, scratch, routed)?;
         }
 
         Ok(())
@@ -352,18 +408,23 @@ impl Refiner {
         video_signals: &Signals<'_>,
         audio: Option<(&Tensor, &Signals<'_>)>,
         scratch: &RefinerScratch,
+        sol: Option<&Sol<'_>>,
     ) -> Result<(), RefinerError> {
         let block = self
             .blocks
             .get(index)
             .ok_or_else(|| RefinerError::Run(format!("no block {index} is loaded")))?;
+        let routed = sol.filter(|policy| block.layer >= policy.first_layer);
 
-        block.apply(gpu, video, video_signals, audio, scratch)
+        block.apply(gpu, video, video_signals, audio, scratch, routed)
     }
 }
 
 /// One `BasicAVTransformerBlock` (`transformer.py:87`).
 struct Block {
+    /// The shard's layer index. The Sol-Attn policy keys on it: layer 0 stays
+    /// dense (`sol_attention.py:4-5`).
+    layer: usize,
     video_self: Attention,
     video_cross: Attention,
     audio_self: Attention,
@@ -387,6 +448,7 @@ impl Block {
         let audio = (HEADS, AUDIO_HEAD_DIM);
 
         Ok(Block {
+            layer,
             video_self: reader.attention(
                 shard,
                 &format!("{at}.attn1"),
@@ -519,9 +581,12 @@ impl Block {
         v: &Signals<'_>,
         audio: Option<(&Tensor, &Signals<'_>)>,
         s: &RefinerScratch,
+        sol: Option<&Sol<'_>>,
     ) -> Result<(), RefinerError> {
         // 1-2. Video self-attention, then the text cross-attention
-        // (`transformer.py:270-298`).
+        // (`transformer.py:270-298`). Only the self-attention's video rows
+        // route: the reference swaps `attn1`'s local head callable and leaves
+        // `attn2` dense (`sol_attention.py:5-7,114-117`).
         self_and_text(
             gpu,
             video,
@@ -531,6 +596,7 @@ impl Block {
             &self.video_prompt_table,
             v,
             &s.video,
+            sol,
         )?;
 
         // 3. Audio self-attention and text cross-attention (`:300-326`).
@@ -544,6 +610,7 @@ impl Block {
                 &self.audio_prompt_table,
                 a,
                 &s.audio,
+                None,
             )?;
         }
 
@@ -656,6 +723,7 @@ fn self_and_text(
     prompt_table: &Tensor,
     signals: &Signals<'_>,
     m: &ModalityScratch,
+    sol: Option<&Sol<'_>>,
 ) -> Result<(), RefinerError> {
     let (rows, dim) = (signals.rows, signals.dim);
 
@@ -698,6 +766,7 @@ fn self_and_text(
             &signals.self_cos,
             &signals.self_sin,
         )),
+        sol,
     )?;
 
     gpu.mul(&m.gated, &m.attention, &m.gate)
@@ -766,6 +835,7 @@ fn self_and_text(
         &m.context,
         rows,
         signals.context_rows,
+        None,
         None,
     )?;
 
@@ -869,6 +939,7 @@ fn av_direction(
             &other_cross.cos,
             &other_cross.sin,
         )),
+        None,
     )?;
 
     gpu.mul_rows(
@@ -975,6 +1046,7 @@ impl Attention {
         q_rows: u32,
         kv_rows: u32,
         rope: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>,
+        sol: Option<&Sol<'_>>,
     ) -> Result<(), RefinerError> {
         let named = |detail: String| RefinerError::Run(format!("{}: {detail}", self.name));
 
@@ -1027,20 +1099,68 @@ impl Attention {
 
         // `scaled_dot_product_attention` at its default scale with no mask
         // (`attention.py:99-100`), the operands token-major, which is what the
-        // projections above produce.
+        // projections above produce. A `sol` policy replaces this call for the
+        // video self-attention alone: `sol_attn` is Sol-Attn's block-sparse
+        // attention at the same scale, over the same `[tokens, heads, dim]`
+        // operands (`sol_attn_backend.py:180-196` reshapes to BTHD and back,
+        // which is this layout read as batch 1).
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        gpu.ltx_attention(
-            &scratch.attention,
-            &scratch.query,
-            &scratch.key,
-            &scratch.value,
-            q_rows,
-            kv_rows,
-            self.heads,
-            self.head_dim,
-            scale,
-        )
-        .map_err(named)?;
+        match sol {
+            Some(policy) => {
+                if self.head_dim != SOL_HEAD_DIM {
+                    return Err(named(format!(
+                        "Sol-Attn needs head dimension {SOL_HEAD_DIM}, got {}",
+                        self.head_dim
+                    )));
+                }
+                if q_rows != kv_rows {
+                    return Err(named(
+                        "Sol-Attn routes a self-attention, whose query and key \
+                         rows are one sequence"
+                            .into(),
+                    ));
+                }
+                // The reference's `prepare` runs per attention call
+                // (`sol_attn/interface.py:270-277`), so the route is this
+                // layer's own and the plan's buffers are overwritten here.
+                gpu.sol_ltx_search(
+                    policy.plan,
+                    &scratch.query,
+                    &scratch.key,
+                    &scratch.value,
+                    q_rows,
+                    self.heads,
+                    scale,
+                    policy.tau,
+                )
+                .map_err(named)?;
+                gpu.sol_ltx_forward(
+                    &scratch.attention,
+                    policy.plan,
+                    &scratch.query,
+                    &scratch.key,
+                    &scratch.value,
+                    q_rows,
+                    self.heads,
+                    scale,
+                )
+                .map_err(named)?;
+            }
+            None => {
+                gpu.ltx_attention(
+                    &scratch.attention,
+                    &scratch.query,
+                    &scratch.key,
+                    &scratch.value,
+                    q_rows,
+                    kv_rows,
+                    self.heads,
+                    self.head_dim,
+                    scale,
+                )
+                .map_err(named)?;
+            }
+        }
 
         // `PytorchGatedAttention` (`ops.py:94-106`): the logits come from the
         // module's input, not the context, and the gate is applied before

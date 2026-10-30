@@ -606,6 +606,37 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    /// The LTX-2.5 refiner's token-major Sol-Attn search: the released
+    /// kernel's `diag` tau policy over `[rows][heads][128]` operands.
+    fn h3d_sol_ltx_search(
+        context: *mut Context,
+        plan: *const SolPlan,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        tau: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// The token-major sparse forward over the mask `h3d_sol_ltx_search` wrote.
+    fn h3d_sol_ltx_forward(
+        context: *mut Context,
+        output: *mut CTensor,
+        plan: *const SolPlan,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3d_add(
         context: *mut Context,
         output: *mut CTensor,
@@ -3802,6 +3833,27 @@ impl Gpu {
         Ok(exact as f64 / (blocks * blocks * heads as u64) as f64)
     }
 
+    /// The routing mask's words for `(sequence, heads)`, one readback. Word
+    /// order is `[q_block][head][word]` (`native/h3/h3_dit_gpu.h:65-74`), so a
+    /// caller can check the diagonal band and the sink itself instead of
+    /// trusting a share.
+    pub fn sol_mask(
+        &self,
+        plan: &SolPlanBuffers,
+        sequence: u32,
+        heads: u32,
+    ) -> Result<Vec<u32>, String> {
+        let blocks = sequence.div_ceil(SOL_BLOCK) as usize;
+        let words = self.sol_words(sequence) as usize;
+        let mut bytes = vec![0u8; blocks * heads as usize * words * 4];
+        self.read(&plan._mask, &mut bytes)?;
+
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
+    }
+
     /// VSA's selector at `sparsity`, exempting the first `prefix_blocks` blocks.    /// `sparsity` is a double because the reference computes its keep count from
     /// a Python float: 0.9 rounded to F32 asks for a different count.
     #[allow(clippy::too_many_arguments)]
@@ -3868,6 +3920,75 @@ impl Gpu {
                 )
             },
             "sparse attention",
+        )
+    }
+
+    /// The LTX-2.5 refiner's token-major Sol-Attn search: it pools the block
+    /// summaries, the per-head statistics and the query centroid, writes the
+    /// routing mask and threshold into `plan`. The caller supplies `tau` -
+    /// `STAGE2_TAUS` (1.0, 1.25, 1.5), one per denoise step
+    /// (`sol_attention.py:18`) - so a step's routing is a caller decision.
+    pub fn sol_ltx_search(
+        &self,
+        plan: &SolPlanBuffers,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        tau: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sol_ltx_search(
+                    self.raw.as_ptr(),
+                    &plan.plan,
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    scale,
+                    tau,
+                    error,
+                    size,
+                )
+            },
+            "Sol-Attn LTX search",
+        )
+    }
+
+    /// The token-major sparse forward over the mask the last
+    /// `sol_ltx_search` wrote for the same plan and operands.
+    pub fn sol_ltx_forward(
+        &self,
+        output: &Tensor,
+        plan: &SolPlanBuffers,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sol_ltx_forward(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    &plan.plan,
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "Sol-Attn LTX forward",
         )
     }
 

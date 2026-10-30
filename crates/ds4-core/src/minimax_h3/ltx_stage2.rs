@@ -29,11 +29,11 @@
 //! - nothing here reorders the schedule: `sigmas[:-1]` is three steps and the
 //!   fourth value is a terminal marker, not an interval.
 
-use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
+use ds4_sys::h3_dit::{Dtype, Gpu, SolPlanBuffers, Tensor};
 
 use super::ltx_refiner::{
     patchify_video, unpatchify_video, EdgeScratch, Edges, Geometry, Refiner, RefinerError,
-    RefinerScratch, Request, CHANNELS, CONTEXT_ROWS,
+    RefinerScratch, Request, Sol, CHANNELS, CONTEXT_ROWS, HEADS, TAU_SCHEDULE,
 };
 
 /// `STAGE2_SIGMAS` (`runtime/stage2_ops/models.py:19`). `euler_denoising_loop`
@@ -168,6 +168,9 @@ pub struct Stage2 {
     blocks: RefinerScratch,
     scratch: StageScratch,
     generator: Generator,
+    /// The Sol-Attn routing plan when the release's policy is on: one set of
+    /// (rows x heads) buffers the 47 routing layers rewrite per layer.
+    sol: Option<SolPlanBuffers>,
 }
 
 impl Stage2 {
@@ -195,7 +198,31 @@ impl Stage2 {
             scratch: StageScratch::new(gpu, &geometry)?,
             geometry,
             generator: Generator::seeded(0),
+            sol: None,
         })
+    }
+
+    /// Turn on the release's Stage 2 Sol-Attn policy
+    /// (`super_acceleration/stage2/sol_attention.py`): layers 1 through 47
+    /// route their video self-attention with one tau per step (`TAU_SCHEDULE`)
+    /// and layer 0 stays dense. Layer 0 has to be among the loaded blocks, so
+    /// the split means what it says.
+    pub fn enable_sol(&mut self, gpu: &Gpu) -> Result<(), RefinerError> {
+        let plan = gpu
+            .sol_plan(self.scratch.rows, HEADS as u32)
+            .map_err(RefinerError::Run)?;
+        self.sol = Some(plan);
+        Ok(())
+    }
+
+    /// Whether the run routes (`sol_attention.py`'s "sol" backend).
+    pub fn sol_enabled(&self) -> bool {
+        self.sol.is_some()
+    }
+
+    /// The routing plan, for a caller that reads the mask back.
+    pub fn sol_plan(&self) -> Option<&SolPlanBuffers> {
+        self.sol.as_ref()
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -286,12 +313,20 @@ impl Stage2 {
         };
         let prepared = self.edges.prepare(gpu, &request, &self.edges_scratch)?;
 
+        // `STAGE2_TAUS` is indexed by the completed step
+        // (`sol_attention.py:188`), so each interval routes at its own tau.
+        let sol = self
+            .sol
+            .as_ref()
+            .map(|plan| Sol::new(plan, TAU_SCHEDULE[index]));
+
         self.refiner.apply(
             gpu,
             &prepared.video,
             &prepared.video_signals,
             None,
             &self.blocks,
+            sol.as_ref(),
         )?;
         self.edges.head(gpu, &prepared, &self.edges_scratch)?;
 
@@ -357,6 +392,9 @@ fn copy(gpu: &Gpu, output: &Tensor, input: &Tensor) -> Result<(), RefinerError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::minimax_h3::ltx_refiner::{
+        SOL_FIRST_LAYER, SOL_HEAD_DIM, SOL_LAYERS, VIDEO_HEAD_DIM,
+    };
 
     #[test]
     fn the_schedule_is_the_releases_and_walks_three_intervals() {
@@ -364,6 +402,21 @@ mod tests {
         assert_eq!(SIGMAS, [0.909375, 0.725, 0.421875, 0.0]);
         assert_eq!(STEPS, 3);
         assert_eq!(NOISE_SCALE, SIGMAS[0]);
+    }
+
+    #[test]
+    fn the_sol_policy_is_the_releases_three_step_split() {
+        // `super_acceleration/stage2/sol_attention.py:18-19`: one tau per
+        // denoise step against 48 transformer layers, the first of which
+        // stays dense.
+        assert_eq!(TAU_SCHEDULE, [1.0, 1.25, 1.5]);
+        assert_eq!(TAU_SCHEDULE.len(), STEPS);
+        assert_eq!(SOL_LAYERS, 48);
+        assert_eq!(SOL_FIRST_LAYER, 1);
+        assert!(SOL_FIRST_LAYER < SOL_LAYERS);
+        // Sol-Attn requires head dimension 128 (`interface.py:29-30`), which
+        // is the video self-attention's, not the audio modules' 64.
+        assert_eq!(SOL_HEAD_DIM as usize, VIDEO_HEAD_DIM);
     }
 
     #[test]

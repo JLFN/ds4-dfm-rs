@@ -41,8 +41,8 @@ use std::time::Instant;
 use ds4_core::minimax_h3::ltx_refiner::{
     patchify_video, unpatchify_video, Cross, EdgeScratch, Edges, Geometry, Refiner, RefinerScratch,
     Request, Signals, AUDIO_BINS, AUDIO_CHANNELS, AUDIO_CONTEXT_DIM, AUDIO_DIM, AUDIO_HEAD_DIM,
-    AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, VIDEO_CONTEXT_DIM, VIDEO_DIM,
-    VIDEO_HEAD_DIM, VIDEO_TOKENS,
+    AUDIO_TOKENS, CHANNELS, CONTEXT_ROWS, HEADS, LAYERS, TAU_SCHEDULE, VIDEO_CONTEXT_DIM,
+    VIDEO_DIM, VIDEO_HEAD_DIM, VIDEO_TOKENS,
 };
 use ds4_core::minimax_h3::ltx_stage2::{Generator, Stage2, NOISE_SCALE, SIGMAS, STEPS};
 use ds4_core::minimax_h3::safetensors::{self, Entry, Shard, ShardWriter};
@@ -140,6 +140,16 @@ fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
         Stage2::open(gpu, path, path, geometry, &layers).map_err(|error| error.token())?;
     let load = started.elapsed().as_secs_f64();
 
+    // The release's Sol-Attn policy: layers 1..47 route, layer 0 stays dense,
+    // and each step uses its own tau (`sol_attention.py:18-19,114-117`).
+    if options.sol {
+        stage.enable_sol(gpu).map_err(|error| error.token())?;
+        println!(
+            "STAGE-SOL-POLICY tau={TAU_SCHEDULE:?} dense_layers=[0] sol_layers=[1..{}]",
+            LAYERS
+        );
+    }
+
     let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
     let latent = match &options.latent {
         Some(file) => read_tensor_file(gpu, file, CHANNELS * rows as usize)?,
@@ -215,6 +225,19 @@ fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
             .step(gpu, index, &context)
             .map_err(|error| error.token())?;
         steps[index] = step_started.elapsed().as_secs_f64();
+
+        // The plan is rewritten once per layer, so this is the last routing
+        // layer's mask at this step's tau: the one number that says whether a
+        // tau is mis-scaled without a golden.
+        if let Some(plan) = stage.sol_plan() {
+            let share = gpu
+                .sol_exact_share(plan, rows, HEADS as u32)
+                .map_err(|detail| format!("sol share: {detail}"))?;
+            println!(
+                "STAGE-SOL step={index} tau={} exact_share={share:.4}",
+                TAU_SCHEDULE[index]
+            );
+        }
 
         failed |= report_state(
             gpu,
@@ -300,7 +323,7 @@ fn run_blocks(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Str
     for block in 0..refiner.blocks() {
         let started = Instant::now();
         refiner
-            .apply_one(block, gpu, &video, &v, Some((&audio, &a)), &scratch)
+            .apply_one(block, gpu, &video, &v, Some((&audio, &a)), &scratch, None)
             .map_err(|error| error.token())?;
         let seconds = started.elapsed().as_secs_f64();
 
@@ -375,7 +398,7 @@ fn identity(gpu: &Gpu, path: &Path, target: &Path, options: &Options) -> Result<
     )?;
 
     refiner
-        .apply(gpu, &video, &v, Some((&audio, &a)), &scratch)
+        .apply(gpu, &video, &v, Some((&audio, &a)), &scratch, None)
         .map_err(|error| error.token())?;
 
     let got_video = read_bf16(gpu, &video)?;
@@ -589,6 +612,7 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
                 &prepared.video_signals,
                 Some((audio_state, audio_signals)),
                 &refiner_scratch,
+                None,
             )
             .map_err(|error| error.token())?;
         let seconds = started.elapsed().as_secs_f64();
@@ -1088,7 +1112,12 @@ fn probe_randn(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
     // The hash is what a second host compares: the draw's values are the
     // device's, so two architectures agreeing here says the two devices'
     // `curand_normal4` agreed, and disagreeing says only that.
-    let hash = fnv1a(&first.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<u8>>());
+    let hash = fnv1a(
+        &first
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
     println!(
         "PROBE randn values={elements} unfilled={unfilled} mean={moment:.4} sd={spread:.6} \
          fnv={hash:016x} verdict=device {}",
@@ -1467,7 +1496,183 @@ fn probe(gpu: &Gpu, rows: usize, seed: u32) -> Result<bool, String> {
     // The stage-2 sampler's seven steps.
     failed |= probe_sampler(gpu, &mut state)?;
 
+    // Sol-Attn's routing and its sparse forward (`sol_attention.py`,
+    // `sol_attn/triton_ref/`), the policy the release's stage 2 runs on the
+    // video self-attention of layers 1..47.
+    failed |= probe_sol(gpu, &mut state)?;
+
     Ok(failed)
+}
+
+/// Sol-Attn, on the refiner's own shapes. Three facts are checkable without a
+/// golden, because the routing is a comparison and the forward is the same
+/// softmax the dense path computes:
+///
+/// - the diagonal band `|q_block - block| <= 1` is always exact
+///   (`triton_ref/fwd.py:99`), whatever tau;
+/// - a larger tau can only drop blocks: the comparison is `col_mean >
+///   threshold` and the threshold is `mean + tau * std` (`preprocess.py:186`);
+/// - a tau low enough to force every block exact makes the sparse walk
+///   item-for-item the dense one, so the two agree bit for bit - the check
+///   that the mask, the summaries and the walk are wired correctly.
+///
+/// The approximated fold gets its own construction: with every 64-token block
+/// of K and V constant, the block mean IS the key and the block sum is 64
+/// values, so the fold computes the exact number by a shorter route and any
+/// difference is summation order in F32.
+fn probe_sol(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
+    let rows = 2_048u32;
+    let heads = HEADS as u32;
+    let blocks = rows.div_ceil(64) as usize;
+    let words = (blocks as u32).div_ceil(32) as usize;
+    let scale = 1.0f32 / (VIDEO_HEAD_DIM as f32).sqrt();
+    let elements = rows as usize * VIDEO_HEAD_DIM * HEADS;
+    let mut failed = false;
+
+    let query = draw(gpu, rows, VIDEO_HEAD_DIM * HEADS, state)?;
+    let plan = gpu
+        .sol_plan(rows, heads)
+        .map_err(|detail| format!("sol plan: {detail}"))?;
+    let sparse = alloc(gpu, Device::Bf16, elements)?;
+    let dense = alloc(gpu, Device::Bf16, elements)?;
+
+    gpu.ltx_attention(
+        &dense,
+        &query,
+        &query,
+        &query,
+        rows,
+        rows,
+        heads,
+        VIDEO_HEAD_DIM as u32,
+        scale,
+    )
+    .map_err(|detail| format!("dense attention: {detail}"))?;
+    let want = read_bf16(gpu, &dense)?;
+
+    let mut shares: Vec<(f32, f64)> = Vec::new();
+
+    for tau in [-1.0e9f32, 0.0, 1.0, 1.25, 1.5] {
+        gpu.sol_ltx_search(&plan, &query, &query, &query, rows, heads, scale, tau)
+            .map_err(|detail| format!("sol search: {detail}"))?;
+        let mask = gpu
+            .sol_mask(&plan, rows, heads)
+            .map_err(|detail| format!("sol mask: {detail}"))?;
+
+        // The band is the routing's one guarantee that does not depend on the
+        // data: a missing bit there is a mis-scaled threshold, not noise.
+        let mut missing = 0usize;
+        for q_block in 0..blocks {
+            for head in 0..heads as usize {
+                for block in 0..blocks {
+                    if q_block.abs_diff(block) > 1 {
+                        continue;
+                    }
+                    let word = mask[(q_block * heads as usize + head) * words + block / 32];
+                    if (word >> (block % 32)) & 1 == 0 {
+                        missing += 1;
+                    }
+                }
+            }
+        }
+        if missing != 0 {
+            println!("PROBE sol_band tau={tau} missing={missing} verdict=exact FAIL");
+            failed = true;
+        }
+
+        let exact: usize = mask.iter().map(|word| word.count_ones() as usize).sum();
+        let share = exact as f64 / (blocks * blocks * heads as usize) as f64;
+        shares.push((tau, share));
+
+        gpu.sol_ltx_forward(&sparse, &plan, &query, &query, &query, rows, heads, scale)
+            .map_err(|detail| format!("sol forward: {detail}"))?;
+        let got = read_bf16(gpu, &sparse)?;
+        // Every block exact is the dense walk with the same item order, so the
+        // check is identity; below it the forward is an approximation and the
+        // verdict is the residual against the dense reference.
+        let verdict = if share >= 1.0 {
+            Verdict::Exact
+        } else {
+            Verdict::Residual
+        };
+        failed |= report(&format!("sol_forward_tau{tau}"), &got, &want, verdict);
+    }
+
+    let mut previous = f64::INFINITY;
+    for (tau, share) in &shares {
+        if *share > previous + 1e-12 {
+            println!("PROBE sol_monotone tau={tau} share={share:.4} above={previous:.4} FAIL");
+            failed = true;
+        }
+        previous = *share;
+    }
+    let listed: Vec<String> = shares
+        .iter()
+        .map(|(tau, share)| format!("{tau}:{share:.4}"))
+        .collect();
+    println!("PROBE sol_shares exact_share=[{}]", listed.join(", "));
+
+    // The fold, isolated: block-constant K/V make `kc` the key itself and `vc`
+    // exactly 64 of them, so the approximated path computes the same number as
+    // the exact one and only its summation order differs.
+    let constant = block_constant(gpu, rows, VIDEO_HEAD_DIM * HEADS, state)?;
+    gpu.ltx_attention(
+        &dense,
+        &constant,
+        &constant,
+        &constant,
+        rows,
+        rows,
+        heads,
+        VIDEO_HEAD_DIM as u32,
+        scale,
+    )
+    .map_err(|detail| format!("dense attention: {detail}"))?;
+    let want = read_bf16(gpu, &dense)?;
+    gpu.sol_ltx_search(
+        &plan, &constant, &constant, &constant, rows, heads, scale, 1.0,
+    )
+    .map_err(|detail| format!("sol search: {detail}"))?;
+    gpu.sol_ltx_forward(
+        &sparse, &plan, &constant, &constant, &constant, rows, heads, scale,
+    )
+    .map_err(|detail| format!("sol forward: {detail}"))?;
+    let got = read_bf16(gpu, &sparse)?;
+    let (differ, rel_rms) = compare(&got, &want);
+    // The two routes differ only by F32 summation order over the same 64
+    // values, so the spread is ~1e-7; 1e-5 is a margin over that and still
+    // two thousand times tighter than a wiring fault.
+    let fold = rel_rms < 1e-5;
+    println!(
+        "PROBE sol_fold values={} differ={differ} rel_rms={rel_rms:.3e} verdict=fold {}",
+        got.len(),
+        if fold { "pass" } else { "FAIL" }
+    );
+    failed |= !fold;
+
+    Ok(failed)
+}
+
+/// A tensor whose every 64-token block repeats one drawn row, so a block's K
+/// mean and V sum are exactly what Sol-Attn's fold assumes them to be.
+fn block_constant(gpu: &Gpu, rows: u32, width: usize, state: &mut u32) -> Result<Tensor, String> {
+    let blocks = rows.div_ceil(64);
+    let mut bytes = Vec::with_capacity(rows as usize * width * 2);
+
+    for block in 0..blocks {
+        let mut row = Vec::with_capacity(width * 2);
+        for _ in 0..width {
+            *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = (*state >> 8) as f32 / (1u32 << 24) as f32;
+            let value = bf16((unit * 2.0 - 1.0) * 2.0);
+            row.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        for _ in 0..(rows - block * 64).min(64) {
+            bytes.extend_from_slice(&row);
+        }
+    }
+
+    upload_bf16(gpu, &bytes)
 }
 
 fn probe_audio_patchify(gpu: &Gpu, state: &mut u32) -> Result<bool, String> {
@@ -1916,8 +2121,9 @@ fn usage(detail: &str) -> String {
          \x20                            [--keyframe-zeroed PATH] [--dump DIR]\n\
          \x20                            [--residual DIR] [--expect NAME=HEX ...]\n       \
          h3_ltx_refiner_gate --stage --transformer PATH [--layers K] [--seed S]\n\
-         \x20                            [--latent FILE] [--context FILE] [--dump DIR]\n\
-         \x20                            [--residual DIR] [--expect NAME=HEX ...]"
+         \x20                            [--latent FILE] [--context FILE] [--sol]\n\
+         \x20                            [--dump DIR] [--residual DIR]\n\
+         \x20                            [--expect NAME=HEX ...]"
     )
 }
 
@@ -1926,6 +2132,7 @@ struct Options {
     identity: Option<PathBuf>,
     edges: bool,
     stage: bool,
+    sol: bool,
     latent: Option<PathBuf>,
     prompt: Option<PathBuf>,
     layers: Option<usize>,
@@ -1947,6 +2154,7 @@ fn split(args: &[String]) -> Result<Options, String> {
     let mut identity = None;
     let mut edges = false;
     let mut stage = false;
+    let mut sol = false;
     let mut latent = None;
     let mut prompt = None;
     let mut layers = None;
@@ -1971,6 +2179,7 @@ fn split(args: &[String]) -> Result<Options, String> {
             "--probe" => probe = true,
             "--edges" => edges = true,
             "--stage" => stage = true,
+            "--sol" => sol = true,
             "--signals" => signals = true,
             "--latent" => latent = Some(PathBuf::from(take(args, &mut index)?)),
             "--context" => prompt = Some(PathBuf::from(take(args, &mut index)?)),
@@ -2021,6 +2230,7 @@ fn split(args: &[String]) -> Result<Options, String> {
         identity,
         edges,
         stage,
+        sol,
         latent,
         prompt,
         layers,

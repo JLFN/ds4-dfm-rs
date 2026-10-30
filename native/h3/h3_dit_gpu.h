@@ -1053,6 +1053,38 @@ int h3d_sol_forward(h3d_context *context, h3d_tensor *output,
                     uint32_t sequence, uint32_t heads, float scale, char *error,
                     size_t error_size);
 
+/* The LTX-2.5 refiner's Sol-Attn, token-major `[rows][heads][128]`. The rule
+ * is `h3d_sol_search`/`h3d_sol_forward`'s, unchanged: the released kernel's
+ * `diag` tau policy (`sol_attn/preprocess.py:280-322`, `triton_ref/fwd.py`),
+ * the only backend the Spark release admits (`Sol-H3-Spark/runtime/stage2_ops/
+ * models.py:100-103`). It is a separate pair of entry points because the
+ * refiner's attention is row-major and a head-major kernel would transpose
+ * every operand per layer. `h3d_sol_stats_kernel` and `h3d_sol_route_kernel`
+ * are reused verbatim; the plan's buffers are the same `struct h3d_sol_plan`.
+ *
+ * The tau schedule and the per-layer split are the caller's, and they are the
+ * release's policy, not this pair's: `sol_attention.py:18` `STAGE2_TAUS =
+ * (1.0, 1.25, 1.5)`, one tau per denoise step, and layers 1 through 47 use
+ * Sol-Attn while layer 0 stays dense (`sol_attention.py:4-5,114-117`).
+ * `h3d_sol_ltx_search` writes the plan's mask and `h3d_sol_ltx_forward` reads
+ * it, so the two are called per layer, the search first.
+ *
+ * No sink: the video self-attention's sequence carries no text or audio
+ * prefix - the adapter replaces only `attn1` (`sol_attention.py:3-4`) - so
+ * the routing's sink range is empty.
+ * Head dimension must be 128 (`interface.py:29-30`); the refiner's video
+ * self-attention is 32 x 128. */
+int h3d_sol_ltx_search(h3d_context *context, const struct h3d_sol_plan *plan,
+                       const h3d_tensor *query, const h3d_tensor *key,
+                       const h3d_tensor *value, uint32_t sequence,
+                       uint32_t heads, float scale, float tau, char *error,
+                       size_t error_size);
+int h3d_sol_ltx_forward(h3d_context *context, h3d_tensor *output,
+                        const struct h3d_sol_plan *plan, const h3d_tensor *query,
+                        const h3d_tensor *key, const h3d_tensor *value,
+                        uint32_t sequence, uint32_t heads, float scale,
+                        char *error, size_t error_size);
+
 /* ------------------------------------------------------------------------
  * h3b_* — the H3-to-LTX latent path (`minimax_h3::ltx_adapter`).
  *

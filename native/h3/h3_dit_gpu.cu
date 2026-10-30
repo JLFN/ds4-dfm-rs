@@ -7169,6 +7169,395 @@ int h3d_sol_forward(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("Sol-Attn forward", error, error_size);
 }
 
+/* -------------------------------------------------------------------------
+ * The LTX-2.5 refiner's Sol-Attn, token-major.
+ *
+ * The rule is the one above, unchanged: the released kernel's `diag` tau
+ * policy (`sol_attn/preprocess.py:280-322`, `sol_attn/triton_ref/fwd.py:40-173`),
+ * which the Spark release enforces as its only backend
+ * (`Sol-H3-Spark/runtime/stage2_ops/models.py:100-103`,
+ * `_actual_sol_backend() != "triton"` raised).
+ * What changes is the layout: the refiner's attention is `[rows][heads][128]`
+ * (`ltx_refiner.rs`'s `Attention::run`), and a head-major kernel would need a
+ * transpose of every operand per layer - 47 layers of 16,128x32x128 BF16, more
+ * traffic than the attention it feeds. So the pooling, the query centroid and
+ * the forward are re-expressed row-major, and the two layout-agnostic steps
+ * (`h3d_sol_stats_kernel`, `h3d_sol_route_kernel`, which read only `kc` and
+ * `query_bar`) are reused verbatim.
+ *
+ * The forward is the same walk as `h3d_sol_forward_kernel`, in the shape of
+ * `h3d_ltx_attention_kernel`: one CTA per (16-row query tile, head), one warp
+ * per H3D_ATTENTION_ROWS rows, each row's 128-wide dot split over the warp's
+ * lanes. Per 64-token KV block: an exact block walks its keys, an approximated
+ * one is folded from `kc`/`vc` in a single step - `denominator += w * length`
+ * because `vc` is a SUM (`sol_attn/preprocess.py:82`,
+ * `sol_attn/triton_ref/preprocess.py:53`), and the fold is
+ * `output += w @ vc` with `row_sum += w * length`
+ * (`sol_attn/triton_ref/fwd.py:121-130`). The block decision
+ * is the plan's mask: the diagonal band and the sink were written into it by
+ * `h3d_sol_ltx_search`, so this kernel reads `kc`, `vc` and `mask` and adds no
+ * policy of its own.
+ *
+ * Deviations, named: row-major against the reference's `[B,T,H,D]` (the same
+ * numbers, indexed differently); natural-log softmax where `fwd.py` tracks the
+ * maximum in log2 units, the port's dense kernel's own units, so a tau that
+ * forces every block exact reproduces `h3d_ltx_attention`'s arithmetic; the
+ * accumulation orders the port fixes where Triton's are not reproducible here.
+ * Sol-Attn requires head dimension 128 (`interface.py:29-30`), which the
+ * refiner's video self-attention has (32 heads x 128).
+ * ------------------------------------------------------------------------- */
+
+__global__ static void h3d_sol_ltx_pool_kernel(
+        __nv_bfloat16 *kc, __nv_bfloat16 *vc, const __nv_bfloat16 *key,
+        const __nv_bfloat16 *value, uint32_t sequence, uint32_t heads,
+        uint32_t blocks) {
+    const uint32_t head = blockIdx.y;
+    const uint32_t block = blockIdx.x;
+    const uint32_t column = threadIdx.x;
+    if (column >= H3D_SOL_HEAD_DIM) return;
+    const uint32_t first = block * H3D_SOL_BLOCK;
+    uint32_t rows = sequence - first;
+    if (rows > H3D_SOL_BLOCK) rows = H3D_SOL_BLOCK;
+    const size_t base = ((size_t)first * heads + head) * H3D_SOL_HEAD_DIM;
+    const size_t stride = (size_t)heads * H3D_SOL_HEAD_DIM;
+    float key_sum = 0.0f;
+    float value_sum = 0.0f;
+    /* Sequential over the block's rows, the reference's row order
+     * (`preprocess.py:64`), so the sum is the same number as the head-major
+     * pool's. */
+    for (uint32_t row = 0; row < rows; ++row) {
+        const size_t at = base + (size_t)row * stride + column;
+        key_sum += h3d_value(key[at]);
+        value_sum += h3d_value(value[at]);
+    }
+    const size_t out =
+        ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM + column;
+    kc[out] = h3d_store(key_sum / (float)rows);
+    vc[out] = h3d_store(value_sum);              /* `:66`: a sum, no divide */
+}
+
+/* The query centroid and the routing threshold, token-major. Identical to
+ * `h3d_sol_threshold_kernel` but for the read index. */
+__global__ static void h3d_sol_ltx_threshold_kernel(
+        float *threshold, float *query_bar, const float *kc_mean,
+        const float *kc_var, const __nv_bfloat16 *query, uint32_t sequence,
+        uint32_t heads, float scale, float tau) {
+    enum { CHUNKS = H3D_SOL_HEAD_DIM / H3D_SOL_WARP };
+    const uint32_t head = blockIdx.y;
+    const uint32_t q_block = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t first = q_block * H3D_SOL_BLOCK;
+    uint32_t rows = sequence - first;
+    if (rows > H3D_SOL_BLOCK) rows = H3D_SOL_BLOCK;
+    const size_t base = ((size_t)first * heads + head) * H3D_SOL_HEAD_DIM;
+    const size_t stride = (size_t)heads * H3D_SOL_HEAD_DIM;
+    float centroid[CHUNKS];
+    for (uint32_t chunk = 0; chunk < CHUNKS; ++chunk) {
+        const uint32_t dim = chunk * H3D_SOL_WARP + lane;
+        float total = 0.0f;
+        for (uint32_t row = 0; row < rows; ++row) {
+            total +=
+                h3d_value(query[base + (size_t)row * stride + dim]);
+        }
+        centroid[chunk] = total / (float)rows;
+        query_bar[((size_t)q_block * heads + head) * H3D_SOL_HEAD_DIM + dim] =
+            centroid[chunk];
+    }
+    const float log2_scale = scale * 1.4426950408889634f;
+    float mean = 0.0f;
+    float variance = 0.0f;
+    for (uint32_t chunk = 0; chunk < CHUNKS; ++chunk) {
+        const uint32_t dim = chunk * H3D_SOL_WARP + lane;
+        const float m = kc_mean[(size_t)head * H3D_SOL_HEAD_DIM + dim];
+        const float v = kc_var[(size_t)head * H3D_SOL_HEAD_DIM + dim];
+        mean += centroid[chunk] * m;
+        variance += centroid[chunk] * centroid[chunk] * v;
+    }
+    for (int offset = H3D_SOL_WARP / 2; offset > 0; offset >>= 1) {
+        mean += __shfl_xor_sync(0xffffffffu, mean, offset);
+        variance += __shfl_xor_sync(0xffffffffu, variance, offset);
+    }
+    if (lane != 0) return;
+    variance *= log2_scale * log2_scale;
+    const float clamped = variance > 0.0f ? variance : 0.0f;
+    const float std = sqrtf(clamped + 1.0e-6f);
+    threshold[(size_t)q_block * heads + head] = mean * log2_scale + tau * std;
+}
+
+__global__ static void h3d_sol_ltx_forward_kernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *query,
+        const __nv_bfloat16 *key, const __nv_bfloat16 *value,
+        const __nv_bfloat16 *kc, const __nv_bfloat16 *vc,
+        const uint32_t *mask, uint32_t q_rows, uint32_t kv_rows,
+        uint32_t heads, uint32_t blocks, uint32_t words, float scale) {
+    enum { PARTS = H3D_SOL_HEAD_DIM / 32, KEYS = 8, ROWS = H3D_ATTENTION_ROWS,
+           QUERIES = 8 * ROWS };
+    __shared__ float shared_key[KEYS][H3D_SOL_HEAD_DIM];
+    __shared__ float shared_value[KEYS][H3D_SOL_HEAD_DIM];
+    const uint32_t warp = threadIdx.x / 32;
+    const uint32_t lane = threadIdx.x % 32;
+    const uint32_t head = blockIdx.y;
+    const uint32_t first_row = blockIdx.x * QUERIES + warp * ROWS;
+    const size_t stride = (size_t)heads * H3D_SOL_HEAD_DIM;
+    /* Every row of this CTA's 16-row tile lies in one 64-token query block
+     * (16 divides 64), so the mask word is the tile's, not the warp's. */
+    const uint32_t q_block = (blockIdx.x * QUERIES) / H3D_SOL_BLOCK;
+    int active[ROWS];
+    float result[ROWS][PARTS];
+    float maximum[ROWS];
+    float denominator[ROWS];
+    float query_item[ROWS][PARTS];
+#pragma unroll
+    for (uint32_t r = 0; r < ROWS; r++) {
+        uint32_t row = first_row + r;
+        active[r] = row < q_rows;
+        maximum[r] = -INFINITY;
+        denominator[r] = 0.0f;
+#pragma unroll
+        for (uint32_t part = 0; part < PARTS; part++) {
+            result[r][part] = 0.0f;
+            query_item[r][part] = 0.0f;
+        }
+        if (!active[r]) {
+            continue;
+        }
+        const size_t query_base = ((size_t)row * heads + head) * H3D_SOL_HEAD_DIM;
+#pragma unroll
+        for (uint32_t part = 0; part < PARTS; part++) {
+            query_item[r][part] =
+                __bfloat162float(query[query_base + lane + part * 32]);
+        }
+    }
+
+    for (uint32_t block = 0; block < blocks; ++block) {
+        const uint32_t word = block / H3D_SOL_GROUP;
+        const uint32_t bit = block % H3D_SOL_GROUP;
+        const uint32_t bits =
+            mask[((size_t)q_block * heads + head) * words + word];
+        const bool exact = (bits >> bit) & 1u;
+        const uint32_t first_key = block * H3D_SOL_BLOCK;
+        uint32_t key_rows = kv_rows - first_key;
+        if (key_rows > H3D_SOL_BLOCK) key_rows = H3D_SOL_BLOCK;
+        if (!key_rows) {
+            continue;
+        }
+        if (!exact) {
+            /* One fold for the whole block: the score is the row's dot with
+             * the block mean of K, the value is the block SUM of V, and the
+             * denominator counts the block's length (`fwd.py:108-131`). */
+            if (threadIdx.x < H3D_SOL_HEAD_DIM) {
+                const size_t summary =
+                    ((size_t)head * blocks + block) * H3D_SOL_HEAD_DIM +
+                    threadIdx.x;
+                shared_key[0][threadIdx.x] = h3d_value(kc[summary]);
+                shared_value[0][threadIdx.x] = h3d_value(vc[summary]);
+            }
+            __syncthreads();
+#pragma unroll
+            for (uint32_t r = 0; r < ROWS; r++) {
+                float product = 0.0f;
+                if (active[r]) {
+#pragma unroll
+                    for (uint32_t part = 0; part < PARTS; part++) {
+                        product += query_item[r][part] *
+                                   shared_key[0][lane + part * 32];
+                    }
+#pragma unroll
+                    for (uint32_t offset = 16; offset; offset >>= 1) {
+                        product += __shfl_down_sync(0xffffffffu, product, offset);
+                    }
+                }
+                float rescale = 1.0f;
+                float weight = 0.0f;
+                if (active[r] && lane == 0) {
+                    float score = product * scale;
+                    float next_maximum = fmaxf(maximum[r], score);
+                    rescale = expf(maximum[r] - next_maximum);
+                    weight = expf(score - next_maximum);
+                    denominator[r] = denominator[r] * rescale +
+                                     weight * (float)key_rows;
+                    maximum[r] = next_maximum;
+                }
+                rescale = __shfl_sync(0xffffffffu, rescale, 0);
+                weight = __shfl_sync(0xffffffffu, weight, 0);
+                if (active[r]) {
+#pragma unroll
+                    for (uint32_t part = 0; part < PARTS; part++) {
+                        result[r][part] = result[r][part] * rescale +
+                                          weight *
+                                          shared_value[0][lane + part * 32];
+                    }
+                }
+            }
+            __syncthreads();
+            continue;
+        }
+        for (uint32_t key_block = 0; key_block < key_rows; key_block += KEYS) {
+            if (threadIdx.x < H3D_SOL_HEAD_DIM) {
+#pragma unroll
+                for (uint32_t item = 0; item < KEYS; item++) {
+                    uint32_t source = first_key + key_block + item;
+                    if (key_block + item < key_rows) {
+                        size_t index = ((size_t)source * heads + head) *
+                                       H3D_SOL_HEAD_DIM + threadIdx.x;
+                        shared_key[item][threadIdx.x] =
+                            __bfloat162float(key[index]);
+                        shared_value[item][threadIdx.x] =
+                            __bfloat162float(value[index]);
+                    }
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (uint32_t item = 0; item < KEYS; item++) {
+                if (key_block + item >= key_rows) {
+                    break;
+                }
+#pragma unroll
+                for (uint32_t r = 0; r < ROWS; r++) {
+                    float product = 0.0f;
+                    if (active[r]) {
+#pragma unroll
+                        for (uint32_t part = 0; part < PARTS; part++) {
+                            uint32_t dimension = lane + part * 32;
+                            product += query_item[r][part] *
+                                       shared_key[item][dimension];
+                        }
+#pragma unroll
+                        for (uint32_t offset = 16; offset; offset >>= 1) {
+                            product +=
+                                __shfl_down_sync(0xffffffffu, product, offset);
+                        }
+                    }
+                    float rescale = 1.0f;
+                    float weight = 0.0f;
+                    if (active[r] && lane == 0) {
+                        float score = product * scale;
+                        float next_maximum = fmaxf(maximum[r], score);
+                        rescale = expf(maximum[r] - next_maximum);
+                        weight = expf(score - next_maximum);
+                        denominator[r] = denominator[r] * rescale + weight;
+                        maximum[r] = next_maximum;
+                    }
+                    rescale = __shfl_sync(0xffffffffu, rescale, 0);
+                    weight = __shfl_sync(0xffffffffu, weight, 0);
+                    if (active[r]) {
+#pragma unroll
+                        for (uint32_t part = 0; part < PARTS; part++) {
+                            uint32_t dimension = lane + part * 32;
+                            result[r][part] = result[r][part] * rescale +
+                                              weight * shared_value[item][dimension];
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < ROWS; r++) {
+        denominator[r] = __shfl_sync(0xffffffffu, denominator[r], 0);
+        if (!active[r]) {
+            continue;
+        }
+        uint32_t row = first_row + r;
+#pragma unroll
+        for (uint32_t part = 0; part < PARTS; part++) {
+            uint32_t dimension = lane + part * 32;
+            size_t index = ((size_t)row * heads + head) * H3D_SOL_HEAD_DIM +
+                           dimension;
+            output[index] = __float2bfloat16(result[r][part] / denominator[r]);
+        }
+    }
+}
+
+/* The refiner's search: pool, statistics, threshold, route. No sink: the
+ * release's stage-2 video self-attention has no prefix in its sequence
+ * (`sol_attention.py:3-4`, `attn1`), so `sink_start`/`sink_tokens` are the
+ * empty range `[blocks, blocks)` and no block is forced exact beyond the
+ * diagonal band the route kernel adds itself. */
+int h3d_sol_ltx_search(h3d_context *context, const struct h3d_sol_plan *plan,
+                       const h3d_tensor *query, const h3d_tensor *key,
+                       const h3d_tensor *value, uint32_t sequence,
+                       uint32_t heads, float scale, float tau, char *error,
+                       size_t error_size) {
+    size_t elements = 0;
+    if (!context || !sequence || !heads ||
+        sequence > UINT32_MAX - (H3D_SOL_BLOCK - 1) ||
+        !h3d_mul_size(sequence, heads, &elements) ||
+        !h3d_mul_size(elements, H3D_SOL_HEAD_DIM, &elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid Sol-Attn search shape");
+    }
+    if (!h3d_is(query, H3D_BF16, elements) || !h3d_is(key, H3D_BF16, elements) ||
+        !h3d_is(value, H3D_BF16, elements) ||
+        !h3d_sol_check(plan, sequence, heads, error, error_size)) {
+        return 0;
+    }
+    const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    const uint32_t words = h3d_sol_words(sequence);
+    dim3 pool_grid(blocks, heads);
+    h3d_sol_ltx_pool_kernel<<<pool_grid, H3D_SOL_THREADS, 0, context->stream>>>(
+        (__nv_bfloat16 *)plan->kc->data, (__nv_bfloat16 *)plan->vc->data,
+        (const __nv_bfloat16 *)key->data,
+        (const __nv_bfloat16 *)value->data, sequence, heads, blocks);
+    if (!h3d_launch_ok("Sol-Attn LTX pool", error, error_size)) return 0;
+    h3d_sol_stats_kernel<<<heads, H3D_SOL_THREADS, 0, context->stream>>>(
+        (float *)plan->kc_mean->data, (float *)plan->kc_var->data,
+        (const __nv_bfloat16 *)plan->kc->data, blocks);
+    if (!h3d_launch_ok("Sol-Attn LTX statistics", error, error_size)) return 0;
+    dim3 threshold_grid(blocks, heads);
+    h3d_sol_ltx_threshold_kernel<<<threshold_grid, H3D_SOL_WARP, 0,
+                                   context->stream>>>(
+        (float *)plan->threshold->data, (float *)plan->query_bar->data,
+        (const float *)plan->kc_mean->data,
+        (const float *)plan->kc_var->data,
+        (const __nv_bfloat16 *)query->data, sequence, heads, scale, tau);
+    if (!h3d_launch_ok("Sol-Attn LTX threshold", error, error_size)) return 0;
+    dim3 route_grid((blocks + H3D_SOL_QM - 1) / H3D_SOL_QM, heads);
+    h3d_sol_route_kernel<<<route_grid, H3D_SOL_WARP, 0, context->stream>>>(
+        (uint32_t *)plan->mask->data, (uint32_t *)plan->count->data,
+        (const __nv_bfloat16 *)plan->kc->data,
+        (const float *)plan->query_bar->data,
+        (const float *)plan->threshold->data, heads, blocks, words,
+        scale, blocks, blocks);
+    return h3d_launch_ok("Sol-Attn LTX route", error, error_size);
+}
+
+int h3d_sol_ltx_forward(h3d_context *context, h3d_tensor *output,
+                        const struct h3d_sol_plan *plan, const h3d_tensor *query,
+                        const h3d_tensor *key, const h3d_tensor *value,
+                        uint32_t sequence, uint32_t heads, float scale,
+                        char *error, size_t error_size) {
+    size_t elements = 0;
+    if (!context || !sequence || !heads ||
+        sequence > UINT32_MAX - (H3D_SOL_BLOCK - 1) ||
+        !h3d_mul_size(sequence, heads, &elements) ||
+        !h3d_mul_size(elements, H3D_SOL_HEAD_DIM, &elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid Sol-Attn forward shape");
+    }
+    if (!h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(query, H3D_BF16, elements) ||
+        !h3d_is(key, H3D_BF16, elements) ||
+        !h3d_is(value, H3D_BF16, elements) ||
+        !h3d_sol_check(plan, sequence, heads, error, error_size)) {
+        return 0;
+    }
+    enum { QUERIES = 8 * H3D_ATTENTION_ROWS };
+    const uint32_t blocks = (sequence + H3D_SOL_BLOCK - 1) / H3D_SOL_BLOCK;
+    dim3 grid((sequence + QUERIES - 1) / QUERIES, heads);
+    h3d_sol_ltx_forward_kernel<<<grid, 256, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)query->data,
+        (const __nv_bfloat16 *)key->data,
+        (const __nv_bfloat16 *)value->data,
+        (const __nv_bfloat16 *)plan->kc->data,
+        (const __nv_bfloat16 *)plan->vc->data,
+        (const uint32_t *)plan->mask->data, sequence, sequence, heads, blocks,
+        h3d_sol_words(sequence), scale);
+    return h3d_launch_ok("Sol-Attn LTX forward", error, error_size);
+}
+
 /* ==========================================================================
  * h3b_* — the H3-to-LTX latent path's device ops.
  *
