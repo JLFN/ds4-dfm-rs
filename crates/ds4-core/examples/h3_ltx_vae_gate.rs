@@ -54,6 +54,7 @@ const HALO_SEPARATION: f64 = 1e-2;
 struct Options {
     probe: bool,
     shapes: bool,
+    impulse: bool,
     vae: Option<PathBuf>,
     latent: Option<PathBuf>,
     frame: Option<PathBuf>,
@@ -242,7 +243,120 @@ fn decode_vae(
         write_frame(file, &values, pixel)?;
     }
 
+    if options.impulse {
+        impulse_check(gpu, &vae, shape, pixel)?;
+    }
+
     Ok(ExitCode::from(if failed { 3 } else { 0 }))
+}
+
+/// Where a single latent cell lands in the frame, as a measurement rather than
+/// a gate. A latent that is zero everywhere but one channel at one spatial
+/// cell, at every frame, gives an impulse response whose centroid stands at
+/// that cell's own block; moving the cell one step along an axis should move
+/// the centroid by the scale factor, 32 pixels = the patch size times the three
+/// spatial doublings, and the cross axes should not move.
+///
+/// It does not, and the measurement is kept because of what that says: the
+/// response's centroid moves only ~0.7 of a cell per cell (section 3 of the
+/// record). The observation is that this decoder's receptive field is
+/// essentially global - a pixel-scale stack of twelve 3x3x3 convolutions
+/// reaches a hundred pixels, and the four res groups before it reach several
+/// hundred - so most of an impulse's response is a diffuse field centred on the
+/// frame and the centroid is damped towards it. A centroid is therefore not a
+/// valid geometric guard here and this is reporting only; the axis order and
+/// the upsampling geometry are pinned by the exact depth-to-space and
+/// unpatchify probes instead.
+fn impulse_check(gpu: &Gpu, vae: &LtxVae, shape: Shape, pixel: [u32; 3]) -> Result<(), String> {
+    let latent_height = shape.height as usize;
+    let latent_width = shape.width as usize;
+    // Deep enough into the frame that every response's own halo stays inside
+    // it, and asymmetric between the axes so a swap of the two cannot cancel.
+    let (cell_h, cell_w) = (latent_height / 2, latent_width - 3);
+
+    let origin = impulse_centroid(gpu, vae, shape, pixel, cell_h, cell_w)?;
+    let down = impulse_centroid(gpu, vae, shape, pixel, cell_h + 1, cell_w)?;
+    let right = impulse_centroid(gpu, vae, shape, pixel, cell_h, cell_w + 1)?;
+
+    let scale = f64::from(scale_factors()[1]);
+    println!(
+        "IMPULSE cell=({cell_h},{cell_w}) step_down=({:.2},{:.2}) step_right=({:.2},{:.2}) \
+         scale={scale:.0} spread=({:.1},{:.1}) (reporting only)",
+        down.1 - origin.1,
+        down.0 - origin.0,
+        right.0 - origin.0,
+        right.1 - origin.1,
+        origin.2,
+        down.2,
+    );
+
+    Ok(())
+}
+
+/// The centroid of one cell's impulse response, in pixels, against the zero
+/// latent's own decode.
+fn impulse_centroid(
+    gpu: &Gpu,
+    vae: &LtxVae,
+    shape: Shape,
+    pixel: [u32; 3],
+    cell_h: usize,
+    cell_w: usize,
+) -> Result<(f64, f64, f64), String> {
+    let elements = shape.elements();
+    let latent_plane = shape.plane();
+    let latent_width = shape.width as usize;
+    let (height, width) = (pixel[1] as usize, pixel[2] as usize);
+
+    let zeros = vec![0u8; elements * 2];
+    let mut impulse = zeros.clone();
+    let value = ((bf16(5.0).to_bits() >> 16) as u16).to_le_bytes();
+    for frame in 0..shape.frames as usize {
+        let at = (frame * latent_plane + cell_h * latent_width + cell_w) * 2;
+        impulse[at..at + 2].copy_from_slice(&value);
+    }
+
+    let baseline = {
+        let latent = upload_bf16(gpu, &zeros)?;
+        let rgb = vae
+            .decode(gpu, &latent, shape)
+            .map_err(|error| error.to_string())?;
+        read_bf16(gpu, rgb)?
+    };
+    let latent = upload_bf16(gpu, &impulse)?;
+    let rgb = vae
+        .decode(gpu, &latent, shape)
+        .map_err(|error| error.to_string())?;
+    let response = read_bf16(gpu, rgb)?;
+
+    let mut mass = 0.0f64;
+    let (mut sum_x, mut sum_y) = (0.0f64, 0.0f64);
+    let (mut square_x, mut square_y) = (0.0f64, 0.0f64);
+    for y in 0..height {
+        for x in 0..width {
+            let at = (y * width + x) * 3;
+            for channel in 0..3 {
+                let difference = (response[at + channel] - baseline[at + channel]).abs() as f64;
+                mass += difference;
+                sum_x += difference * x as f64;
+                sum_y += difference * y as f64;
+                square_x += difference * (x as f64).powi(2);
+                square_y += difference * (y as f64).powi(2);
+            }
+        }
+    }
+
+    if mass <= 1e-6 {
+        return Err(format!(
+            "the impulse at ({cell_h}, {cell_w}) moved nothing: mass {mass:.3e}"
+        ));
+    }
+
+    let (centroid_x, centroid_y) = (sum_x / mass, sum_y / mass);
+    let spread_x = (square_x / mass - centroid_x * centroid_x).max(0.0).sqrt();
+    let spread_y = (square_y / mass - centroid_y * centroid_y).max(0.0).sqrt();
+
+    Ok((centroid_x, centroid_y, spread_x.max(spread_y)))
 }
 
 /// Every new device op against a host transcription of the reference's own
@@ -862,6 +976,7 @@ fn split(arguments: &[String]) -> Result<Options, String> {
     let mut options = Options {
         probe: false,
         shapes: false,
+        impulse: false,
         vae: None,
         latent: None,
         frame: None,
@@ -878,6 +993,7 @@ fn split(arguments: &[String]) -> Result<Options, String> {
         match argument {
             "--probe" => options.probe = true,
             "--shapes" => options.shapes = true,
+            "--impulse-check" => options.impulse = true,
             "--vae" => options.vae = Some(PathBuf::from(value(arguments, &mut index, argument)?)),
             "--latent" => {
                 options.latent = Some(PathBuf::from(value(arguments, &mut index, argument)?))

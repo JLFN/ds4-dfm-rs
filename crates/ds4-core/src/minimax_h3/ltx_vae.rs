@@ -167,7 +167,7 @@ pub struct Shape {
 impl Shape {
     /// The elements one channel holds: the channel stride, and the position
     /// count a normalization reduces over.
-    fn plane(&self) -> usize {
+    pub fn plane(&self) -> usize {
         self.frames as usize * self.height as usize * self.width as usize
     }
 

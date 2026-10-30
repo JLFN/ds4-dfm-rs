@@ -119,6 +119,41 @@ The 8.6 s load is the gvfs mount at ~110 MB/s, not the artifact; the decode
 itself is 53 ms. `RANGE outside=0` is the fold's own check — the reference
 clamps, so any value outside `[0, 1]` would mean the fold is not its own.
 
+What the whole-graph run does **not** prove, said plainly: there is no
+value-level reference for the composition, because the only real latent in hand
+is a draw. `refiner-latent10.bf16` is `h3_ltx_adapter_gate --dump-latent`'s
+output, and the adapter's input is the oracle's own
+`h3_input = torch.randn(1, *h3_shape, dtype=dtype)`
+(`tools/minimax_h3/ltx/latent_oracle.py:175-176`, seed 1234), so every network
+downstream of it - the upscaler, the adapter and now this decoder - is being
+asked to image white noise. Its statistics say so: 128 x 16 x 24 x 42 values,
+mean 0.0054, std 0.8693, and its neighbouring tokens differ by 0.71 / 0.71 /
+0.65 (w / h / f) against that std, i.e. as much as random pairs do. Decoding it
+gives a band-limited colourful field (the frame is in the record's own directory
+after unit 12b), which is what a working decoder produces from noise - not a
+picture. A real latent needs the chain's entry point (a source image through the
+H3 encoder) or the LTX VAE's own encoder half, and both are owed.
+
+### 3.1 A guard that was tried and rejected, with its number
+
+The first structural guard was the obvious one: the graph is stride-1 with
+symmetric halos and regular upsampling, so an impulse at one latent cell should
+move the frame's response by exactly one cell (32 pixels) when the cell moves
+one step, and not at all across axes. It does not. Measured at
+`--decode-shape 2,8,16` (a 9-frame 256x512 decode, four decodes, 0.13 s each):
+
+    IMPULSE cell=(4,13) step_down=(22.41,-0.50) step_right=(23.77,-0.46) scale=32 spread=(106.2,105.2)
+
+The cross-axis steps are zero (so an axis swap *would* show), but the along-axis
+step is 0.7 of a cell, and the reason is in the same line: the impulse
+response's own spread is 106 pixels against a 32-pixel cell. This decoder's
+receptive field is essentially global - twelve 3x3x3 convolutions at the pixel
+scale, and four res groups at 1/8 and 1/4 resolution before them - so most of a
+response is a diffuse field centred on the frame and the centroid is damped
+towards it. The instrument stays in the gate as `--impulse-check`, reporting
+only; the geometry is pinned by the exact `depth_to_space` and `unpatchify`
+probes instead, which is where it belongs.
+
 ## 4. The tiling decision, named
 
 **The decode is untiled.** The release decodes through `TILES`
