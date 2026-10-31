@@ -121,6 +121,7 @@ The model's license is included in the downloaded repository.
 - [The reference's NVFP4-AWQ prompt encoder, 2026-10-28](nvfp4-encoder-2026-10-28.md)
 - [Sol-H3-Spark recon, 2026-10-28](sol-h3-spark-recon-2026-10-28.md)
 - [Sol-Attn's search step, 2026-10-28](sol-search-step-2026-10-28.md)
+- [The product route in one process: a job list on the resident engine, 2026-10-31](resident-product-2026-10-31.md)
 
 Model-free checks include H3 core and server unit tests, the portable
 host/tokenizer gates, and `make tests/h3-test_av_mux`. The CUDA boundary gate
