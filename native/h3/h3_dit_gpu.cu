@@ -8970,6 +8970,20 @@ int h3b_accumulate(h3d_context *context, h3d_tensor *accumulator,
     return h3d_launch_ok("latent accumulate", error, error_size);
 }
 
+int h3b_zero(h3d_context *context, h3d_tensor *tensor, char *error,
+             size_t error_size) {
+    if (!context || !tensor) {
+        return h3d_set_error(error, error_size, "invalid zero tensor");
+    }
+    size_t bytes = tensor->elements * h3d_dtype_size(tensor->dtype);
+    if (bytes == 0) return 1;
+    if (!h3d_cuda_ok(cudaMemsetAsync(tensor->data, 0, bytes, context->stream),
+                     "zero tensor", error, error_size)) {
+        return 0;
+    }
+    return 1;
+}
+
 int h3b_blend_finish(h3d_context *context, h3d_tensor *output,
                      const h3d_tensor *accumulator, const h3d_tensor *weight,
                      int dtype, uint32_t channels, uint32_t frames,

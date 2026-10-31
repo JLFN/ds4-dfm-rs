@@ -1815,6 +1815,12 @@ impl Upscaler {
         let out_width = width * 2;
         let out_plane = out_height as usize * out_width as usize;
 
+        // `h3b_accumulate` adds into a persistent f32 sum, so it starts at zero
+        // on every forward, not only when the scratch was allocated: a
+        // resident process runs the upscaler once per request, and the second
+        // request would otherwise add its segments to the first's.
+        device(gpu.zero(&self.scratch.accumulator))?;
+
         for (index, segment) in self.plan.segments.iter().enumerate() {
             let count = (segment.input.1 - segment.input.0) as u32;
 

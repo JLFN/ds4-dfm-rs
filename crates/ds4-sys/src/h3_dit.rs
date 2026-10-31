@@ -1345,6 +1345,13 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3b_zero(
+        context: *mut Context,
+        tensor: *mut CTensor,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3b_blend_finish(
         context: *mut Context,
         output: *mut CTensor,
@@ -5552,6 +5559,16 @@ impl Gpu {
                 )
             },
             "latent_accumulate",
+        )
+    }
+
+    /// `h3b_zero`: zero a whole tensor on the context's own stream. The
+    /// chunked upscaler's accumulator sums, so a resident process must clear it
+    /// before every forward.
+    pub fn zero(&self, tensor: &Tensor) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe { h3b_zero(self.raw.as_ptr(), tensor.raw(), error, size) },
+            "zero tensor",
         )
     }
 

@@ -1238,13 +1238,18 @@ int h3b_unshuffle2(h3d_context *context, h3d_tensor *output,
 
 /* The chunked upscaler's `out_full += segment * weight` and its
  * `out_full / weight_full.clamp(min=1e-8)`; the accumulator is f32 and holds
- * every output frame. */
+ * every output frame. `h3b_accumulate` adds, so `h3b_zero` must run on the
+ * accumulator before each forward: a resident process runs the upscaler more
+ * than once, and the second call would otherwise add to the first. */
 int h3b_accumulate(h3d_context *context, h3d_tensor *accumulator,
                    const h3d_tensor *segment, const h3d_tensor *weight,
                    int dtype, uint32_t channels, uint32_t frames,
                    uint32_t segment_frames, uint32_t spatial, uint32_t in_frames,
                    uint32_t in_begin, uint32_t out_begin, char *error,
                    size_t error_size);
+
+int h3b_zero(h3d_context *context, h3d_tensor *tensor, char *error,
+             size_t error_size);
 
 int h3b_blend_finish(h3d_context *context, h3d_tensor *output,
                      const h3d_tensor *accumulator, const h3d_tensor *weight,
