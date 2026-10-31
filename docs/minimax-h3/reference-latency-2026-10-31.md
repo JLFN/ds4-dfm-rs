@@ -164,3 +164,16 @@ Consequence for the product route: a faithful sharp 2x exists today and it
 does not use the LTX bridge at all. Draft latent -> upscaler -> H3 video VAE,
 measured on the Spark: upscaler 2.83 s, H3 decode at 1344x768 62.25 s, mux
 0.86 s. The adapter and the refiner are what cost content.
+
+## 10. The upscale route needs nothing from LTX, and that is now enforced
+
+`--h3-video` requires only the latent, the soundtrack, the upscaler and the
+H3 video VAE. The adapter, the refiner, the LTX VAE and the prompt context
+are required only by the LTX route, so the faithful arm can run without
+them and without Gemma.
+
+Measured on the Spark: `h3-sol-rs --latent ... --audio ... --upscaler ...
+--h3-vae ... --h3-video upscaled` produced a clip byte-identical to the one
+that also carried the LTX arguments, sha256
+`8718b3eb6d5b3c3ed455dd4f07bb1234b37922b3d79c3085f0e2f3e3d9abb169`, 5.175 s,
+1344x768, decode 60.29 s. Nothing on the LTX side reaches the picture.

@@ -471,6 +471,10 @@ fn read_pcm(path: &Path) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+/// A borrowed empty path, so the required-argument check can name a flag that
+/// has no default.
+static EMPTY: PathBuf = PathBuf::new();
+
 fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
     let mut options = Options {
         latent: PathBuf::new(),
@@ -532,19 +536,28 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
         }
     }
 
-    let missing: Vec<&str> = [
+    // The isolation arm stops after the upscaler, so it needs the H3 VAE and
+    // nothing of the LTX side: no adapter, no refiner, no prompt context.
+    let mut required = vec![
         ("--latent", &options.latent),
         ("--audio", &options.audio),
         ("--upscaler", &options.upscaler),
-        ("--adapter", &options.adapter),
-        ("--refiner", &options.refiner),
-        ("--vae", &options.vae),
-        ("--context", &options.context),
-    ]
-    .iter()
-    .filter(|(_, path)| path.as_os_str().is_empty())
-    .map(|(flag, _)| *flag)
-    .collect();
+    ];
+
+    if options.h3_video.is_some() {
+        required.push(("--h3-vae", options.h3_vae.as_ref().unwrap_or(&EMPTY)));
+    } else {
+        required.push(("--adapter", &options.adapter));
+        required.push(("--refiner", &options.refiner));
+        required.push(("--vae", &options.vae));
+        required.push(("--context", &options.context));
+    }
+
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|(_, path)| path.as_os_str().is_empty())
+        .map(|(flag, _)| *flag)
+        .collect();
 
     if !missing.is_empty() {
         return Err(format!("missing {}", missing.join(", ")));
