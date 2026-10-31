@@ -168,6 +168,11 @@ pub struct Stage2 {
     blocks: RefinerScratch,
     scratch: StageScratch,
     generator: Generator,
+    /// The sigmas the loop walks, release first. `SIGMAS` is the shipped
+    /// route; a shorter, lower-starting schedule keeps more of the draft's
+    /// signal (the first value is the noise scale, so `1 - s` is what the
+    /// latent contributes).
+    schedule: Vec<f32>,
     /// The Sol-Attn routing plan when the release's policy is on: one set of
     /// (rows x heads) buffers the 47 routing layers rewrite per layer.
     sol: Option<SolPlanBuffers>,
@@ -201,6 +206,7 @@ impl Stage2 {
             scratch: StageScratch::new(gpu, &geometry)?,
             geometry,
             generator: Generator::seeded(0),
+            schedule: SIGMAS.to_vec(),
             sol: None,
         })
     }
@@ -273,6 +279,41 @@ impl Stage2 {
         Ok(&self.scratch.grid)
     }
 
+    /// Replace the release's schedule. The first value is the noise scale, so
+    /// a lower start keeps more of the transferred latent: `SIGMAS[0]` keeps
+    /// 9.1%, `0.5` keeps half. Any schedule other than the release's runs the
+    /// refiner dense, because `TAU_SCHEDULE` defines one tau per one of its
+    /// three intervals and has no meaning for another length.
+    pub fn set_schedule(&mut self, sigmas: &[f32]) -> Result<(), RefinerError> {
+        validate_schedule(sigmas)?;
+
+        if self.sol.is_some() && sigmas != SIGMAS {
+            return Err(RefinerError::Run(
+                "Sol-Attn's taus are defined per release interval; drop --sol for a \
+                 custom schedule"
+                    .into(),
+            ));
+        }
+
+        self.schedule = sigmas.to_vec();
+        Ok(())
+    }
+
+    /// The intervals this run walks.
+    pub fn steps(&self) -> usize {
+        self.schedule.len() - 1
+    }
+
+    /// The schedule's own values, for the record.
+    pub fn schedule(&self) -> &[f32] {
+        &self.schedule
+    }
+
+    /// Whether the run walks the release's schedule exactly.
+    pub fn is_release_schedule(&self) -> bool {
+        self.schedule == SIGMAS
+    }
+
     /// `create_noised_state` (`helpers.py:428-448`) with `conditionings=[]`:
     /// patchify the initial latent into the state, copy it to the clean latent,
     /// draw the noise, and run `GaussianNoiser.__call__`'s two lerps.
@@ -294,7 +335,7 @@ impl Stage2 {
             &self.scratch.mask,
             rows,
             width,
-            NOISE_SCALE,
+            self.schedule[0],
         )
         .map_err(RefinerError::Run)
     }
@@ -308,8 +349,8 @@ impl Stage2 {
         index: usize,
         context: &Tensor,
     ) -> Result<(u32, u32), RefinerError> {
-        let sigma = SIGMAS[index];
-        let next = SIGMAS[index + 1];
+        let sigma = self.schedule[index];
+        let next = self.schedule[index + 1];
         let (rows, width) = (self.scratch.rows, self.scratch.width);
 
         // `SimpleDenoiser.__call__` (`denoisers.py:225-252`) builds one Modality
@@ -392,14 +433,38 @@ impl Stage2 {
         Ok(calls)
     }
 
-    /// `euler_denoising_loop` (`samplers.py:39-80`) over `SIGMAS[:-1]`.
+    /// `euler_denoising_loop` (`samplers.py:39-80`) over the schedule's
+    /// `sigmas[:-1]`, which is the release's three intervals by default.
     pub fn run(&self, gpu: &Gpu, context: &Tensor) -> Result<(), RefinerError> {
-        for index in 0..STEPS {
+        for index in 0..self.steps() {
             self.step(gpu, index, context)?;
         }
 
         Ok(())
     }
+}
+
+/// A schedule is walked from its first value to a terminal zero, strictly
+/// descending, inside `(0, 1]`. The first value is the noise scale, so it is
+/// also what the run keeps of the transferred latent: `1 - s`.
+fn validate_schedule(sigmas: &[f32]) -> Result<(), RefinerError> {
+    if sigmas.len() < 2 {
+        return Err(RefinerError::Run("a schedule needs two values".into()));
+    }
+
+    if sigmas[sigmas.len() - 1] != 0.0 {
+        return Err(RefinerError::Run("a schedule must end at zero".into()));
+    }
+
+    for pair in sigmas.windows(2) {
+        if !(pair[0] > pair[1]) || pair[0] <= 0.0 || pair[0] > 1.0 {
+            return Err(RefinerError::Run(format!(
+                "schedule {sigmas:?} must fall inside (0, 1] and strictly decrease"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// A device-to-device copy of a whole BF16 tensor, for the reference's
@@ -528,6 +593,22 @@ mod tests {
             assert_eq!(step, bf16(factor));
             assert!(step.abs() <= sample.abs());
         }
+    }
+
+    /// The anchored pass is a schedule whose first value is low enough that
+    /// the draft dominates the state: `1 - s` is the share it keeps, so the
+    /// release's 0.909375 keeps 9.1% and a 0.3 pass keeps 70%.
+    #[test]
+    fn a_schedule_must_descend_to_zero_inside_the_unit_interval() {
+        assert!(validate_schedule(&[0.909375, 0.725, 0.421875, 0.0]).is_ok());
+        assert!(validate_schedule(&[0.3, 0.0]).is_ok());
+
+        assert!(validate_schedule(&[0.3]).is_err(), "a lone value is no interval");
+        assert!(validate_schedule(&[0.3, 0.1]).is_err(), "the walk must end at zero");
+        assert!(validate_schedule(&[0.3, 0.4, 0.0]).is_err(), "the walk must descend");
+        assert!(validate_schedule(&[0.0, 0.0]).is_err(), "a zero start keeps all of it");
+        assert!(validate_schedule(&[1.5, 0.0]).is_err(), "past full noise");
+        assert!(validate_schedule(&[0.3, -0.1, 0.0]).is_err(), "negative noise");
     }
 
     /// Round to BF16 the way the device's `__float2bfloat16` does: nearest

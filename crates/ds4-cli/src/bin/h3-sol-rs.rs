@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_adapter::{self, Adapter, Arm, Upscaler};
 use ds4_core::minimax_h3::ltx_refiner::{Geometry as RefinerGeometry, Lora, LAYERS};
-use ds4_core::minimax_h3::ltx_stage2::{Stage2, STEPS};
+use ds4_core::minimax_h3::ltx_stage2::Stage2;
 use ds4_core::minimax_h3::ltx_vae::{pixel_shape, release_latent, LtxVae, RELEASE_LATENT};
 use ds4_core::minimax_h3::prompt_cache::{self, FIXED_PROMPT};
 use ds4_core::minimax_h3::render::{mux_mp4, RgbFrames};
@@ -68,6 +68,9 @@ struct Options {
     draft_height: usize,
     seed: u64,
     sol: bool,
+    /// `--sigmas A,B,...`: the refiner's own schedule, release default. A
+    /// lower first value is the noise scale, so it keeps more of the draft.
+    sigmas: Vec<f32>,
     /// Decode the upscaler and adapter output without running the refiner.
     transfer_only: bool,
     output: PathBuf,
@@ -212,6 +215,19 @@ fn run() -> Result<ExitCode, String> {
         stage.enable_sol(&gpu).map_err(|error| error.token())?;
     }
 
+    if !options.sigmas.is_empty() {
+        stage
+            .set_schedule(&options.sigmas)
+            .map_err(|error| error.token())?;
+    }
+
+    println!(
+        "SIGMAS values={:?} steps={} release={}",
+        stage.schedule(),
+        stage.steps(),
+        stage.is_release_schedule()
+    );
+
     stage.seed(options.seed);
 
     let started = Instant::now();
@@ -222,7 +238,7 @@ fn run() -> Result<ExitCode, String> {
 
     let started = Instant::now();
 
-    for index in 0..STEPS {
+    for index in 0..stage.steps() {
         let step_started = Instant::now();
         stage
             .step(&gpu, index, &context)
@@ -365,6 +381,7 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
         draft_height: DEFAULT_DRAFT_HEIGHT,
         seed: DEFAULT_SEED,
         sol: false,
+        sigmas: Vec::new(),
         transfer_only: false,
         output: PathBuf::from(DEFAULT_OUTPUT),
     };
@@ -392,6 +409,7 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
             "--draft-height" => options.draft_height = unsigned(&mut argv, &flag)? as usize,
             "--seed" => options.seed = unsigned(&mut argv, &flag)?,
             "--sol" => options.sol = true,
+            "--sigmas" => options.sigmas = csv(&mut argv, &flag)?,
             "--transfer-only" => options.transfer_only = true,
             "-o" | "--output" => options.output = PathBuf::from(value(&mut argv, &flag)?),
             other => return Err(format!("unknown flag {other}; see --help")),
@@ -448,6 +466,27 @@ fn real(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<f32, Stri
     Ok(parsed)
 }
 
+/// A comma-separated refiner schedule, walked from the first value to zero.
+fn csv(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<Vec<f32>, String> {
+    let raw = value(argv, flag)?;
+    let mut schedule = Vec::new();
+
+    for piece in raw.split(',') {
+        let parsed: f32 = piece
+            .trim()
+            .parse()
+            .map_err(|_| format!("{flag} has a value that is not a number"))?;
+
+        if !parsed.is_finite() || parsed < 0.0 {
+            return Err(format!("{flag} must be finite and non-negative"));
+        }
+
+        schedule.push(parsed);
+    }
+
+    Ok(schedule)
+}
+
 fn usage() -> String {
     "\
 Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
@@ -469,6 +508,8 @@ Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
   --draft-height N          stage-1 canvas height (default 384)
   --seed N                  stage-2 noise seed (default 42)
   --sol                     enable the release's Sol-Attn routing
+  --sigmas A,B,...          refiner schedule, release is 0.909375,0.725,0.421875,0
+                            a lower first value keeps more of the draft
   --transfer-only           decode upscaler + adapter output, no refiner
   -o, --output PATH         MP4 path (default outputs/h3-sol.mp4)
   --help                    this text
