@@ -156,9 +156,42 @@ One decoder (the H3 video VAE, `H3_VAE_ATTENTION=tensor`,
 The upscaler is 4.2x sharper than a bicubic resize at the same canvas (SSIM
 0.847 against it, same pose, same ears, same muzzle), so it is adding real
 structure. Decoded through the adapter and the LTX VAE instead, the same
-latent yields 3.82 - almost the bicubic number - because the adapter's latent
-is refiner input at sigma 0.909375, not a clean LTX latent, and the LTX VAE
-was never asked to decode it in the reference.
+latent yields 3.82 - almost the bicubic number. The loss is in the combined
+adapter-plus-LTX-VAE path; an earlier note here blamed it on the adapter
+returning a noised latent, and that is wrong: the adapter returns its model
+output unnoised and the stage-2 noiser adds the noise afterwards
+(runtime/stage2_ops/h3_ltx_adapter/adapter.py:70-102, then
+official_compat_h3_refiner_diagnostic.py:324-332). What is established is
+only where the detail disappears, not which of the two stages inside that
+path causes it.
+
+## 9a. External review of the identity question (Gpt-6-Astra)
+
+An independent review read the release, the diagnostic, the pinned LTX-2
+sources and the port, and confirmed the mechanism with the upstream noiser:
+`torch.lerp(latent, noise, noise_scale)` then
+`torch.lerp(clean_latent, latent, denoise_mask)` with an all-ones mask
+(ltx-core `components/noisers.py:30-37`), which is algebraically
+0.090625 x draft + 0.909375 x noise, and the per-step blend
+`denoised * mask + clean * (1 - mask)` with mask one gives the clean draft a
+zero coefficient (`utils/helpers.py:461-463`, `utils/samplers.py:25-36`).
+Its findings, in its own order:
+
+1. The published recipe is generative refinement, not content-locked
+   super-resolution. Its only draft contribution is the noised initial state;
+   the image conditioning that could anchor a frame exists in the diagnostic
+   but is deliberately disabled by the release runtime
+   (`runtime/stage2.py:38-44`).
+2. The port's remaining recipe deviation is real and unmeasured: the release
+   builds a clean, frozen audio state and runs the joint AV transformer
+   (`runtime/stage2.py:78-99`), while the port passes `audio=None`.
+3. The earlier sigma sweep conflates sigma with step count and with Sol being
+   off for custom schedules, so it bounds the effect but does not isolate
+   sigma.
+4. The port already exposes the faithful route (`--h3-video upscaled` with
+   `--h3-vae`), which returns before the adapter loads; it is not the
+   published LTX route.
+
 
 Consequence for the product route: a faithful sharp 2x exists today and it
 does not use the LTX bridge at all. Draft latent -> upscaler -> H3 video VAE,
