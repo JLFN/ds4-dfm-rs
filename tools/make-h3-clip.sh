@@ -57,8 +57,12 @@ cd "$ROOT" || exit 1
 mkdir -p "$(dirname "$OUT")" scratch
 
 export H3_DIT_SOL=0.9
-export H3_VAE_ATTENTION=tensor
-export H3_VAE_GEMM=bf16
+# The decoder's arms: the campaign's, unless the operator states its own. `bf16i`
+# is the faster one (48.5 s against 60.5 at 1344x768) and the decode line in the
+# log names whichever ran.
+: "${H3_VAE_ATTENTION:=tensor}"
+: "${H3_VAE_GEMM:=bf16}"
+export H3_VAE_ATTENTION H3_VAE_GEMM
 
 guard() {
   local log=$1

@@ -57,8 +57,9 @@ itself.
 The latent is `/mnt/h3/upscaled.bin`: 24x37x48x84, the 2x upscale of
 `/mnt/h3/recipe.bin` that the upscaler isolation run wrote at 12:44. It is **not**
 the product clip's own draft (`scratch/clip.bin`, a different sample), because
-that clip's command and prompt were not kept (section 7). Same shape, same plan,
-same weights; the decoder's cost does not depend on the values.
+that clip's prompt is not in its record (section 7; the tool is
+`tools/make-h3-clip.sh`). Same shape, same plan, same weights; the decoder's cost
+does not depend on the values.
 
 | arm | `H3_VAE_GEMM` | `H3_VAE_ATTENTION` | seconds | frame hash |
 |---|---|---|---:|---|
@@ -226,7 +227,11 @@ picture should prefer its decoder too.
 - **Clock state.** No clock policy exists on this host; all numbers are at boost
   with the temperatures quoted. The 0.6% drift pair bounds one session, not a day.
 - **The H3 video VAE encoder and the audio VAE** are untouched by all of this.
-- **The product clip cannot be re-rendered from its record.** Its script and its
-  structured prompt were not kept, so its frames, its 64.648 s and its 133.569 s
-  wall are a report and not a reproduction. Every arm above is a reproduction:
-  the gate, the shape and the words are in this record, and each hash repeats.
+- **The product clip cannot be re-rendered from its record.** The tool that made
+  it is `tools/make-h3-clip.sh`, but the structured prompt it was given lives in
+  `draft-anatomy-2026-10-31.md` only as a description, so its frames, its
+  64.648 s and its 133.569 s wall are a report and not a reproduction. Every arm
+  above is a reproduction: the gate, the shape and the words are in this record,
+  and each hash repeats. The tool now takes its arms from the environment
+  (`H3_VAE_ATTENTION`/`H3_VAE_GEMM`, defaulting to the campaign's), so the
+  fastest arm is one word away from a product run.
