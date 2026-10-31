@@ -97,6 +97,11 @@ struct Options {
     /// `--save-audio`: the decoded soundtrack as raw little-endian F32,
     /// interleaved, at the printed rate and channel count.
     audio_out: Option<PathBuf>,
+    /// `--latent-only`: stop after the soundtrack. The reference's latency
+    /// route never decodes the H3 video: the latent goes straight to the
+    /// upscaler and the adapter (`runtime/stage1.py` records
+    /// `video_decode: False`, and its capture asserts `h3_decoder_calls == 0`).
+    latent_only: bool,
     /// `--preview-dir` (`main.c:58`, `:340`, `:493`).
     preview_dir: Option<PathBuf>,
     /// `--show` (`main.c:59`, `:541-560`).
@@ -370,6 +375,19 @@ fn run() -> Result<ExitCode, String> {
             waveform.sample_rate,
             waveform.pcm.len() * 4
         );
+    }
+
+    // The latent route stops here: the reference hands the denoised latent to
+    // the upscaler and never materializes H3 video, so the 672x384 decode that
+    // would cost more than every denoise update together is not paid at all.
+    if options.latent_only {
+        if options.latent_out.is_none() {
+            return Err("--latent-only needs --save-latent".to_string());
+        }
+
+        println!("LATENT-ONLY skipped=video_decode");
+
+        return Ok(ExitCode::SUCCESS);
     }
 
     let started = Instant::now();
@@ -851,6 +869,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         frames_dir: None,
         latent_out: None,
         audio_out: None,
+        latent_only: false,
         preview_dir: None,
         show: false,
         zoom: 2,
@@ -941,6 +960,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--frames-dir" => options.frames_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--save-latent" => options.latent_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--save-audio" => options.audio_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--latent-only" => options.latent_only = true,
             "--preview-dir" => options.preview_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--show" => options.show = true,
             "--zoom" => {
@@ -1111,6 +1131,8 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
                             [channel][time][height][width]
   --save-audio PATH         write the soundtrack as raw little-endian F32,
                             interleaved at the printed rate and channels
+  --latent-only             stop after the soundtrack: no H3 video decode and
+                            no mux (the reference's latency route)
   --preview-dir PATH        write one PPM preview per denoising step
   --show                    display a preview frame per step (Kitty/iTerm2)
   --zoom N                  preview zoom for the terminal (default 2)
