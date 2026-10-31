@@ -53,6 +53,15 @@ if [ -z "$PROMPT" ]; then
   exit 2
 fi
 
+# The two-stage route's stage 2 is the release's own geometry: its upscale
+# target and adapter shape are 37 latent frames of 48x84, which is 124 frames
+# at 672x384. Refuse another length before stage 1 spends its load, instead of
+# leaving the saved latent to fail the check in h3-sol-rs.
+if [ "$DIRECT" = "0" ] && [ "$FRAMES" != "124" ]; then
+  echo "the two-stage route renders 124 frames; --frames $FRAMES needs --direct" >&2
+  exit 2
+fi
+
 cd "$ROOT" || exit 1
 mkdir -p "$(dirname "$OUT")" scratch
 
