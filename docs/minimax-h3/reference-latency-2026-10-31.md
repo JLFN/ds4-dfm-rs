@@ -140,3 +140,27 @@ or from a better draft, and both are measurable:
   which is the upscaler's whole contribution as measured so far. Isolating
   it needs the upscaled H3 latent decoded by the H3 VAE against a
   bicubic-upscaled draft decoded the same way.
+
+## 9. The upscaler isolated: it works, and the LTX bridge was hiding it
+
+One decoder (the H3 video VAE, `H3_VAE_ATTENTION=tensor`,
+`H3_VAE_GEMM=bf16`), two latents, same draft and prompt, frame at 2.0 s:
+
+| latent decoded | canvas | lapvar |
+|---|---|---|
+| the draft itself | 672x384 | 32.86 |
+| the draft, bicubic 2x | 1344x768 | 3.34 |
+| the draft, lanczos 2x | 1344x768 | 3.56 |
+| the upscaler's own latent | 1344x768 | 14.11 |
+
+The upscaler is 4.2x sharper than a bicubic resize at the same canvas (SSIM
+0.847 against it, same pose, same ears, same muzzle), so it is adding real
+structure. Decoded through the adapter and the LTX VAE instead, the same
+latent yields 3.82 - almost the bicubic number - because the adapter's latent
+is refiner input at sigma 0.909375, not a clean LTX latent, and the LTX VAE
+was never asked to decode it in the reference.
+
+Consequence for the product route: a faithful sharp 2x exists today and it
+does not use the LTX bridge at all. Draft latent -> upscaler -> H3 video VAE,
+measured on the Spark: upscaler 2.83 s, H3 decode at 1344x768 62.25 s, mux
+0.86 s. The adapter and the refiner are what cost content.

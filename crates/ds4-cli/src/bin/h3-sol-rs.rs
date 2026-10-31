@@ -33,6 +33,7 @@ use ds4_core::minimax_h3::ltx_stage2::Stage2;
 use ds4_core::minimax_h3::ltx_vae::{pixel_shape, release_latent, LtxVae, RELEASE_LATENT};
 use ds4_core::minimax_h3::prompt_cache::{self, FIXED_PROMPT};
 use ds4_core::minimax_h3::render::{mux_mp4, RgbFrames};
+use ds4_core::minimax_h3::vae_video;
 use ds4_core::minimax_h3::torch_file::TorchDtype;
 use ds4_core::minimax_h3::vision::bf16_to_f32;
 use ds4_core::minimax_h3::h3_dit::{Dtype, Gpu, Tensor};
@@ -73,6 +74,13 @@ struct Options {
     sigmas: Vec<f32>,
     /// Decode the upscaler and adapter output without running the refiner.
     transfer_only: bool,
+    /// `--h3-vae DIR --h3-video draft|upscaled`: decode that H3 latent with the
+    /// H3 video VAE and stop. The isolation arm for the upscaler: the same
+    /// decoder, the same output canvas, only the latent differs.
+    h3_vae: Option<PathBuf>,
+    h3_video: Option<String>,
+    /// `--save-upscaled PATH`: the upscaler's own BF16 `[c][t][h][w]` latent.
+    upscaled_out: Option<PathBuf>,
     output: PathBuf,
 }
 
@@ -135,6 +143,16 @@ fn run() -> Result<ExitCode, String> {
     let upscaler = Upscaler::load(&options.upscaler, Arm::Bf16, &geometry)
         .map_err(|error| error.to_string())?;
     let upscaled = upscaler.forward(&draft).map_err(|error| error.to_string())?;
+
+    // The upscaler's own latent, before the adapter or any refiner touches it.
+    if let Some(path) = &options.upscaled_out {
+        write_latent(&gpu, path, &upscaled)?;
+    }
+
+    // The isolation arm stops here: one decoder, one canvas, two latents.
+    if let Some(which) = options.h3_video.clone() {
+        return decode_h3(&gpu, &options, &which, &draft, &upscaled, &geometry);
+    }
     let adapter = Adapter::load(&options.adapter, Arm::Bf16, &geometry)
         .map_err(|error| error.to_string())?;
     let converted = adapter.convert(&upscaled).map_err(|error| error.to_string())?;
@@ -260,6 +278,96 @@ fn run() -> Result<ExitCode, String> {
 /// Decode a BF16 `[channel][frame][height][width]` latent with the LTX VAE and
 /// mux the stage-1 PCM beside it. The refiner's grid and the transfer's own
 /// output share this contract (`ltx_vae::decode`).
+/// The upscaler's latent as raw BF16 `[channel][time][height][width]`, the
+/// same layout `h3-rs --save-latent` writes and reads.
+fn write_latent(gpu: &Gpu, path: &Path, tensor: &Tensor) -> Result<(), String> {
+    let mut bytes = vec![0u8; tensor.bytes()];
+    gpu.read(tensor, &mut bytes)
+        .map_err(|detail| format!("latent readback: {detail}"))?;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+    }
+
+    std::fs::write(path, &bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!("UPSCALED path={} bytes={}", path.display(), bytes.len());
+
+    Ok(())
+}
+
+/// Decode the draft's H3 latent or the upscaler's with the H3 video VAE and
+/// mux it. Both arms run the same decoder to the same canvas, so the only
+/// difference is the latent the upscaler did or did not produce.
+fn decode_h3(
+    gpu: &Gpu,
+    options: &Options,
+    which: &str,
+    draft: &Tensor,
+    upscaled: &Tensor,
+    geometry: &ltx_adapter::Geometry,
+) -> Result<ExitCode, String> {
+    let directory = options
+        .h3_vae
+        .as_ref()
+        .ok_or("--h3-video needs --h3-vae")?;
+    let [channels, time, up_height, up_width] = geometry.h3;
+
+    let (dims, values) = match which {
+        "upscaled" => ([channels, time, up_height, up_width], read_bf16(gpu, upscaled)?),
+        "draft" => (
+            [channels, time, up_height / 2, up_width / 2],
+            read_bf16(gpu, draft)?,
+        ),
+        other => return Err(format!("--h3-video takes draft or upscaled, not {other}")),
+    };
+
+    let started = Instant::now();
+    let decoded = vae_video::decode(
+        directory,
+        &values,
+        dims[1] as usize,
+        dims[2] as usize,
+        dims[3] as usize,
+    )
+    .map_err(|error| error.to_string())?;
+    println!(
+        "H3-VAE latent={which} frames={} height={} width={} seconds={:.3}",
+        decoded.frames,
+        decoded.height,
+        decoded.width,
+        started.elapsed().as_secs_f64()
+    );
+
+    let frames = RgbFrames::from_f32(
+        &decoded.rgb,
+        decoded.frames as i32,
+        decoded.width as i32,
+        decoded.height as i32,
+    )?;
+    let pcm = read_pcm(&options.audio)?;
+    let samples = i32::try_from(pcm.len() / options.channels as usize)
+        .map_err(|_| "audio is longer than the muxer takes".to_string())?;
+    let program = std::env::var_os("H3_FFMPEG")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    mux_mp4(
+        &program,
+        &options.output,
+        &frames,
+        &pcm,
+        samples,
+        options.channels,
+        options.rate,
+    )?;
+    println!("H3-VIDEO path={}", options.output.display());
+
+    Ok(ExitCode::SUCCESS)
+}
+
 fn decode_and_mux(gpu: &Gpu, options: &Options, latent: &Tensor) -> Result<(), String> {
     let shape = release_latent();
     let started = Instant::now();
@@ -383,6 +491,9 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
         sol: false,
         sigmas: Vec::new(),
         transfer_only: false,
+        h3_vae: None,
+        h3_video: None,
+        upscaled_out: None,
         output: PathBuf::from(DEFAULT_OUTPUT),
     };
     let mut argv = arguments.into_iter();
@@ -409,6 +520,11 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
             "--draft-height" => options.draft_height = unsigned(&mut argv, &flag)? as usize,
             "--seed" => options.seed = unsigned(&mut argv, &flag)?,
             "--sol" => options.sol = true,
+            "--h3-vae" => options.h3_vae = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--h3-video" => options.h3_video = Some(value(&mut argv, &flag)?),
+            "--save-upscaled" => {
+                options.upscaled_out = Some(PathBuf::from(value(&mut argv, &flag)?))
+            }
             "--sigmas" => options.sigmas = csv(&mut argv, &flag)?,
             "--transfer-only" => options.transfer_only = true,
             "-o" | "--output" => options.output = PathBuf::from(value(&mut argv, &flag)?),
@@ -508,6 +624,9 @@ Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
   --draft-height N          stage-1 canvas height (default 384)
   --seed N                  stage-2 noise seed (default 42)
   --sol                     enable the release's Sol-Attn routing
+  --save-upscaled PATH      write the upscaler's own H3 latent, [c][t][h][w] BF16
+  --h3-vae DIR              H3 video VAE component, for the isolation arm
+  --h3-video draft|upscaled decode that latent with the H3 VAE and stop
   --sigmas A,B,...          refiner schedule, release is 0.909375,0.725,0.421875,0
                             a lower first value keeps more of the draft
   --transfer-only           decode upscaler + adapter output, no refiner
