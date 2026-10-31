@@ -43,6 +43,8 @@ const DEFAULT_DRAFT_HEIGHT: usize = 384;
 const DEFAULT_DRAFT_WIDTH: usize = 672;
 const DEFAULT_SEED: u64 = 42;
 const DEFAULT_OUTPUT: &str = "outputs/h3-sol.mp4";
+/// `configs/default.json:53`: the distilled refiner LoRA is applied at 0.8.
+const DEFAULT_LORA_STRENGTH: f32 = 0.8;
 
 /// The refiner's text context: the cached prompt's own shape
 /// (`prompt_cache.py`; `CONTEXT_ROWS` in `ltx_refiner`).
@@ -60,11 +62,14 @@ struct Options {
     vae: PathBuf,
     context: PathBuf,
     lora: Option<PathBuf>,
+    lora_strength: f32,
     frames: usize,
     draft_width: usize,
     draft_height: usize,
     seed: u64,
     sol: bool,
+    /// Decode the upscaler and adapter output without running the refiner.
+    transfer_only: bool,
     output: PathBuf,
 }
 
@@ -150,6 +155,16 @@ fn run() -> Result<ExitCode, String> {
     drop(upscaler);
     drop(draft);
 
+    let initial = upload_bf16(&gpu, &cropped)?;
+
+    // The transfer-only arm: decode what the upscaler and adapter produced,
+    // without the refiner. It answers whether a change comes from the transfer
+    // or from the denoise, and it never loads the 42 GB refiner.
+    if options.transfer_only {
+        decode_and_mux(&gpu, &options, &initial)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // The cached stage-2 prompt: Gemma4 plus the connector, built offline.
     let cache = prompt_cache::load(&options.context, FIXED_PROMPT)
         .map_err(|error| format!("context: {error}"))?;
@@ -168,7 +183,14 @@ fn run() -> Result<ExitCode, String> {
 
     let context = upload_bf16(&gpu, &cache.video.bytes)?;
     let lora = match &options.lora {
-        Some(path) => Some(Lora::open(path, 1.0).map_err(|error| error.token())?),
+        Some(path) => {
+            println!(
+                "LORA path={} strength={:.2}",
+                path.display(),
+                options.lora_strength
+            );
+            Some(Lora::open(path, options.lora_strength).map_err(|error| error.token())?)
+        }
         None => None,
     };
 
@@ -192,7 +214,6 @@ fn run() -> Result<ExitCode, String> {
 
     stage.seed(options.seed);
 
-    let initial = upload_bf16(&gpu, &cropped)?;
     let started = Instant::now();
     stage
         .noised_state(&gpu, &initial)
@@ -215,17 +236,26 @@ fn run() -> Result<ExitCode, String> {
     let grid = stage.latent_grid(&gpu).map_err(|error| error.token())?;
     println!("STAGE2 denoise_seconds={:.3}", started.elapsed().as_secs_f64());
 
-    // The refiner's grid is exactly the VAE's own input: BF16
-    // `[channel][frame][height][width]` (`ltx_vae::decode`'s contract).
+    decode_and_mux(&gpu, &options, grid)?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Decode a BF16 `[channel][frame][height][width]` latent with the LTX VAE and
+/// mux the stage-1 PCM beside it. The refiner's grid and the transfer's own
+/// output share this contract (`ltx_vae::decode`).
+fn decode_and_mux(gpu: &Gpu, options: &Options, latent: &Tensor) -> Result<(), String> {
     let shape = release_latent();
     let started = Instant::now();
-    let vae = LtxVae::open(&gpu, &options.vae, shape).map_err(|error| error.to_string())?;
-    let rgb = vae.decode(&gpu, grid, shape).map_err(|error| error.to_string())?;
+    let vae = LtxVae::open(gpu, &options.vae, shape).map_err(|error| error.to_string())?;
+    let rgb = vae
+        .decode(gpu, latent, shape)
+        .map_err(|error| error.to_string())?;
     gpu.sync().map_err(|detail| format!("sync: {detail}"))?;
     println!("LTX-VAE decode_seconds={:.3}", started.elapsed().as_secs_f64());
 
     let pixel = pixel_shape(RELEASE_LATENT);
-    let values = read_bf16(&gpu, rgb)?;
+    let values = read_bf16(gpu, rgb)?;
     let frames = RgbFrames::from_f32(
         &values,
         pixel[0] as i32,
@@ -240,7 +270,6 @@ fn run() -> Result<ExitCode, String> {
     );
 
     drop(vae);
-    drop(stage);
 
     let pcm = read_pcm(&options.audio)?;
     let samples = i32::try_from(pcm.len() / options.channels as usize)
@@ -265,7 +294,7 @@ fn run() -> Result<ExitCode, String> {
         started.elapsed().as_secs_f64()
     );
 
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// The reference's `latent[:, :, :16]` (`runtime/stage2.py:76`): the first 16
@@ -330,11 +359,13 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
         vae: PathBuf::new(),
         context: PathBuf::new(),
         lora: None,
+        lora_strength: DEFAULT_LORA_STRENGTH,
         frames: DEFAULT_FRAMES,
         draft_width: DEFAULT_DRAFT_WIDTH,
         draft_height: DEFAULT_DRAFT_HEIGHT,
         seed: DEFAULT_SEED,
         sol: false,
+        transfer_only: false,
         output: PathBuf::from(DEFAULT_OUTPUT),
     };
     let mut argv = arguments.into_iter();
@@ -355,11 +386,13 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
             "--vae" => options.vae = PathBuf::from(value(&mut argv, &flag)?),
             "--context" => options.context = PathBuf::from(value(&mut argv, &flag)?),
             "--lora" => options.lora = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--lora-strength" => options.lora_strength = real(&mut argv, &flag)?,
             "--frames" => options.frames = unsigned(&mut argv, &flag)? as usize,
             "--draft-width" => options.draft_width = unsigned(&mut argv, &flag)? as usize,
             "--draft-height" => options.draft_height = unsigned(&mut argv, &flag)? as usize,
             "--seed" => options.seed = unsigned(&mut argv, &flag)?,
             "--sol" => options.sol = true,
+            "--transfer-only" => options.transfer_only = true,
             "-o" | "--output" => options.output = PathBuf::from(value(&mut argv, &flag)?),
             other => return Err(format!("unknown flag {other}; see --help")),
         }
@@ -402,6 +435,19 @@ fn unsigned(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, 
         .map_err(|_| format!("{flag} is not an unsigned integer"))
 }
 
+/// A finite, non-negative strength or scale.
+fn real(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<f32, String> {
+    let parsed: f32 = value(argv, flag)?
+        .parse()
+        .map_err(|_| format!("{flag} is not a number"))?;
+
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{flag} must be a finite non-negative number"));
+    }
+
+    Ok(parsed)
+}
+
 fn usage() -> String {
     "\
 Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
@@ -417,11 +463,13 @@ Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
   --vae PATH                LTX video VAE checkpoint
   --context PATH            cached stage-2 prompt (prompt_cache container)
   --lora PATH               distilled refiner LoRA, fused as weights are read
+  --lora-strength N         LoRA strength (default 0.8, the release's value)
   --frames N                stage-1 pixel frames (default 124)
   --draft-width N           stage-1 canvas width (default 672)
   --draft-height N          stage-1 canvas height (default 384)
   --seed N                  stage-2 noise seed (default 42)
   --sol                     enable the release's Sol-Attn routing
+  --transfer-only           decode upscaler + adapter output, no refiner
   -o, --output PATH         MP4 path (default outputs/h3-sol.mp4)
   --help                    this text
 
