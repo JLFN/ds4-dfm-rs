@@ -23,6 +23,7 @@ use std::time::Instant;
 use ds4_core::minimax_h3::dit::{
     Attention, Dit, DitError, LoadMode, LoadOptions, Reduction, VaeAttention, VaeGemm,
 };
+use ds4_core::minimax_h3::engine::{EngineHandle, RenderRequest, Upscale};
 use ds4_core::minimax_h3::host::{reuse_schedule, temporal, Rng, Schedule};
 use ds4_core::minimax_h3::render::mux_mp4;
 use ds4_core::minimax_h3::render::{check_frames, Canvas, RgbFrames};
@@ -31,7 +32,7 @@ use ds4_core::minimax_h3::text_forward;
 use ds4_core::minimax_h3::tokenizer::{EmptyPrompt, Tokenizer};
 use ds4_core::minimax_h3::vision::f32_to_bf16;
 use ds4_core::minimax_h3::{
-    condition, device, media, reference, render, terminal, vae_audio, vae_encoder, vae_video,
+    condition, device, jobs, media, reference, render, terminal, vae_audio, vae_encoder, vae_video,
 };
 
 /// `h3.h:13-17`.
@@ -104,6 +105,14 @@ struct Options {
     /// upscaler and the adapter (`runtime/stage1.py` records
     /// `video_decode: False`, and its capture asserts `h3_decoder_calls == 0`).
     latent_only: bool,
+    /// `--jobs FILE`: the resident product route. One request per line,
+    /// rendered in one process through a resident encoder, DiT and upscaler
+    /// (the one-shot path stays the default when this is absent).
+    jobs: Option<PathBuf>,
+    /// `--upscaler FILE`: the stage-2 x2 latent upscaler. With `--jobs` every
+    /// request in the list takes the release's route: the line's canvas is the
+    /// draft's, the latent is doubled, and the doubled canvas is decoded.
+    upscaler: Option<PathBuf>,
     /// `--preview-dir` (`main.c:58`, `:340`, `:493`).
     preview_dir: Option<PathBuf>,
     /// `--show` (`main.c:59`, `:541-560`).
@@ -138,6 +147,12 @@ fn run() -> Result<ExitCode, String> {
     let Some(options) = parse(std::env::args().skip(1).collect())? else {
         return Ok(ExitCode::SUCCESS);
     };
+
+    // The resident list is its own lifetime: one process, one engine, one
+    // request at a time. Without `--jobs` everything below is unchanged.
+    if options.jobs.is_some() {
+        return run_jobs(&options);
+    }
 
     let canvas = Canvas::new(
         options.width,
@@ -494,6 +509,115 @@ fn run() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The product route as a list: `runtime/stage1.py` drafts, and with an
+/// upscaler `runtime/stage2.py` doubles that latent and decodes the doubled
+/// canvas. The one-shot path above is the same work split across processes;
+/// here the encoder, the DiT and the upscaler stay resident, so clip N+1 pays
+/// only the denoise, the upscale and the decode.
+///
+/// Rollback is the absence of `--jobs`: every line of this function is new,
+/// and the one-shot path it returns to is the one the campaign measured.
+fn run_jobs(options: &Options) -> Result<ExitCode, String> {
+    let path = options
+        .jobs
+        .as_ref()
+        .expect("run_jobs is only reached with --jobs");
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let jobs = jobs::parse(&text, &path.display().to_string())
+        .map_err(|error| error.message().to_string())?;
+
+    // Every line is checked before the first weight is read: a bad canvas must
+    // not cost a 62 GiB load.
+    for (index, job) in jobs.iter().enumerate() {
+        Canvas::new(job.width, job.height, 0, 0)
+            .map_err(|error| format!("line {}: canvas: {error}", index + 1))?;
+        check_frames(job.frames).map_err(|error| format!("line {}: {error}", index + 1))?;
+    }
+
+    let upscale = options.upscaler.as_ref().map(|checkpoint| Upscale {
+        checkpoint: checkpoint.clone(),
+    });
+    println!(
+        "JOBS count={} route={} upscaler={} model={}",
+        jobs.len(),
+        if upscale.is_some() {
+            "draft-upscale"
+        } else {
+            "direct"
+        },
+        options
+            .upscaler
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        options.model_dir.display()
+    );
+
+    let engine =
+        EngineHandle::spawn(&options.model_dir).map_err(|error| error.message().to_string())?;
+
+    let started = Instant::now();
+    for (index, job) in jobs.iter().enumerate() {
+        let request = RenderRequest {
+            prompt: job.prompt.clone(),
+            width: job.width,
+            height: job.height,
+            frames: job.frames,
+            steps: job.steps,
+            reuse: options.reuse,
+            seed: job.seed,
+            first_frame: None,
+            last_frame: None,
+            references: Vec::new(),
+            attention: options.attention,
+            vae_attention: options.vae_attention,
+            vae_gemm: options.vae_gemm,
+            upscale: upscale.clone(),
+            text_encoder: options.text_encoder.clone(),
+            output: job.output.clone(),
+        };
+
+        let job_started = Instant::now();
+        let report = engine
+            .render(request)
+            .map_err(|error| format!("line {}: {}", index + 1, error.message()))?;
+
+        println!(
+            "JOB n={} canvas={}x{}x{} steps={} seed={} text={:.3}s{} load={:.3}s{} \
+             upscaler_load={:.3}s{} upscale={:.3}s denoise={:.3}s audio={:.3}s \
+             video={:.3}s mux={:.3}s wall={:.3}s video_fnv={:016x} audio_fnv={:016x} \
+             frames_fnv={:016x} out={}",
+            index + 1,
+            job.width,
+            job.height,
+            job.frames,
+            job.steps,
+            job.seed,
+            report.text_seconds,
+            if report.text_hit { " (hit)" } else { "" },
+            report.load_seconds,
+            if report.prepared_hit { " (hit)" } else { "" },
+            report.upscaler_load_seconds,
+            if report.upscaler_hit { " (hit)" } else { "" },
+            report.upscale_seconds,
+            report.denoise_seconds,
+            report.audio_seconds,
+            report.video_seconds,
+            report.mux_seconds,
+            job_started.elapsed().as_secs_f64(),
+            report.video_hash,
+            report.audio_hash,
+            report.frames_hash,
+            job.output.display()
+        );
+    }
+
+    println!("JOBS wall={:.3}s", started.elapsed().as_secs_f64());
+
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The denoise preview (`main.c:196-260`, `:540-575`): one decoded frame after
 /// every step, written to `--preview-dir` and/or displayed by the terminal.
 struct Preview {
@@ -533,9 +657,13 @@ impl Preview {
             })?;
         }
 
-        let decoder =
-            vae_video::PreviewDecoder::load(&vae, latent_h as usize, latent_w as usize, vae_arms(options))
-                .map_err(|error| error.to_string())?;
+        let decoder = vae_video::PreviewDecoder::load(
+            &vae,
+            latent_h as usize,
+            latent_w as usize,
+            vae_arms(options),
+        )
+        .map_err(|error| error.to_string())?;
 
         Ok(Some(Preview {
             decoder,
@@ -887,6 +1015,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         latent_out: None,
         audio_out: None,
         latent_only: false,
+        jobs: None,
+        upscaler: None,
         preview_dir: None,
         show: false,
         zoom: 2,
@@ -978,6 +1108,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--save-latent" => options.latent_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--save-audio" => options.audio_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--latent-only" => options.latent_only = true,
+            "--jobs" => options.jobs = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--upscaler" => options.upscaler = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--preview-dir" => options.preview_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--show" => options.show = true,
             "--zoom" => {
@@ -1031,8 +1163,14 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         return Err("-d MODEL_DIR is required".to_string());
     }
 
-    if !options.info && options.prompt.is_empty() {
+    if !options.info && options.jobs.is_none() && options.prompt.is_empty() {
         return Err("-p PROMPT is required".to_string());
+    }
+
+    if options.jobs.is_some() {
+        check_jobs_mode(&options)?;
+    } else if options.upscaler.is_some() {
+        return Err("--upscaler applies to the --jobs route".to_string());
     }
 
     // The port runs the full stack; a truncated layer count is a diagnostic
@@ -1046,6 +1184,50 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
 
 fn value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     argv.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+/// `--jobs` owns every per-request field, and the resident route has no
+/// preview, latent file or streaming mode. A flag the route cannot apply is a
+/// refusal, not a silent drop: the whole point of the resident list is that
+/// each line is the request that ran.
+fn check_jobs_mode(options: &Options) -> Result<(), String> {
+    let unusable = [
+        (!options.prompt.is_empty(), "-p"),
+        (options.output != PathBuf::from(DEFAULT_OUTPUT), "-o"),
+        (options.width != DEFAULT_WIDTH, "--width"),
+        (options.height != DEFAULT_HEIGHT, "--height"),
+        (options.render_width != 0, "--render-width"),
+        (options.render_height != 0, "--render-height"),
+        (options.frames != DEFAULT_FRAMES, "--frames"),
+        (options.steps != DEFAULT_STEPS, "--steps"),
+        (options.seed != DEFAULT_SEED, "--seed"),
+        (options.reuse != DEFAULT_REUSE, "--reuse"),
+        (options.core_reuse != 1, "--core-reuse"),
+        (options.stream, "--ssd-streaming"),
+        (options.token_reduction, "--token-reduction"),
+        (options.latent_only, "--latent-only"),
+        (options.latent_out.is_some(), "--save-latent"),
+        (options.audio_out.is_some(), "--save-audio"),
+        (options.frames_dir.is_some(), "--frames-dir"),
+        (options.preview_dir.is_some(), "--preview-dir"),
+        (options.show, "--show"),
+        (options.first_frame.is_some(), "--first-frame"),
+        (options.last_frame.is_some(), "--last-frame"),
+        (!options.references.is_empty(), "--ref-*"),
+        (options.info, "--info"),
+        (options.hash, "--hash"),
+    ];
+
+    for (given, flag) in unusable {
+        if given {
+            return Err(format!(
+                "{flag} does not apply with --jobs: every request field comes from \
+                 the list (prompt, seed, steps, width, height, frames, output)"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Decoded geometry is `usize` in the VAE APIs and the reference's `int` in
@@ -1151,6 +1333,15 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
                             interleaved at the printed rate and channels
   --latent-only             stop after the soundtrack: no H3 video decode and
                             no mux (the reference's latency route)
+  --jobs FILE               render a list of requests in one process, through a
+                            resident encoder, DiT and upscaler; one request per
+                            line, TAB-separated:
+                            prompt, seed, steps, width, height, frames, output
+                            (blank and # lines are skipped; per-request flags
+                            above are refused, the line owns them)
+  --upscaler FILE           stage-2 x2 H3 latent upscaler; with --jobs the line's
+                            canvas is the draft's and the doubled canvas is
+                            decoded (the release's route)
   --preview-dir PATH        write one PPM preview per denoising step
   --show                    display a preview frame per step (Kitty/iTerm2)
   --zoom N                  preview zoom for the terminal (default 2)

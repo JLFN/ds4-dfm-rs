@@ -39,6 +39,7 @@ use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
 
 use crate::mapped::MappedFile;
 use crate::minimax_h3::safetensors::{self, Dtype as StDtype};
+use crate::minimax_h3::vision::{bf16_to_f32, f32_to_bf16};
 
 /// `constants.py:3-7`: the H3 latent's own geometry.
 pub const H3_LATENT_CHANNELS: usize = 24;
@@ -1944,6 +1945,38 @@ impl Upscaler {
         ))?;
         device(gpu.sync())?;
         Ok(result)
+    }
+
+    /// The whole handoff in one call: a denoised F32 latent arrives as the
+    /// engine holds it, is rounded at the BF16 boundary the BF16 arm reads,
+    /// doubled, and comes back as F32. The rounding is the one the two-process
+    /// route writes (`h3-rs --save-latent` stores BF16), so both routes feed
+    /// the network the same bytes for the same latent.
+    pub fn upscale(&self, latent: &[f32]) -> Result<Vec<f32>, LatentError> {
+        let expected = self.geometry.upscaler_input_elements();
+        if latent.len() != expected {
+            return Err(LatentError::Shape(format!(
+                "upscaler takes {expected} values, got {}",
+                latent.len()
+            )));
+        }
+
+        let mut bytes = Vec::with_capacity(latent.len() * 2);
+        for value in latent {
+            bytes.extend_from_slice(&f32_to_bf16(*value).to_le_bytes());
+        }
+
+        let input = device(self.gpu.alloc(Dtype::Bf16, latent.len()))?;
+        device(self.gpu.upload(&input, &bytes))?;
+        let doubled = self.forward(&input)?;
+
+        let mut out = vec![0u8; doubled.bytes()];
+        device(self.gpu.read(&doubled, &mut out))?;
+
+        Ok(out
+            .chunks_exact(2)
+            .map(|pair| bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+            .collect())
     }
 
     /// One block list, from the slot holding its input to the slot holding its

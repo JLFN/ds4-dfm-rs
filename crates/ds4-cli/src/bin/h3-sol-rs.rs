@@ -69,6 +69,10 @@ struct Options {
     draft_height: usize,
     seed: u64,
     sol: bool,
+    /// `--hash`: the decoded frames' FNV, the same value the resident route
+    /// prints. It is how the two lifetimes are compared: same request, same
+    /// arm, same frames.
+    hash: bool,
     /// `--sigmas A,B,...`: the refiner's own schedule, release default. A
     /// lower first value is the noise scale, so it keeps more of the draft.
     sigmas: Vec<f32>,
@@ -343,6 +347,9 @@ fn decode_h3(
         decoded.width,
         started.elapsed().as_secs_f64()
     );
+    if options.hash {
+        println!("H3-VAE frames_fnv={:016x}", fnv_f32(&decoded.rgb));
+    }
 
     let frames = RgbFrames::from_f32(
         &decoded.rgb,
@@ -395,6 +402,9 @@ fn decode_and_mux(gpu: &Gpu, options: &Options, latent: &Tensor) -> Result<(), S
         frames.height(),
         frames.width()
     );
+    if options.hash {
+        println!("FRAMES frames_fnv={:016x}", fnv_f32(&values));
+    }
 
     drop(vae);
 
@@ -461,6 +471,19 @@ fn read_bf16(gpu: &Gpu, tensor: &Tensor) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+/// The gate hash convention `h3-rs` and the engine use: FNV-1a over the
+/// little-endian F32 bytes, so the two lifetimes compare the same number.
+fn fnv_f32(values: &[f32]) -> u64 {
+    use ds4_core::minimax_h3::text_forward::{FNV_OFFSET, FNV_PRIME};
+
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+        })
+}
+
 fn read_pcm(path: &Path) -> Result<Vec<f32>, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
 
@@ -496,6 +519,7 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
         draft_height: DEFAULT_DRAFT_HEIGHT,
         seed: DEFAULT_SEED,
         sol: false,
+        hash: false,
         sigmas: Vec::new(),
         transfer_only: false,
         h3_vae: None,
@@ -527,6 +551,7 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
             "--draft-height" => options.draft_height = unsigned(&mut argv, &flag)? as usize,
             "--seed" => options.seed = unsigned(&mut argv, &flag)?,
             "--sol" => options.sol = true,
+            "--hash" => options.hash = true,
             "--h3-vae" => options.h3_vae = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--h3-video" => options.h3_video = Some(value(&mut argv, &flag)?),
             "--save-upscaled" => {
@@ -640,6 +665,8 @@ Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
   --draft-height N          stage-1 canvas height (default 384)
   --seed N                  stage-2 noise seed (default 42)
   --sol                     enable the release's Sol-Attn routing
+  --hash                    print the decoded frames' FNV (how the resident
+                            route and this one are compared)
   --save-upscaled PATH      write the upscaler's own H3 latent, [c][t][h][w] BF16
   --h3-vae DIR              H3 video VAE component, for the isolation arm
   --h3-video draft|upscaled decode that latent with the H3 VAE and stop

@@ -35,6 +35,7 @@ pub mod gemma;
 pub mod gemma_connector;
 pub mod gemma_token;
 pub mod host;
+pub mod jobs;
 pub mod layout;
 pub mod local_api;
 pub mod lora;
