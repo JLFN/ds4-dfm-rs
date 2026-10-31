@@ -1323,6 +1323,32 @@ int h3v_to_rgb(h3d_context *context, h3d_tensor *output, const h3d_tensor *input
                int dtype, uint32_t depth, uint32_t height, uint32_t width,
                char *error, size_t error_size);
 
+/* The LTX-2.5 audio VAE encoder (`minimax_h3::ltx_audio_vae`). Both take the
+ * encoder's channels-last `[h][w][c]` F32 planes, which is the layout the F32
+ * valid convolution `h3d_conv3d` reads. */
+
+/* `F.pad(x, (left, right, top, bottom))` with zeros
+ * (`audio_vae/causal_conv_2d.py:47-57`, `downsample.py:43-57`): the causal
+ * convolution pads its time axis above only, the mel axis on both sides. */
+int h3a_pad_zero(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, uint32_t height, uint32_t width,
+                 uint32_t channels, uint32_t before_h, uint32_t after_h,
+                 uint32_t before_w, uint32_t after_w, char *error,
+                 size_t error_size);
+
+/* `PixelNorm(dim=1, eps=1e-6)` (`model/common/normalization.py:15-38`):
+ * `x / sqrt(mean(x**2, channels) + eps)`, channels-last. */
+int h3a_pixel_norm(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, uint32_t channels,
+                   size_t positions, float epsilon, char *error,
+                   size_t error_size);
+
+/* `left + right` on F32, the encoder's residual add (`resnet.py:158-170`).
+ * The pair kernel `h3d_add` is BF16 only. */
+int h3a_add(h3d_context *context, h3d_tensor *output,
+            const h3d_tensor *left, const h3d_tensor *right, size_t elements,
+            char *error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif

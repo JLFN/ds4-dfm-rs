@@ -9400,3 +9400,136 @@ int h3v_to_rgb(h3d_context *context, h3d_tensor *output, const h3d_tensor *input
     }
     return h3d_launch_ok("to rgb", error, error_size);
 }
+
+/* ------------------------------------------------------------------------
+ * h3a_* — the LTX-2.5 audio VAE encoder (`minimax_h3::ltx_audio_vae`).
+ *
+ * Source of truth: `/data/ltx2-pin/packages/ltx-core`, pin d1511477 = tag
+ * v1.2.0, `model/audio_vae/`. The graph is `audio_vae.py:172-247` and its two
+ * layer types:
+ *
+ *   CausalConv2d, causality_axis=HEIGHT (`causal_conv_2d.py:47-57`):
+ *     F.pad(x, (pad_w // 2, pad_w - pad_w // 2, pad_h, 0)) then a valid conv.
+ *     Kernels are 3 (or 1), so the pad is (1, 1, 2, 0) on the mel-time plane.
+ *   Downsample (`downsample.py:36-57`), same axis: F.pad(x, (0, 1, 2, 0)) with
+ *     `mode="constant", value=0`, then a stride-2 valid conv.
+ *
+ * Every pad in this encoder is zeros - unlike the video VAE's replicated
+ * temporal halo - so the two kernels below are what the F32 valid convolution
+ * (`h3d_conv3d` above, channels-last `[b][d][h][w][c]`) needs around it.
+ * ------------------------------------------------------------------------ */
+
+/* Zero padding with a per-side extent on each axis of a channels-last plane:
+ * the pad `F.pad(x, (left, right, top, bottom))` writes before the convolution
+ * runs. One thread per output element; the interior copies, the rest is zero. */
+__global__ static void h3a_pad_zero_kernel(
+    float *out, const float *in, uint32_t height, uint32_t width,
+    uint32_t channels, uint32_t before_h, uint32_t after_h, uint32_t before_w,
+    uint32_t after_w, size_t elements) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    uint32_t channel = (uint32_t)(index % channels);
+    size_t position = index / channels;
+    uint32_t out_width = width + before_w + after_w;
+    uint32_t out_height = height + before_h + after_h;
+    uint32_t x = (uint32_t)(position % out_width);
+    uint32_t y = (uint32_t)((position / out_width) % out_height);
+    if (x < before_w || x >= before_w + width || y < before_h ||
+        y >= before_h + height) {
+        out[index] = 0.0f;
+        return;
+    }
+    size_t source =
+        ((size_t)(y - before_h) * width + (x - before_w)) * channels + channel;
+    out[index] = in[source];
+}
+
+int h3a_pad_zero(h3d_context *context, h3d_tensor *output,
+                 const h3d_tensor *input, uint32_t height, uint32_t width,
+                 uint32_t channels, uint32_t before_h, uint32_t after_h,
+                 uint32_t before_w, uint32_t after_w, char *error,
+                 size_t error_size) {
+    size_t sources = 0, outputs = 0;
+    if (!context || !channels || !height || !width ||
+        !h3d_mul_size((size_t)height * width, channels, &sources) ||
+        !h3d_mul_size((size_t)(height + before_h + after_h) *
+                          (width + before_w + after_w),
+                      channels, &outputs) ||
+        !h3d_is(input, H3D_F32, sources) ||
+        !h3d_is(output, H3D_F32, outputs)) {
+        return h3d_set_error(error, error_size, "invalid audio pad shape");
+    }
+    if (outputs == 0) return 1;
+    h3a_pad_zero_kernel<<<h3b_blocks(outputs), H3B_BLOCK, 0,
+                          context->stream>>>(
+        (float *)output->data, (const float *)input->data, height, width,
+        channels, before_h, after_h, before_w, after_w, outputs);
+    return h3d_launch_ok("audio pad", error, error_size);
+}
+
+/* `PixelNorm(dim=1, eps=1e-6)` (`model/common/normalization.py:15-38`) on a
+ * channels-last tensor: `x / sqrt(mean(x**2, channels) + eps)`. Torch's
+ * expression is the square, the mean, the epsilon add, the square root and the
+ * divide, each one rounding; the kernel keeps that order and one thread per
+ * position owns its whole channel row, so an in-place call is safe. */
+__global__ static void h3a_pixel_norm_kernel(float *out, const float *in,
+                                             uint32_t channels, float epsilon,
+                                             size_t positions) {
+    size_t position = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (position >= positions) return;
+    const float *source = in + position * channels;
+    float total = 0.0f;
+    for (uint32_t channel = 0; channel < channels; ++channel) {
+        total += source[channel] * source[channel];
+    }
+    float rms = sqrtf(total / (float)channels + epsilon);
+    float *destination = out + position * channels;
+    for (uint32_t channel = 0; channel < channels; ++channel) {
+        destination[channel] = source[channel] / rms;
+    }
+}
+
+int h3a_pixel_norm(h3d_context *context, h3d_tensor *output,
+                   const h3d_tensor *input, uint32_t channels,
+                   size_t positions, float epsilon, char *error,
+                   size_t error_size) {
+    size_t elements = 0;
+    if (!context || !channels || epsilon < 0.0f ||
+        !h3d_mul_size(positions, channels, &elements) ||
+        !h3d_is(input, H3D_F32, elements) ||
+        !h3d_is(output, H3D_F32, elements)) {
+        return h3d_set_error(error, error_size, "invalid audio pixel norm shape");
+    }
+    if (elements == 0) return 1;
+    h3a_pixel_norm_kernel<<<h3b_blocks(positions), H3B_BLOCK, 0,
+                            context->stream>>>(
+        (float *)output->data, (const float *)input->data, channels, epsilon,
+        positions);
+    return h3d_launch_ok("audio pixel norm", error, error_size);
+}
+
+/* `left + right` on F32, the encoder's residual add (`resnet.py:158-170`).
+ * The shortcut and the block output are both F32 and torch's add rounds once,
+ * so one thread per element with a single add is exact. `h3d_add` is the
+ * BF16 pair kernel and cannot take these planes. */
+__global__ static void h3a_add_kernel(float *output, const float *left,
+                                      const float *right, size_t count) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    output[index] = left[index] + right[index];
+}
+
+int h3a_add(h3d_context *context, h3d_tensor *output,
+            const h3d_tensor *left, const h3d_tensor *right, size_t elements,
+            char *error, size_t error_size) {
+    if (!context || !h3d_is(output, H3D_F32, elements) ||
+        !h3d_is(left, H3D_F32, elements) ||
+        !h3d_is(right, H3D_F32, elements)) {
+        return h3d_set_error(error, error_size, "invalid F32 audio add tensors");
+    }
+    if (elements == 0) return 1;
+    h3a_add_kernel<<<h3b_blocks(elements), H3B_BLOCK, 0, context->stream>>>(
+        (float *)output->data, (const float *)left->data,
+        (const float *)right->data, elements);
+    return h3d_launch_ok("audio add", error, error_size);
+}

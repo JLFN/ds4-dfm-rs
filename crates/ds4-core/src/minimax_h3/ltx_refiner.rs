@@ -2552,12 +2552,13 @@ fn tensor_of(gpu: &Gpu, bytes: &[u8]) -> Result<Tensor, RefinerError> {
 /// (`VideoLatentTools.create_initial_state`, `tools.py:139-184`), so it is
 /// [`patchify_video`]'s and runs once per evaluation.
 ///
-/// `audio` is `None` on the release's stage-2 route
-/// (`refiner_encoder_ablation_single_gpu.py:706-712`), which reaches
-/// `LTXModel.forward` as `audio=None` and is what makes the branch set
-/// video-only; `audio` and `audio_context` are present or absent together.
+/// The release's stage-2 route holds audio clean and frozen
+/// (`runtime/stage2.py:78-99`); the video-only ablation passes `None`
+/// (`refiner_encoder_ablation_single_gpu.py:706-712`). The audio state
+/// and its prompt context are present or absent together.
 pub struct Request<'a> {
     pub sigma: f32,
+    pub audio_sigma: f32,
     pub geometry: Geometry,
     pub video: &'a Tensor,
     pub audio: Option<&'a Tensor>,
@@ -2794,6 +2795,7 @@ impl Edges {
                 RefinerError::Run("the audio half needs its prompt context".into())
             })?;
             let audio_positions = audio_positions(&geometry);
+            let audio_values = sinusoid(request.audio_sigma * TIMESTEP_SCALE);
 
             let state = alloc(gpu, audio_rows as usize * AUDIO_DIM)?;
             self.audio_patchify
@@ -2817,7 +2819,12 @@ impl Edges {
 
             gpu.upload(
                 &scratch.audio_sinusoid,
-                &sinusoid_bytes(&values, audio_rows as usize),
+                &sinusoid_bytes(&audio_values, audio_rows as usize),
+            )
+            .map_err(RefinerError::Run)?;
+            gpu.upload(
+                &scratch.single_sinusoid,
+                &sinusoid_bytes(&audio_values, 1),
             )
             .map_err(RefinerError::Run)?;
             self.audio_adaln.apply(
@@ -2865,6 +2872,8 @@ impl Edges {
                 &scratch.video.single_hidden,
                 &video_gate,
             )?;
+            gpu.upload(&scratch.single_sinusoid, &sinusoid_bytes(&values, 1))
+                .map_err(RefinerError::Run)?;
             self.v2a_gate.apply(
                 gpu,
                 &scratch.single_sinusoid,

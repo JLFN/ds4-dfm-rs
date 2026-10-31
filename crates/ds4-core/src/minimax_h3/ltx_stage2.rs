@@ -1,8 +1,8 @@
 //! The LTX-2.5 stage-2 sampler: the schedule, the x0 model, the Euler step and
 //! the noiser, over the refiner graph in [`super::ltx_refiner`].
 //!
-//! The route is the release's own. `RefinerEncoderAblationStage2` builds the
-//! joint AudioVideo transformer and then denoises it with **no audio state**:
+//! The video-only ablation builds the joint AudioVideo transformer and then
+//! denoises it with no audio state:
 //! `prepare_denoise(upscaled, seed)` makes one noised video state
 //! (`refiner_encoder_ablation_single_gpu.py:691-701`) and `denoise` runs
 //!
@@ -348,6 +348,7 @@ impl Stage2 {
         gpu: &Gpu,
         index: usize,
         context: &Tensor,
+        audio: Option<(&Tensor, &Tensor)>,
     ) -> Result<(u32, u32), RefinerError> {
         let sigma = self.schedule[index];
         let next = self.schedule[index + 1];
@@ -356,15 +357,16 @@ impl Stage2 {
         // `SimpleDenoiser.__call__` (`denoisers.py:225-252`) builds one Modality
         // from the state and calls `X0Model.forward` (`model.py:590-605`): the
         // velocity model on the patchified rows, then `to_denoised` at
-        // `video.timesteps`. `audio_state` and `a_context` are both absent, so
-        // `audio=None` reaches the blocks.
+        // `video.timesteps`. The release passes the clean frozen audio latent
+        // and its prompt context each step (`runtime/stage2.py:78-99`).
         let request = Request {
             sigma,
+            audio_sigma: 0.0,
             geometry: self.geometry,
             video: &self.scratch.latent,
-            audio: None,
+            audio: audio.map(|(latent, _)| latent),
             video_context: context,
-            audio_context: None,
+            audio_context: audio.map(|(_, audio_context)| audio_context),
         };
         let prepared = self.edges.prepare(gpu, &request, &self.edges_scratch)?;
 
@@ -382,7 +384,9 @@ impl Stage2 {
             gpu,
             &prepared.video,
             &prepared.video_signals,
-            None,
+            prepared.audio.as_ref().zip(prepared.audio_signals.as_ref()).map(
+                |(state, signals)| (state, signals),
+            ),
             &self.blocks,
             sol.as_ref(),
         )?;
@@ -437,7 +441,7 @@ impl Stage2 {
     /// `sigmas[:-1]`, which is the release's three intervals by default.
     pub fn run(&self, gpu: &Gpu, context: &Tensor) -> Result<(), RefinerError> {
         for index in 0..self.steps() {
-            self.step(gpu, index, context)?;
+            self.step(gpu, index, context, None)?;
         }
 
         Ok(())

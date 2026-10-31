@@ -28,7 +28,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::ltx_adapter::{self, Adapter, Arm, Upscaler};
-use ds4_core::minimax_h3::ltx_refiner::{Geometry as RefinerGeometry, Lora, LAYERS};
+use ds4_core::minimax_h3::ltx_audio_vae::{self, Encoder as AudioEncoder};
+use ds4_core::minimax_h3::ltx_refiner::{
+    Geometry as RefinerGeometry, Lora, AUDIO_CONTEXT_DIM, LAYERS,
+};
 use ds4_core::minimax_h3::ltx_stage2::Stage2;
 use ds4_core::minimax_h3::ltx_vae::{pixel_shape, release_latent, LtxVae, RELEASE_LATENT};
 use ds4_core::minimax_h3::prompt_cache::{self, FIXED_PROMPT};
@@ -55,6 +58,8 @@ const CONTEXT_WIDTH: usize = 4096;
 struct Options {
     latent: PathBuf,
     audio: PathBuf,
+    audio_vae: Option<PathBuf>,
+    no_audio_state: bool,
     rate: i32,
     channels: i32,
     upscaler: PathBuf,
@@ -207,6 +212,46 @@ fn run() -> Result<ExitCode, String> {
     }
 
     let context = upload_bf16(&gpu, &cache.video.bytes)?;
+    let audio = if options.no_audio_state {
+        println!("AUDIO state=off (ablation)");
+        None
+    } else {
+        if cache.audio.dtype != TorchDtype::BFloat16
+            || cache.audio.shape != [1, CONTEXT_ROWS as u64, AUDIO_CONTEXT_DIM as u64]
+        {
+            return Err(format!(
+                "context audio is {:?} {:?}, expected BF16 [1, {CONTEXT_ROWS}, {AUDIO_CONTEXT_DIM}]",
+                cache.audio.dtype, cache.audio.shape
+            ));
+        }
+
+        let started = Instant::now();
+        let pcm = read_pcm(&options.audio)?;
+        let mel = ltx_audio_vae::log_mel(&pcm, options.channels as usize, options.rate as u32)
+            .map_err(|error| error.to_string())?;
+        let path = options.audio_vae.as_deref().ok_or("missing --audio-vae")?;
+        let encoder = AudioEncoder::open(&gpu, path)
+            .map_err(|error| error.to_string())?;
+        let encoded = encoder.encode(&gpu, &mel).map_err(|error| error.to_string())?;
+        let conformed = encoded.conformed(RefinerGeometry::release().audio_frames);
+        let bytes = conformed.bf16_bytes();
+        let samples: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|pair| bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+            .collect();
+        let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
+        let std = (samples.iter().map(|value| (value - mean).powi(2)).sum::<f32>()
+            / samples.len() as f32)
+            .sqrt();
+        println!(
+            "AUDIO state={}x{}x{} mean={mean:.5} std={std:.5} encode_seconds={:.3}",
+            conformed.channels,
+            conformed.frames,
+            conformed.bins,
+            started.elapsed().as_secs_f64()
+        );
+        Some((upload_bf16(&gpu, &bytes)?, upload_bf16(&gpu, &cache.audio.bytes)?))
+    };
     let lora = match &options.lora {
         Some(path) => {
             println!(
@@ -263,7 +308,7 @@ fn run() -> Result<ExitCode, String> {
     for index in 0..stage.steps() {
         let step_started = Instant::now();
         stage
-            .step(&gpu, index, &context)
+            .step(&gpu, index, &context, audio.as_ref().map(|(state, prompt)| (state, prompt)))
             .map_err(|error| error.token())?;
         println!(
             "STAGE2 step={index} seconds={:.3}",
@@ -505,6 +550,8 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
     let mut options = Options {
         latent: PathBuf::new(),
         audio: PathBuf::new(),
+        audio_vae: None,
+        no_audio_state: false,
         rate: 32_000,
         channels: 2,
         upscaler: PathBuf::new(),
@@ -537,6 +584,8 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
             }
             "--latent" => options.latent = PathBuf::from(value(&mut argv, &flag)?),
             "--audio" => options.audio = PathBuf::from(value(&mut argv, &flag)?),
+            "--audio-vae" => options.audio_vae = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--no-audio-state" => options.no_audio_state = true,
             "--rate" => options.rate = integer(&mut argv, &flag)?,
             "--channels" => options.channels = integer(&mut argv, &flag)?,
             "--upscaler" => options.upscaler = PathBuf::from(value(&mut argv, &flag)?),
@@ -579,6 +628,9 @@ fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
         required.push(("--refiner", &options.refiner));
         required.push(("--vae", &options.vae));
         required.push(("--context", &options.context));
+        if !options.no_audio_state && !options.transfer_only {
+            required.push(("--audio-vae", options.audio_vae.as_ref().unwrap_or(&EMPTY)));
+        }
     }
 
     let missing: Vec<&str> = required
@@ -651,6 +703,8 @@ Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
 
   --latent PATH             stage-1 latent: raw BF16 [channel][time][height][width]
   --audio PATH              soundtrack: raw little-endian F32, interleaved
+  --audio-vae PATH          LTX audio VAE for the clean frozen audio state
+  --no-audio-state          video-only ablation; omit the audio state and context
   --rate N                  soundtrack sample rate (default 32000)
   --channels N              soundtrack channels (default 2)
   --upscaler PATH           minimax_h3_latent_upscaler_3d checkpoint

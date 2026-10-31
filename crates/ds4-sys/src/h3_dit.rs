@@ -1402,6 +1402,44 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    // The LTX-2.5 audio VAE encoder (`minimax_h3::ltx_audio_vae`): its
+    // channels-last F32 pads and its per-location RMS norm.
+    fn h3a_pad_zero(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        height: u32,
+        width: u32,
+        channels: u32,
+        before_h: u32,
+        after_h: u32,
+        before_w: u32,
+        after_w: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3a_pixel_norm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        channels: u32,
+        positions: usize,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3a_add(
+        context: *mut Context,
+        output: *mut CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     // ---- the Gemma4 encoder's INT8 convrot route (`native/h3/h3_dit_gpu.h`).
     // The reference is comfy-kitchen 0.2.26, called by the release from
     // `runtime/cache_ops/int8_policy.py`; `h3d_int8_plan` is the chain's
@@ -4733,6 +4771,95 @@ impl Gpu {
                 )
             },
             "conv3d",
+        )
+    }
+
+    /// `h3a_pad_zero`: the LTX audio encoder's zero pad on a channels-last F32
+    /// plane, with a per-side extent on each axis
+    /// (`causal_conv_2d.py:47-57`, `downsample.py:43-57`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn audio_pad_zero(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        height: u32,
+        width: u32,
+        channels: u32,
+        before_h: u32,
+        after_h: u32,
+        before_w: u32,
+        after_w: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3a_pad_zero(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    height,
+                    width,
+                    channels,
+                    before_h,
+                    after_h,
+                    before_w,
+                    after_w,
+                    error,
+                    size,
+                )
+            },
+            "audio pad",
+        )
+    }
+
+    /// `h3a_pixel_norm`: `PixelNorm(dim=1, eps=1e-6)` over a channels-last F32
+    /// tensor (`model/common/normalization.py:15-38`).
+    pub fn audio_pixel_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        channels: u32,
+        positions: usize,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3a_pixel_norm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    channels,
+                    positions,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "audio pixel norm",
+        )
+    }
+
+    /// `h3a_add`: `left + right` on F32, the audio encoder's residual add
+    /// (`resnet.py:158-170`). `add` is the BF16 pair kernel.
+    pub fn audio_add(
+        &self,
+        output: &Tensor,
+        left: &Tensor,
+        right: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3a_add(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    left.raw(),
+                    right.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "audio add",
         )
     }
 

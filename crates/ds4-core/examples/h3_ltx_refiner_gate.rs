@@ -625,7 +625,7 @@ fn run_stage(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
     for index in 0..STEPS {
         let step_started = Instant::now();
         let calls = stage
-            .step(gpu, index, &context)
+            .step(gpu, index, &context, None)
             .map_err(|error| error.token())?;
         steps[index] = step_started.elapsed().as_secs_f64();
 
@@ -940,6 +940,7 @@ fn run_edges(gpu: &Gpu, path: &Path, options: &Options) -> Result<ExitCode, Stri
 
     let request = Request {
         sigma,
+        audio_sigma: sigma,
         geometry,
         video: &video,
         audio: Some(&audio),
