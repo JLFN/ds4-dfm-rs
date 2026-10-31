@@ -331,6 +331,9 @@ fn decode_h3(
         dims[1] as usize,
         dims[2] as usize,
         dims[3] as usize,
+        // No flag states the decoder's arms on this route: the environment's
+        // word (`H3_VAE_GEMM`, `H3_VAE_ATTENTION`) or the reference's default.
+        vae_video::Arms::default(),
     )
     .map_err(|error| error.to_string())?;
     println!(

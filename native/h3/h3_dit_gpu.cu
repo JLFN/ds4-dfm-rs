@@ -116,6 +116,15 @@ int h3d_vae_gemm_mode(const h3d_context *context) {
     return context ? context->vae.gemm : H3D_VAE_GEMM_FP32;
 }
 
+/* The other two decoder options, read back for a log line. */
+int h3d_vae_attention_mma(const h3d_context *context) {
+    return context ? context->vae.attention_mma : 0;
+}
+
+int h3d_vae_sdpa_rows(const h3d_context *context) {
+    return context ? context->vae.query_major : 0;
+}
+
 /* Select one video VAE decoder option per run. Names and values: "attention"
  * (scalar, tensor), "sdpa_order" (heads, rows), "gemm" (fp32, tf32, bf16,
  * bf16i). Exact words here, unlike the environment's first-letter rule,

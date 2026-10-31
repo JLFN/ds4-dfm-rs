@@ -105,6 +105,10 @@ unsafe extern "C" {
 
     fn h3d_vae_gemm_mode(context: *const Context) -> c_int;
 
+    fn h3d_vae_attention_mma(context: *const Context) -> c_int;
+
+    fn h3d_vae_sdpa_rows(context: *const Context) -> c_int;
+
     fn h3d_fp8_scale(
         context: *mut Context,
         scale: *mut CTensor,
@@ -2900,6 +2904,29 @@ impl Gpu {
         const BF16_INPUTS: c_int = 3; // H3D_VAE_GEMM_BF16_INPUTS
 
         unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) == BF16_INPUTS }
+    }
+
+    /// This context's video VAE GEMM mode by name, as the context parsed it:
+    /// "fp32", "tf32", "bf16" or "bf16i" (`H3D_VAE_GEMM_*`).
+    pub fn vae_gemm_name(&self) -> &'static str {
+        match unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) } {
+            1 => "tf32",
+            2 => "bf16",
+            3 => "bf16i",
+            _ => "fp32",
+        }
+    }
+
+    /// Whether this context's video VAE attention is the tensor-core F32 kernel
+    /// (`H3_VAE_ATTENTION=tensor`) rather than the reference's scalar one.
+    pub fn vae_attention_mma(&self) -> bool {
+        unsafe { h3d_vae_attention_mma(self.raw.as_ptr()) != 0 }
+    }
+
+    /// Whether that attention walks its CTA order row-major
+    /// (`H3_VAE_SDPA_ORDER=rows`) rather than head-major.
+    pub fn vae_sdpa_rows(&self) -> bool {
+        unsafe { h3d_vae_sdpa_rows(self.raw.as_ptr()) != 0 }
     }
 
     /// Set one video VAE decoder bench option on this context

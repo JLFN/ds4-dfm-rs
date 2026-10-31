@@ -113,6 +113,13 @@ int h3d_set_vae_option(h3d_context *context, const char *name,
  * dtype and the kernel path asks here instead of reading H3_VAE_GEMM again. */
 int h3d_vae_gemm_mode(const h3d_context *context);
 
+/* The decoder's attention and CTA order in effect on this context: 1 for the
+ * tensor-core F32 attention (`tensor`) and the row-major CTA order (`rows`), 0
+ * for the reference's `scalar` and `heads`. A product log has to be able to
+ * state the arm it ran, and these two are not derivable from the timing. */
+int h3d_vae_attention_mma(const h3d_context *context);
+int h3d_vae_sdpa_rows(const h3d_context *context);
+
 h3d_tensor *h3d_alloc(h3d_context *context, int dtype, size_t elements,
                       char *error, size_t error_size);
 void h3d_free(h3d_tensor *tensor);

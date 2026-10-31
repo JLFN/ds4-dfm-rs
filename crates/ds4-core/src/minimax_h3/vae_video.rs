@@ -25,9 +25,9 @@
 //!   it (`run_decoder`, `:458-531`); the port keeps all 36 blocks resident
 //!   (`load_resident_weights`, `:518-531`), which the chunked path needs
 //!   anyway. The arithmetic per row is unchanged and the E8 gate is bit-exact.
-//! - `H3_VAE_TILE_PIXELS` (`:666-690`) is not read; the default search that
-//!   the reference uses when the variable is absent is. Every released shape
-//!   picks the reference's tile size.
+//! - `H3_VAE_TILE_PIXELS` (`:666-690`) is read, with the reference's own
+//!   bounds (256..=512, a multiple of 16); when it is absent the default
+//!   search runs. Every released shape picks the reference's tile size.
 //!
 //! A third is a schedule change with no value change: the four block linears
 //! are called without their bias and the bias is added on load by their
@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
 
+use super::dit::{VaeAttention, VaeGemm};
 use super::vae_store::{Store, f1, f2, f2_bf16};
 
 pub const LATENT_CHANNELS: usize = 24;
@@ -70,6 +71,10 @@ const ROPE_HALF: u32 = 24;
 const OUTPUT_PATCH: usize = 3 * 4 * 16 * 16;
 const SPATIAL_RATIO: usize = 16;
 const TILE_PIXELS: usize = 256;
+/// The override's ceiling (`:671`): `H3_VAE_TILE_PIXELS` may name 512, which is
+/// the largest tile the release accepts and the only one that fits two frames
+/// of a 512x512 canvas in a single tap.
+const TILE_PIXELS_MAX: usize = 512;
 const TILE_OVERLAP_MIN: usize = 64;
 const EPSILON: f32 = 1e-5;
 /// Pixels per latent edge, both axes.
@@ -169,10 +174,25 @@ fn tile_count_for_extent(extent: usize, tile_pixels: usize) -> usize {
     count
 }
 
-/// `configured_tile_pixels` (`:666-690`): the smallest `tiles * pixels^2`
-/// wins, searching 256..=320 in 16-pixel steps. The reference's environment
-/// override is not read here.
+/// `configured_tile_pixels` (`:666-690`): the reference's own
+/// `H3_VAE_TILE_PIXELS` override first (256..=512, a multiple of 16), then the
+/// smallest `tiles * pixels^2`, searching 256..=320 in 16-pixel steps. The
+/// override is the reference's, not this port's: it is how the release picks a
+/// tile size the search cannot, and the only way to ask for one tile.
 fn configured_tile_pixels(height: usize, width: usize) -> usize {
+    if let Some(value) = std::env::var_os("H3_VAE_TILE_PIXELS") {
+        let text = value.to_string_lossy();
+        if !text.is_empty() {
+            if let Ok(pixels) = text.parse::<usize>() {
+                let allowed = (TILE_PIXELS..=TILE_PIXELS_MAX).contains(&pixels)
+                    && pixels.is_multiple_of(SPATIAL_RATIO);
+                if allowed {
+                    return pixels;
+                }
+            }
+        }
+    }
+
     let mut best = TILE_PIXELS;
     let mut best_score = usize::MAX;
 
@@ -225,6 +245,22 @@ fn tile_axis(extent: usize, tile_pixels: usize) -> Result<TileAxis, VaeError> {
     })
 }
 
+/// The spatial plan `decode` will use for a pixel canvas: the tile edge and
+/// the tile counts. Exposed so a gate can report what it measured instead of
+/// inferring it from the timing line.
+pub fn tile_plan(pixel_h: usize, pixel_w: usize) -> Result<(usize, usize, usize), VaeError> {
+    let pixels = configured_tile_pixels(pixel_h, pixel_w);
+    let y_axis = tile_axis(pixel_h, pixels)?;
+    let x_axis = tile_axis(pixel_w, pixels)?;
+    Ok((pixels, y_axis.count(), x_axis.count()))
+}
+
+/// `(chunks, frames)` for a latent time, without decoding: what the gate's
+/// plan line reports and what a caller sizes its output buffer by.
+pub fn frame_plan(latent_time: usize) -> Result<(usize, usize), VaeError> {
+    chunk_plan(latent_time)
+}
+
 /// `(latent_time - 2) / 5` chunks and `chunks * 17 + 5` frames
 /// (`h3_video_vae.c:1092-1093`); latent time 2 is the two-token path.
 fn chunk_plan(latent_time: usize) -> Result<(usize, usize), VaeError> {
@@ -257,6 +293,51 @@ struct Block {
     w2: Weight,
     w2_b: Tensor,
     scale2: Tensor,
+}
+
+/// The arms a decode was asked to run.
+///
+/// `None` states nothing and leaves the choice to the context, which read
+/// `H3_VAE_ATTENTION`/`H3_VAE_GEMM` when it was created and otherwise runs the
+/// reference's own path. A host with an explicit value states it. The decoder
+/// creates its own device context, so a request field that is only applied to
+/// the DiT's context never reaches it; this is the path that carries it.
+#[derive(Clone, Copy, Default)]
+pub struct Arms {
+    pub attention: Option<VaeAttention>,
+    pub gemm: Option<VaeGemm>,
+}
+
+impl Arms {
+    /// Both arms stated: what a request that carries its own values means.
+    pub fn stated(attention: VaeAttention, gemm: VaeGemm) -> Arms {
+        Arms {
+            attention: Some(attention),
+            gemm: Some(gemm),
+        }
+    }
+}
+
+fn apply_arms(gpu: &Gpu, arms: Arms) -> Result<(), VaeError> {
+    if let Some(attention) = arms.attention {
+        gpu.set_vae_option(
+            "attention",
+            match attention {
+                VaeAttention::Scalar => "scalar",
+                VaeAttention::Tensor => "tensor",
+            },
+        )?;
+    }
+    if let Some(gemm) = arms.gemm {
+        gpu.set_vae_option(
+            "gemm",
+            match gemm {
+                VaeGemm::Fp32 => "fp32",
+                VaeGemm::Reduced => "bf16",
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// A block projection's weight: the reference's F32, or the BF16 copy the arm
@@ -440,17 +521,21 @@ fn prepare_input_rows(
 
 impl Decoder {
     /// Load the whole decoder for one tile shape and build its RoPE tables.
+    /// `arms` is applied before the weights are read: the BF16 arm's weights
+    /// are narrowed as they load, so the choice cannot come later.
     pub fn load(
         directory: &Path,
         latent_height: usize,
         latent_width: usize,
         mean: Vec<f32>,
         deviation: Vec<f32>,
+        arms: Arms,
     ) -> Result<Decoder, VaeError> {
         if latent_height < 1 || latent_width < 1 {
             return fail("invalid video VAE latent shape");
         }
         let gpu = device(Gpu::create())?;
+        apply_arms(&gpu, arms)?;
         let store = Store::open(directory, "video VAE")?;
         let arithmetic = Arithmetic::of(&gpu);
 
@@ -1170,6 +1255,7 @@ impl PreviewDecoder {
         weight_directory: &Path,
         latent_h: usize,
         latent_w: usize,
+        arms: Arms,
     ) -> Result<PreviewDecoder, VaeError> {
         if latent_h < 1 || latent_w < 1 {
             return fail("invalid video VAE latent shape");
@@ -1186,6 +1272,7 @@ impl PreviewDecoder {
             x_axis.length / SPATIAL_RATIO,
             mean,
             deviation,
+            arms,
         )?;
 
         Ok(PreviewDecoder {
@@ -1249,6 +1336,7 @@ pub fn decode(
     latent_time: usize,
     latent_h: usize,
     latent_w: usize,
+    arms: Arms,
 ) -> Result<Frames, VaeError> {
     let (chunks, output_frames) = chunk_plan(latent_time)?;
     if latent_h < 1 || latent_w < 1 {
@@ -1277,7 +1365,37 @@ pub fn decode(
         x_axis.length / SPATIAL_RATIO,
         mean,
         deviation,
+        arms,
     )?;
+
+    // The line a product log needs to be reproducible: the plan the reference's
+    // own rules produced and the three arms the context parsed. A timing without
+    // it cannot say which computation it measured (the F32 route and the
+    // campaign's bf16 arm differ six-fold at 1344x768).
+    eprintln!(
+        "VAE latent={}x{}x{} canvas={}x{} tile={} tiles={}x{} chunks={} frames={} gemm={} attention={} order={}",
+        latent_time,
+        latent_h,
+        latent_w,
+        pixel_w,
+        pixel_h,
+        tile_pixels,
+        x_axis.count(),
+        y_axis.count(),
+        chunks,
+        output_frames,
+        decoder.gpu.vae_gemm_name(),
+        if decoder.gpu.vae_attention_mma() {
+            "tensor"
+        } else {
+            "scalar"
+        },
+        if decoder.gpu.vae_sdpa_rows() {
+            "rows"
+        } else {
+            "heads"
+        }
+    );
 
     // One activation set for every tile of every chunk (`:1089`).
     let scratch = TileScratch::new(&decoder.gpu, decoder.patches, decoder.sequence)?;

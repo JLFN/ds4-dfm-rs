@@ -853,10 +853,13 @@ pub struct LoadOptions {
     /// Attention path; the tensor-core kernel unless `Scalar` is asked for.
     pub attention: Attention,
     /// The video decoder's attention kernel, set on the same context as
-    /// [`LoadOptions::attention`] and independent of it.
-    pub vae_attention: VaeAttention,
-    /// The video decoder's GEMM mode, likewise.
-    pub vae_gemm: VaeGemm,
+    /// [`LoadOptions::attention`] and independent of it. `None` states nothing:
+    /// the context keeps what the environment gave it at creation, which is the
+    /// reference's scalar kernel when `H3_VAE_ATTENTION` is unset.
+    pub vae_attention: Option<VaeAttention>,
+    /// The video decoder's GEMM mode, likewise. `None` leaves the reference's
+    /// F32 route.
+    pub vae_gemm: Option<VaeGemm>,
 }
 
 impl LoadOptions {
@@ -868,8 +871,8 @@ impl LoadOptions {
             reduction: Reduction::Environment,
             core_reuse: 1,
             attention: Attention::Tensor,
-            vae_attention: VaeAttention::Scalar,
-            vae_gemm: VaeGemm::Fp32,
+            vae_attention: None,
+            vae_gemm: None,
         }
     }
 }
@@ -1813,23 +1816,29 @@ impl Dit {
         gpu.set_attention(matches!(options.attention, Attention::Scalar));
         // The decoder's two switches, in the native side's own words. A value it
         // does not know is a bug in this mapping rather than user input: every
-        // string here is one of the three the header documents.
-        gpu.set_vae_option(
-            "attention",
-            match options.vae_attention {
-                VaeAttention::Scalar => "scalar",
-                VaeAttention::Tensor => "tensor",
-            },
-        )
-        .map_err(DitError::Gpu)?;
-        gpu.set_vae_option(
-            "gemm",
-            match options.vae_gemm {
-                VaeGemm::Fp32 => "fp32",
-                VaeGemm::Reduced => "bf16",
-            },
-        )
-        .map_err(DitError::Gpu)?;
+        // string here is one of the three the header documents. `None` is not a
+        // default: it leaves the context with what it read from the environment
+        // (the same words) when it was created.
+        if let Some(attention) = options.vae_attention {
+            gpu.set_vae_option(
+                "attention",
+                match attention {
+                    VaeAttention::Scalar => "scalar",
+                    VaeAttention::Tensor => "tensor",
+                },
+            )
+            .map_err(DitError::Gpu)?;
+        }
+        if let Some(gemm) = options.vae_gemm {
+            gpu.set_vae_option(
+                "gemm",
+                match gemm {
+                    VaeGemm::Fp32 => "fp32",
+                    VaeGemm::Reduced => "bf16",
+                },
+            )
+            .map_err(DitError::Gpu)?;
+        }
 
         let geometry = Geometry::check(&config, &sequence, text.tokens())?;
         let hidden_width = config.hidden as u32;

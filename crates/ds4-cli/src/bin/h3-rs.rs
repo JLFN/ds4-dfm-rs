@@ -81,11 +81,13 @@ struct Options {
     attention: Attention,
     /// `--vae-attention`: the video decoder's own kernel, with the opposite
     /// default. `scalar` is the reference path and portable; `tensor` is faster
-    /// and not portable across architectures.
-    vae_attention: VaeAttention,
+    /// and not portable across architectures. Absent, the decoder keeps what
+    /// `H3_VAE_ATTENTION` said when it was created, else the reference path.
+    vae_attention: Option<VaeAttention>,
     /// `--vae-gemm`: `fp32` is the reference rounding, `bf16` the one
-    /// tensor-core computation four orders below the value scale.
-    vae_gemm: VaeGemm,
+    /// tensor-core computation four orders below the value scale. Absent,
+    /// the same rule: the environment's word, else the reference.
+    vae_gemm: Option<VaeGemm>,
     /// `--text-nvfp4`: the reference's NVFP4-AWQ prompt encoder. Absent means
     /// the released BF16 shards under `-d`.
     text_encoder: text_forward::Encoder,
@@ -110,6 +112,16 @@ struct Options {
     zoom: u16,
     info: bool,
     hash: bool,
+}
+
+/// The video decoder's arms as this run states them: a flag when it was given,
+/// otherwise nothing, which leaves the decoder with the environment's word and
+/// then the reference's own path.
+fn vae_arms(options: &Options) -> vae_video::Arms {
+    vae_video::Arms {
+        attention: options.vae_attention,
+        gemm: options.vae_gemm,
+    }
 }
 
 fn main() -> ExitCode {
@@ -397,6 +409,10 @@ fn run() -> Result<ExitCode, String> {
         shape.video_t as usize,
         latent_h as usize,
         latent_w as usize,
+        // The decoder builds its own device context, so the arms have to
+        // travel with the call; setting them on the DiT's context leaves the
+        // decoder on the environment's word.
+        vae_arms(&options),
     )
     .map_err(|error| error.to_string())?;
     println!(
@@ -517,8 +533,9 @@ impl Preview {
             })?;
         }
 
-        let decoder = vae_video::PreviewDecoder::load(&vae, latent_h as usize, latent_w as usize)
-            .map_err(|error| error.to_string())?;
+        let decoder =
+            vae_video::PreviewDecoder::load(&vae, latent_h as usize, latent_w as usize, vae_arms(options))
+                .map_err(|error| error.to_string())?;
 
         Ok(Some(Preview {
             decoder,
@@ -863,8 +880,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         token_reduction: false,
         core_reuse: 1,
         attention: Attention::Tensor,
-        vae_attention: VaeAttention::Scalar,
-        vae_gemm: VaeGemm::Fp32,
+        vae_attention: None,
+        vae_gemm: None,
         text_encoder: text_forward::Encoder::Bf16,
         frames_dir: None,
         latent_out: None,
@@ -983,7 +1000,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                 }
             }
             "--vae-attention" => {
-                options.vae_attention = match value(&mut argv, &flag)?.as_str() {
+                options.vae_attention = Some(match value(&mut argv, &flag)?.as_str() {
                     "scalar" => VaeAttention::Scalar,
                     "tensor" => VaeAttention::Tensor,
                     other => {
@@ -991,14 +1008,14 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                             "--vae-attention must be scalar or tensor, not {other}"
                         ))
                     }
-                }
+                })
             }
             "--vae-gemm" => {
-                options.vae_gemm = match value(&mut argv, &flag)?.as_str() {
+                options.vae_gemm = Some(match value(&mut argv, &flag)?.as_str() {
                     "fp32" => VaeGemm::Fp32,
                     "bf16" => VaeGemm::Reduced,
                     other => return Err(format!("--vae-gemm must be fp32 or bf16, not {other}")),
-                }
+                })
             }
             "--text-nvfp4" => {
                 options.text_encoder =
@@ -1116,11 +1133,12 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
   --token-reduction         pair video tokens in middle DiT blocks
   --attention tensor|scalar attention kernel; tensor is the default, scalar
                             is byte-exact and slower
-  --vae-attention scalar|tensor  decoder attention kernel; scalar is the
-                            reference path and the default, tensor is faster
-                            and not portable across architectures
-  --vae-gemm fp32|bf16      decoder GEMM; fp32 is the reference rounding, bf16
-                            is one tensor-core computation below its scale
+  --vae-attention scalar|tensor  decoder attention kernel; unset keeps
+                            H3_VAE_ATTENTION's word, else the reference's scalar
+                            path; tensor is faster, not portable
+  --vae-gemm fp32|bf16      decoder GEMM; unset keeps H3_VAE_GEMM's word, else
+                            the reference's fp32 rounding; bf16 is one
+                            tensor-core computation below its scale
                             (window from H3_TOKEN_REDUCTION_* env)
   --text-nvfp4 PATH         encode the prompt with the reference's NVFP4-AWQ
                             artifact instead of the BF16 shards; the same

@@ -368,6 +368,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 temporal.video_t as usize,
                 latent_h as usize,
                 latent_w as usize,
+                vae_video::Arms::default(),
             )
             .map_err(|error| error.to_string())?;
             let frame_seconds = started.elapsed().as_secs_f64();

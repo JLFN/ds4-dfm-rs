@@ -317,8 +317,8 @@ impl Engine {
                 canvas.rope_scale(false),
                 LoadOptions {
                     attention: request.attention,
-                    vae_attention: request.vae_attention,
-                    vae_gemm: request.vae_gemm,
+                    vae_attention: Some(request.vae_attention),
+                    vae_gemm: Some(request.vae_gemm),
                     ..LoadOptions::resident()
                 },
             )
@@ -385,6 +385,10 @@ impl Engine {
             shape.video_t as usize,
             latent_h as usize,
             latent_w as usize,
+            // The decoder builds its own device context, so the request's arms
+            // have to travel with the call: setting them on the DiT's context
+            // leaves the decoder on the environment's default.
+            vae_video::Arms::stated(request.vae_attention, request.vae_gemm),
         )
         .map_err(|error| EngineError::new(format!("video VAE: {error}")))?;
         let video_seconds = video_started.elapsed().as_secs_f64();
