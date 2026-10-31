@@ -61,8 +61,8 @@ uses it. What it does is bound how much that stage can ever give us.
 ## 3. What we do not have, in order of measured size
 
 1. The Sol-Engine stack around the kernel. The paper's 5.08x on HunyuanVideo is
-   kernel fusion 1.21x, then diffusion step cache 2.59-2.64x, then Sol-Attn
-   (section 4.4, Figure 7). We run neither of the first two. The port does carry
+   kernel fusion 1.11-1.21x, then diffusion step cache 2.59-2.64x, then
+   Sol-Attn (section 4.4, Figure 7). We run neither of the first two. The port does carry
    the release engine's own step cache as `--core-reuse` (1 exact, 4 fast, 6
    aggressive; `crates/ds4-cli/src/bin/h3-rs.rs:1128`), and every render so far
    ran it at 1. The direct route spends 502.9 s of its 630.3 s in denoise, so
@@ -73,7 +73,7 @@ uses it. What it does is bound how much that stage can ever give us.
    Algorithm 1, Figure 4). Ours is five launches: pool, statistics, threshold,
    route, forward, with a bitmask in HBM between the last two. Measured at
    18,432 x 56 x 128 on the Spark: pool 2.493 ms, statistics 0.008, threshold
-   1.323, route 0.852, total 4.676 ms against 173.163 ms of dense attention
+   1.323, route 0.852, total 4.924 ms against 173.163 ms of dense attention
    (`9b2bdc48`); at 768x768x107 the routing passes are 407 ms of a 7,977 ms
    evaluation, 5.1%. The paper's own end-to-end comparison puts the separate
    routing stage at 6.2% of a cuDNN BSA run (Figure 10). Worth low single
