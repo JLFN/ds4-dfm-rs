@@ -86,3 +86,57 @@ none. It needs one profile of a single step before anyone promises 56 s here.
 3. Make the stage-2 sigma schedule a runtime value and test a one-step pass
    from a low sigma as the detail pass: the anchor stays, the model supplies
    the texture the direct decode loses.
+
+## 7. The publish bar, checked against our phases
+
+The upstream page (NVlabs/Sana, branch `sol-engine`, the same tree as
+`/data/Sol-h3-Spark`; README, configs, `runtime/*.py` and `infer.py` diff
+identical) publishes 56 s with a share per phase. Reading those shares:
+
+| phase | share | seconds | ours |
+|---|---|---|---|
+| Qwen prompt encode | 3.8 % | 2.13 | 15.35 (NVFP4, loaded in-process) |
+| H3 4-step generation | 35.2 % | 19.77 | 21.40 (VSA 0.9) |
+| 2x upscale + VAE adapter | 2.4 % | 1.35 | 2.83 |
+| LTX 3-step refinement | 44.0 % | 24.71 | 110.37 |
+| LTX VAE decode | 12.5 % | 7.02 | 15.34 |
+| MP4 + audio mux | 1.3 % | 0.73 | 0.86 |
+| request overhead | 0.9 % | 0.51 | 35.14 + ~42 (model loads) |
+
+Stage 1 is at parity (1.08x). The refinement bar is not: three passes of the
+22B BF16 transformer is 3 x 34.6 GiB = 104 GiB, and 24.71 s for that is
+4.5 TB/s against this host's measured 241-246 GB/s (`docs/gb10-hardware.md`).
+Either their stage 2 runs different weights or the bar is not this artifact
+on this part. No 56 s promise is honest until one `nsys` profile of a single
+refinement step says whether the step is kernel-bound or stream-bound.
+
+## 8. The anchored pass, measured
+
+One 4-step draft, `--sigmas` swept, no `--sol` (the taus belong to the
+release's intervals). Frame at 2.0 s; sharpness is Laplacian variance,
+faithfulness is SSIM against the transfer-only decode of the same latent.
+
+| route | lapvar | SSIM |
+|---|---|---|
+| transfer only | 2.82 | 1.000 |
+| one step from 0.3 | 3.04 | 0.940 |
+| one step from 0.45 | 3.30 | 0.923 |
+| two steps from 0.6 -> 0.3 -> 0 | 3.67 | 0.893 |
+| release, three from 0.909375 | 5.54 | 0.777 |
+
+Content follows the start sigma exactly as `noised_state` says it must: at
+0.3 the fox survives, at 0.909375 it is redrawn. Detail follows the same
+knob, so the refiner cannot be both faithful and sharp: there is no sigma
+that keeps the animal and restores texture. A denser pass also costs more
+than the release's: one dense step measured 127.7 s against 36.8 s per
+Sol step.
+
+The detail for a faithful upscale therefore has to come from the upscaler
+or from a better draft, and both are measurable:
+- a 20-step draft lifts the draft's lapvar from 25.31 to 35.93 and the
+  transfer decode from 3.82 to 4.63 (same-frame controls: bicubic 2.71 and
+  3.65), so the chain tracks the draft's quality;
+- the transfer decode beats a bicubic resize by 1.27-1.41x on those frames,
+  which is the upscaler's whole contribution as measured so far. Isolating
+  it needs the upscaled H3 latent decoded by the H3 VAE against a
+  bicubic-upscaled draft decoded the same way.
