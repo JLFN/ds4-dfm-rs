@@ -28,6 +28,9 @@ pub mod condition;
 pub mod device;
 pub mod dit;
 pub mod engine;
+/// The device types the H3 modules' public APIs name. Re-exported so a host
+/// binary depends on ds4-core rather than the raw FFI crate.
+pub use ds4_sys::h3_dit;
 pub mod gemma;
 pub mod gemma_connector;
 pub mod gemma_token;

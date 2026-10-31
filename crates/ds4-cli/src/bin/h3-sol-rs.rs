@@ -1,0 +1,433 @@
+//! The latent path's single command: a stage-1 draft, the x2 upscaler and the
+//! H3-to-LTX adapter, three stage-2 steps, the LTX VAE, and the mux.
+//!
+//! Inputs are the two files `h3-rs` writes beside a stage-1 render:
+//! `--save-latent` (raw BF16 `[channel][time][height][width]`, 24 channels,
+//! before any VAE touches it) and `--save-audio` (raw little-endian F32,
+//! interleaved). The route is the reference's (`runtime/stage2.py:58-76`,
+//! `refiner_encoder_ablation_single_gpu.py:691-721`):
+//!
+//! ```text
+//! draft latent -> upscaler (x2) -> adapter (align, 22 blocks, 2x shuffle)
+//!   -> crop to 16 latent frames -> 3 Euler steps over SIGMAS -> LTX VAE
+//!   -> frames -> mux with the stage-1 soundtrack
+//! ```
+//!
+//! Every stage is the ported module the gates exercise; this binary only
+//! composes them and checks each handoff's shape, so a mismatch fails loudly
+//! instead of decoding something the reference never produced.
+//!
+//! Usage:
+//!   h3-sol-rs --latent DRAFT --audio PCM --rate N --channels N
+//!     --upscaler FILE --adapter DIR --refiner FILE --vae FILE --context FILE
+//!     [--lora FILE] [--frames 124] [--draft-width 672] [--draft-height 384]
+//!     [--seed N] [--sol] [-o OUT.mp4]
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use ds4_core::minimax_h3::ltx_adapter::{self, Adapter, Arm, Upscaler};
+use ds4_core::minimax_h3::ltx_refiner::{Geometry as RefinerGeometry, Lora, LAYERS};
+use ds4_core::minimax_h3::ltx_stage2::{Stage2, STEPS};
+use ds4_core::minimax_h3::ltx_vae::{pixel_shape, release_latent, LtxVae, RELEASE_LATENT};
+use ds4_core::minimax_h3::prompt_cache::{self, FIXED_PROMPT};
+use ds4_core::minimax_h3::render::{mux_mp4, RgbFrames};
+use ds4_core::minimax_h3::torch_file::TorchDtype;
+use ds4_core::minimax_h3::vision::bf16_to_f32;
+use ds4_core::minimax_h3::h3_dit::{Dtype, Gpu, Tensor};
+
+/// The release's stage-1 draft: 672x384 at 124 frames (`stage2.py`'s input).
+const DEFAULT_FRAMES: usize = 124;
+const DEFAULT_DRAFT_HEIGHT: usize = 384;
+const DEFAULT_DRAFT_WIDTH: usize = 672;
+const DEFAULT_SEED: u64 = 42;
+const DEFAULT_OUTPUT: &str = "outputs/h3-sol.mp4";
+
+/// The refiner's text context: the cached prompt's own shape
+/// (`prompt_cache.py`; `CONTEXT_ROWS` in `ltx_refiner`).
+const CONTEXT_ROWS: usize = 1024;
+const CONTEXT_WIDTH: usize = 4096;
+
+struct Options {
+    latent: PathBuf,
+    audio: PathBuf,
+    rate: i32,
+    channels: i32,
+    upscaler: PathBuf,
+    adapter: PathBuf,
+    refiner: PathBuf,
+    vae: PathBuf,
+    context: PathBuf,
+    lora: Option<PathBuf>,
+    frames: usize,
+    draft_width: usize,
+    draft_height: usize,
+    seed: u64,
+    sol: bool,
+    output: PathBuf,
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(detail) => {
+            eprintln!("h3-sol-rs: {detail}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run() -> Result<ExitCode, String> {
+    let Some(options) = parse(std::env::args().skip(1).collect())? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    // The draft's geometry is the reference's: the upscaler doubles the
+    // canvas, the adapter takes the doubled one, and the crop to 16 latent
+    // frames is what the refiner was built for.
+    let geometry = ltx_adapter::geometry(options.frames, options.draft_height, options.draft_width)
+        .map_err(|error| error.to_string())?;
+    let [channels, time, height, width] = geometry.upscaler_input;
+    println!(
+        "DRAFT frames={} canvas={}x{} latent={}x{}x{} upscaled={:?} ltx={:?}",
+        options.frames,
+        geometry.draft_width,
+        geometry.draft_height,
+        channels,
+        time,
+        height * width,
+        geometry.h3,
+        geometry.ltx
+    );
+
+    let started = Instant::now();
+    let latent = std::fs::read(&options.latent)
+        .map_err(|error| format!("{}: {error}", options.latent.display()))?;
+    let expected = geometry.upscaler_input_elements() * 2;
+
+    if latent.len() != expected {
+        return Err(format!(
+            "{} holds {} bytes, a {}x{}x{} draft needs {expected}",
+            options.latent.display(),
+            latent.len(),
+            channels,
+            time,
+            height * width
+        ));
+    }
+
+    let gpu = Gpu::create().map_err(|detail| format!("device: {detail}"))?;
+    let draft = upload_bf16(&gpu, &latent)?;
+    println!("LOAD draft_bytes={} seconds={:.3}", latent.len(), started.elapsed().as_secs_f64());
+
+    // The latent path's two models, in the reference's order. Both are freed
+    // before the refiner allocates: this host shares one memory pool.
+    let started = Instant::now();
+    let upscaler = Upscaler::load(&options.upscaler, Arm::Bf16, &geometry)
+        .map_err(|error| error.to_string())?;
+    let upscaled = upscaler.forward(&draft).map_err(|error| error.to_string())?;
+    let adapter = Adapter::load(&options.adapter, Arm::Bf16, &geometry)
+        .map_err(|error| error.to_string())?;
+    let converted = adapter.convert(&upscaled).map_err(|error| error.to_string())?;
+    gpu.sync().map_err(|detail| format!("sync: {detail}"))?;
+
+    let mut bytes = vec![0u8; converted.bytes()];
+    gpu.read(&converted, &mut bytes)
+        .map_err(|detail| format!("latent readback: {detail}"))?;
+    let cropped = crop_frames(&bytes, &geometry);
+    println!(
+        "LATENT-PATH upscaled={:?} converted={:?} refiner_input={} bytes seconds={:.3}",
+        geometry.h3,
+        geometry.ltx,
+        cropped.len(),
+        started.elapsed().as_secs_f64()
+    );
+
+    drop(upscaled);
+    drop(converted);
+    drop(adapter);
+    drop(upscaler);
+    drop(draft);
+
+    // The cached stage-2 prompt: Gemma4 plus the connector, built offline.
+    let cache = prompt_cache::load(&options.context, FIXED_PROMPT)
+        .map_err(|error| format!("context: {error}"))?;
+
+    // `cache_builder.py:129-150` stores each context as `[1, rows, inner]`;
+    // the refiner reads it as `rows` x `inner`, so only the element count and
+    // the dtype matter here.
+    if cache.video.dtype != TorchDtype::BFloat16
+        || cache.video.shape != [1, CONTEXT_ROWS as u64, CONTEXT_WIDTH as u64]
+    {
+        return Err(format!(
+            "context video is {:?} {:?}, expected BF16 [1, {CONTEXT_ROWS}, {CONTEXT_WIDTH}]",
+            cache.video.dtype, cache.video.shape
+        ));
+    }
+
+    let context = upload_bf16(&gpu, &cache.video.bytes)?;
+    let lora = match &options.lora {
+        Some(path) => Some(Lora::open(path, 1.0).map_err(|error| error.token())?),
+        None => None,
+    };
+
+    // The refiner's own geometry is the release's, not the draft's: 16 latent
+    // frames of 24x42.
+    let refiner_geometry = RefinerGeometry::release();
+    let layers: Vec<usize> = (0..LAYERS).collect();
+    let mut stage = Stage2::open(
+        &gpu,
+        &options.refiner,
+        &options.refiner,
+        refiner_geometry,
+        &layers,
+        lora.as_ref(),
+    )
+    .map_err(|error| error.token())?;
+
+    if options.sol {
+        stage.enable_sol(&gpu).map_err(|error| error.token())?;
+    }
+
+    stage.seed(options.seed);
+
+    let initial = upload_bf16(&gpu, &cropped)?;
+    let started = Instant::now();
+    stage
+        .noised_state(&gpu, &initial)
+        .map_err(|error| error.token())?;
+    println!("STAGE2 prepare={:.3}", started.elapsed().as_secs_f64());
+
+    let started = Instant::now();
+
+    for index in 0..STEPS {
+        let step_started = Instant::now();
+        stage
+            .step(&gpu, index, &context)
+            .map_err(|error| error.token())?;
+        println!(
+            "STAGE2 step={index} seconds={:.3}",
+            step_started.elapsed().as_secs_f64()
+        );
+    }
+
+    let grid = stage.latent_grid(&gpu).map_err(|error| error.token())?;
+    println!("STAGE2 denoise_seconds={:.3}", started.elapsed().as_secs_f64());
+
+    // The refiner's grid is exactly the VAE's own input: BF16
+    // `[channel][frame][height][width]` (`ltx_vae::decode`'s contract).
+    let shape = release_latent();
+    let started = Instant::now();
+    let vae = LtxVae::open(&gpu, &options.vae, shape).map_err(|error| error.to_string())?;
+    let rgb = vae.decode(&gpu, grid, shape).map_err(|error| error.to_string())?;
+    gpu.sync().map_err(|detail| format!("sync: {detail}"))?;
+    println!("LTX-VAE decode_seconds={:.3}", started.elapsed().as_secs_f64());
+
+    let pixel = pixel_shape(RELEASE_LATENT);
+    let values = read_bf16(&gpu, rgb)?;
+    let frames = RgbFrames::from_f32(
+        &values,
+        pixel[0] as i32,
+        pixel[2] as i32,
+        pixel[1] as i32,
+    )?;
+    println!(
+        "FRAMES frames={} height={} width={}",
+        frames.frames(),
+        frames.height(),
+        frames.width()
+    );
+
+    drop(vae);
+    drop(stage);
+
+    let pcm = read_pcm(&options.audio)?;
+    let samples = i32::try_from(pcm.len() / options.channels as usize)
+        .map_err(|_| "audio is longer than the muxer takes".to_string())?;
+    let program = std::env::var_os("H3_FFMPEG")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let started = Instant::now();
+    mux_mp4(
+        &program,
+        &options.output,
+        &frames,
+        &pcm,
+        samples,
+        options.channels,
+        options.rate,
+    )?;
+    println!(
+        "VIDEO path={} seconds={:.3}",
+        options.output.display(),
+        started.elapsed().as_secs_f64()
+    );
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The reference's `latent[:, :, :16]` (`runtime/stage2.py:76`): the first 16
+/// frames of each channel's own run, not a prefix of the buffer.
+fn crop_frames(bytes: &[u8], geometry: &ltx_adapter::Geometry) -> Vec<u8> {
+    let [channels, frames, height, width] = geometry.ltx;
+    let keep = RELEASE_LATENT[0] as usize;
+    let plane = height * width;
+    let mut out = Vec::with_capacity(channels * keep * plane * 2);
+
+    for channel in 0..channels {
+        let start = channel * frames * plane * 2;
+        out.extend_from_slice(&bytes[start..start + keep * plane * 2]);
+    }
+
+    out
+}
+
+fn upload_bf16(gpu: &Gpu, bytes: &[u8]) -> Result<Tensor, String> {
+    let tensor = gpu
+        .alloc(Dtype::Bf16, bytes.len() / 2)
+        .map_err(|detail| format!("alloc: {detail}"))?;
+    gpu.upload(&tensor, bytes)
+        .map_err(|detail| format!("upload: {detail}"))?;
+
+    Ok(tensor)
+}
+
+fn read_bf16(gpu: &Gpu, tensor: &Tensor) -> Result<Vec<f32>, String> {
+    let mut bytes = vec![0u8; tensor.bytes()];
+    gpu.read(tensor, &mut bytes)
+        .map_err(|detail| format!("readback: {detail}"))?;
+
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|pair| bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+        .collect())
+}
+
+fn read_pcm(path: &Path) -> Result<Vec<f32>, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+
+    if bytes.len() % 4 != 0 {
+        return Err(format!("{} is not whole F32 samples", path.display()));
+    }
+
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|sample| f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]))
+        .collect())
+}
+
+fn parse(arguments: Vec<String>) -> Result<Option<Options>, String> {
+    let mut options = Options {
+        latent: PathBuf::new(),
+        audio: PathBuf::new(),
+        rate: 32_000,
+        channels: 2,
+        upscaler: PathBuf::new(),
+        adapter: PathBuf::new(),
+        refiner: PathBuf::new(),
+        vae: PathBuf::new(),
+        context: PathBuf::new(),
+        lora: None,
+        frames: DEFAULT_FRAMES,
+        draft_width: DEFAULT_DRAFT_WIDTH,
+        draft_height: DEFAULT_DRAFT_HEIGHT,
+        seed: DEFAULT_SEED,
+        sol: false,
+        output: PathBuf::from(DEFAULT_OUTPUT),
+    };
+    let mut argv = arguments.into_iter();
+
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--help" | "-h" => {
+                print!("{}", usage());
+                return Ok(None);
+            }
+            "--latent" => options.latent = PathBuf::from(value(&mut argv, &flag)?),
+            "--audio" => options.audio = PathBuf::from(value(&mut argv, &flag)?),
+            "--rate" => options.rate = integer(&mut argv, &flag)?,
+            "--channels" => options.channels = integer(&mut argv, &flag)?,
+            "--upscaler" => options.upscaler = PathBuf::from(value(&mut argv, &flag)?),
+            "--adapter" => options.adapter = PathBuf::from(value(&mut argv, &flag)?),
+            "--refiner" => options.refiner = PathBuf::from(value(&mut argv, &flag)?),
+            "--vae" => options.vae = PathBuf::from(value(&mut argv, &flag)?),
+            "--context" => options.context = PathBuf::from(value(&mut argv, &flag)?),
+            "--lora" => options.lora = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--frames" => options.frames = unsigned(&mut argv, &flag)? as usize,
+            "--draft-width" => options.draft_width = unsigned(&mut argv, &flag)? as usize,
+            "--draft-height" => options.draft_height = unsigned(&mut argv, &flag)? as usize,
+            "--seed" => options.seed = unsigned(&mut argv, &flag)?,
+            "--sol" => options.sol = true,
+            "-o" | "--output" => options.output = PathBuf::from(value(&mut argv, &flag)?),
+            other => return Err(format!("unknown flag {other}; see --help")),
+        }
+    }
+
+    let missing: Vec<&str> = [
+        ("--latent", &options.latent),
+        ("--audio", &options.audio),
+        ("--upscaler", &options.upscaler),
+        ("--adapter", &options.adapter),
+        ("--refiner", &options.refiner),
+        ("--vae", &options.vae),
+        ("--context", &options.context),
+    ]
+    .iter()
+    .filter(|(_, path)| path.as_os_str().is_empty())
+    .map(|(flag, _)| *flag)
+    .collect();
+
+    if !missing.is_empty() {
+        return Err(format!("missing {}", missing.join(", ")));
+    }
+
+    Ok(Some(options))
+}
+
+fn value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
+    argv.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn integer(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<i32, String> {
+    value(argv, flag)?
+        .parse()
+        .map_err(|_| format!("{flag} is not an integer"))
+}
+
+fn unsigned(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, String> {
+    value(argv, flag)?
+        .parse()
+        .map_err(|_| format!("{flag} is not an unsigned integer"))
+}
+
+fn usage() -> String {
+    "\
+Usage: h3-sol-rs --latent DRAFT --audio PCM --upscaler FILE --adapter DIR \
+--refiner FILE --vae FILE --context FILE -o OUT.mp4 [options]
+
+  --latent PATH             stage-1 latent: raw BF16 [channel][time][height][width]
+  --audio PATH              soundtrack: raw little-endian F32, interleaved
+  --rate N                  soundtrack sample rate (default 32000)
+  --channels N              soundtrack channels (default 2)
+  --upscaler PATH           minimax_h3_latent_upscaler_3d checkpoint
+  --adapter DIR             H3-to-LTX adapter directory
+  --refiner PATH            LTX-2.5 transformer (edges shard is the same file)
+  --vae PATH                LTX video VAE checkpoint
+  --context PATH            cached stage-2 prompt (prompt_cache container)
+  --lora PATH               distilled refiner LoRA, fused as weights are read
+  --frames N                stage-1 pixel frames (default 124)
+  --draft-width N           stage-1 canvas width (default 672)
+  --draft-height N          stage-1 canvas height (default 384)
+  --seed N                  stage-2 noise seed (default 42)
+  --sol                     enable the release's Sol-Attn routing
+  -o, --output PATH         MP4 path (default outputs/h3-sol.mp4)
+  --help                    this text
+
+The draft is the file h3-rs --save-latent writes, at the canvas h3-rs
+--width 672 --height 384 --frames 124 rendered. The audio is h3-rs
+--save-audio. FFmpeg is taken from H3_FFMPEG when set, else from PATH.
+"
+        .to_string()
+}

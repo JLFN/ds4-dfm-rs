@@ -29,6 +29,7 @@ use ds4_core::minimax_h3::render::{check_frames, Canvas, RgbFrames};
 use ds4_core::minimax_h3::sequence::{self, Spec};
 use ds4_core::minimax_h3::text_forward;
 use ds4_core::minimax_h3::tokenizer::{EmptyPrompt, Tokenizer};
+use ds4_core::minimax_h3::vision::f32_to_bf16;
 use ds4_core::minimax_h3::{
     condition, device, media, reference, render, terminal, vae_audio, vae_encoder, vae_video,
 };
@@ -90,6 +91,12 @@ struct Options {
     text_encoder: text_forward::Encoder,
     /// `--frames-dir` (`main.c:57`, `:339`, `:492`): the decoded frames.
     frames_dir: Option<PathBuf>,
+    /// `--save-latent`: the denoised video latent as raw BF16
+    /// `[channel][time][height][width]`, the latent path's own layout.
+    latent_out: Option<PathBuf>,
+    /// `--save-audio`: the decoded soundtrack as raw little-endian F32,
+    /// interleaved, at the printed rate and channel count.
+    audio_out: Option<PathBuf>,
     /// `--preview-dir` (`main.c:58`, `:340`, `:493`).
     preview_dir: Option<PathBuf>,
     /// `--show` (`main.c:59`, `:541-560`).
@@ -315,6 +322,28 @@ fn run() -> Result<ExitCode, String> {
         started.elapsed().as_secs_f64()
     );
 
+    // The latent path's handoff: the denoised state before any VAE touches it.
+    if let Some(path) = &options.latent_out {
+        let started = Instant::now();
+        write_latent(
+            path,
+            &video,
+            shape.video_t as usize,
+            latent_h as usize,
+            latent_w as usize,
+        )?;
+        println!(
+            "LATENT path={} channels={} time={} height={} width={} bytes={} seconds={:.3}",
+            path.display(),
+            vae_video::LATENT_CHANNELS,
+            shape.video_t,
+            latent_h,
+            latent_w,
+            video.len() * 2,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
     // Retire the DiT before the two VAEs are loaded: their weights are
     // allocated in the same unified pool the denoise just used.
     drop(model);
@@ -329,6 +358,19 @@ fn run() -> Result<ExitCode, String> {
         waveform.sample_rate,
         started.elapsed().as_secs_f64()
     );
+
+    // The stage-2 pipeline re-muxes the same soundtrack beside its own video.
+    if let Some(path) = &options.audio_out {
+        write_pcm(path, &waveform.pcm)?;
+        println!(
+            "AUDIO-RAW path={} samples={} channels={} rate={} bytes={}",
+            path.display(),
+            waveform.samples,
+            waveform.channels,
+            waveform.sample_rate,
+            waveform.pcm.len() * 4
+        );
+    }
 
     let started = Instant::now();
     let decoded = vae_video::decode(
@@ -546,6 +588,62 @@ fn write_ppm(
 /// `cli_frame`'s frame branch (`main.c:214-245`): `--frames-dir` gets one
 /// `frame-%04d.ppm` per generated frame, written straight rather than through
 /// a scratch name, as the reference does for final frames.
+/// Raw BF16 `[channel][time][height][width]`: the layout the latent path's
+/// kernels read (channel-major, 24 channels). The only rounding is the BF16
+/// boundary, so the file holds the model's own values.
+fn write_latent(
+    path: &std::path::Path,
+    latent: &[f32],
+    time: usize,
+    height: usize,
+    width: usize,
+) -> Result<(), String> {
+    let expected = vae_video::LATENT_CHANNELS * time * height * width;
+
+    if latent.len() != expected {
+        return Err(format!(
+            "latent has {} values, expected {expected}",
+            latent.len()
+        ));
+    }
+
+    create_parent(path)?;
+    let mut bytes = Vec::with_capacity(latent.len() * 2);
+
+    for value in latent {
+        bytes.extend_from_slice(&f32_to_bf16(*value).to_le_bytes());
+    }
+
+    std::fs::write(path, &bytes)
+        .map_err(|error| format!("cannot write latent to {}: {error}", path.display()))
+}
+
+/// Raw little-endian F32, interleaved: `mux_mp4`'s own sample form.
+fn write_pcm(path: &std::path::Path, pcm: &[f32]) -> Result<(), String> {
+    create_parent(path)?;
+    let mut bytes = Vec::with_capacity(pcm.len() * 4);
+
+    for value in pcm {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    std::fs::write(path, &bytes)
+        .map_err(|error| format!("cannot write audio to {}: {error}", path.display()))
+}
+
+fn create_parent(path: &std::path::Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))
+}
+
 fn write_frames(dir: &std::path::Path, frames: &RgbFrames) -> Result<(), String> {
     use std::io::Write;
 
@@ -751,6 +849,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         vae_gemm: VaeGemm::Fp32,
         text_encoder: text_forward::Encoder::Bf16,
         frames_dir: None,
+        latent_out: None,
+        audio_out: None,
         preview_dir: None,
         show: false,
         zoom: 2,
@@ -839,6 +939,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--ssd-streaming" => options.stream = true,
             "--token-reduction" => options.token_reduction = true,
             "--frames-dir" => options.frames_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--save-latent" => options.latent_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--save-audio" => options.audio_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--preview-dir" => options.preview_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--show" => options.show = true,
             "--zoom" => {
@@ -1005,6 +1107,10 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
                             forward, a smaller read
   --core-reuse N            core refresh: 1 exact, 4 fast, 6 aggressive
   --frames-dir PATH         write one PPM per generated frame
+  --save-latent PATH        write the denoised video latent as raw BF16
+                            [channel][time][height][width]
+  --save-audio PATH         write the soundtrack as raw little-endian F32,
+                            interleaved at the printed rate and channels
   --preview-dir PATH        write one PPM preview per denoising step
   --show                    display a preview frame per step (Kitty/iTerm2)
   --zoom N                  preview zoom for the terminal (default 2)
