@@ -39,6 +39,13 @@ The phase line also states the realized mask: `sparsity=0.900 prefix_blocks=7
 first call: 9753 rows, 56 heads, exact share 0.1830` - 18.3% of blocks computed
 exactly, 81.7% folded from the pooled summaries.
 
+The direct canvas, 20 steps, one run each, BF16 then FP8: phases 630.340 to
+503.3, wall 631.5 to 504.2, denoise 502.929 to 375.663 (25.15 to 18.78 s per
+step), decode 66.630 to 67.312, load 41.068 to 43.482, sharpness 17.54 to
+16.64. Output `outputs/direct-fp8-1344x768.mp4`, 4,862,168 B, sha256
+`99aa188a...`, one fox at 0.5 to 4.5 s. Its mask: 37,725 rows, exact share
+0.1224, so 87.8% of blocks folded at the output canvas.
+
 ## 2. What the paper adds, and what of it we already run
 
 The paper is the method behind the release's stage-2 sparsifier. Its own
