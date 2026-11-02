@@ -868,6 +868,94 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    // The `bf16a` chain's six primitives: the same kernels over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_sdpa_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_rms_norm_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_layer_norm_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_swiglu_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        fused: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_scale_add_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        residual: *const CTensor,
+        branch: *const CTensor,
+        bias: *const CTensor,
+        scale: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_video_qkv_rope_bf16(
+        context: *mut Context,
+        query: *mut CTensor,
+        key: *mut CTensor,
+        value: *mut CTensor,
+        qkv: *const CTensor,
+        bias: *const CTensor,
+        rope_cos: *const CTensor,
+        rope_sin: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        rope_half: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     #[allow(clippy::too_many_arguments)]
     fn h3d_vae_encoder_pad(
         context: *mut Context,
@@ -1542,14 +1630,23 @@ impl Gpu {
     }
 
     /// This context's video VAE GEMM mode by name, as the context parsed it:
-    /// "fp32", "tf32", "bf16" or "bf16i" (`H3D_VAE_GEMM_*`).
+    /// "fp32", "tf32", "bf16", "bf16i" or "bf16a" (`H3D_VAE_GEMM_*`).
     pub fn vae_gemm_name(&self) -> &'static str {
         match unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) } {
             1 => "tf32",
             2 => "bf16",
             3 => "bf16i",
+            4 => "bf16a",
             _ => "fp32",
         }
+    }
+
+    /// Whether this context's video VAE decoder runs the BF16 activation chain,
+    /// which is `H3_VAE_GEMM=bf16a`.
+    pub fn vae_bf16_chain(&self) -> bool {
+        const BF16_CHAIN: c_int = 4; // H3D_VAE_GEMM_BF16_CHAIN
+
+        unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) == BF16_CHAIN }
     }
 
     /// Whether this context's video VAE attention is the tensor-core F32 kernel
@@ -1567,7 +1664,7 @@ impl Gpu {
     /// Set one video VAE decoder bench option on this context
     /// (`h3d_set_vae_option`). The native side owns the names and the accepted
     /// values — "attention" (scalar, tensor), "sdpa_order" (heads, rows),
-    /// "gemm" (fp32, tf32, bf16, bf16i) — and refuses an unknown pair, so a
+    /// "gemm" (fp32, tf32, bf16, bf16i, bf16a) — and refuses an unknown pair, so a
     /// typo is an error rather than a silent default.
     pub fn set_vae_option(&self, name: &str, value: &str) -> Result<(), String> {
         let name = CString::new(name).map_err(|_| "option name has a NUL".to_string())?;
@@ -2922,6 +3019,199 @@ impl Gpu {
                 )
             },
             "video_qkv_rope_f32",
+        )
+    }
+
+    /// The `bf16a` chain's attention: BF16 Q/K/V in and BF16 out, the
+    /// tensor-core kernel only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_bf16(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sdpa_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    head_dim,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "sdpa_bf16",
+        )
+    }
+
+    /// `rms_norm_f32` over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_rms_norm_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    width,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "rms_norm_bf16",
+        )
+    }
+
+    /// `layer_norm_f32` over a BF16 input, still writing F32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_norm_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_layer_norm_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    rows,
+                    width,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "layer_norm_bf16",
+        )
+    }
+
+    /// `swiglu_f32` over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_bf16(
+        &self,
+        output: &Tensor,
+        fused: &Tensor,
+        bias: Option<&Tensor>,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_swiglu_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    fused.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "swiglu_bf16",
+        )
+    }
+
+    /// `scale_add_f32` over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_add_bf16(
+        &self,
+        output: &Tensor,
+        residual: &Tensor,
+        branch: &Tensor,
+        bias: Option<&Tensor>,
+        scale: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_scale_add_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    residual.raw(),
+                    branch.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    scale.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "scale_add_bf16",
+        )
+    }
+
+    /// `video_qkv_rope_f32` over BF16 Q/K/V and a BF16 QKV row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn video_qkv_rope_bf16(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        qkv: &Tensor,
+        bias: Option<&Tensor>,
+        rope_cos: &Tensor,
+        rope_sin: &Tensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        rope_half: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_video_qkv_rope_bf16(
+                    self.raw.as_ptr(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    qkv.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    rope_cos.raw(),
+                    rope_sin.raw(),
+                    sequence,
+                    heads,
+                    head_dim,
+                    rope_half,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "video_qkv_rope_bf16",
         )
     }
 

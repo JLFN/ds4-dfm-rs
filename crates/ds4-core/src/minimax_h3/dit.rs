@@ -856,6 +856,11 @@ pub enum VaeGemm {
     /// (`tests/h3/vae_gemm_bm`); the output is narrowed, so it is a rounding
     /// arm like `Reduced`, not the reference's class.
     Full,
+    /// `Full`'s operands with every block activation in BF16 as well, the
+    /// `bf16a` chain. The narrows and widens that cost `Full` 10.4 s of a 46.2 s
+    /// decode collapse to one pair a tile, and the rounding moves from each
+    /// projection's output to each primitive's store.
+    Chain,
 }
 
 /// How the core runs: residency, active block count and token pairing
@@ -1875,6 +1880,7 @@ impl Dit {
                     VaeGemm::Fp32 => "fp32",
                     VaeGemm::Reduced => "bf16",
                     VaeGemm::Full => "bf16i",
+                    VaeGemm::Chain => "bf16a",
                 },
             )
             .map_err(DitError::Gpu)?;

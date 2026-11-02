@@ -343,6 +343,7 @@ fn apply_arms(gpu: &Gpu, arms: Arms) -> Result<(), VaeError> {
                 VaeGemm::Fp32 => "fp32",
                 VaeGemm::Reduced => "bf16",
                 VaeGemm::Full => "bf16i",
+                VaeGemm::Chain => "bf16a",
             },
         )?;
     }
@@ -357,12 +358,14 @@ enum Weight {
     Bf16(Tensor),
 }
 
-/// The decoder's block arithmetic: the reference's F32 projections, or the
-/// `bf16i` arm's narrow, compute, widen.
+/// The decoder's block arithmetic: the reference's F32 projections, the
+/// `bf16i` arm's narrow, compute, widen, or the `bf16a` chain, which keeps the
+/// block's activations in BF16 so the narrows and widens do not exist.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arithmetic {
     F32,
     Bf16,
+    Bf16Chain,
 }
 
 impl Arithmetic {
@@ -370,11 +373,24 @@ impl Arithmetic {
     /// parsed the variable when it was created, so the host asks it instead of
     /// reading the same variable a second time and risking a different answer.
     fn of(gpu: &Gpu) -> Arithmetic {
-        if gpu.vae_bf16_operands() {
+        if gpu.vae_bf16_chain() {
+            Arithmetic::Bf16Chain
+        } else if gpu.vae_bf16_operands() {
             Arithmetic::Bf16
         } else {
             Arithmetic::F32
         }
+    }
+
+    /// Whether the block's activations live in BF16 rather than F32.
+    fn bf16_buffers(self) -> bool {
+        self == Arithmetic::Bf16Chain
+    }
+
+    /// Whether the block projections take BF16 operands and a BF16 result, in
+    /// either arm: the checkpoint's weights are loaded narrowed either way.
+    fn bf16_weights(self) -> bool {
+        self != Arithmetic::F32
     }
 }
 
@@ -411,6 +427,8 @@ pub struct Decoder {
     rope_sin: Tensor,
     /// Present exactly when the context's `H3_VAE_GEMM` is `bf16i`.
     narrow: Option<Narrow>,
+    /// Which arithmetic the buffers and the primitives use (`H3_VAE_GEMM`).
+    arithmetic: Arithmetic,
     mean: Vec<f32>,
     deviation: Vec<f32>,
 }
@@ -427,7 +445,7 @@ fn load_block(
     // difference between the arms at load: the checkpoint is F32 either way.
     let projection = |suffix: &str, rows: u64, columns: u64| -> Result<Weight, VaeError> {
         let name = name(suffix);
-        Ok(if arithmetic == Arithmetic::Bf16 {
+        Ok(if arithmetic.bf16_weights() {
             Weight::Bf16(f2_bf16(store, gpu, &name, rows, columns)?)
         } else {
             Weight::F32(f2(store, gpu, &name, rows, columns)?)
@@ -547,6 +565,14 @@ impl Decoder {
         apply_arms(&gpu, arms)?;
         let store = Store::open(directory, "video VAE")?;
         let arithmetic = Arithmetic::of(&gpu);
+        // The chain's attention runs on BF16 Q/K/V, which only the tensor-core
+        // kernel serves; refusing here names the combination instead of leaving
+        // the decode to fail inside a launch.
+        if arithmetic.bf16_buffers() && !gpu.vae_attention_mma() {
+            return fail(
+                "the bf16a chain needs the tensor-core attention (H3_VAE_ATTENTION=tensor)",
+            );
+        }
 
         let patches = CHUNK_LATENT_TIME * latent_height * latent_width;
         let sequence = patches + SUFFIX;
@@ -596,6 +622,8 @@ impl Decoder {
         let rope_sin = f32_alloc(&gpu, sequence * ROPE_HALF as usize)?;
         upload_f32(&gpu, &rope_sin, &sines)?;
 
+        // The `bf16i` arm narrows and widens around every projection; the
+        // `bf16a` chain has no such pass to make.
         let narrow = if arithmetic == Arithmetic::Bf16 {
             Some(Narrow {
                 activations: bf16_alloc(&gpu, sequence * FFN)?,
@@ -614,6 +642,7 @@ impl Decoder {
             rope_cos,
             rope_sin,
             narrow,
+            arithmetic,
             mean,
             deviation,
         })
@@ -639,6 +668,13 @@ impl Decoder {
                 device(gpu.vae_linear(output, input, weight, None, rows, input_dim, output_dim))
             }
             Weight::Bf16(weight) => {
+                // The chain's buffers are already BF16, so the projection is
+                // one call and its result is what the next primitive reads.
+                if self.arithmetic == Arithmetic::Bf16Chain {
+                    return device(
+                        gpu.vae_linear_bf16(output, input, weight, rows, input_dim, output_dim),
+                    );
+                }
                 let narrow = self
                     .narrow
                     .as_ref()
@@ -661,6 +697,155 @@ impl Decoder {
     }
 
     /// One block (`run_block`, `:423-456`) in the reference's op order.
+    /// The block's RMS norm over whichever element type its buffers hold.
+    fn rms_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.rms_norm_bf16(output, input, weight, rows, width, EPSILON))
+            }
+            _ => device(gpu.rms_norm_f32(output, input, weight, rows, width, EPSILON)),
+        }
+    }
+
+    /// The Q/K RMS and the pair rotation, over the QKV row's element type.
+    fn qkv_rope(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        qkv: &Tensor,
+        bias: &Tensor,
+        rows: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => device(gpu.video_qkv_rope_bf16(
+                query,
+                key,
+                value,
+                qkv,
+                Some(bias),
+                &self.rope_cos,
+                &self.rope_sin,
+                rows,
+                HEADS,
+                HEAD_DIM,
+                ROPE_HALF,
+                EPSILON,
+            )),
+            _ => device(gpu.video_qkv_rope_f32(
+                query,
+                key,
+                value,
+                qkv,
+                Some(bias),
+                &self.rope_cos,
+                &self.rope_sin,
+                rows,
+                HEADS,
+                HEAD_DIM,
+                ROPE_HALF,
+                EPSILON,
+            )),
+        }
+    }
+
+    /// The block attention: the F32 tensor-core kernel, or its BF16 twin.
+    fn attention(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        rows: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.sdpa_bf16(output, query, key, value, rows, HEADS, HEAD_DIM, scale))
+            }
+            _ => device(gpu.sdpa_f32(output, query, key, value, rows, HEADS, HEAD_DIM, scale)),
+        }
+    }
+
+    /// SwiGLU of the fused row, in the buffers' element type.
+    fn swiglu(
+        &self,
+        output: &Tensor,
+        fused: &Tensor,
+        bias: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.swiglu_bf16(output, fused, Some(bias), rows, width))
+            }
+            _ => device(gpu.swiglu_f32(output, fused, Some(bias), rows, width)),
+        }
+    }
+
+    /// `residual + branch * scale`, writing the residual stream back in place.
+    fn scale_add(
+        &self,
+        hidden: &Tensor,
+        branch: &Tensor,
+        bias: &Tensor,
+        scale: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.scale_add_bf16(hidden, hidden, branch, Some(bias), scale, rows, width))
+            }
+            _ => device(gpu.scale_add_f32(hidden, hidden, branch, Some(bias), scale, rows, width)),
+        }
+    }
+
+    /// The tile's output layer norm: `out` is the F32 buffer the `proj_out`
+    /// GEMM reads, which the chain keeps separately from its BF16 `norm`.
+    fn layer_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => device(gpu.layer_norm_bf16(
+                output,
+                input,
+                &self.parts.norm_out_w,
+                &self.parts.norm_out_b,
+                rows,
+                width,
+                EPSILON,
+            )),
+            _ => device(gpu.layer_norm_f32(
+                output,
+                input,
+                &self.parts.norm_out_w,
+                &self.parts.norm_out_b,
+                rows,
+                width,
+                EPSILON,
+            )),
+        }
+    }
+
     fn run_block(
         &self,
         block: &Block,
@@ -668,16 +853,7 @@ impl Decoder {
         buffers: &Buffers,
         rows: u32,
     ) -> Result<(), VaeError> {
-        let gpu = &self.gpu;
-
-        device(gpu.rms_norm_f32(
-            &buffers.norm,
-            hidden,
-            &block.norm1,
-            rows,
-            HIDDEN as u32,
-            EPSILON,
-        ))?;
+        self.rms_norm(&buffers.norm, hidden, &block.norm1, rows, HIDDEN as u32)?;
         self.project(
             &buffers.qkv,
             &buffers.norm,
@@ -686,30 +862,21 @@ impl Decoder {
             HIDDEN as u32,
             (INNER * 3) as u32,
         )?;
-        device(gpu.video_qkv_rope_f32(
+        self.qkv_rope(
             &buffers.query,
             &buffers.key,
             &buffers.value,
             &buffers.qkv,
-            Some(&block.qkv_b),
-            &self.rope_cos,
-            &self.rope_sin,
+            &block.qkv_b,
             rows,
-            HEADS,
-            HEAD_DIM,
-            ROPE_HALF,
-            EPSILON,
-        ))?;
-        device(gpu.sdpa_f32(
+        )?;
+        self.attention(
             &buffers.heads,
             &buffers.query,
             &buffers.key,
             &buffers.value,
             rows,
-            HEADS,
-            HEAD_DIM,
-            1.0f32 / (HEAD_DIM as f32).sqrt(),
-        ))?;
+        )?;
         self.project(
             &buffers.branch,
             &buffers.heads,
@@ -718,24 +885,16 @@ impl Decoder {
             INNER as u32,
             HIDDEN as u32,
         )?;
-        device(gpu.scale_add_f32(
-            hidden,
+        self.scale_add(
             hidden,
             &buffers.branch,
-            Some(&block.out_b),
+            &block.out_b,
             &block.scale1,
             rows,
             HIDDEN as u32,
-        ))?;
+        )?;
 
-        device(gpu.rms_norm_f32(
-            &buffers.norm,
-            hidden,
-            &block.norm2,
-            rows,
-            HIDDEN as u32,
-            EPSILON,
-        ))?;
+        self.rms_norm(&buffers.norm, hidden, &block.norm2, rows, HIDDEN as u32)?;
         self.project(
             &buffers.ff1,
             &buffers.norm,
@@ -744,13 +903,13 @@ impl Decoder {
             HIDDEN as u32,
             (FFN * 2) as u32,
         )?;
-        device(gpu.swiglu_f32(
+        self.swiglu(
             &buffers.activated,
             &buffers.ff1,
-            Some(&block.w1_b),
+            &block.w1_b,
             rows,
             FFN as u32,
-        ))?;
+        )?;
         self.project(
             &buffers.branch,
             &buffers.activated,
@@ -759,15 +918,14 @@ impl Decoder {
             FFN as u32,
             HIDDEN as u32,
         )?;
-        device(gpu.scale_add_f32(
-            hidden,
+        self.scale_add(
             hidden,
             &buffers.branch,
-            Some(&block.w2_b),
+            &block.w2_b,
             &block.scale2,
             rows,
             HIDDEN as u32,
-        ))?;
+        )?;
         Ok(())
     }
 
@@ -813,38 +971,63 @@ impl Decoder {
             LATENT_CHANNELS as u32,
             HIDDEN as u32,
         ))?;
-        device(gpu.copy_f32(&buffers.hidden, 0, patch_hidden, 0, patches * HIDDEN))?;
-        device(gpu.copy_f32(
-            &buffers.hidden,
-            patches * HIDDEN,
-            &self.parts.registers,
-            0,
-            REGISTERS * HIDDEN,
-        ))?;
-        device(gpu.copy_f32(
-            &buffers.hidden,
-            (patches + REGISTERS) * HIDDEN,
-            zero,
-            0,
-            HIDDEN,
-        ))?;
+        if self.arithmetic.bf16_buffers() {
+            // The chain's one narrow: the tile's F32 embed output becomes the
+            // block's BF16 hidden, and the two constant rows are the copies
+            // `TileScratch` made once for the whole decode.
+            device(gpu.cast_narrow(&buffers.hidden, patch_hidden, patches * HIDDEN))?;
+            let registers = scratch
+                .chain_registers
+                .as_ref()
+                .ok_or_else(|| VaeError("video VAE chain has no register copy".into()))?;
+            let chain_zero = scratch
+                .chain_zero
+                .as_ref()
+                .ok_or_else(|| VaeError("video VAE chain has no zero row".into()))?;
+            device(gpu.copy(
+                &buffers.hidden,
+                patches * HIDDEN,
+                registers,
+                0,
+                REGISTERS * HIDDEN,
+            ))?;
+            device(gpu.copy(
+                &buffers.hidden,
+                (patches + REGISTERS) * HIDDEN,
+                chain_zero,
+                0,
+                HIDDEN,
+            ))?;
+        } else {
+            device(gpu.copy_f32(&buffers.hidden, 0, patch_hidden, 0, patches * HIDDEN))?;
+            device(gpu.copy_f32(
+                &buffers.hidden,
+                patches * HIDDEN,
+                &self.parts.registers,
+                0,
+                REGISTERS * HIDDEN,
+            ))?;
+            device(gpu.copy_f32(
+                &buffers.hidden,
+                (patches + REGISTERS) * HIDDEN,
+                zero,
+                0,
+                HIDDEN,
+            ))?;
+        }
 
         for block in &self.blocks {
             self.run_block(block, &buffers.hidden, buffers, rows)?;
         }
 
-        device(gpu.layer_norm_f32(
-            &buffers.norm,
-            &buffers.hidden,
-            &self.parts.norm_out_w,
-            &self.parts.norm_out_b,
-            rows,
-            HIDDEN as u32,
-            EPSILON,
-        ))?;
+        let norm_out = match &scratch.outer {
+            Some(outer) => outer,
+            None => &buffers.norm,
+        };
+        self.layer_norm(norm_out, &buffers.hidden, rows, HIDDEN as u32)?;
         device(gpu.vae_linear(
             &buffers.projected,
-            &buffers.norm,
+            norm_out,
             &self.parts.proj_w,
             Some(&self.parts.proj_b),
             rows,
@@ -881,18 +1064,29 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn new(gpu: &Gpu, sequence: usize) -> Result<Buffers, VaeError> {
+    /// The block's activations in the arm's element type: F32 for the reference
+    /// and `bf16i` paths, BF16 for the `bf16a` chain, whose primitives read and
+    /// write BF16 and never widen. `projected` stays F32 either way: it is the
+    /// readback the frames are cut from.
+    fn new(gpu: &Gpu, sequence: usize, arithmetic: Arithmetic) -> Result<Buffers, VaeError> {
+        let alloc = |elements: usize| {
+            if arithmetic.bf16_buffers() {
+                bf16_alloc(gpu, elements)
+            } else {
+                f32_alloc(gpu, elements)
+            }
+        };
         Ok(Buffers {
-            hidden: f32_alloc(gpu, sequence * HIDDEN)?,
-            norm: f32_alloc(gpu, sequence * HIDDEN)?,
-            qkv: f32_alloc(gpu, sequence * INNER * 3)?,
-            query: f32_alloc(gpu, sequence * INNER)?,
-            key: f32_alloc(gpu, sequence * INNER)?,
-            value: f32_alloc(gpu, sequence * INNER)?,
-            heads: f32_alloc(gpu, sequence * INNER)?,
-            branch: f32_alloc(gpu, sequence * HIDDEN)?,
-            ff1: f32_alloc(gpu, sequence * FFN * 2)?,
-            activated: f32_alloc(gpu, sequence * FFN)?,
+            hidden: alloc(sequence * HIDDEN)?,
+            norm: alloc(sequence * HIDDEN)?,
+            qkv: alloc(sequence * INNER * 3)?,
+            query: alloc(sequence * INNER)?,
+            key: alloc(sequence * INNER)?,
+            value: alloc(sequence * INNER)?,
+            heads: alloc(sequence * INNER)?,
+            branch: alloc(sequence * HIDDEN)?,
+            ff1: alloc(sequence * FFN * 2)?,
+            activated: alloc(sequence * FFN)?,
             projected: f32_alloc(gpu, sequence * OUTPUT_PATCH)?,
         })
     }
@@ -911,18 +1105,42 @@ struct TileScratch {
     post: Tensor,
     patch_hidden: Tensor,
     zero: Tensor,
+    /// The `bf16a` chain's entry: the tile's F32 embed output, the register
+    /// tokens and the zero suffix row, narrowed once here instead of once a
+    /// projection. `None` on the F32 and `bf16i` paths.
+    chain_registers: Option<Tensor>,
+    chain_zero: Option<Tensor>,
+    /// The chain's output layer norm target, which it keeps F32 because the
+    /// `proj_out` GEMM runs on F32 operands. `None` off the chain.
+    outer: Option<Tensor>,
 }
 
 impl TileScratch {
-    fn new(gpu: &Gpu, patches: usize, sequence: usize) -> Result<TileScratch, VaeError> {
+    fn new(decoder: &Decoder, patches: usize, sequence: usize) -> Result<TileScratch, VaeError> {
+        let gpu = &decoder.gpu;
         let zero = f32_alloc(gpu, HIDDEN)?;
         upload_f32(gpu, &zero, &[0.0f32; HIDDEN])?;
 
+        let chain = decoder.arithmetic.bf16_buffers();
+        let (chain_registers, chain_zero, outer) = if chain {
+            let registers = bf16_alloc(gpu, REGISTERS * HIDDEN)?;
+            device(gpu.cast_narrow(&registers, &decoder.parts.registers, REGISTERS * HIDDEN))?;
+            let chain_zero = bf16_alloc(gpu, HIDDEN)?;
+            device(gpu.cast_narrow(&chain_zero, &zero, HIDDEN))?;
+            let outer = f32_alloc(gpu, sequence * HIDDEN)?;
+            (Some(registers), Some(chain_zero), Some(outer))
+        } else {
+            (None, None, None)
+        };
+
         Ok(TileScratch {
-            buffers: Buffers::new(gpu, sequence)?,
+            buffers: Buffers::new(gpu, sequence, decoder.arithmetic)?,
             post: f32_alloc(gpu, patches * LATENT_CHANNELS)?,
             patch_hidden: f32_alloc(gpu, patches * HIDDEN)?,
             zero,
+            chain_registers,
+            chain_zero,
+            outer,
         })
     }
 }
@@ -1514,11 +1732,7 @@ impl PreviewDecoder {
         if global_frame >= output_frames {
             global_frame = output_frames - 1;
         }
-        let scratch = TileScratch::new(
-            &self.decoder.gpu,
-            self.decoder.patches,
-            self.decoder.sequence,
-        )?;
+        let scratch = TileScratch::new(&self.decoder, self.decoder.patches, self.decoder.sequence)?;
         let frames = decode_chunk(
             &self.decoder,
             &scratch,
@@ -1638,7 +1852,7 @@ pub fn decode_with(
     );
 
     // One activation set for every tile of every chunk (`:1089`).
-    let scratch = TileScratch::new(&decoder.gpu, decoder.patches, decoder.sequence)?;
+    let scratch = TileScratch::new(&decoder, decoder.patches, decoder.sequence)?;
 
     // `:1226-1252`: the two-token path hands the whole latent, already padded
     // to the chunk, straight to the graph; one spatial tile, five frames, no
@@ -1773,7 +1987,7 @@ fn decode_chunks(
                         )
                         .and_then(|decoder| {
                             let scratch =
-                                TileScratch::new(&decoder.gpu, decoder.patches, decoder.sequence)?;
+                                TileScratch::new(&decoder, decoder.patches, decoder.sequence)?;
                             Ok((decoder, scratch))
                         });
                         match built {

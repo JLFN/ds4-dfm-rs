@@ -500,12 +500,30 @@ int h3d_sdpa_f32(h3d_context *context, h3d_tensor *output,
                  uint32_t head_dim, float scale, char *error,
                  size_t error_size);
 
+/* `h3d_sdpa_f32` for the `bf16a` chain: BF16 Q/K/V and a BF16 result, the
+ * tensor-core arm only. The staging inside is BF16 in both instantiations, so
+ * this path copies where the F32 path rounds, and the scores, running maximum,
+ * sum and accumulator stay FP32. */
+int h3d_sdpa_bf16(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *query, const h3d_tensor *key,
+                  const h3d_tensor *value, uint32_t sequence, uint32_t heads,
+                  uint32_t head_dim, float scale, char *error,
+                  size_t error_size);
+
 /* `h3_gpu_rms_norm_f32` (`:2496-2510`) with `h3_rms_norm_f32_kernel`
  * (`:2438-2460`): 256 threads per row, fmaf square sum, rsqrtf. */
 int h3d_rms_norm_f32(h3d_context *context, h3d_tensor *output,
                      const h3d_tensor *input, const h3d_tensor *weight,
                      uint32_t rows, uint32_t width, float epsilon, char *error,
                      size_t error_size);
+
+/* The same kernel over BF16 buffers, arithmetic in F32 (`bf16a`). The weight
+ * stays F32 in both: it is the checkpoint's, and rounding it is the arm's
+ * load-time choice, not this kernel's. */
+int h3d_rms_norm_bf16(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *input, const h3d_tensor *weight,
+                      uint32_t rows, uint32_t width, float epsilon, char *error,
+                      size_t error_size);
 
 /* `h3_gpu_layer_norm_f32` (`:2601-2617`) with `h3_layer_norm_f32_kernel`
  * (`:2529-2561`): the mean is a plain running sum, the variance an fmaf sum,
@@ -514,6 +532,13 @@ int h3d_layer_norm_f32(h3d_context *context, h3d_tensor *output,
                        const h3d_tensor *input, const h3d_tensor *weight,
                        const h3d_tensor *bias, uint32_t rows, uint32_t width,
                        float epsilon, char *error, size_t error_size);
+
+/* The `bf16a` chain's layer norm: a BF16 hidden buffer in, F32 out, because
+ * the `proj_out` GEMM that consumes it runs on F32 operands. */
+int h3d_layer_norm_bf16(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        const h3d_tensor *bias, uint32_t rows, uint32_t width,
+                        float epsilon, char *error, size_t error_size);
 
 /* `h3_gpu_swiglu_f32` (`:2874-2877`) with `h3_swiglu_kernel` (`:2841-2852`):
  * gate and up halves of each fused row, `gate / (1 + expf(-gate)) * up`.
@@ -525,6 +550,12 @@ int h3d_swiglu_f32(h3d_context *context, h3d_tensor *output,
                    uint32_t rows, uint32_t width, char *error,
                    size_t error_size);
 
+/* The same kernel over BF16 buffers, `gate / (1 + expf(-gate)) * up` in F32. */
+int h3d_swiglu_bf16(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *fused, const h3d_tensor *bias,
+                    uint32_t rows, uint32_t width, char *error,
+                    size_t error_size);
+
 /* `h3_gpu_scale_add_f32` (`:2895-2910`) with `h3_scale_add_kernel`
  * (`:2885-2893`): `residual + branch * scale`, one multiply, no fma. `bias`,
  * when given, is added to `branch` on load, before the multiply. */
@@ -533,6 +564,14 @@ int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
                       const h3d_tensor *bias, const h3d_tensor *scale,
                       uint32_t rows, uint32_t width, char *error,
                       size_t error_size);
+
+/* The same kernel over BF16 buffers, with `residual` and `output` the same
+ * buffer: the chain's residual stream is the block's BF16 hidden. */
+int h3d_scale_add_bf16(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *residual, const h3d_tensor *branch,
+                       const h3d_tensor *bias, const h3d_tensor *scale,
+                       uint32_t rows, uint32_t width, char *error,
+                       size_t error_size);
 
 /* `h3_gpu_video_qkv_rope_f32` (`:3190-3205`) with `h3_qkv_rope_kernel`
  * (`:3078-3136`) at `grouped = 1`, `normalize = 1`, `weighted = 0`: the
@@ -547,6 +586,18 @@ int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
                            uint32_t heads, uint32_t head_dim,
                            uint32_t rope_half, float epsilon, char *error,
                            size_t error_size);
+
+/* The same kernel over BF16 buffers: Q/K/V and the QKV row are BF16, the bias
+ * and the rope tables F32. The staged Q and K rows stay F32, so the serial sums
+ * and the rotation are the F32 path's arithmetic on a rounded input. */
+int h3d_video_qkv_rope_bf16(h3d_context *context, h3d_tensor *query,
+                            h3d_tensor *key, h3d_tensor *value,
+                            const h3d_tensor *qkv, const h3d_tensor *bias,
+                            const h3d_tensor *rope_cos,
+                            const h3d_tensor *rope_sin, uint32_t sequence,
+                            uint32_t heads, uint32_t head_dim,
+                            uint32_t rope_half, float epsilon, char *error,
+                            size_t error_size);
 
 /* ---- F32 primitives the VideoVAE encoder needs (`h3_video_encoder.c`) ---- */
 

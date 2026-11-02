@@ -73,6 +73,10 @@ enum {
     H3D_VAE_GEMM_BF16 = 2,   /* CUBLAS_COMPUTE_32F_FAST_16BF, which cuBLASLt
                               * serves with a TF32-class kernel */
     H3D_VAE_GEMM_BF16_INPUTS = 3, /* CUDA_R_16BF operands and output ("bf16i") */
+    H3D_VAE_GEMM_BF16_CHAIN = 4,  /* "bf16a": `bf16i`'s operands with every
+                                   * block activation in BF16 too, so the
+                                   * decoder narrows once a tile instead of
+                                   * eight times a block */
 };
 
 struct h3d_vae_options {
@@ -206,8 +210,9 @@ static struct h3d_vae_options h3d_vae_options_from_env(void) {
     if (order) options.query_major = order[0] == 'r' || order[0] == 'R';
     if (gemm && (gemm[0] == 't' || gemm[0] == 'T')) options.gemm = H3D_VAE_GEMM_TF32;
     if (gemm && (gemm[0] == 'b' || gemm[0] == 'B')) {
-        options.gemm = strcmp(gemm, "bf16i") == 0 ? H3D_VAE_GEMM_BF16_INPUTS
-                                                  : H3D_VAE_GEMM_BF16;
+        options.gemm = strcmp(gemm, "bf16i") == 0   ? H3D_VAE_GEMM_BF16_INPUTS
+                       : strcmp(gemm, "bf16a") == 0 ? H3D_VAE_GEMM_BF16_CHAIN
+                                                    : H3D_VAE_GEMM_BF16;
     }
     return options;
 }
@@ -252,6 +257,7 @@ int h3d_set_vae_option(h3d_context *context, const char *name,
         if (strcmp(value, "tf32") == 0) { context->vae.gemm = H3D_VAE_GEMM_TF32; return 1; }
         if (strcmp(value, "bf16") == 0) { context->vae.gemm = H3D_VAE_GEMM_BF16; return 1; }
         if (strcmp(value, "bf16i") == 0) { context->vae.gemm = H3D_VAE_GEMM_BF16_INPUTS; return 1; }
+        if (strcmp(value, "bf16a") == 0) { context->vae.gemm = H3D_VAE_GEMM_BF16_CHAIN; return 1; }
         return 0;
     }
     return 0;
@@ -1488,8 +1494,11 @@ int h3d_vae_linear(h3d_context *context, h3d_tensor *output,
                /* The `bf16i` arm serves only the four block GEMMs
                 * (`h3d_vae_linear_bf16`); the projections around them are F32
                 * operands and keep the FAST class the F32 route runs, which is
-                * what this entry point gives them. */
-               context->vae.gemm == H3D_VAE_GEMM_BF16_INPUTS) {
+                * what this entry point gives them. The `bf16a` chain is the
+                * same arm plus BF16 activations, and its outer projections stay
+                * F32 operands for the same reason. */
+               context->vae.gemm == H3D_VAE_GEMM_BF16_INPUTS ||
+               context->vae.gemm == H3D_VAE_GEMM_BF16_CHAIN) {
         compute = CUBLAS_COMPUTE_32F_FAST_16BF;
     }
     if (!h3d_linear_lt_compute(context, output->data, input->data,
@@ -5151,9 +5160,58 @@ __device__ __forceinline__ static uint4 h3d_mma_bf16_chunk(const float *source) 
     return packed;
 }
 
-__global__ static void h3d_attention_mma_f32_kernel(
-        float *output, const float *query, const float *key,
-        const float *value, uint32_t sequence, uint32_t heads, float scale) {
+/* ---------------------------------------------------------------------------
+ * The decoder's BF16 activation chain (`H3_VAE_GEMM=bf16a`).
+ *
+ * `bf16i` narrows each projection's operand and widens its result, which is
+ * 689.6 MB of casts a decode at the delivery canvas (`docs/minimax-h3/
+ * vae-decode-bytes-2026-11-02.md`). The chain instead keeps the block's
+ * activations in BF16, so every primitive below reads and writes BF16 and the
+ * casts fall to one a tile. Each is templated on the element type of its
+ * buffers and does its arithmetic in F32 between the load and the store, so the
+ * F32 instantiation is the same code the reference path ran and the arm adds
+ * only the rounding at each store. The reference implementation this mirrors
+ * (`/data/Rapid-H3`, `vae_fast.py`) runs its whole decode on fp16 activations.
+ * ------------------------------------------------------------------------- */
+template <typename T>
+__device__ __forceinline__ float h3d_vae_wide(T value);
+template <>
+__device__ __forceinline__ float h3d_vae_wide<float>(float value) {
+    return value;
+}
+template <>
+__device__ __forceinline__ float h3d_vae_wide<__nv_bfloat16>(
+        __nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T h3d_vae_round(float value);
+template <>
+__device__ __forceinline__ float h3d_vae_round<float>(float value) {
+    return value;
+}
+template <>
+__device__ __forceinline__ __nv_bfloat16 h3d_vae_round<__nv_bfloat16>(
+        float value) {
+    return __float2bfloat16(value);
+}
+
+/* One staged row chunk: a rounding pass for F32 input, a 16-byte copy for BF16,
+ * which is where the arm's K/V staging saving comes from. Every `at` is a
+ * multiple of eight elements, so the BF16 read is a `uint4` load. */
+__device__ __forceinline__ static uint4 h3d_mma_chunk(const float *source) {
+    return h3d_mma_bf16_chunk(source);
+}
+__device__ __forceinline__ static uint4 h3d_mma_chunk(
+        const __nv_bfloat16 *source) {
+    return *(const uint4 *)source;
+}
+
+template <typename TIn, typename TOut>
+__global__ static void h3d_attention_mma_kernel(
+        TOut *output, const TIn *query, const TIn *key, const TIn *value,
+        uint32_t sequence, uint32_t heads, float scale) {
     __shared__ __align__(16) __nv_bfloat16 shared_key[H3D_VFA_KEYS][H3D_VFA_LD];
     __shared__ __align__(16) __nv_bfloat16 shared_value[H3D_VFA_KEYS][H3D_VFA_LD];
     const uint32_t lane = threadIdx.x & 31u;
@@ -5169,9 +5227,9 @@ __global__ static void h3d_attention_mma_f32_kernel(
      * keeps the CTA's reads in bounds without branching the MMAs. */
     const uint32_t read0 = live0 ? row0 : sequence - 1u;
     const uint32_t read1 = live1 ? row1 : sequence - 1u;
-    const float *query0 =
+    const TIn *query0 =
             query + ((size_t)head * sequence + read0) * H3D_VFA_HD;
-    const float *query1 =
+    const TIn *query1 =
             query + ((size_t)head * sequence + read1) * H3D_VFA_HD;
 
     /* Q lives in registers as the four k16 A fragments, built once per CTA. */
@@ -5179,10 +5237,14 @@ __global__ static void h3d_attention_mma_f32_kernel(
 #pragma unroll
     for (uint32_t step = 0; step < H3D_VFA_KS; step++) {
         const uint32_t dim = step * 16u + column;
-        a[step][0] = h3d_mma_pair(query0[dim], query0[dim + 1u]);
-        a[step][1] = h3d_mma_pair(query1[dim], query1[dim + 1u]);
-        a[step][2] = h3d_mma_pair(query0[dim + 8u], query0[dim + 9u]);
-        a[step][3] = h3d_mma_pair(query1[dim + 8u], query1[dim + 9u]);
+        a[step][0] = h3d_mma_pair(h3d_vae_wide(query0[dim]),
+                                  h3d_vae_wide(query0[dim + 1u]));
+        a[step][1] = h3d_mma_pair(h3d_vae_wide(query1[dim]),
+                                  h3d_vae_wide(query1[dim + 1u]));
+        a[step][2] = h3d_mma_pair(h3d_vae_wide(query0[dim + 8u]),
+                                  h3d_vae_wide(query0[dim + 9u]));
+        a[step][3] = h3d_mma_pair(h3d_vae_wide(query1[dim + 8u]),
+                                  h3d_vae_wide(query1[dim + 9u]));
     }
 
     float maximum0 = -INFINITY, maximum1 = -INFINITY;
@@ -5209,9 +5271,9 @@ __global__ static void h3d_attention_mma_f32_kernel(
                         ((size_t)head * sequence + source) * H3D_VFA_HD +
                         chunk * 8u;
                 *(uint4 *)&shared_key[row][chunk * 8u] =
-                        h3d_mma_bf16_chunk(key + at);
+                        h3d_mma_chunk(key + at);
                 *(uint4 *)&shared_value[row][chunk * 8u] =
-                        h3d_mma_bf16_chunk(value + at);
+                        h3d_mma_chunk(value + at);
             } else {
                 const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
                 *(uint4 *)&shared_key[row][chunk * 8u] = zero;
@@ -5325,14 +5387,15 @@ __global__ static void h3d_attention_mma_f32_kernel(
     }
 
     __syncthreads();
-    /* The output is row-major in F32, the layout the scalar dispatch writes. */
+    /* The output is row-major in the caller's element type, the layout the
+     * scalar dispatch writes. */
     if (live0) {
 #pragma unroll
         for (uint32_t dim = 0; dim < H3D_VFA_DIMS; dim++) {
             const size_t at = ((size_t)row0 * heads + head) * H3D_VFA_HD +
                               dim * 8u + column;
-            output[at] = result[dim][0] / denominator0;
-            output[at + 1u] = result[dim][1] / denominator0;
+            output[at] = h3d_vae_round<TOut>(result[dim][0] / denominator0);
+            output[at + 1u] = h3d_vae_round<TOut>(result[dim][1] / denominator0);
         }
     }
     if (live1) {
@@ -5340,8 +5403,8 @@ __global__ static void h3d_attention_mma_f32_kernel(
         for (uint32_t dim = 0; dim < H3D_VFA_DIMS; dim++) {
             const size_t at = ((size_t)row1 * heads + head) * H3D_VFA_HD +
                               dim * 8u + column;
-            output[at] = result[dim][2] / denominator1;
-            output[at + 1u] = result[dim][3] / denominator1;
+            output[at] = h3d_vae_round<TOut>(result[dim][2] / denominator1);
+            output[at + 1u] = h3d_vae_round<TOut>(result[dim][3] / denominator1);
         }
     }
 }
@@ -5365,8 +5428,8 @@ int h3d_sdpa_f32(h3d_context *context, h3d_tensor *output,
         /* The tensor-core arm, off unless the decoder's options ask for it. */
         if (context->vae.attention_mma) {
             dim3 mma_grid((sequence + H3D_VFA_ROWS - 1) / H3D_VFA_ROWS, heads);
-            h3d_attention_mma_f32_kernel<<<mma_grid, H3D_VFA_WARPS * 32u, 0,
-                                           context->stream>>>(
+            h3d_attention_mma_kernel<float, float>
+                    <<<mma_grid, H3D_VFA_WARPS * 32u, 0, context->stream>>>(
                 (float *)output->data, (const float *)query->data,
                 (const float *)key->data, (const float *)value->data, sequence,
                 heads, scale);
@@ -5401,19 +5464,54 @@ int h3d_sdpa_f32(h3d_context *context, h3d_tensor *output,
     return h3d_launch_ok("F32 attention", error, error_size);
 }
 
+/* `h3d_sdpa_f32` for the `bf16a` chain: BF16 Q/K/V and a BF16 result, which is
+ * the operand pair the out projection's GEMM reads. The staging inside the
+ * kernel is BF16 in both instantiations, so this path is a 16-byte copy where
+ * the F32 path rounds eight values, and its scores, running maximum, sum and
+ * accumulator are the same FP32 ones. Only the tensor-core arm serves it: the
+ * scalar and tiled fallbacks read F32 operands, and a chain that picks one is
+ * refused here rather than run at a different precision than it claims. */
+int h3d_sdpa_bf16(h3d_context *context, h3d_tensor *output,
+                  const h3d_tensor *query, const h3d_tensor *key,
+                  const h3d_tensor *value, uint32_t sequence, uint32_t heads,
+                  uint32_t head_dim, float scale, char *error,
+                  size_t error_size) {
+    size_t elements = 0;
+    if (!context || !sequence || !heads || !head_dim ||
+        !h3d_mul_size((size_t)sequence * heads, head_dim, &elements) ||
+        !h3d_is(output, H3D_BF16, elements) ||
+        !h3d_is(query, H3D_BF16, elements) ||
+        !h3d_is(key, H3D_BF16, elements) ||
+        !h3d_is(value, H3D_BF16, elements)) {
+        return h3d_set_error(error, error_size,
+                             "invalid BF16 attention tensors or shape");
+    }
+    if (head_dim != 64 || !context->vae.attention_mma) {
+        return h3d_set_error(error, error_size,
+                             "BF16 attention needs head_dim 64 and the "
+                             "tensor-core kernel");
+    }
+    dim3 grid((sequence + H3D_VFA_ROWS - 1) / H3D_VFA_ROWS, heads);
+    h3d_attention_mma_kernel<__nv_bfloat16, __nv_bfloat16>
+            <<<grid, H3D_VFA_WARPS * 32u, 0, context->stream>>>(
+        (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)query->data,
+        (const __nv_bfloat16 *)key->data, (const __nv_bfloat16 *)value->data,
+        sequence, heads, scale);
+    return h3d_launch_ok("BF16 attention (mma)", error, error_size);
+}
+
 /* `h3_rms_norm_f32_kernel` (`:2438-2460`): one block per row, 256 threads,
  * fmaf square sum, tree reduction over shared memory, rsqrtf. */
-__global__ static void h3d_rms_norm_f32_kernel(float *output,
-                                               const float *input,
-                                               const float *weight,
-                                               uint32_t rows, uint32_t width,
-                                               float epsilon) {
+template <typename T>
+__global__ static void h3d_rms_norm_kernel(T *output, const T *input,
+                                           const float *weight, uint32_t rows,
+                                           uint32_t width, float epsilon) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     __shared__ float sums[256];
     float sum = 0.0f;
     for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
-        float value = input[(size_t)row * width + column];
+        float value = h3d_vae_wide(input[(size_t)row * width + column]);
         sum = fmaf(value, value, sum);
     }
     sums[threadIdx.x] = sum;
@@ -5427,41 +5525,70 @@ __global__ static void h3d_rms_norm_f32_kernel(float *output,
     float inverse = rsqrtf(sums[0] / (float)width + epsilon);
     for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
         size_t index = (size_t)row * width + column;
-        output[index] = input[index] * inverse * weight[column];
+        output[index] = h3d_vae_round<T>(h3d_vae_wide(input[index]) * inverse *
+                                         weight[column]);
     }
+}
+
+/* The RMS norm over either element type: `h3d_rms_norm_f32` is the reference's
+ * F32 path, `h3d_rms_norm_bf16` the `bf16a` chain's. */
+static int h3d_rms_norm(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        uint32_t rows, uint32_t width, float epsilon, int bf16,
+                        char *error, size_t error_size) {
+    size_t elements = 0;
+    int type = bf16 ? H3D_BF16 : H3D_F32;
+    if (!context || !rows || !width ||
+        !h3d_mul_size(rows, width, &elements) || epsilon < 0.0f ||
+        !h3d_is(output, type, elements) ||
+        !h3d_is(input, type, elements) ||
+        !h3d_is(weight, H3D_F32, width)) {
+        return h3d_set_error(error, error_size,
+                             bf16 ? "invalid BF16 RMS norm arguments"
+                                  : "invalid F32 RMS norm arguments");
+    }
+    if (bf16) {
+        h3d_rms_norm_kernel<__nv_bfloat16><<<rows, 256, 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)input->data,
+            (const float *)weight->data, rows, width, epsilon);
+    } else {
+        h3d_rms_norm_kernel<float><<<rows, 256, 0, context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const float *)weight->data, rows, width, epsilon);
+    }
+    return h3d_launch_ok(bf16 ? "BF16 RMS norm" : "F32 RMS norm", error,
+                         error_size);
 }
 
 int h3d_rms_norm_f32(h3d_context *context, h3d_tensor *output,
                      const h3d_tensor *input, const h3d_tensor *weight,
                      uint32_t rows, uint32_t width, float epsilon, char *error,
                      size_t error_size) {
-    size_t elements = 0;
-    if (!context || !rows || !width ||
-        !h3d_mul_size(rows, width, &elements) || epsilon < 0.0f ||
-        !h3d_is(output, H3D_F32, elements) ||
-        !h3d_is(input, H3D_F32, elements) ||
-        !h3d_is(weight, H3D_F32, width)) {
-        return h3d_set_error(error, error_size,
-                             "invalid F32 RMS norm arguments");
-    }
-    h3d_rms_norm_f32_kernel<<<rows, 256, 0, context->stream>>>(
-        (float *)output->data, (const float *)input->data,
-        (const float *)weight->data, rows, width, epsilon);
-    return h3d_launch_ok("F32 RMS norm", error, error_size);
+    return h3d_rms_norm(context, output, input, weight, rows, width, epsilon, 0,
+                        error, error_size);
+}
+
+int h3d_rms_norm_bf16(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *input, const h3d_tensor *weight,
+                      uint32_t rows, uint32_t width, float epsilon, char *error,
+                      size_t error_size) {
+    return h3d_rms_norm(context, output, input, weight, rows, width, epsilon, 1,
+                        error, error_size);
 }
 
 /* `h3_layer_norm_f32_kernel` (`:2529-2561`): the mean accumulates with plain
  * adds, the variance with fmaf; the epilogue is
  * `(input - mean) * inverse * weight + bias` in that order. */
-__global__ static void h3d_layer_norm_f32_kernel(
-        float *output, const float *input, const float *weight,
+template <typename T>
+__global__ static void h3d_layer_norm_kernel(
+        float *output, const T *input, const float *weight,
         const float *bias, uint32_t rows, uint32_t width, float epsilon) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
     __shared__ float sums[256];
     float sum = 0.0f;
     for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
-        sum += input[(size_t)row * width + column];
+        sum += h3d_vae_wide(input[(size_t)row * width + column]);
     }
     sums[threadIdx.x] = sum;
     __syncthreads();
@@ -5474,7 +5601,7 @@ __global__ static void h3d_layer_norm_f32_kernel(
     float mean = sums[0] / (float)width;
     sum = 0.0f;
     for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
-        float centered = input[(size_t)row * width + column] - mean;
+        float centered = h3d_vae_wide(input[(size_t)row * width + column]) - mean;
         sum = fmaf(centered, centered, sum);
     }
     sums[threadIdx.x] = sum;
@@ -5488,88 +5615,178 @@ __global__ static void h3d_layer_norm_f32_kernel(
     float inverse = rsqrtf(sums[0] / (float)width + epsilon);
     for (uint32_t column = threadIdx.x; column < width; column += blockDim.x) {
         size_t index = (size_t)row * width + column;
-        output[index] = (input[index] - mean) * inverse * weight[column] +
+        output[index] = (h3d_vae_wide(input[index]) - mean) * inverse *
+                            weight[column] +
                         bias[column];
     }
+}
+
+/* The layer norm over either element type, F32 in and out in either case: the
+ * `bf16a` chain runs it on the tile's BF16 hidden buffer and its result feeds
+ * the F32 `proj_out` GEMM. */
+static int h3d_layer_norm(h3d_context *context, h3d_tensor *output,
+                          const h3d_tensor *input, const h3d_tensor *weight,
+                          const h3d_tensor *bias, uint32_t rows, uint32_t width,
+                          float epsilon, int bf16, char *error,
+                          size_t error_size) {
+    size_t elements = 0;
+    if (!context || !rows || !width ||
+        !h3d_mul_size(rows, width, &elements) || epsilon < 0.0f ||
+        !h3d_is(output, H3D_F32, elements) ||
+        !h3d_is(input, bf16 ? H3D_BF16 : H3D_F32, elements) ||
+        !h3d_is(weight, H3D_F32, width) ||
+        !h3d_is(bias, H3D_F32, width)) {
+        return h3d_set_error(error, error_size,
+                             bf16 ? "invalid BF16 layer norm arguments"
+                                  : "invalid F32 layer norm arguments");
+    }
+    if (bf16) {
+        h3d_layer_norm_kernel<__nv_bfloat16><<<rows, 256, 0, context->stream>>>(
+            (float *)output->data, (const __nv_bfloat16 *)input->data,
+            (const float *)weight->data, (const float *)bias->data, rows, width,
+            epsilon);
+    } else {
+        h3d_layer_norm_kernel<float><<<rows, 256, 0, context->stream>>>(
+            (float *)output->data, (const float *)input->data,
+            (const float *)weight->data, (const float *)bias->data, rows, width,
+            epsilon);
+    }
+    return h3d_launch_ok(bf16 ? "BF16 layer norm" : "F32 layer norm", error,
+                         error_size);
 }
 
 int h3d_layer_norm_f32(h3d_context *context, h3d_tensor *output,
                        const h3d_tensor *input, const h3d_tensor *weight,
                        const h3d_tensor *bias, uint32_t rows, uint32_t width,
                        float epsilon, char *error, size_t error_size) {
-    size_t elements = 0;
-    if (!context || !rows || !width ||
-        !h3d_mul_size(rows, width, &elements) || epsilon < 0.0f ||
-        !h3d_is(output, H3D_F32, elements) ||
-        !h3d_is(input, H3D_F32, elements) ||
-        !h3d_is(weight, H3D_F32, width) ||
-        !h3d_is(bias, H3D_F32, width)) {
-        return h3d_set_error(error, error_size,
-                             "invalid F32 layer norm arguments");
-    }
-    h3d_layer_norm_f32_kernel<<<rows, 256, 0, context->stream>>>(
-        (float *)output->data, (const float *)input->data,
-        (const float *)weight->data, (const float *)bias->data, rows, width,
-        epsilon);
-    return h3d_launch_ok("F32 layer norm", error, error_size);
+    return h3d_layer_norm(context, output, input, weight, bias, rows, width,
+                          epsilon, 0, error, error_size);
+}
+
+int h3d_layer_norm_bf16(h3d_context *context, h3d_tensor *output,
+                        const h3d_tensor *input, const h3d_tensor *weight,
+                        const h3d_tensor *bias, uint32_t rows, uint32_t width,
+                        float epsilon, char *error, size_t error_size) {
+    return h3d_layer_norm(context, output, input, weight, bias, rows, width,
+                          epsilon, 1, error, error_size);
 }
 
 /* `h3_swiglu_kernel<float>` (`:2841-2852`): the fused row holds gate then up,
  * and the gate passes through `gate / (1 + expf(-gate))`, not `1 / (1 + ...)`. */
-__global__ static void h3d_swiglu_f32_kernel(float *output,
-                                             const float *fused,
-                                             const float *bias,
-                                             uint32_t rows, uint32_t width) {
+template <typename T>
+__global__ static void h3d_swiglu_kernel(T *output, const T *fused,
+                                         const float *bias, uint32_t rows,
+                                         uint32_t width) {
     uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t row = blockIdx.y;
     if (row >= rows || column >= width) return;
     size_t base = (size_t)row * width * 2;
-    float gate = fused[base + column];
-    float up = fused[base + width + column];
+    float gate = h3d_vae_wide(fused[base + column]);
+    float up = h3d_vae_wide(fused[base + width + column]);
     if (bias) {
         gate += bias[column];
         up += bias[width + column];
     }
     output[(size_t)row * width + column] =
-        gate / (1.0f + expf(-gate)) * up;
+        h3d_vae_round<T>(gate / (1.0f + expf(-gate)) * up);
+}
+
+static int h3d_swiglu(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *fused, const h3d_tensor *bias,
+                      uint32_t rows, uint32_t width, int bf16, char *error,
+                      size_t error_size) {
+    size_t elements = 0;
+    int type = bf16 ? H3D_BF16 : H3D_F32;
+    if (!context || !h3d_mul_size(rows, width, &elements) ||
+        elements > SIZE_MAX / 2 ||
+        !h3d_is(output, type, elements) ||
+        !h3d_is(fused, type, elements * 2) ||
+        (bias && !h3d_is(bias, H3D_F32, (size_t)width * 2))) {
+        return h3d_set_error(error, error_size,
+                             bf16 ? "invalid BF16 SwiGLU arguments"
+                                  : "invalid SwiGLU arguments");
+    }
+    dim3 grid((width + 255) / 256, rows);
+    if (bf16) {
+        h3d_swiglu_kernel<__nv_bfloat16><<<grid, 256, 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)fused->data,
+            bias ? (const float *)bias->data : NULL, rows, width);
+    } else {
+        h3d_swiglu_kernel<float><<<grid, 256, 0, context->stream>>>(
+            (float *)output->data, (const float *)fused->data,
+            bias ? (const float *)bias->data : NULL, rows, width);
+    }
+    return h3d_launch_ok(bf16 ? "BF16 SwiGLU" : "F32 SwiGLU", error,
+                         error_size);
 }
 
 int h3d_swiglu_f32(h3d_context *context, h3d_tensor *output,
                    const h3d_tensor *fused, const h3d_tensor *bias,
                    uint32_t rows, uint32_t width,
                    char *error, size_t error_size) {
-    size_t elements = 0;
-    if (!context || !h3d_mul_size(rows, width, &elements) ||
-        elements > SIZE_MAX / 2 ||
-        !h3d_is(output, H3D_F32, elements) ||
-        !h3d_is(fused, H3D_F32, elements * 2) ||
-        (bias && !h3d_is(bias, H3D_F32, (size_t)width * 2))) {
-        return h3d_set_error(error, error_size, "invalid SwiGLU arguments");
-    }
-    dim3 grid((width + 255) / 256, rows);
-    h3d_swiglu_f32_kernel<<<grid, 256, 0, context->stream>>>(
-        (float *)output->data, (const float *)fused->data,
-        bias ? (const float *)bias->data : NULL, rows, width);
-    return h3d_launch_ok("F32 SwiGLU", error, error_size);
+    return h3d_swiglu(context, output, fused, bias, rows, width, 0, error,
+                      error_size);
+}
+
+int h3d_swiglu_bf16(h3d_context *context, h3d_tensor *output,
+                    const h3d_tensor *fused, const h3d_tensor *bias,
+                    uint32_t rows, uint32_t width, char *error,
+                    size_t error_size) {
+    return h3d_swiglu(context, output, fused, bias, rows, width, 1, error,
+                      error_size);
 }
 
 /* `h3_scale_add_kernel` (`:2885-2893`): `residual + branch * scale`, one
  * multiply, and no fma. `bias` is added to the branch on load, which is the
  * same F32 add the bias kernel would have made in place. */
-__global__ static void h3d_scale_add_f32_kernel(float *output,
-                                                const float *residual,
-                                                const float *branch,
-                                                const float *bias,
-                                                const float *scale,
-                                                uint32_t rows,
-                                                uint32_t width) {
+template <typename T>
+__global__ static void h3d_scale_add_kernel(T *output, const T *residual,
+                                            const T *branch, const float *bias,
+                                            const float *scale, uint32_t rows,
+                                            uint32_t width) {
     uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t row = blockIdx.y;
     if (row >= rows || column >= width) return;
     size_t index = (size_t)row * width + column;
-    float value = branch[index];
+    float value = h3d_vae_wide(branch[index]);
     if (bias) value += bias[column];
-    output[index] = residual[index] + value * scale[column];
+    output[index] =
+            h3d_vae_round<T>(h3d_vae_wide(residual[index]) + value * scale[column]);
+}
+
+static int h3d_scale_add(h3d_context *context, h3d_tensor *output,
+                         const h3d_tensor *residual, const h3d_tensor *branch,
+                         const h3d_tensor *bias, const h3d_tensor *scale,
+                         uint32_t rows, uint32_t width, int bf16, char *error,
+                         size_t error_size) {
+    size_t elements = 0;
+    int type = bf16 ? H3D_BF16 : H3D_F32;
+    if (!context || !h3d_mul_size(rows, width, &elements) ||
+        !h3d_is(output, type, elements) ||
+        !h3d_is(residual, type, elements) ||
+        !h3d_is(branch, type, elements) ||
+        !h3d_is(scale, H3D_F32, width) ||
+        (bias && !h3d_is(bias, H3D_F32, width))) {
+        return h3d_set_error(error, error_size,
+                             bf16 ? "invalid BF16 scale-add arguments"
+                                  : "invalid F32 scale-add arguments");
+    }
+    dim3 grid((width + 255) / 256, rows);
+    if (bf16) {
+        h3d_scale_add_kernel<__nv_bfloat16><<<grid, 256, 0, context->stream>>>(
+            (__nv_bfloat16 *)output->data,
+            (const __nv_bfloat16 *)residual->data,
+            (const __nv_bfloat16 *)branch->data,
+            bias ? (const float *)bias->data : NULL,
+            (const float *)scale->data, rows, width);
+    } else {
+        h3d_scale_add_kernel<float><<<grid, 256, 0, context->stream>>>(
+            (float *)output->data, (const float *)residual->data,
+            (const float *)branch->data, bias ? (const float *)bias->data : NULL,
+            (const float *)scale->data, rows, width);
+    }
+    return h3d_launch_ok(bf16 ? "BF16 scale add" : "F32 scale add", error,
+                         error_size);
 }
 
 int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
@@ -5577,22 +5794,17 @@ int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
                       const h3d_tensor *bias, const h3d_tensor *scale,
                       uint32_t rows, uint32_t width,
                       char *error, size_t error_size) {
-    size_t elements = 0;
-    if (!context || !h3d_mul_size(rows, width, &elements) ||
-        !h3d_is(output, H3D_F32, elements) ||
-        !h3d_is(residual, H3D_F32, elements) ||
-        !h3d_is(branch, H3D_F32, elements) ||
-        !h3d_is(scale, H3D_F32, width) ||
-        (bias && !h3d_is(bias, H3D_F32, width))) {
-        return h3d_set_error(error, error_size,
-                             "invalid F32 scale-add arguments");
-    }
-    dim3 grid((width + 255) / 256, rows);
-    h3d_scale_add_f32_kernel<<<grid, 256, 0, context->stream>>>(
-        (float *)output->data, (const float *)residual->data,
-        (const float *)branch->data, bias ? (const float *)bias->data : NULL,
-        (const float *)scale->data, rows, width);
-    return h3d_launch_ok("F32 scale add", error, error_size);
+    return h3d_scale_add(context, output, residual, branch, bias, scale, rows,
+                         width, 0, error, error_size);
+}
+
+int h3d_scale_add_bf16(h3d_context *context, h3d_tensor *output,
+                       const h3d_tensor *residual, const h3d_tensor *branch,
+                       const h3d_tensor *bias, const h3d_tensor *scale,
+                       uint32_t rows, uint32_t width, char *error,
+                       size_t error_size) {
+    return h3d_scale_add(context, output, residual, branch, bias, scale, rows,
+                         width, 1, error, error_size);
 }
 
 /* `h3_qkv_rope_kernel<float>` (`:3078-3136`) at `grouped = 1`,
@@ -5602,13 +5814,16 @@ int h3d_scale_add_f32(h3d_context *context, h3d_tensor *output,
 /* The QKV linear's bias, added on load: `h3d_linear_bias_kernel<float>`'s own
  * F32 add, one column per qkv element. `bias` is NULL when the caller already
  * added it. */
-static __device__ inline float h3d_qkv_bias(const float *qkv, const float *bias,
+template <typename T>
+static __device__ inline float h3d_qkv_bias(const T *qkv, const float *bias,
                                             size_t index, size_t column) {
-    return bias ? qkv[index] + bias[column] : qkv[index];
+    float value = h3d_vae_wide(qkv[index]);
+    return bias ? value + bias[column] : value;
 }
 
-__global__ static void h3d_video_qkv_rope_f32_kernel(
-        float *query, float *key, float *value, const float *qkv,
+template <typename T>
+__global__ static void h3d_video_qkv_rope_kernel(
+        T *query, T *key, T *value, const T *qkv,
         const float *bias, const float *rope_cos, const float *rope_sin,
         uint32_t sequence, uint32_t heads, uint32_t head_dim,
         uint32_t rope_half, float epsilon) {
@@ -5668,11 +5883,64 @@ __global__ static void h3d_video_qkv_rope_f32_kernel(
             }
         }
         size_t output_index = ((size_t)head * sequence + row) * head_dim + d;
-        query[output_index] = q0;
-        key[output_index] = k0;
-        value[output_index] = h3d_qkv_bias(qkv, bias, v_base + d,
-                                           column_base + 2 * head_dim + d);
+        query[output_index] = h3d_vae_round<T>(q0);
+        key[output_index] = h3d_vae_round<T>(k0);
+        value[output_index] = h3d_vae_round<T>(
+                h3d_qkv_bias(qkv, bias, v_base + d,
+                             column_base + 2 * head_dim + d));
     }
+}
+
+static int h3d_video_qkv_rope(h3d_context *context, h3d_tensor *query,
+                              h3d_tensor *key, h3d_tensor *value,
+                              const h3d_tensor *qkv, const h3d_tensor *bias,
+                              const h3d_tensor *rope_cos,
+                              const h3d_tensor *rope_sin, uint32_t sequence,
+                              uint32_t heads, uint32_t head_dim,
+                              uint32_t rope_half, float epsilon, int bf16,
+                              char *error, size_t error_size) {
+    size_t elements = 0;
+    int type = bf16 ? H3D_BF16 : H3D_F32;
+    if (!context || !sequence || !heads || !head_dim ||
+        !h3d_mul_size((size_t)sequence * heads, head_dim, &elements) ||
+        rope_half > head_dim / 2 || epsilon < 0.0f ||
+        !h3d_is(query, type, elements) ||
+        !h3d_is(key, type, elements) ||
+        !h3d_is(value, type, elements) ||
+        !h3d_is(qkv, type, elements * 3) ||
+        (bias && !h3d_is(bias, H3D_F32, (size_t)heads * head_dim * 3)) ||
+        !h3d_is(rope_cos, H3D_F32, (size_t)sequence * rope_half) ||
+        !h3d_is(rope_sin, H3D_F32, (size_t)sequence * rope_half)) {
+        return h3d_set_error(error, error_size,
+                             bf16 ? "invalid BF16 QKV/RoPE tensors"
+                                  : "invalid QKV/RoPE tensors");
+    }
+    /* One block per head of one row, as many threads as the head has
+     * dimensions (capped so the block stays legal), and one staged copy of the
+     * Q and K rows for the block. The 64 threads a released head_dim asks for
+     * are enough: the staged kernel is at this shape's traffic floor. */
+    unsigned threads = head_dim < 256 ? head_dim : 256;
+    dim3 grid(1, heads, sequence);
+    if (bf16) {
+        h3d_video_qkv_rope_kernel<__nv_bfloat16>
+                <<<grid, threads, 2 * head_dim * sizeof(float),
+                   context->stream>>>(
+            (__nv_bfloat16 *)query->data, (__nv_bfloat16 *)key->data,
+            (__nv_bfloat16 *)value->data, (const __nv_bfloat16 *)qkv->data,
+            bias ? (const float *)bias->data : NULL,
+            (const float *)rope_cos->data, (const float *)rope_sin->data,
+            sequence, heads, head_dim, rope_half, epsilon);
+    } else {
+        h3d_video_qkv_rope_kernel<float>
+                <<<grid, threads, 2 * head_dim * sizeof(float),
+                   context->stream>>>(
+            (float *)query->data, (float *)key->data, (float *)value->data,
+            (const float *)qkv->data, bias ? (const float *)bias->data : NULL,
+            (const float *)rope_cos->data, (const float *)rope_sin->data,
+            sequence, heads, head_dim, rope_half, epsilon);
+    }
+    return h3d_launch_ok(bf16 ? "BF16 video QKV RoPE" : "F32 video QKV RoPE",
+                         error, error_size);
 }
 
 int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
@@ -5683,33 +5951,22 @@ int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
                            uint32_t heads, uint32_t head_dim,
                            uint32_t rope_half, float epsilon, char *error,
                            size_t error_size) {
-    size_t elements = 0;
-    if (!context || !sequence || !heads || !head_dim ||
-        !h3d_mul_size((size_t)sequence * heads, head_dim, &elements) ||
-        rope_half > head_dim / 2 || epsilon < 0.0f ||
-        !h3d_is(query, H3D_F32, elements) ||
-        !h3d_is(key, H3D_F32, elements) ||
-        !h3d_is(value, H3D_F32, elements) ||
-        !h3d_is(qkv, H3D_F32, elements * 3) ||
-        (bias && !h3d_is(bias, H3D_F32, (size_t)heads * head_dim * 3)) ||
-        !h3d_is(rope_cos, H3D_F32, (size_t)sequence * rope_half) ||
-        !h3d_is(rope_sin, H3D_F32, (size_t)sequence * rope_half)) {
-        return h3d_set_error(error, error_size, "invalid QKV/RoPE tensors");
-    }
-    /* One block per head of one row, as many threads as the head has
-     * dimensions (capped so the block stays legal), and one staged copy of the
-     * Q and K rows for the block. The 64 threads a released head_dim asks for
-     * are enough: the staged kernel is at this shape's traffic floor. */
-    unsigned threads = head_dim < 256 ? head_dim : 256;
-    dim3 grid(1, heads, sequence);
-    h3d_video_qkv_rope_f32_kernel<<<grid, threads,
-                                    2 * head_dim * sizeof(float),
-                                    context->stream>>>(
-        (float *)query->data, (float *)key->data, (float *)value->data,
-        (const float *)qkv->data, bias ? (const float *)bias->data : NULL,
-        (const float *)rope_cos->data, (const float *)rope_sin->data, sequence,
-        heads, head_dim, rope_half, epsilon);
-    return h3d_launch_ok("F32 video QKV RoPE", error, error_size);
+    return h3d_video_qkv_rope(context, query, key, value, qkv, bias, rope_cos,
+                              rope_sin, sequence, heads, head_dim, rope_half,
+                              epsilon, 0, error, error_size);
+}
+
+int h3d_video_qkv_rope_bf16(h3d_context *context, h3d_tensor *query,
+                            h3d_tensor *key, h3d_tensor *value,
+                            const h3d_tensor *qkv, const h3d_tensor *bias,
+                            const h3d_tensor *rope_cos,
+                            const h3d_tensor *rope_sin, uint32_t sequence,
+                            uint32_t heads, uint32_t head_dim,
+                            uint32_t rope_half, float epsilon, char *error,
+                            size_t error_size) {
+    return h3d_video_qkv_rope(context, query, key, value, qkv, bias, rope_cos,
+                              rope_sin, sequence, heads, head_dim, rope_half,
+                              epsilon, 1, error, error_size);
 }
 
 /* ---------------------------------------------------------------------------

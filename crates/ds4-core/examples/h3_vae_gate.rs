@@ -13,7 +13,7 @@
 //! enough to time an arm and not enough to judge one.
 //!
 //! The arms are the decoder's own environment switches, so the gate reads none
-//! of them itself: `H3_VAE_GEMM` (fp32 | tf32 | bf16 | bf16i), `H3_VAE_ATTENTION`
+//! of them itself: `H3_VAE_GEMM` (fp32 | tf32 | bf16 | bf16i | bf16a), `H3_VAE_ATTENTION`
 //! and `H3_VAE_TILE_PIXELS` are the released surface (`h3_video_vae.c:666-690`,
 //! `docs/minimax-h3/*`), and `H3_VAE_TIMING=1` splits each chunk.
 //!

@@ -399,11 +399,13 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         Some(Value::String(mode)) => match mode.as_str() {
             "fp32" => VaeGemm::Fp32,
             "bf16" => VaeGemm::Reduced,
+            "bf16i" => VaeGemm::Full,
+            "bf16a" => VaeGemm::Chain,
             other => {
                 return Err(ApiError::bad_request(
                     "invalid_vae_gemm",
                     Some("vae_gemm"),
-                    format!("vae_gemm must be fp32 or bf16, not {other}"),
+                    format!("vae_gemm must be fp32, bf16, bf16i or bf16a, not {other}"),
                 ))
             }
         },

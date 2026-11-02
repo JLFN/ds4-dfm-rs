@@ -1277,9 +1277,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                     "fp32" => VaeGemm::Fp32,
                     "bf16" => VaeGemm::Reduced,
                     "bf16i" => VaeGemm::Full,
+                    "bf16a" => VaeGemm::Chain,
                     other => {
                         return Err(format!(
-                            "--vae-gemm must be fp32, bf16 or bf16i, not {other}"
+                            "--vae-gemm must be fp32, bf16, bf16i or bf16a, not {other}"
                         ))
                     }
                 })
@@ -1485,9 +1486,11 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
                             (default 1, the reference's serial chunk loop)
   --vae-tile N              the decoder's spatial tile in pixels, 256-512,
                             a multiple of 16 (default: the reference's search)
-  --vae-gemm fp32|bf16|bf16i  the decoder's GEMM class: fp32 is the reference,
+  --vae-gemm fp32|bf16|bf16i|bf16a
+                            the decoder's GEMM class: fp32 is the reference,
                             bf16 narrows the compute, bf16i narrows the
-                            operands too and is the fastest storage arm
+                            operands too, bf16a keeps the block's activations
+                            in BF16 as well and needs --vae-attention tensor
   --crf N                   x264 quality, 0-51 (default 19, the reference's)
   --preset NAME             x264 preset (default veryfast, the reference's);
                             slow and veryslow keep far more fine texture
