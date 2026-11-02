@@ -17,10 +17,12 @@ sm_121a, CUDA 13.0, 65 C, no clock touched.
 The preparation pass writes K's tiles as they are read and V's **transposed**, a
 dimension a row: for each `(head, dimension, tile)` one thread writes four
 bytes, the four keys of its group. Its rows were `round_up(sequence, 16)` bytes
-wide - 37,728 at the delivery shape. The last tile starts at 37,696 and its last
-group ends at 37,759, so **32 bytes of every dimension's last tile landed in the
+wide - 37,728 at the benchmark's 37,722 rows, 37,792 at the delivery job's
+37,786. The last tile of 37,722 begins at 37,696 and its last group ends at
+37,759, so **32 bytes of every dimension's last tile landed in the
 next dimension's row**, on keys 28-31 of that row's first tile, which another
-thread was writing with real data. Whichever store retired last won. Nothing
+thread was writing with real data (at 37,786 it is the same 32 bytes, 37,792 to
+37,823). Whichever store retired last won. Nothing
 about the preparation's maxima or its scales moved, because the overflow was
 past the values they reduce over - which is exactly what the evidence said: K8
 byte-identical, V8 differing, differences at tile boundaries, and none of it at
@@ -39,7 +41,8 @@ there (`:3902`).
 The write path is `:3842`; the arm's selector is `:119`, its dispatch `:4312`,
 the block `:3909`, the preparation `:3700`.
 
-Two determinism witnesses, both at the delivery shape: `tests/h3/attn_bm 37722
+Two determinism witnesses, at the delivery canvas in both spellings - 37,722 rows
+in the benchmark, 37,786 in the job - `tests/h3/attn_bm 37722
 56 3` prints `out_fnv=b8d31bd13276ad67` on every process, and the two delivery
 renders below produce the same clip md5 (`4124fcf2737c6bd40cd949eebbb6c76a`)
 from two separate processes. At engine level the same fact is the gate: the
@@ -75,9 +78,12 @@ one process an arm, same job line as `outputs/two-stage/one.jobs`):
 | E4M3 arm | 27.851 | 6.590 | **208.246** | **34.75** | 46.910 | **295.891** | `4124fcf2...` |
 
 `DENOISE` **-24.705 s (-10.6%)**, step **-4.36 s (-11.2%)**, wall -23.4 s
-(-7.3%) with `LOAD` warm and equal in both rows. The step's delta is larger than
-50 calls of the bench's 81.6 ms (4.08 s): the connector attention is 128-wide at
-76 rows and takes the arm too, and the step's own spread is 0.4 s. The BF16 row
+(-7.3%) with `LOAD` warm and equal in both rows. The render's own sequence is
+**37,786** rows, not the benchmark's 37,722 (the job's sequence carries 64 rows
+the bench's shape does not), and the arm's line in the log says so: fifty calls
+of the bench's 81.6 ms is 4.04 s of the step's 4.36, and the 76-row connector
+attention - 128-wide, also on the arm - plus the step's own 0.4 s spread are the
+rest, so the bench and the step agree to about 7%. The BF16 row
 is the arm's own baseline and is **byte-identical to the route unit's clip**
 (`878f0f7d8d8e28dd7b00029623d6b2b8`, `outputs/two-stage/one.mp4`) and carries
 its content hashes (`video_fnv=1e11a80f73242ad6`), which is the acceptance's
