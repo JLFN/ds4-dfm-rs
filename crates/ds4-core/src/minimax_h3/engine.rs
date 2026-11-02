@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use super::dit::{Attention, Dit, LoadOptions, VaeAttention, VaeGemm};
+use super::dit::{Attention, AttentionType, Dit, LoadOptions, VaeAttention, VaeGemm};
 use super::host::{reuse_schedule, temporal, Rng, Schedule, Temporal};
 use super::latent_upscale::Upscaler;
 use super::media::{self, Fit};
@@ -108,6 +108,14 @@ pub struct RenderRequest {
     /// the byte-exact one, which is the only path that reproduces the
     /// reference (`docs/minimax-h3/tensor-default-2026-10-27.md`).
     pub attention: Attention,
+    /// The **draft leg's** attention data type, and only that leg's: `None`
+    /// leaves the stage on `H3_DIT_ATTENTION`'s word, which is the BF16 block
+    /// when the environment says nothing. Refused without a two-stage route,
+    /// because on a single pass the draft leg *is* the delivery - the place the
+    /// clip gate refused this arm (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`).
+    /// The refine keeps the environment's word whatever this says: it is the
+    /// stage whose output is delivered.
+    pub draft_attention: Option<AttentionType>,
     /// The video decoder's attention kernel, a second and independent choice:
     /// `Scalar` is the reference path. `None` leaves the context on
     /// `H3_VAE_ATTENTION`'s word, as the CLI's own flag does.
@@ -209,6 +217,9 @@ struct PreparedKey {
     /// kernel: for `Scalar` that would silently drop the byte-exact promise the
     /// create body makes.
     attention: Attention,
+    /// The attention's data type, in the key for the same reason: it is set on
+    /// the context `Dit::load_with` creates, so the two arms are two graphs.
+    attention_type: Option<AttentionType>,
     /// The decoder's switches belong here for the same reason and not because
     /// they touch a weight: both are set on the context `Dit::load_with`
     /// creates, so a request that asks for the other one has to miss. `None`
@@ -313,6 +324,15 @@ impl Engine {
             None => None,
         };
 
+        // The draft arm names a stage, not a render: refused where there is no
+        // draft, because the single pass would apply it to the delivery - the
+        // one clip the gate refused it on.
+        if draft.is_none() && request.draft_attention.is_some() {
+            return Err(EngineError::new(
+                "the draft attention arm needs a two-stage route (--draft)",
+            ));
+        }
+
         // The prompt embedding is the first stage's, which on the two-stage
         // route is the draft's: the reference's `encode_once="draft"`
         // (`harness/workflow.py:52`) pays one Qwen pass and re-encodes only the
@@ -414,6 +434,9 @@ impl Engine {
             sigma: None,
             rope: first_rope.to_bits(),
             attention: request.attention,
+            // Stage one is the draft whenever there is a route, and the guard
+            // above keeps this `None` on the single pass.
+            attention_type: request.draft_attention,
             vae_attention: request.vae_attention,
             vae_gemm: request.vae_gemm,
         };
@@ -529,6 +552,9 @@ impl Engine {
                 sigma: Some(route.sigma.to_bits()),
                 rope: canvas.rope_scale(false).to_bits(),
                 attention: request.attention,
+                // The refine is the delivery: this stage keeps the
+                // environment's word, never the draft leg's arm.
+                attention_type: None,
                 vae_attention: request.vae_attention,
                 vae_gemm: request.vae_gemm,
             };
@@ -711,6 +737,9 @@ impl Engine {
             rope,
             LoadOptions {
                 attention: request.attention,
+                // The stage's own statement, from the key it was asked for:
+                // the draft leg's arm never reaches the refine's context.
+                attention_type: key.attention_type,
                 vae_attention: request.vae_attention,
                 vae_gemm: request.vae_gemm,
                 ..LoadOptions::resident()
@@ -1124,6 +1153,7 @@ mod tests {
             sigma: None,
             rope: 16,
             attention: Attention::Tensor,
+            attention_type: None,
             vae_attention: Some(VaeAttention::Scalar),
             vae_gemm: Some(VaeGemm::Fp32),
         }
@@ -1330,6 +1360,37 @@ mod tests {
         assert_eq!(scalar, {
             let mut same = key(4, conditioning);
             same.attention = Attention::Scalar;
+            same
+        });
+    }
+
+    /// The data type is the same kind of fact as the kernel choice above: it is
+    /// set on the context the load created, so a draft leg that ran E4M3 must
+    /// not hand its graph to a leg that asked for BF16 - the two stages of the
+    /// route differ in canvas already, but the arm is an independent word and a
+    /// re-run at one canvas would otherwise reuse the other arm's graph.
+    #[test]
+    fn the_attention_type_is_part_of_the_prepared_key() {
+        let conditioning = [9u8; 32];
+        let plain = key(4, conditioning);
+
+        let mut arm = plain.clone();
+        arm.attention_type = Some(AttentionType::E4M3);
+        assert_ne!(
+            plain, arm,
+            "an E4M3 draft must not reuse a BF16-prepared DiT"
+        );
+
+        // The word states itself rather than the environment's default: a
+        // request that says `Bf16` is a different key from one that says
+        // nothing, because only the second one follows `H3_DIT_ATTENTION`.
+        let mut stated = plain.clone();
+        stated.attention_type = Some(AttentionType::Bf16);
+        assert_ne!(plain, stated);
+        // And the same arm still hits.
+        assert_eq!(arm, {
+            let mut same = plain.clone();
+            same.attention_type = Some(AttentionType::E4M3);
             same
         });
     }

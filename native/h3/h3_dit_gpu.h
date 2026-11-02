@@ -95,6 +95,14 @@ void h3d_destroy(h3d_context *context);
  * tensor-core default. Overrides H3_DIT_ATTENTION and H3_DIT_ATTENTION_MMA. */
 void h3d_set_attention(h3d_context *context, int scalar);
 
+/* The attention's data type for this context: nonzero runs the E4M3 block,
+ * zero the BF16 one the release ships. `h3d_create` and `h3d_set_attention`
+ * both read it from H3_DIT_ATTENTION; this is the per-context word that lets a
+ * host confine the arm to one stage of a two-stage render, whose stages run on
+ * separate contexts. Call it after `h3d_set_attention`, which resets the flag
+ * to the environment's word. */
+void h3d_set_attention_type(h3d_context *context, int fp8);
+
 /* One video VAE decoder option per call, for benchmarking an arm on one binary.
  * Names and values: "attention" (scalar | tensor, the F32 attention kernel),
  * "sdpa_order" (heads | rows, the F32 attention CTA order), "gemm" (fp32 |

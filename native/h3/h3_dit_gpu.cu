@@ -178,6 +178,19 @@ void h3d_set_attention(h3d_context *context, int scalar) {
     }
 }
 
+/* The data type on its own, after the path above. A host that runs the two
+ * stages of a route on two contexts - the draft at one canvas and the refine at
+ * another - can state the arm for one leg and leave the other to the
+ * environment, which is not expressible while the flag is only read at
+ * creation. `scalar` still wins: `h3d_set_attention` zeroes the flag, and the
+ * scalar kernel has no quantized path, so a host that wants both is refused on
+ * its own side rather than served here. */
+void h3d_set_attention_type(h3d_context *context, int fp8) {
+    if (context) {
+        context->attention_fp8 = fp8 ? 1 : 0;
+    }
+}
+
 /* The video VAE decoder's options, from the environment, read once per
  * context. Unset means the reference path, so an arm is always a comparison
  * against the same binary's own default. Each value is matched on its first

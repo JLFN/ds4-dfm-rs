@@ -817,6 +817,19 @@ pub enum Attention {
     Scalar,
 }
 
+/// The attention's data type, the `fp8` word of `H3_DIT_ATTENTION` at load
+/// time. `Bf16` is the block the release ships; `E4M3` is the arm that measured
+/// **-15.9%** on the attention class and that the clip gate refused when it ran
+/// the whole delivery (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`). A
+/// third choice and not a variant of [`Attention`]: that one names the kernel
+/// family, and the data type applies to the tensor-core family alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttentionType {
+    #[default]
+    Bf16,
+    E4M3,
+}
+
 /// The video decoder's attention kernel (`H3_VAE_ATTENTION`). A separate choice
 /// from [`Attention`], and with the opposite default: the decoder's `Scalar` is
 /// the reference path and the only arm whose output is reproducible across
@@ -858,6 +871,10 @@ pub struct LoadOptions {
     pub core_reuse: u32,
     /// Attention path; the tensor-core kernel unless `Scalar` is asked for.
     pub attention: Attention,
+    /// The attention's data type, set on the same context. `None` states
+    /// nothing: the context keeps what `H3_DIT_ATTENTION` gave it at creation,
+    /// which is the reference's BF16 block when the environment is unset.
+    pub attention_type: Option<AttentionType>,
     /// The video decoder's attention kernel, set on the same context as
     /// [`LoadOptions::attention`] and independent of it. `None` states nothing:
     /// the context keeps what the environment gave it at creation, which is the
@@ -877,6 +894,7 @@ impl LoadOptions {
             reduction: Reduction::Environment,
             core_reuse: 1,
             attention: Attention::Tensor,
+            attention_type: None,
             vae_attention: None,
             vae_gemm: None,
         }
@@ -1820,6 +1838,21 @@ impl Dit {
         let config = weights.config().clone();
         let gpu = device(Gpu::create())?;
         gpu.set_attention(matches!(options.attention, Attention::Scalar));
+        // `scalar` is the byte-exact kernel and has no quantized path, so the
+        // two words together are a contradiction: refuse it rather than let the
+        // arm be dropped, or applied, behind the promise the caller asked for.
+        if options.attention == Attention::Scalar
+            && options.attention_type == Some(AttentionType::E4M3)
+        {
+            return Err(DitError::Unsupported {
+                detail: "E4M3 attention is the tensor-core block's data type; \
+                         the scalar kernel is the byte-exact one"
+                    .into(),
+            });
+        }
+        if let Some(kind) = options.attention_type {
+            gpu.set_attention_type(matches!(kind, AttentionType::E4M3));
+        }
         // The decoder's two switches, in the native side's own words. A value it
         // does not know is a bug in this mapping rather than user input: every
         // string here is one of the three the header documents. `None` is not a

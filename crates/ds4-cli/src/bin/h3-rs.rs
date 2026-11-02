@@ -21,7 +21,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ds4_core::minimax_h3::dit::{
-    Attention, Dit, DitError, LoadMode, LoadOptions, Reduction, VaeAttention, VaeGemm,
+    Attention, AttentionType, Dit, DitError, LoadMode, LoadOptions, Reduction, VaeAttention,
+    VaeGemm,
 };
 use ds4_core::minimax_h3::engine::{Draft, EngineHandle, RenderRequest};
 use ds4_core::minimax_h3::host::{reuse_schedule, temporal, Rng, Schedule};
@@ -118,6 +119,14 @@ struct Options {
     /// rather than deriving it from the draft's terminal
     /// (`docs/minimax-h3/four-step-draft-2026-11-02.md` section 3).
     refine_sigma: Option<f32>,
+    /// `--draft-attention`: the **draft leg's** attention data type. `e4m3` is
+    /// the arm the E4M3 unit measured and the clip gate refused when it ran the
+    /// whole delivery (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`);
+    /// `bf16` states the released block and is what pins the draft while
+    /// `H3_DIT_ATTENTION=fp8` carries the refine. Absent, the leg keeps the
+    /// environment's word. Needs `--draft`: on a single pass the draft leg is
+    /// the delivery.
+    draft_attention: Option<AttentionType>,
     /// `--vae-workers` (`:1089`): the decode's chunk loop spread over this
     /// many device contexts. One is the reference's own serial loop.
     vae_workers: usize,
@@ -175,6 +184,12 @@ fn run() -> Result<ExitCode, String> {
     if options.draft.is_some() || options.refine_sigma.is_some() {
         return Err(
             "--draft/--refine-sigma need --jobs: the two-stage route runs through the resident engine"
+                .to_string(),
+        );
+    }
+    if options.draft_attention.is_some() {
+        return Err(
+            "--draft-attention needs --jobs and --draft: it states one leg of the two-stage route"
                 .to_string(),
         );
     }
@@ -307,6 +322,9 @@ fn run() -> Result<ExitCode, String> {
         reduction,
         core_reuse: options.core_reuse,
         attention: options.attention,
+        // The one-shot path renders one canvas and refuses the arm above, so
+        // this stage's data type is the environment's word.
+        attention_type: None,
         vae_attention: options.vae_attention,
         vae_gemm: options.vae_gemm,
     };
@@ -558,6 +576,11 @@ fn run_jobs(options: &Options) -> Result<ExitCode, String> {
     if options.refine_sigma.is_some() && options.draft.is_none() {
         return Err("--refine-sigma needs --draft".to_string());
     }
+    // The same rule for the arm: it names a leg, and without the route the leg
+    // it would name is the delivery.
+    if options.draft_attention.is_some() && options.draft.is_none() {
+        return Err("--draft-attention needs --draft".to_string());
+    }
     let draft = options.draft.map(|scale| Draft {
         scale,
         sigma: options.refine_sigma.unwrap_or(Draft::RELEASED.sigma),
@@ -607,6 +630,7 @@ fn run_jobs(options: &Options) -> Result<ExitCode, String> {
             last_frame: None,
             references: Vec::new(),
             attention: options.attention,
+            draft_attention: options.draft_attention,
             vae_attention: options.vae_attention,
             vae_gemm: options.vae_gemm,
             text_encoder: options.text_encoder.clone(),
@@ -1055,6 +1079,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         jobs: None,
         draft: None,
         refine_sigma: None,
+        draft_attention: None,
         vae_workers: 1,
         vae_tile: None,
         encode: Encode::default(),
@@ -1165,6 +1190,22 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                     text.parse()
                         .map_err(|_| "--refine-sigma takes a sigma such as 0.72".to_string())?,
                 );
+            }
+            // The draft leg's data type. Two words, both stated on purpose:
+            // `e4m3` is the arm, and `bf16` is how a run pins the draft while
+            // `H3_DIT_ATTENTION` carries another leg. `fp8` is accepted as the
+            // arm's other spelling in the environment, so a script that reads
+            // one name writes the other.
+            "--draft-attention" => {
+                options.draft_attention = Some(match value(&mut argv, &flag)?.as_str() {
+                    "bf16" => AttentionType::Bf16,
+                    "e4m3" | "fp8" => AttentionType::E4M3,
+                    other => {
+                        return Err(format!(
+                            "--draft-attention must be bf16 or e4m3, not {other}"
+                        ))
+                    }
+                });
             }
             "--vae-tile" => {
                 let pixels: usize = unsigned(&mut argv, &flag)?

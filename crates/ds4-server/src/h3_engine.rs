@@ -97,6 +97,9 @@ impl Renderer for EngineRenderer {
             last_frame: last.as_ref().map(|file| file.path().to_path_buf()),
             references,
             attention: spec.attention,
+            // The local contract has no two-stage route, so it has no draft leg
+            // to state an arm for.
+            draft_attention: None,
             vae_attention: spec.vae_attention,
             vae_gemm: spec.vae_gemm,
             text_encoder: self.text_encoder.clone(),

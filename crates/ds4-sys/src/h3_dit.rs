@@ -34,6 +34,7 @@ unsafe extern "C" {
     fn h3d_create(error: *mut c_char, error_size: usize) -> *mut Context;
     fn h3d_destroy(context: *mut Context);
     fn h3d_set_attention(context: *mut Context, scalar: c_int);
+    fn h3d_set_attention_type(context: *mut Context, fp8: c_int);
 
     fn h3d_alloc(
         context: *mut Context,
@@ -1112,6 +1113,14 @@ impl Gpu {
     /// false selects the tensor-core default. Overrides the environment.
     pub fn set_attention(&self, scalar: bool) {
         unsafe { h3d_set_attention(self.raw.as_ptr(), scalar as c_int) };
+    }
+
+    /// State this context's attention data type: `fp8` true asks for the E4M3
+    /// block, false for the BF16 one, overriding `H3_DIT_ATTENTION` for this
+    /// context alone. Call it after [`Gpu::set_attention`], which resets the
+    /// flag to the environment's word.
+    pub fn set_attention_type(&self, fp8: bool) {
+        unsafe { h3d_set_attention_type(self.raw.as_ptr(), fp8 as c_int) };
     }
 
     pub fn alloc(&self, dtype: Dtype, elements: usize) -> Result<Tensor, String> {

@@ -18,6 +18,11 @@
 //! stages are two canvases, so the claim it makes on the second render is the
 //! prompt encode, not the load.
 //!
+//! `--draft-attention e4m3` states the draft leg's attention data type, the
+//! arm the E4M3 unit measured and the clip gate refused when it ran the whole
+//! delivery (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`). The refine
+//! keeps `H3_DIT_ATTENTION`'s word, so one run can price the arm on one leg.
+//!
 //! Live gate: it needs the FastH3 checkpoint and a GPU. The checkpoint is
 //! named by the environment, never by a path in this file: `H3_MODEL` for the
 //! model directory, or `H3_ARTIFACTS` plus `H3_MODEL_NAME`. Unset, or absent
@@ -28,7 +33,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ds4_core::minimax_h3::dit::{Attention, VaeAttention, VaeGemm};
+use ds4_core::minimax_h3::dit::{Attention, AttentionType, VaeAttention, VaeGemm};
 use ds4_core::minimax_h3::engine::{Draft, EngineHandle, RenderReport, RenderRequest};
 use ds4_core::minimax_h3::render::Encode;
 use ds4_core::minimax_h3::text_forward::Encoder;
@@ -51,6 +56,7 @@ fn main() -> ExitCode {
     let mut vae_attention = Some(VaeAttention::Tensor);
     let mut vae_gemm = Some(VaeGemm::Reduced);
     let mut draft: Option<Draft> = None;
+    let mut draft_attention: Option<AttentionType> = None;
 
     let mut argv = std::env::args().skip(1).peekable();
     while let Some(flag) = argv.next() {
@@ -130,6 +136,20 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            // The draft leg's attention data type, the arm the E4M3 unit
+            // measured and the clip gate refused on the delivery
+            // (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`). Stated here
+            // as a word of its own so the gate can run one leg of the route on
+            // it: the repeat is what it asserts, and the arm's own line names
+            // the sequence it ran.
+            "--draft-attention" => match argv.next().as_deref() {
+                Some("bf16") => draft_attention = Some(AttentionType::Bf16),
+                Some("e4m3") | Some("fp8") => draft_attention = Some(AttentionType::E4M3),
+                other => {
+                    eprintln!("--draft-attention takes bf16 or e4m3, not {other:?}");
+                    return ExitCode::from(2);
+                }
+            },
             // The upscaler's checkpoint directory, as the engine wants it:
             // through the environment, never as a path in the engine.
             "--upscaler" => match argv.next() {
@@ -143,7 +163,8 @@ fn main() -> ExitCode {
                 println!(
                     "usage: h3_engine_gate [--width N --height N --frames N --steps N] \
                      [--vae-arms env] [--vae-attention scalar|tensor] \
-                     [--vae-gemm fp32|bf16] [--draft [SCALE] [--refine-sigma S]] [--upscaler DIR]"
+                     [--vae-gemm fp32|bf16] [--draft [SCALE] [--refine-sigma S] \
+                     [--draft-attention bf16|e4m3]] [--upscaler DIR]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -215,6 +236,7 @@ fn main() -> ExitCode {
             last_frame: None,
             references: Vec::new(),
             attention: Attention::Tensor,
+            draft_attention,
             vae_attention,
             vae_gemm,
             text_encoder: encoder.clone(),
