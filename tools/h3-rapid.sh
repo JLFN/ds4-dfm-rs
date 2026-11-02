@@ -44,6 +44,13 @@
 #   H3_RS                   the renderer binary (default target/release/h3-rs)
 #   H3_DIT_GEMM, H3_VAE_GEMM, H3_VAE_ATTENTION   the shipped arms
 #
+# Recipes: --profiles FILE (default tools/h3-profiles.json) holds named recipes
+# (`ts_h2`, `rapid`, `rapid-e4m3`, `one-pass`, `portrait`) and --profile NAME
+# applies one as defaults, before any flag - so an explicit flag wins, while the
+# profile wins over the environment's arms, which are the shell's leftovers. The
+# resolved values are on the PLAN lines of every render.
+#   --list-profiles         print the file's names and what each is
+#
 # Exit: 0 rendered, 1 the renderer failed, 2 bad arguments, 3 a missing artifact.
 set -u
 
@@ -65,6 +72,31 @@ CRF=15
 PRESET=slow
 ONE_PASS=0
 DRY_RUN=0
+PROFILE=
+PROFILES=$ROOT/tools/h3-profiles.json
+
+# The profile is applied BEFORE the flag loop, so a flag on the command line
+# still overrides the recipe. This is a pre-scan only; the loop below parses the
+# same words again.
+prescan=$#
+prescan_args=("$@")
+index=0
+while [ $index -lt $prescan ]; do
+  case "${prescan_args[$index]}" in
+    --profiles) PROFILES=${prescan_args[$((index + 1))]:-}; index=$((index + 2)) ;;
+    --profile) PROFILE=${prescan_args[$((index + 1))]:-}; index=$((index + 2)) ;;
+    --list-profiles)
+      exec /usr/bin/python3 "$ROOT/tools/h3-profile.py" --file "$PROFILES" --list
+      ;;
+    *) index=$((index + 1)) ;;
+  esac
+done
+if [ -n "$PROFILE" ]; then
+  [ -r "$PROFILES" ] || { echo "cannot read profile file: $PROFILES" >&2; exit 2; }
+  recipe=$(/usr/bin/python3 "$ROOT/tools/h3-profile.py" --file "$PROFILES" --name "$PROFILE") ||
+    exit 2
+  eval "$recipe"
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -81,6 +113,9 @@ while [ $# -gt 0 ]; do
     --draft-attention) DRAFT_ATTENTION=$2; shift 2 ;;
     --crf) CRF=$2; shift 2 ;;
     --preset) PRESET=$2; shift 2 ;;
+    --profiles) shift 2 ;;
+    --profile) shift 2 ;;
+    --list-profiles) shift ;;
     --one-pass) ONE_PASS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
@@ -113,6 +148,9 @@ fi
 MODEL=${H3_MODEL:-$A/MiniMax-H3-Turbo-v4}
 : "${H3_VAE:=$A/MiniMax-H3-FastH3-4step/FL2VA/video_vae/source}"
 : "${H3_UPSCALER_DIR:=$A/models/latent_upscale}"
+# A profile's own assignment above already replaced whatever the shell exported,
+# so a named recipe always renders what it says; with no profile the environment
+# still wins, which is the behaviour every earlier record was written against.
 : "${H3_DIT_GEMM:=fp8}"
 : "${H3_VAE_GEMM:=bf16i}"
 : "${H3_VAE_ATTENTION:=tensor}"
@@ -129,12 +167,20 @@ case "$OUTPUT" in
   /*) OUT_PATH=$OUTPUT ;;
   *) OUT_PATH=$ROOT/$OUTPUT ;;
 esac
-mkdir -p "$(dirname "$OUT_PATH")"
 
-# One request: prompt, seed, steps, width, height, frames, output.
+# One request: prompt, seed, steps, width, height, frames, output. A dry run
+# prints it instead of writing it: the path may be a baseline clip's own job
+# line, and overwriting that with a throwaway prompt is how a pinned render loses
+# the recipe it was made with.
 JOBS=${OUT_PATH%.mp4}.jobs
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-  "$PROMPT" "$SEED" "$STEPS" "$WIDTH" "$HEIGHT" "$FRAMES" "$OUT_PATH" > "$JOBS"
+request=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  "$PROMPT" "$SEED" "$STEPS" "$WIDTH" "$HEIGHT" "$FRAMES" "$OUT_PATH")
+if [ "$DRY_RUN" = "1" ]; then
+  echo "DRY jobs=$JOBS: ${request//$'\t'/|}"
+else
+  mkdir -p "$(dirname "$OUT_PATH")"
+  printf '%s\n' "$request" > "$JOBS"
+fi
 
 # The route's own flags. Without `--draft` the request is the one-pass arm.
 ROUTE=()
@@ -148,7 +194,7 @@ draft_width=$(( draft_width * 32 ))
 draft_height=$(awk -v h="$HEIGHT" -v s="$DRAFT_SCALE" 'BEGIN {printf "%d", (h*s/32)+0.5}')
 draft_height=$(( draft_height * 32 ))
 
-echo "PLAN route=$([ "$ONE_PASS" = "0" ] && echo two-stage || echo one-pass)"
+echo "PLAN route=$([ "$ONE_PASS" = "0" ] && echo two-stage || echo one-pass) profile=${PROFILE:-none}"
 echo "PLAN delivery=${WIDTH}x${HEIGHT} draft=${draft_width}x${draft_height} scale=$DRAFT_SCALE"
 echo "PLAN frames=$FRAMES aligned=$ALIGNED seconds=$(awk -v f="$ALIGNED" 'BEGIN {printf "%.3f", f/24}') fps=24"
 echo "PLAN steps=$STEPS seed=$SEED sigma=$REFINE_SIGMA draft-attention=$DRAFT_ATTENTION"

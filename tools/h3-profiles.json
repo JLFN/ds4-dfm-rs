@@ -1,0 +1,86 @@
+{
+  "_doc": [
+    "Named render recipes for tools/h3-rapid.sh: `tools/h3-rapid.sh --profile NAME`.",
+    "A profile is applied as defaults before any flag, so an explicit flag on the",
+    "command line still wins; a profile does win over the environment's",
+    "H3_DIT_GEMM/H3_VAE_GEMM/H3_VAE_ATTENTION, because choosing a profile is an",
+    "explicit act and the shell's leftovers are not. The resolved values are",
+    "printed on the PLAN lines of every render, so a clip always records its own",
+    "recipe. Keys are the script's own flags; `doc` is for --list-profiles."
+  ],
+  "profiles": {
+    "ts_h2": {
+      "doc": "The reference's default preset (Rapid-H3 harness/workflow.py:50-52: steps=6, draft 0.7, refine_sigmas 0.72 0, freeze_audio, encode_once). Best quality of the route family; 12.3 s a draft step plus a 38.4 s refine step.",
+      "steps": 6,
+      "draft_scale": 0.7,
+      "refine_sigma": 0.72,
+      "draft_attention": "bf16",
+      "seconds": 5,
+      "width": 1344,
+      "height": 768,
+      "crf": 15,
+      "preset": "slow",
+      "dit_gemm": "fp8",
+      "vae_gemm": "bf16a",
+      "vae_attention": "tensor"
+    },
+    "rapid": {
+      "doc": "The speed point: the same route at 4 draft steps. -25.4 s of wall and -10.2% detail energy against ts_h2, and the clip gate passes (four-step-draft-2026-11-02.md).",
+      "steps": 4,
+      "draft_scale": 0.7,
+      "refine_sigma": 0.72,
+      "draft_attention": "bf16",
+      "seconds": 5,
+      "width": 1344,
+      "height": 768,
+      "crf": 15,
+      "preset": "slow",
+      "dit_gemm": "fp8",
+      "vae_gemm": "bf16a",
+      "vae_attention": "tensor"
+    },
+    "rapid-e4m3": {
+      "doc": "rapid with the draft leg on the E4M3 attention arm: draft -7.1%, gate exit 0, delivered audio +1.55 dB (draft-fp8-attention-2026-11-02.md). Opt-in for that reason.",
+      "steps": 4,
+      "draft_scale": 0.7,
+      "refine_sigma": 0.72,
+      "draft_attention": "e4m3",
+      "seconds": 5,
+      "width": 1344,
+      "height": 768,
+      "crf": 15,
+      "preset": "slow",
+      "dit_gemm": "fp8",
+      "vae_gemm": "bf16a",
+      "vae_attention": "tensor"
+    },
+    "one-pass": {
+      "doc": "The reference's ts_s6 shape: no draft, no upscale, one stage at full size. Stock-level camera moves and close-up faces, 347.6 s at five seconds; the arm to reach for on a push-in or a beauty close-up.",
+      "one_pass": true,
+      "steps": 6,
+      "seconds": 5,
+      "width": 1344,
+      "height": 768,
+      "crf": 15,
+      "preset": "slow",
+      "dit_gemm": "fp8",
+      "vae_gemm": "bf16a",
+      "vae_attention": "tensor"
+    },
+    "portrait": {
+      "doc": "The same speed point at 9:16. Draft lands at 544x960 and the delivery at 768x1344; nothing else moves.",
+      "steps": 4,
+      "draft_scale": 0.7,
+      "refine_sigma": 0.72,
+      "draft_attention": "bf16",
+      "seconds": 5,
+      "width": 768,
+      "height": 1344,
+      "crf": 15,
+      "preset": "slow",
+      "dit_gemm": "fp8",
+      "vae_gemm": "bf16a",
+      "vae_attention": "tensor"
+    }
+  }
+}
