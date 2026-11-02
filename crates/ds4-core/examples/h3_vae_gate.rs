@@ -2,7 +2,7 @@
 //! arithmetic arm change?
 //!
 //! Usage: h3_vae_gate --latent T,H,W [--shape PIXEL_H,PIXEL_W] [--latent-file
-//!        FILE] [--seed N] [--repeat N] [--expect HEX]
+//!        FILE] [--seed N] [--repeat N] [--expect HEX] [--workers N]
 //!
 //! The decoder alone: no DiT, no prompt, no mux. `--latent T,H,W` is the
 //! latent's own shape in the layout the product route writes, `[channel]
@@ -47,6 +47,7 @@ fn run() -> Result<ExitCode, String> {
     let mut latent_file: Option<PathBuf> = None;
     let mut seed = 1u64;
     let mut repeat = 1usize;
+    let mut workers = 1usize;
     let mut expect: Option<String> = None;
     let mut dump: Option<PathBuf> = None;
 
@@ -65,12 +66,13 @@ fn run() -> Result<ExitCode, String> {
             "--latent-file" => latent_file = Some(PathBuf::from(value()?)),
             "--seed" => seed = parse(&value()?, "integer")?,
             "--repeat" => repeat = parse(&value()?, "integer")?,
+            "--workers" => workers = parse(&value()?, "integer")?,
             "--expect" => expect = Some(value()?.clone()),
             "--dump" => dump = Some(PathBuf::from(value()?)),
             "-h" | "--help" => {
                 println!(
                     "usage: h3_vae_gate --latent T,H,W [--shape H,W] [--latent-file FILE] \
-                     [--seed N] [--repeat N] [--expect HEX] [--dump FILE]"
+                     [--seed N] [--repeat N] [--expect HEX] [--dump FILE] [--workers N]"
                 );
                 return Ok(ExitCode::SUCCESS);
             }
@@ -118,7 +120,7 @@ fn run() -> Result<ExitCode, String> {
 
     for attempt in 0..repeat {
         let started = Instant::now();
-        let decoded = vae_video::decode(
+        let decoded = vae_video::decode_with(
             &directory,
             &latent,
             time,
@@ -127,12 +129,16 @@ fn run() -> Result<ExitCode, String> {
             // The gate's arms are the environment's, which is the point: each
             // run of the harness is one word on one binary.
             vae_video::Arms::default(),
+            // `--workers` spreads the chunk loop over that many contexts and
+            // streams; one is the reference's own shape and the default.
+            workers,
+            None,
         )
         .map_err(|error| format!("decode: {error}"))?;
         let seconds = started.elapsed().as_secs_f64();
         let hash = fnv_f32(&decoded.rgb);
         println!(
-            "RUN {attempt} seconds={seconds:.3} frames={} height={} width={} hash={hash:016x} first={:.9} last={:.9}",
+            "RUN {attempt} seconds={seconds:.3} workers={workers} frames={} height={} width={} hash={hash:016x} first={:.9} last={:.9}",
             decoded.frames,
             decoded.height,
             decoded.width,

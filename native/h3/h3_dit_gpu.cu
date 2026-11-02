@@ -4831,10 +4831,20 @@ __global__ static void h3d_video_qkv_rope_f32_kernel(
         const float *bias, const float *rope_cos, const float *rope_sin,
         uint32_t sequence, uint32_t heads, uint32_t head_dim,
         uint32_t rope_half, float epsilon) {
-    uint32_t dimension = blockIdx.x * blockDim.x + threadIdx.x;
+    /* The Q and K rows are staged into shared once, and every thread then runs
+     * the reference's own serial sum over them: the reduction order and its
+     * operands are the shipped kernel's, so the inverse is the same bits, while
+     * the row is read from global once instead of once per thread. `vae_rope_bm`
+     * prices the shapes at 2,805 rows: 0.894 ms a call here, 0.629 staged, and
+     * 0.621 with the sums and the rotation removed, which is this shape's
+     * traffic floor (`h3d_video_qkv_rope_f32` is 3.48 s of the decode's 48.2).
+     * `blockIdx.x` is one: a block is one head of one row. */
+    extern __shared__ float staged[];
+    float *q_row = staged;
+    float *k_row = staged + head_dim;
+    uint32_t dimension = threadIdx.x;
     uint32_t head = blockIdx.y;
     uint32_t row = blockIdx.z;
-    if (row >= sequence || head >= heads || dimension >= head_dim) return;
     size_t inner = (size_t)heads * head_dim;
     size_t row_base = (size_t)row * inner * 3;
     size_t column_base = (size_t)head * head_dim * 3;
@@ -4842,43 +4852,46 @@ __global__ static void h3d_video_qkv_rope_f32_kernel(
     size_t k_base = q_base + head_dim;
     size_t v_base = k_base + head_dim;
 
+    for (uint32_t d = dimension; d < head_dim; d += blockDim.x) {
+        q_row[d] = h3d_qkv_bias(qkv, bias, q_base + d, column_base + d);
+        k_row[d] = h3d_qkv_bias(qkv, bias, k_base + d, column_base + head_dim + d);
+    }
+    __syncthreads();
+
     float q_sum = 0.0f, k_sum = 0.0f;
     for (uint32_t d = 0; d < head_dim; d++) {
-        float q = h3d_qkv_bias(qkv, bias, q_base + d, column_base + d);
-        float k = h3d_qkv_bias(qkv, bias, k_base + d, column_base + head_dim + d);
+        float q = q_row[d];
+        float k = k_row[d];
         q_sum = fmaf(q, q, q_sum);
         k_sum = fmaf(k, k, k_sum);
     }
     float q_inverse = rsqrtf(q_sum / (float)head_dim + epsilon);
     float k_inverse = rsqrtf(k_sum / (float)head_dim + epsilon);
 
-    float q0 = h3d_qkv_bias(qkv, bias, q_base + dimension,
-                            column_base + dimension) * q_inverse;
-    float k0 = h3d_qkv_bias(qkv, bias, k_base + dimension,
-                            column_base + head_dim + dimension) * k_inverse;
-    if (dimension < rope_half * 2) {
-        uint32_t rope_index = dimension % rope_half;
-        uint32_t pair = dimension < rope_half ? dimension + rope_half :
-                                                 dimension - rope_half;
-        float q1 = h3d_qkv_bias(qkv, bias, q_base + pair,
-                                column_base + pair) * q_inverse;
-        float k1 = h3d_qkv_bias(qkv, bias, k_base + pair,
-                                column_base + head_dim + pair) * k_inverse;
-        float c = rope_cos[(size_t)row * rope_half + rope_index];
-        float s = rope_sin[(size_t)row * rope_half + rope_index];
-        if (dimension < rope_half) {
-            q0 = q0 * c - q1 * s;
-            k0 = k0 * c - k1 * s;
-        } else {
-            q0 = q0 * c + q1 * s;
-            k0 = k0 * c + k1 * s;
+    for (uint32_t d = dimension; d < head_dim; d += blockDim.x) {
+        float q0 = q_row[d] * q_inverse;
+        float k0 = k_row[d] * k_inverse;
+        if (d < rope_half * 2) {
+            uint32_t rope_index = d % rope_half;
+            uint32_t pair = d < rope_half ? d + rope_half : d - rope_half;
+            float q1 = q_row[pair] * q_inverse;
+            float k1 = k_row[pair] * k_inverse;
+            float c = rope_cos[(size_t)row * rope_half + rope_index];
+            float s = rope_sin[(size_t)row * rope_half + rope_index];
+            if (d < rope_half) {
+                q0 = q0 * c - q1 * s;
+                k0 = k0 * c - k1 * s;
+            } else {
+                q0 = q0 * c + q1 * s;
+                k0 = k0 * c + k1 * s;
+            }
         }
+        size_t output_index = ((size_t)head * sequence + row) * head_dim + d;
+        query[output_index] = q0;
+        key[output_index] = k0;
+        value[output_index] = h3d_qkv_bias(qkv, bias, v_base + d,
+                                           column_base + 2 * head_dim + d);
     }
-    size_t output_index = ((size_t)head * sequence + row) * head_dim + dimension;
-    query[output_index] = q0;
-    key[output_index] = k0;
-    value[output_index] = h3d_qkv_bias(qkv, bias, v_base + dimension,
-                                       column_base + 2 * head_dim + dimension);
 }
 
 int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
@@ -4902,8 +4915,15 @@ int h3d_video_qkv_rope_f32(h3d_context *context, h3d_tensor *query,
         !h3d_is(rope_sin, H3D_F32, (size_t)sequence * rope_half)) {
         return h3d_set_error(error, error_size, "invalid QKV/RoPE tensors");
     }
-    dim3 grid((head_dim + 127) / 128, heads, sequence);
-    h3d_video_qkv_rope_f32_kernel<<<grid, 128, 0, context->stream>>>(
+    /* One block per head of one row, as many threads as the head has
+     * dimensions (capped so the block stays legal), and one staged copy of the
+     * Q and K rows for the block. The 64 threads a released head_dim asks for
+     * are enough: the staged kernel is at this shape's traffic floor. */
+    unsigned threads = head_dim < 256 ? head_dim : 256;
+    dim3 grid(1, heads, sequence);
+    h3d_video_qkv_rope_f32_kernel<<<grid, threads,
+                                    2 * head_dim * sizeof(float),
+                                    context->stream>>>(
         (float *)query->data, (float *)key->data, (float *)value->data,
         (const float *)qkv->data, bias ? (const float *)bias->data : NULL,
         (const float *)rope_cos->data, (const float *)rope_sin->data, sequence,

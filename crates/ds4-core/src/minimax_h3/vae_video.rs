@@ -1099,12 +1099,167 @@ fn extract_latent_tile(
     tile
 }
 
-/// One chunk (`decoder_decode_chunk`, `:831-951`): every tile through the
-/// graph, then one stitched frame set.
+/// What a finished chunk's worker hands back: the stitched frames, the two host
+/// costs it measured, and how many tiles it unpacked.
+struct ChunkDone {
+    frames: Frames,
+    unpacked: Duration,
+    stitched: Duration,
+    tiles: usize,
+}
+
+/// One unit of work for the unpack/stitch worker: a tile's projection, or the
+/// end of a chunk (which is when that chunk's tiles are stitched).
+enum LaundryJob {
+    Tile(Vec<f32>),
+    End,
+}
+
+/// What the worker needs that does not change inside one decode.
+struct Geometry<'a> {
+    tile_h: usize,
+    tile_w: usize,
+    total_frames: usize,
+    first_frame: usize,
+    frame_count: usize,
+    y_axis: &'a TileAxis,
+    x_axis: &'a TileAxis,
+}
+
+/// The video VAE's host work, behind the stream: `unpack_frames` per tile and
+/// `stitch_tiles` per chunk, both of which only need that tile's own readback.
+///
+/// The buffers are recycled - the worker hands each one back through `spare` -
+/// so no projection is ever copied or reallocated, and neither channel can
+/// block: exactly as many buffers exist as the pool holds, and the results
+/// channel is unbounded, so a chunk's `End` is never waiting on the main thread.
+fn laundry_worker(
+    work: std::sync::mpsc::Receiver<LaundryJob>,
+    spare: std::sync::mpsc::SyncSender<Vec<f32>>,
+    results: std::sync::mpsc::Sender<Result<ChunkDone, VaeError>>,
+    geometry: Geometry<'_>,
+) {
+    let mut tiles: Vec<Vec<f32>> = Vec::new();
+    let mut unpacked = Duration::ZERO;
+    for job in work.iter() {
+        match job {
+            LaundryJob::Tile(projected) => {
+                let started = Instant::now();
+                match unpack_frames(
+                    &projected,
+                    geometry.tile_h,
+                    geometry.tile_w,
+                    geometry.total_frames,
+                    geometry.first_frame,
+                    geometry.frame_count,
+                ) {
+                    Ok(rgb) => {
+                        tiles.push(rgb);
+                        unpacked += started.elapsed();
+                    }
+                    Err(error) => {
+                        let _ = results.send(Err(error));
+                        return;
+                    }
+                }
+                let _ = spare.send(projected);
+            }
+            LaundryJob::End => {
+                let started = Instant::now();
+                let frames =
+                    stitch_tiles(&tiles, geometry.y_axis, geometry.x_axis, geometry.frame_count);
+                let done = ChunkDone {
+                    frames,
+                    unpacked,
+                    stitched: started.elapsed(),
+                    tiles: tiles.len(),
+                };
+                if results.send(Ok(done)).is_err() {
+                    return;
+                }
+                tiles = Vec::new();
+                unpacked = Duration::ZERO;
+            }
+        }
+    }
+}
+
+/// The worker and the two channels, alive for as long as the chunks it serves.
+struct Laundry<'scope> {
+    jobs: std::sync::mpsc::SyncSender<LaundryJob>,
+    results: std::sync::mpsc::Receiver<Result<ChunkDone, VaeError>>,
+    spare: std::sync::mpsc::Receiver<Vec<f32>>,
+    pool: Vec<Vec<f32>>,
+    worker: std::thread::ScopedJoinHandle<'scope, ()>,
+}
+
+impl<'scope> Laundry<'scope> {
+    fn start<'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        geometry: Geometry<'scope>,
+        elements: usize,
+    ) -> Laundry<'scope> {
+        let (jobs, work) = std::sync::mpsc::sync_channel::<LaundryJob>(2);
+        let (spare, recycled) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let (results, finished) = std::sync::mpsc::channel::<Result<ChunkDone, VaeError>>();
+        let worker = scope.spawn(move || laundry_worker(work, spare, results, geometry));
+        Laundry {
+            jobs,
+            results: finished,
+            spare: recycled,
+            pool: vec![vec![0.0f32; elements], vec![0.0f32; elements]],
+            worker,
+        }
+    }
+
+    /// A projection buffer, from the pool or back from the worker.
+    fn buffer(&mut self) -> Result<Vec<f32>, VaeError> {
+        while let Ok(buffer) = self.spare.try_recv() {
+            self.pool.push(buffer);
+        }
+        match self.pool.pop() {
+            Some(buffer) => Ok(buffer),
+            None => self
+                .spare
+                .recv()
+                .map_err(|_| VaeError("the video VAE unpack worker stopped".into())),
+        }
+    }
+
+    fn send(&self, buffer: Vec<f32>) -> Result<(), VaeError> {
+        self.jobs
+            .send(LaundryJob::Tile(buffer))
+            .map_err(|_| VaeError("the video VAE unpack worker stopped".into()))
+    }
+
+    fn end_chunk(&self) -> Result<(), VaeError> {
+        self.jobs
+            .send(LaundryJob::End)
+            .map_err(|_| VaeError("the video VAE unpack worker stopped".into()))
+    }
+
+    /// The chunk that finished earliest and has not been taken yet.
+    fn take(&self) -> Result<ChunkDone, VaeError> {
+        self.results
+            .recv()
+            .map_err(|_| VaeError("the video VAE unpack worker stopped".into()))?
+    }
+
+    fn finish(self) {
+        let Laundry { jobs, worker, .. } = self;
+        drop(jobs);
+        let _ = worker.join();
+    }
+}
+
+/// One chunk's tiles through the graph, in tile order: extract, normalize,
+/// launch, read back, and hand the projection to the worker. Nothing here
+/// waits for the unpack, which is the point.
 #[allow(clippy::too_many_arguments)]
-fn decode_chunk(
+fn run_chunk_tiles(
     decoder: &Decoder,
     scratch: &TileScratch,
+    laundry: &mut Laundry<'_>,
     latent: &[f32],
     latent_time: usize,
     chunk: usize,
@@ -1112,36 +1267,16 @@ fn decode_chunk(
     full_w: usize,
     y_axis: &TileAxis,
     x_axis: &TileAxis,
-    total_frames: usize,
-    selected: Option<usize>,
-) -> Result<Frames, VaeError> {
+) -> Result<(Duration, Duration), VaeError> {
     let tile_h = y_axis.length / SPATIAL_RATIO;
     let tile_w = x_axis.length / SPATIAL_RATIO;
-    let mut tiles = Vec::with_capacity(y_axis.count() * x_axis.count());
-    // `H3_VAE_TIMING=1` splits the phase's host time: the latent tile's
-    // extraction and normalization, the graph call (which carries the readback
-    // wait), and the per-tile unpack. The stitch is the last line.
-    let timing = std::env::var_os("H3_VAE_TIMING").is_some();
     let mut extracted = Duration::ZERO;
     let mut graphed = Duration::ZERO;
-    let mut unpacked = Duration::ZERO;
-    let mut projected = Vec::new();
-    // `h3_video_vae.c:850`: a preview asks for one frame, so only that frame
-    // is unpacked per tile (`:874-877`) instead of the whole chunk.
-    let (first_frame, frame_count) = match selected {
-        Some(frame) => (frame, 1),
-        None => (
-            0,
-            if total_frames == FIRST_CHUNK_FRAMES {
-                FIRST_CHUNK_FRAMES
-            } else {
-                total_frames
-            },
-        ),
-    };
 
     for tile_y in 0..y_axis.count() {
         for tile_x in 0..x_axis.count() {
+            let mut buffer = laundry.buffer()?;
+
             let started = Instant::now();
             let input = extract_latent_tile(
                 latent,
@@ -1159,35 +1294,100 @@ fn decode_chunk(
             extracted += started.elapsed();
 
             let started = Instant::now();
-            decoder.run_tile(scratch, &rows, &mut projected)?;
+            decoder.run_tile(scratch, &rows, &mut buffer)?;
             graphed += started.elapsed();
-
-            let started = Instant::now();
-            tiles.push(unpack_frames(
-                &projected,
-                tile_h,
-                tile_w,
-                total_frames,
-                first_frame,
-                frame_count,
-            )?);
-            unpacked += started.elapsed();
+            laundry.send(buffer)?;
         }
     }
+    Ok((extracted, graphed))
+}
 
-    let started = Instant::now();
-    let frames = stitch_tiles(&tiles, y_axis, x_axis, frame_count);
-    if timing {
-        eprintln!(
-            "vae chunk {chunk}: extract {:.3}s graph {:.3}s unpack {:.3}s stitch {:.3}s ({} tiles)",
-            extracted.as_secs_f64(),
-            graphed.as_secs_f64(),
-            unpacked.as_secs_f64(),
-            started.elapsed().as_secs_f64(),
-            tiles.len()
-        );
+/// One chunk (`decoder_decode_chunk`, `:831-951`): every tile through the
+/// graph, then one stitched frame set.
+///
+/// The graph call is one stream, and the phase used to stop that stream twice
+/// per tile and once per chunk: the readback waits for the tile, then the host
+/// unpacks 26 MB of projection and, at the chunk's end, stitches fifteen tiles
+/// before the next chunk's first kernel can be submitted. In an nsys capture of
+/// the unchanged decoder that is 98 tile-boundary gaps of 11.8 ms (1.16 s) and
+/// 6 chunk-boundary gaps of 115 ms (0.69 s). The readback stays on the calling
+/// thread - it is the wait the tile's own kernels impose - and both pieces of
+/// host arithmetic run on a worker, which took the phase from 47.068 / 46.598 s
+/// to 46.342 / 45.837 s on the product canvas. `--vae-workers 2` was measured as
+/// the alternative and is slower (47.632 against 47.133 s: a second decoder's
+/// load and stream cost more than the gaps they hide), and hoisting this worker
+/// across the whole chunk loop was tried and did not beat it either (see the
+/// loop in `decode_with`).
+#[allow(clippy::too_many_arguments)]
+fn decode_chunk(
+    decoder: &Decoder,
+    scratch: &TileScratch,
+    latent: &[f32],
+    latent_time: usize,
+    chunk: usize,
+    full_h: usize,
+    full_w: usize,
+    y_axis: &TileAxis,
+    x_axis: &TileAxis,
+    total_frames: usize,
+    selected: Option<usize>,
+) -> Result<Frames, VaeError> {
+    // `h3_video_vae.c:850`: a preview asks for one frame, so only that frame
+    // is unpacked per tile (`:874-877`) instead of the whole chunk.
+    let (first_frame, frame_count) = match selected {
+        Some(frame) => (frame, 1),
+        None => (
+            0,
+            if total_frames == FIRST_CHUNK_FRAMES {
+                FIRST_CHUNK_FRAMES
+            } else {
+                total_frames
+            },
+        ),
+    };
+    let elements = decoder.sequence * OUTPUT_PATCH;
+
+    std::thread::scope(|scope| {
+        let geometry = Geometry {
+            tile_h: y_axis.length / SPATIAL_RATIO,
+            tile_w: x_axis.length / SPATIAL_RATIO,
+            total_frames,
+            first_frame,
+            frame_count,
+            y_axis,
+            x_axis,
+        };
+        let mut laundry = Laundry::start(scope, geometry, elements);
+        let (extracted, graphed) = run_chunk_tiles(
+            decoder, scratch, &mut laundry, latent, latent_time, chunk, full_h, full_w, y_axis,
+            x_axis,
+        )?;
+        laundry.end_chunk()?;
+        let done = laundry.take()?;
+        report_chunk(chunk, extracted, graphed, &done);
+        laundry.finish();
+        Ok(done.frames)
+    })
+}
+
+/// `H3_VAE_TIMING=1` splits the phase's host time: the latent tile's extraction
+/// and normalization and the graph call (which carries the readback wait) are
+/// the submitting thread's; the unpack and the stitch are the worker's, and
+/// they run behind the graph, so those two figures are what the phase no longer
+/// spends in front of the stream.
+fn report_chunk(chunk: usize, extracted: Duration, graphed: Duration, done: &ChunkDone) {
+    if std::env::var_os("H3_VAE_TIMING").is_none() {
+        return;
     }
-    Ok(frames)
+    eprintln!(
+        "vae chunk {chunk}: extract {:.3}s graph {:.3}s unpack {:.3}s stitch {:.3}s \
+         ({} tiles, unpack and stitch on a worker)",
+        extracted.as_secs_f64(),
+        graphed.as_secs_f64(),
+        done.unpacked.as_secs_f64(),
+        done.stitched.as_secs_f64(),
+        done.tiles
+    );
 }
 
 /// `load_latent_normalization` (`:271-318`): `latents_mean` and `latents_std`
@@ -1482,6 +1682,10 @@ pub fn decode_with(
         };
         decode_chunks(weight_directory, latent, &plan, arms, chunks, workers)?
     } else {
+        // One worker per chunk. Hoisting it across the whole loop, so that a
+        // chunk's stitch would run behind the next chunk's kernels, was tried
+        // and did not beat this shape (46.640 s and up against 46.342 / 45.837),
+        // so the simpler shape ships.
         let mut decoded = Vec::with_capacity(chunks);
         for chunk in 0..chunks {
             decoded.push(decode_chunk(

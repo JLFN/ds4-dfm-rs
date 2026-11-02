@@ -443,6 +443,12 @@ tests/h3/attn_bm: tests/h3/attn_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_g
 tests/h3/attn_f32_bm: tests/h3/attn_f32_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# And for the QKV/RoPE kernel the decoder runs once per block per tile (105
+# submissions of 2,805 rows at the product canvas): the staged shapes against
+# the shipped one, hashed, with the traffic floor beside them.
+tests/h3/vae_rope_bm: tests/h3/vae_rope_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # The video VAE decoder's four F32 matmuls at the tile shape, one call per
 # block, so a per-call figure times 1,944 prices the block's matmul set.
 tests/h3/vae_gemm_bm: tests/h3/vae_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
