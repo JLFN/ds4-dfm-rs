@@ -109,8 +109,35 @@ The loader (`tools/h3-profile.py`) is standard library only, refuses an unknown
 key by name rather than ignoring it, and `shlex.quote`s every value so a `doc`
 with an apostrophe cannot break the `eval`.
 
-## 4. Traps
+## 4. Run for real, twice
 
+The profile path was not only dry-run. Both renders below are the same prompt,
+seed 42, five seconds, on `2cd8e5f0`:
+
+| command | canvas | draft | steps | draft | refine | decode | wall | md5 |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| `--profile ts_h2` | 1344x768 | 928x544 | 6 | 74.4 | 38.5 | 28.1 | 192.3 s | `89392d81e25979439e3c0af13678ba2d` |
+| `--profile portrait` | 768x1344 | 544x928 | 4 | 50.0 | 38.7 | 28.2 | 168.1 s | (its own, `frames_fnv 4c77fcbeefab146f`) |
+
+- **The profile is the flags it expands to, bit for bit**: `--profile ts_h2`
+  reproduced the earlier `--steps 6` render exactly - same md5, same
+  `video_fnv=eaac4c9dd7d0911c`, same `frames_fnv=c0a9c6d218f5884e`, same
+  6,105,975 bytes. A recipe that renders something slightly different from the
+  flags it claims to be would be worse than no recipe.
+- **The canvas does not change the arithmetic**: 768x1344 costs the same as
+  1344x768 at equal pixels (draft 50.0 against 49.7, refine 38.7 against 38.4,
+  decode 28.2 against 28.1). The 181.2 s of the 16:9 `rapid` run in §2 against
+  this 168.1 s is the page-cache load (26.2 against 13.6), not the shot.
+- One correction this run produced: the `portrait` profile's own doc said its
+  draft lands at 544x960; `round(1344*0.7/32)*32` is **544x928**. The recipe was
+  right and its description was wrong, which is the failure mode a profile file
+  exists to prevent - fixed in the same commit.
+
+## 5. Traps
+
+- Recipes describe, they do not define: the `portrait` doc carried a wrong draft
+  size (544x960 for 544x928) through a commit, and only running it caught that.
+  `--dry-run` prints the resolved geometry for exactly this reason.
 - A dry run used to write the `.jobs` file - and the path may be a pinned
   clip's own job line. It clobbered `outputs/rapid/rapid.jobs` with a throwaway
   prompt during this unit's smoke test (restored). A dry run now prints the line

@@ -68,7 +68,7 @@
       "vae_attention": "tensor"
     },
     "portrait": {
-      "doc": "The same speed point at 9:16. Draft lands at 544x960 and the delivery at 768x1344; nothing else moves.",
+      "doc": "The same speed point at 9:16. Draft lands at 544x928 (0.7 of 768x1344, rounded to /32) and the delivery at 768x1344; nothing else moves.",
       "steps": 4,
       "draft_scale": 0.7,
       "refine_sigma": 0.72,
