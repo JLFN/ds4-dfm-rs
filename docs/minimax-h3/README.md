@@ -116,6 +116,7 @@ The model's license is included in the downloaded repository.
 - [The per-row FP8 arm, built and priced: exact, 1.73 s/eval, no visible gain, 2026-10-29](fp8-row-arm-2026-10-29.md)
 - [The release's FP8 route at the delivery canvas: 12.8% of a step, and detail the arm does not lose, 2026-11-02](fp8-delivery-2026-11-02.md)
 - [Three attention widths, measured: the block is not bound by K/V traffic, 2026-11-02](attention-widths-2026-11-02.md)
+- [E4M3 attention: the pipe halves, and the cast eats it, 2026-11-02](fp8-attention-2026-11-02.md)
 - [The Gemma4 encoder path leaves the tree, and the gate hashes do not move, 2026-11-02](gemma-removal-2026-11-02.md)
 - [The draft's anatomy: what holds it, 2026-10-31](draft-anatomy-2026-10-31.md)
 - [The two-stage route: a draft at 0.7, one upscale, one refine step, 2026-11-01](two-stage-route-2026-11-01.md)
