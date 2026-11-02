@@ -91,6 +91,9 @@ struct h3d_context {
     int stage_pending;    /* a DMA out of `stage` has not been waited for yet */
     int attention_mma;    /* 1 = tensor-core attention (default), 0 = byte-exact scalar */
     int attention_warps;  /* the pipelined block's warps per CTA; 0 = the four-warp block */
+    int attention_fp8;    /* 1 = the E4M3 block, which is opt-in and not bit-identical */
+    void *attn_scratch;   /* the E4M3 arm's prepared K/V, grown to fit the shape */
+    size_t attn_scratch_bytes;
     struct h3d_vae_options vae;
 };
 
@@ -107,6 +110,20 @@ enum {
     H3D_ATTN_PIPE12 = 12,
     H3D_ATTN_PIPE16 = 16
 };
+
+/* Whether the E4M3 block was asked for. It is opt-in for the same reason
+ * `H3_DIT_GEMM=fp8` is: it is an arithmetic change, so nothing about it is
+ * bit-identical to BF16. `fp8` and `e4m3` both name it; `four` still names the
+ * synchronous BF16 block, so the two arms that start with an `f` are told
+ * apart by their second letter, not their first. */
+static int h3d_attention_fp8_from_env(void) {
+    const char *mode = getenv("H3_DIT_ATTENTION");
+    if (!mode) return 0;
+    if (mode[0] == 'f' || mode[0] == 'F') {
+        return mode[1] == 'p' || mode[1] == 'P' || mode[1] == '8';
+    }
+    return mode[0] == 'e' || mode[0] == 'E';
+}
 
 /* Whether the byte-exact scalar attention was asked for, from the environment.
  * Unset means the tensor-core kernel, which is the default. `H3_DIT_ATTENTION`
@@ -134,7 +151,12 @@ static int h3d_attention_scalar_from_env(void) {
 static int h3d_attention_warps_from_env(void) {
     const char *mode = getenv("H3_DIT_ATTENTION");
     if (!mode) return H3D_ATTN_PIPE8;
-    if (mode[0] == 'f' || mode[0] == 'F') return H3D_ATTN_FOUR;
+    /* `fp8` is a data type and not a width: it leaves the width at the default
+     * so that a refused FP8 admission falls back to the measured eight-warp
+     * block rather than to the older synchronous one. */
+    const int fp8 = (mode[0] == 'f' || mode[0] == 'F') &&
+                    (mode[1] == 'p' || mode[1] == 'P' || mode[1] == '8');
+    if (!fp8 && (mode[0] == 'f' || mode[0] == 'F')) return H3D_ATTN_FOUR;
     for (const char *at = mode; at[0] != '\0'; at++) {
         if (at[0] == '1' && at[1] == '2') return H3D_ATTN_PIPE12;
         if (at[0] == '1' && at[1] == '6') return H3D_ATTN_PIPE16;
@@ -152,6 +174,7 @@ void h3d_set_attention(h3d_context *context, int scalar) {
     if (context) {
         context->attention_mma = !scalar;
         context->attention_warps = scalar ? 0 : h3d_attention_warps_from_env();
+        context->attention_fp8 = scalar ? 0 : h3d_attention_fp8_from_env();
     }
 }
 
@@ -325,6 +348,8 @@ h3d_context *h3d_create(char *error, size_t error_size) {
     context->attention_mma = !h3d_attention_scalar_from_env();
     context->attention_warps =
             context->attention_mma ? h3d_attention_warps_from_env() : 0;
+    context->attention_fp8 =
+            context->attention_mma ? h3d_attention_fp8_from_env() : 0;
     context->vae = h3d_vae_options_from_env();
     h3d_lt_forget();
     return context;
@@ -332,6 +357,7 @@ h3d_context *h3d_create(char *error, size_t error_size) {
 
 void h3d_destroy(h3d_context *context) {
     if (!context) return;
+    if (context->attn_scratch) cudaFree(context->attn_scratch);
     if (context->lt_workspace) cudaFree(context->lt_workspace);
     if (context->stage_done) cudaEventDestroy(context->stage_done);
     if (context->stage) cudaFreeHost(context->stage);
@@ -3525,6 +3551,737 @@ static int h3d_pipe_launch(h3d_context *context, h3d_tensor *output,
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * FP8 attention — the E4M3 arm the width unit's numbers point at.
+ *
+ * The unit before it wrapped the block in four widths and all four were
+ * bit-identical, with twelve warps 1.0% over eight and sixteen 30% under it on
+ * spills: 33% less K/V traffic per row bought nothing, so the block is not
+ * waiting on traffic and the per-row MMA and softmax are the critical path.
+ * Only a narrower operand shrinks that. A probe of the two MMA shapes on this
+ * host (`~/ds4-test/fp8mma.cu`) measured 123.1 TFLOP/s of BF16 and 246.2 of
+ * E4M3 at the same instruction rate, from a single CTA of eight warps, so
+ * `m16n8k32` is exactly twice the arithmetic per issue.
+ *
+ * The arithmetic stays the BF16 block's step for step: one maximum per 64-key
+ * tile, one exponential per score, the FP32 running maximum, denominator and
+ * output accumulator, and the online rescale. What E4M3 changes is named
+ * rather than hidden:
+ *   - K and V are divided by a scale per 64-key tile, and Q by one per warp;
+ *     the score is multiplied by the product and the output accumulator
+ *     carries the V scale as one more factor on the rescale it already does.
+ *   - P is E4M3 with a fixed scale of 448, which is exact for the weights
+ *     because the online softmax's weights are already <= 1; the output divides
+ *     it back out. Three mantissa bits is a coarser P than the BF16 block's
+ *     seven, and the RMS gate against that block is what prices it.
+ *   - Scores and the accumulator stay FP32, as there.
+ *
+ * Where the operands are converted is the one place this unit departed from
+ * its plan, on measurement. Converting K and V in the staging path - one pass
+ * for the tile's maximum, one to cast against it - put 538 ms on a call whose
+ * arithmetic is 330: the conversion is not free, and the tile it converts
+ * arrives by global loads whose latency no longer hides behind anything, so
+ * the first shape of this block ran at 1,043.8 ms and the second, with the
+ * tile's reads hoisted over the arithmetic, at 868.0. Prepared once per call
+ * instead (`h3d_f8_prepare_kernel`), the same arithmetic runs its 330 ms and
+ * the block's staging is four `cp.async` copies a thread against the BF16
+ * block's eight - because E4M3 is half a BF16. The preparation is one pass over
+ * K and V and a write of half their bytes, 2.4 GB at this host's rate.
+ *
+ * Layout, and the two places it is not the obvious one. K is staged as it is
+ * read, 128 dimensions a row and rows padded to 144 so `ldmatrix` can read them
+ * and eight rows of a tile land in eight bank groups. V is staged *transposed*
+ * (a dimension a row, 64 keys a row, padded to 80) because the PV fragment
+ * wants four keys of one dimension in one register, while V's own rows are four
+ * dimensions of one key; the preparation writes it that way. P goes through
+ * this warp's own 16x80 tile for the same reason in the other direction: the
+ * score fragments hold two adjacent keys a lane and the PV fragments want four,
+ * so a shared-memory round trip is the exchange and `__syncwarp` is its only
+ * fence.
+ *
+ * Registers are what bound the shape before, so nothing here is wider: eight
+ * warps, 128 query rows, a three-stage ring. The ring drops from 98,304 B to
+ * 68,608 B, which does not buy a second CTA - the probe says eight warps
+ * already saturate the pipe - but leaves the spill report the unit it was.
+ * ------------------------------------------------------------------------ */
+enum {
+    H3D_F8_HD = 128,                     /* head dimension, the one shape served */
+    H3D_F8_KEYS = 64,                    /* key rows staged per tile */
+    H3D_F8_M = 16,                       /* query rows a warp owns */
+    H3D_F8_WARPS = 8,                    /* the width the BF16 unit measured */
+    H3D_F8_ROWS = H3D_F8_M * H3D_F8_WARPS,
+    H3D_F8_STAGES = 3,
+    H3D_F8_KSTRIDE = H3D_F8_HD + 16,     /* 144: 16-byte rows, eight bank groups */
+    H3D_F8_VSTRIDE = H3D_F8_KEYS + 16,   /* 80: same, over 64 keys */
+    H3D_F8_PSTRIDE = H3D_F8_KEYS + 16,
+    H3D_F8_KPLANE = H3D_F8_KEYS * H3D_F8_KSTRIDE,  /* 9,216 B */
+    H3D_F8_VPLANE = H3D_F8_HD * H3D_F8_VSTRIDE,    /* 10,240 B */
+    H3D_F8_PPLANE = H3D_F8_M * H3D_F8_PSTRIDE,     /* 1,280 B a warp */
+    H3D_F8_THREADS = H3D_F8_WARPS * 32,
+    H3D_F8_SMEM = H3D_F8_STAGES * (H3D_F8_KPLANE + H3D_F8_VPLANE) +
+                  H3D_F8_WARPS * H3D_F8_PPLANE
+};
+
+/* `mma.sync.m16n8k32` E4M3 in, FP32 accumulate: twice the head dimensions per
+ * instruction, so a 128-dimension step is four of these where the BF16 block
+ * issues eight k16 ones, and the key dimension's 8 steps become 4. */
+__device__ __forceinline__ static void h3d_mma_step_fp8(float *c,
+                                                        const uint32_t *a,
+                                                        uint32_t b0, uint32_t b1) {
+    asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+/* Four values as one E4M3 quad, the first in the low byte: that is the order a
+ * fragment register holds its four head dimensions, and the order `ldmatrix`
+ * leaves a staged row in, so packing and loading agree by construction. */
+__device__ __forceinline__ static uint32_t h3d_f8_pack(float x, float y,
+                                                       float z, float w) {
+    uint32_t out = (uint32_t)__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+    out |= (uint32_t)__nv_cvt_float_to_fp8(y, __NV_SATFINITE, __NV_E4M3) << 8;
+    out |= (uint32_t)__nv_cvt_float_to_fp8(z, __NV_SATFINITE, __NV_E4M3) << 16;
+    out |= (uint32_t)__nv_cvt_float_to_fp8(w, __NV_SATFINITE, __NV_E4M3) << 24;
+    return out;
+}
+
+/* The two BF16 halves of one packed word, as floats, and both magnitudes as one
+ * integer maximum: a BF16 magnitude orders as its bit pattern does once the
+ * sign is gone, so a tile's maximum is an integer maximum and no value is
+ * widened twice. */
+__device__ __forceinline__ static float h3d_f8_low(uint32_t word) {
+    return __bfloat162float(__ushort_as_bfloat16((unsigned short)(word & 0xffffu)));
+}
+
+__device__ __forceinline__ static float h3d_f8_high(uint32_t word) {
+    return __bfloat162float(__ushort_as_bfloat16((unsigned short)(word >> 16)));
+}
+
+__device__ __forceinline__ static uint32_t h3d_f8_mag(uint32_t word) {
+    const uint32_t masked = word & 0x7fff7fffu;
+    return max(masked & 0xffffu, masked >> 16);
+}
+
+__device__ __forceinline__ static uint32_t h3d_f8_warp_max_bits(uint32_t value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = max(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+__device__ __forceinline__ static float h3d_f8_warp_max(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+/* One tile's scales, as the preparation left them: one float a tile for K and
+ * one for V, at `head * tiles + tile`. The floor is `h3d_fp8_scale_kernel`'s, so
+ * an all-zero tile divides by the same number the projection route would. */
+__device__ __forceinline__ static float h3d_f8_scale(const float *scales,
+                                                     uint32_t at) {
+    return fmaxf(scales[at] / H3D_FP8_MAX, H3D_FP8_MIN_SCALE);
+}
+
+/* One 64-key tile of K and V, prepared once for the whole call: K as read,
+ * V transposed, each divided by its own tile's scale. The tile's maximum and
+ * its cast are one pass here rather than one pass a tile in the attention
+ * block, where the reads would sit in front of arithmetic that could not hide
+ * them. A key past the end of the sequence reads the last row it can, so the
+ * maximum is still a value of this head, and converts to zero.
+ *
+ * Two reductions, one barrier apart: the per-warp maxima go to shared memory,
+ * thread zero divides them by 448 and writes both scales, and the second
+ * barrier releases the stores. */
+__global__ __launch_bounds__(H3D_F8_THREADS, 1)
+static void h3d_f8_prepare_kernel(const __nv_bfloat16 *key,
+                                  const __nv_bfloat16 *value,
+                                  unsigned char *key8, unsigned char *value8,
+                                  float *k_scale, float *v_scale,
+                                  uint32_t sequence, uint32_t value_stride) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tile = blockIdx.x;
+    const uint32_t base = tile * H3D_F8_KEYS;
+    const uint32_t tiles = gridDim.x;
+    /* Two planes: K's maximum and V's are separate sums and land in separate
+     * scales, so they cannot share a slot. */
+    __shared__ float warp_max[2][H3D_F8_WARPS];
+
+    /* K: thirty-two bytes a thread, which is sixteen dimensions of two keys. */
+    uint4 key_words[2][2];
+    uint32_t k_bits = 0u;
+#pragma unroll
+    for (uint32_t unit = 0; unit < 2u; unit++) {
+        const uint32_t index = tid + unit * H3D_F8_THREADS;
+        const uint32_t row = index >> 3, chunk = index & 7u;
+        const uint32_t source = base + row;
+        const uint32_t read = source < sequence ? source : sequence - 1u;
+        const __nv_bfloat16 *const from =
+                key + ((size_t)head * sequence + read) * H3D_F8_HD + chunk * 16u;
+        key_words[unit][0] = *(const uint4 *)from;
+        key_words[unit][1] = *(const uint4 *)(from + 8u);
+#pragma unroll
+        for (uint32_t half = 0; half < 2u; half++) {
+            const uint4 word = key_words[unit][half];
+            k_bits = max(k_bits, h3d_f8_mag(word.x));
+            k_bits = max(k_bits, h3d_f8_mag(word.y));
+            k_bits = max(k_bits, h3d_f8_mag(word.z));
+            k_bits = max(k_bits, h3d_f8_mag(word.w));
+        }
+    }
+    k_bits = h3d_f8_warp_max_bits(k_bits);
+    if (lane == 0) {
+        warp_max[0][warp] =
+                __bfloat162float(__ushort_as_bfloat16((unsigned short)k_bits));
+    }
+
+    /* V: four keys of one dimension a word, read in the same order the output
+     * writes, so the maximum sees every value once. */
+    uint32_t v_bits = 0u;
+#pragma unroll
+    for (uint32_t unit = 0; unit < 8u; unit++) {
+        const uint32_t index = tid + unit * H3D_F8_THREADS;
+        const uint32_t dim = index & (H3D_F8_HD - 1u);
+        const uint32_t group = index / H3D_F8_HD;
+        uint32_t pair0 = 0u, pair1 = 0u;
+#pragma unroll
+        for (uint32_t key_at = 0; key_at < 4u; key_at++) {
+            const uint32_t source = base + group * 4u + key_at;
+            if (source < sequence) {
+                const uint32_t bits = (uint32_t)__bfloat16_as_ushort(
+                        value[((size_t)head * sequence + source) * H3D_F8_HD +
+                              dim]);
+                if (key_at < 2u) {
+                    pair0 |= bits << (key_at * 16u);
+                } else {
+                    pair1 |= bits << ((key_at - 2u) * 16u);
+                }
+            }
+        }
+        v_bits = max(v_bits, h3d_f8_mag(pair0));
+        v_bits = max(v_bits, h3d_f8_mag(pair1));
+    }
+    v_bits = h3d_f8_warp_max_bits(v_bits);
+    if (lane == 0) {
+        warp_max[1][warp] =
+                __bfloat162float(__ushort_as_bfloat16((unsigned short)v_bits));
+    }
+    __syncthreads();
+
+    if (tid == 0u) {
+        float key_max = 0.0f, value_max = 0.0f;
+#pragma unroll
+        for (uint32_t at = 0; at < H3D_F8_WARPS; at++) {
+            key_max = fmaxf(key_max, warp_max[0][at]);
+            value_max = fmaxf(value_max, warp_max[1][at]);
+        }
+        k_scale[head * tiles + tile] = key_max;
+        v_scale[head * tiles + tile] = value_max;
+    }
+    __syncthreads();
+    const float k_gain = 1.0f / h3d_f8_scale(k_scale, head * tiles + tile);
+    const float v_gain = 1.0f / h3d_f8_scale(v_scale, head * tiles + tile);
+
+    /* K as read: sixteen dimensions a chunk, two chunks a thread. */
+#pragma unroll
+    for (uint32_t unit = 0; unit < 2u; unit++) {
+        const uint32_t index = tid + unit * H3D_F8_THREADS;
+        const uint32_t row = index >> 3, chunk = index & 7u;
+        const uint32_t source = base + row;
+        if (source >= sequence) continue;
+        const uint4 low = key_words[unit][0], high = key_words[unit][1];
+        uint4 words;
+        words.x = h3d_f8_pack(h3d_f8_low(low.x) * k_gain,
+                              h3d_f8_high(low.x) * k_gain,
+                              h3d_f8_low(low.y) * k_gain,
+                              h3d_f8_high(low.y) * k_gain);
+        words.y = h3d_f8_pack(h3d_f8_low(low.z) * k_gain,
+                              h3d_f8_high(low.z) * k_gain,
+                              h3d_f8_low(low.w) * k_gain,
+                              h3d_f8_high(low.w) * k_gain);
+        words.z = h3d_f8_pack(h3d_f8_low(high.x) * k_gain,
+                              h3d_f8_high(high.x) * k_gain,
+                              h3d_f8_low(high.y) * k_gain,
+                              h3d_f8_high(high.y) * k_gain);
+        words.w = h3d_f8_pack(h3d_f8_low(high.z) * k_gain,
+                              h3d_f8_high(high.z) * k_gain,
+                              h3d_f8_low(high.w) * k_gain,
+                              h3d_f8_high(high.w) * k_gain);
+        *(uint4 *)(key8 + ((size_t)head * sequence + source) * H3D_F8_HD +
+                   chunk * 16u) = words;
+    }
+
+    /* V transposed, and written a dimension at a time: sixteen threads carry
+     * one dimension's sixty-four keys, so a warp writes two contiguous runs of
+     * sixty-four bytes and nothing is scattered. */
+#pragma unroll
+    for (uint32_t unit = 0; unit < 8u; unit++) {
+        const uint32_t index = tid + unit * H3D_F8_THREADS;
+        const uint32_t dim = index >> 4;
+        const uint32_t group = index & 15u;
+        uint32_t pair0 = 0u, pair1 = 0u;
+#pragma unroll
+        for (uint32_t key_at = 0; key_at < 4u; key_at++) {
+            const uint32_t source = base + group * 4u + key_at;
+            if (source < sequence) {
+                const uint32_t bits = (uint32_t)__bfloat16_as_ushort(
+                        value[((size_t)head * sequence + source) * H3D_F8_HD +
+                              dim]);
+                if (key_at < 2u) {
+                    pair0 |= bits << (key_at * 16u);
+                } else {
+                    pair1 |= bits << ((key_at - 2u) * 16u);
+                }
+            }
+        }
+        *(uint32_t *)(value8 + ((size_t)head * H3D_F8_HD + dim) * value_stride +
+                      base + group * 4u) =
+                h3d_f8_pack(h3d_f8_low(pair0) * v_gain,
+                            h3d_f8_high(pair0) * v_gain,
+                            h3d_f8_low(pair1) * v_gain,
+                            h3d_f8_high(pair1) * v_gain);
+    }
+}
+
+/* A 16-byte global-to-shared copy that does not block the issuing warp;
+ * `bytes` under 16 zero-fills the rest, and zero bytes zero-fill all of it,
+ * which is how a tile's tail is staged without a branch. */
+__device__ __forceinline__ static void h3d_f8_copy(void *destination,
+                                                   const void *source,
+                                                   uint32_t bytes) {
+    const uint32_t at = (uint32_t)__cvta_generic_to_shared(destination);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at),
+                 "l"(source), "r"(bytes));
+}
+
+/* One tile of the prepared operands into the ring's stage, four sixteen-byte
+ * copies a thread: K's eight chunks a row, V's four across its sixty-four keys.
+ * Both rings pad their rows, so the copy is per chunk and the padding stays
+ * where the fragments want it. */
+__device__ __forceinline__ static void h3d_f8_stage(
+        unsigned char *const key_rings, unsigned char *const value_rings,
+        uint32_t stage, const unsigned char *key8, const unsigned char *value8,
+        uint32_t head, uint32_t sequence, uint32_t value_stride, uint32_t base) {
+    unsigned char *const tile_key = key_rings + (size_t)stage * H3D_F8_KPLANE;
+    unsigned char *const tile_value = value_rings + (size_t)stage * H3D_F8_VPLANE;
+    const uint32_t tid = threadIdx.x;
+#pragma unroll
+    for (uint32_t unit = 0; unit < 2u; unit++) {
+        const uint32_t index = tid + unit * H3D_F8_THREADS;
+        const uint32_t row = index >> 3, chunk = index & 7u;
+        const uint32_t source = base + row;
+        const uint32_t live = source < sequence ? 16u : 0u;
+        const uint32_t read = source < sequence ? source : sequence - 1u;
+        h3d_f8_copy(tile_key + (size_t)row * H3D_F8_KSTRIDE + chunk * 16u,
+                    key8 + ((size_t)head * sequence + read) * H3D_F8_HD +
+                            chunk * 16u,
+                    live);
+    }
+    /* V's ring row is one dimension's keys, so a thread carries sixteen keys of
+     * one dimension and the tail chunk is partly live. The tail chunk's source
+     * is its own key offset and not `sequence - 1`, which is neither the tile's
+     * nor sixteen-byte aligned; the prepared row is as wide as every tile, so
+     * that address exists and holds the zeros the preparation wrote there. */
+#pragma unroll
+    for (uint32_t unit = 0; unit < 2u; unit++) {
+        const uint32_t index = tid + unit * H3D_F8_THREADS;
+        const uint32_t dim = index & (H3D_F8_HD - 1u);
+        const uint32_t chunk = index / H3D_F8_HD;   /* sixteen keys each */
+        const uint32_t first = base + chunk * 16u;
+        const uint32_t live = first >= sequence
+                                      ? 0u
+                                      : (sequence - first < 16u
+                                                 ? sequence - first
+                                                 : 16u);
+        h3d_f8_copy(tile_value + (size_t)dim * H3D_F8_VSTRIDE + chunk * 16u,
+                    value8 + ((size_t)head * H3D_F8_HD + dim) * value_stride +
+                            first,
+                    live);
+    }
+}
+
+__global__ __launch_bounds__(H3D_F8_THREADS, 1)
+static void h3d_attention_fp8_kernel(
+        __nv_bfloat16 *output, const __nv_bfloat16 *query,
+        const unsigned char *key8, const unsigned char *value8,
+        const float *k_scale, const float *v_scale, uint32_t sequence,
+        uint32_t heads, uint32_t value_stride, float scale) {
+    extern __shared__ __align__(16) unsigned char fp8_ring[];
+    unsigned char *const key_rings = fp8_ring;
+    unsigned char *const value_rings =
+            fp8_ring + (size_t)H3D_F8_STAGES * H3D_F8_KPLANE;
+    unsigned char *const p_rings =
+            value_rings + (size_t)H3D_F8_STAGES * H3D_F8_VPLANE;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    unsigned char *const p_tile = p_rings + (size_t)warp * H3D_F8_PPLANE;
+    const uint32_t quad = lane >> 2u;            /* the accumulator row a lane serves */
+    const uint32_t within = lane & 3u;           /* the four dimensions it owns */
+    const uint32_t head = blockIdx.y;
+    const uint32_t tiles = (sequence + H3D_F8_KEYS - 1u) / H3D_F8_KEYS;
+    const uint32_t first_row = blockIdx.x * H3D_F8_ROWS + warp * H3D_F8_M;
+    const uint32_t row0 = first_row + quad, row1 = row0 + 8u;
+    const int live0 = row0 < sequence, live1 = row1 < sequence;
+    const uint32_t read0 = live0 ? row0 : sequence - 1u;
+    const uint32_t read1 = live1 ? row1 : sequence - 1u;
+    const __nv_bfloat16 *const query0 =
+            query + ((size_t)head * sequence + read0) * H3D_F8_HD;
+    const __nv_bfloat16 *const query1 =
+            query + ((size_t)head * sequence + read1) * H3D_F8_HD;
+
+    /* Q: the warp's own sixteen rows, converted once per CTA against one scale
+     * the warp reduces for itself. Q is the one operand still cast here,
+     * because it is read once a CTA and not once a tile. */
+    float q_max = 0.0f;
+#pragma unroll
+    for (uint32_t step = 0; step < 4u; step++) {
+        const uint32_t dim = step * 32u + within * 4u;
+        for (uint32_t half = 0; half < 2u; half++) {
+            const __nv_bfloat16 *const rows[2] = {query0, query1};
+            for (uint32_t which = 0; which < 2u; which++) {
+                const __nv_bfloat162 *const pairs =
+                        (const __nv_bfloat162 *)(rows[which] + dim + half * 16u);
+                const float2 low = __bfloat1622float2(pairs[0]);
+                const float2 high = __bfloat1622float2(pairs[1]);
+                q_max = fmaxf(q_max, fmaxf(fabsf(low.x), fabsf(low.y)));
+                q_max = fmaxf(q_max, fmaxf(fabsf(high.x), fabsf(high.y)));
+            }
+        }
+    }
+    q_max = h3d_f8_warp_max(q_max);
+    const float q_scale = fmaxf(q_max / H3D_FP8_MAX, H3D_FP8_MIN_SCALE);
+    const float q_gain = 1.0f / q_scale;
+    uint32_t a[4][4];
+#pragma unroll
+    for (uint32_t step = 0; step < 4u; step++) {
+        const uint32_t dim = step * 32u + within * 4u;
+        for (uint32_t half = 0; half < 2u; half++) {
+            const __nv_bfloat162 *const low0 =
+                    (const __nv_bfloat162 *)(query0 + dim + half * 16u);
+            const __nv_bfloat162 *const low1 =
+                    (const __nv_bfloat162 *)(query1 + dim + half * 16u);
+            const float2 a0 = __bfloat1622float2(low0[0]);
+            const float2 a1 = __bfloat1622float2(low1[0]);
+            const float2 a2 = __bfloat1622float2(low0[1]);
+            const float2 a3 = __bfloat1622float2(low1[1]);
+            a[step][half * 2u + 0u] = h3d_f8_pack(a0.x * q_gain, a0.y * q_gain,
+                                                  a2.x * q_gain, a2.y * q_gain);
+            a[step][half * 2u + 1u] = h3d_f8_pack(a1.x * q_gain, a1.y * q_gain,
+                                                  a3.x * q_gain, a3.y * q_gain);
+        }
+    }
+
+    float maximum0 = -INFINITY, maximum1 = -INFINITY;
+    float denominator0 = 0.0f, denominator1 = 0.0f;
+    float carry = 0.0f;   /* the previous tile's V scale, once one has been read */
+    float result[H3D_F8_HD / 8u][4];
+#pragma unroll
+    for (uint32_t dim = 0; dim < H3D_F8_HD / 8u; dim++) {
+        result[dim][0] = result[dim][1] = result[dim][2] = result[dim][3] = 0.0f;
+    }
+
+    /* The ring, filled and refilled exactly as the BF16 block's: one tile a
+     * stage, one stage a commit group, and the tile being read completed
+     * `stages - 1` tiles ago. */
+    h3d_f8_stage(key_rings, value_rings, 0u, key8, value8, head, sequence,
+                 value_stride, 0u);
+    asm volatile("cp.async.commit_group;\n" ::);
+    for (uint32_t ahead = 1; ahead + 1u < H3D_F8_STAGES; ahead++) {
+        const uint32_t base = ahead * H3D_F8_KEYS;
+        if (base < sequence) {
+            h3d_f8_stage(key_rings, value_rings, ahead % H3D_F8_STAGES, key8,
+                         value8, head, sequence, value_stride, base);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    }
+
+    for (uint32_t tile = 0, base = 0; base < sequence;
+         tile++, base += H3D_F8_KEYS) {
+        const uint32_t next = base + (H3D_F8_STAGES - 1u) * H3D_F8_KEYS;
+        const uint32_t current = tile % H3D_F8_STAGES;
+        if (next < sequence) {
+            h3d_f8_stage(key_rings, value_rings,
+                         (tile + H3D_F8_STAGES - 1u) % H3D_F8_STAGES, key8,
+                         value8, head, sequence, value_stride, next);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(H3D_F8_STAGES - 1));
+        __syncthreads();
+
+        const unsigned char *const shared_key =
+                key_rings + (size_t)current * H3D_F8_KPLANE;
+        const unsigned char *const shared_value =
+                value_rings + (size_t)current * H3D_F8_VPLANE;
+        const float value_scale = h3d_f8_scale(v_scale, head * tiles + tile);
+        const float score_scale =
+                scale * q_scale * h3d_f8_scale(k_scale, head * tiles + tile);
+        /* The first tile's accumulator is empty, so its ratio is any number;
+         * one is the one that makes the recursion read as written. */
+        const float v_ratio = carry > 0.0f ? carry / value_scale : 1.0f;
+        carry = value_scale;
+
+        /* Scores: S = Q * K^T over all H3D_F8_KEYS staged keys. */
+        float score[H3D_F8_KEYS / 8u][4];
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_F8_KEYS / 8u; slice++) {
+            score[slice][0] = score[slice][1] = 0.0f;
+            score[slice][2] = score[slice][3] = 0.0f;
+        }
+#pragma unroll
+        for (uint32_t step = 0; step < 4u; step++) {
+#pragma unroll
+            for (uint32_t part = 0; part < H3D_F8_KEYS / 16u; part++) {
+                const uint32_t row =
+                        part * 16u + 8u * ((lane >> 4) & 1u) + (lane & 7u);
+                const uint32_t dim = step * 32u + 16u * ((lane >> 3) & 1u);
+                uint32_t b[4];
+                h3d_mma_load(b, shared_key + (size_t)row * H3D_F8_KSTRIDE + dim);
+                h3d_mma_step_fp8(score[2u * part], a[step], b[0], b[1]);
+                h3d_mma_step_fp8(score[2u * part + 1u], a[step], b[2], b[3]);
+            }
+        }
+
+        /* Scale, then mask the tail keys out of the softmax. */
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_F8_KEYS / 8u; slice++) {
+            const uint32_t first = slice * 8u + (lane & 3u) * 2u;
+            score[slice][0] *= score_scale;
+            score[slice][1] *= score_scale;
+            score[slice][2] *= score_scale;
+            score[slice][3] *= score_scale;
+            if (base + first >= sequence) {
+                score[slice][0] = -INFINITY;
+                score[slice][2] = -INFINITY;
+            }
+            if (base + first + 1u >= sequence) {
+                score[slice][1] = -INFINITY;
+                score[slice][3] = -INFINITY;
+            }
+        }
+
+        /* One maximum per tile, reduced across the four lanes of a row. */
+        float tile0 = -INFINITY, tile1 = -INFINITY;
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_F8_KEYS / 8u; slice++) {
+            tile0 = fmaxf(tile0, fmaxf(score[slice][0], score[slice][1]));
+            tile1 = fmaxf(tile1, fmaxf(score[slice][2], score[slice][3]));
+        }
+        tile0 = fmaxf(tile0, __shfl_xor_sync(0xffffffffu, tile0, 1));
+        tile0 = fmaxf(tile0, __shfl_xor_sync(0xffffffffu, tile0, 2));
+        tile1 = fmaxf(tile1, __shfl_xor_sync(0xffffffffu, tile1, 1));
+        tile1 = fmaxf(tile1, __shfl_xor_sync(0xffffffffu, tile1, 2));
+        const float next0 = fmaxf(maximum0, tile0);
+        const float next1 = fmaxf(maximum1, tile1);
+        /* Two factors, and they belong to different sums: the denominator
+         * carries the exponential alone, while the numerator's accumulator
+         * carries the V scale too, because the tile it is about to add was
+         * divided by a scale of its own. */
+        const float keep0 = expf(maximum0 - next0);
+        const float keep1 = expf(maximum1 - next1);
+        const float rescale0 = keep0 * v_ratio;
+        const float rescale1 = keep1 * v_ratio;
+
+        float weight[H3D_F8_KEYS / 8u][4];
+        float part0 = 0.0f, part1 = 0.0f;
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_F8_KEYS / 8u; slice++) {
+            weight[slice][0] = expf(score[slice][0] - next0);
+            weight[slice][1] = expf(score[slice][1] - next0);
+            weight[slice][2] = expf(score[slice][2] - next1);
+            weight[slice][3] = expf(score[slice][3] - next1);
+            part0 += weight[slice][0] + weight[slice][1];
+            part1 += weight[slice][2] + weight[slice][3];
+        }
+        part0 += __shfl_xor_sync(0xffffffffu, part0, 1);
+        part0 += __shfl_xor_sync(0xffffffffu, part0, 2);
+        part1 += __shfl_xor_sync(0xffffffffu, part1, 1);
+        part1 += __shfl_xor_sync(0xffffffffu, part1, 2);
+        denominator0 = denominator0 * keep0 + part0;
+        denominator1 = denominator1 * keep1 + part1;
+        maximum0 = next0;
+        maximum1 = next1;
+#pragma unroll
+        for (uint32_t dim = 0; dim < H3D_F8_HD / 8u; dim++) {
+            result[dim][0] *= rescale0;
+            result[dim][1] *= rescale0;
+            result[dim][2] *= rescale1;
+            result[dim][3] *= rescale1;
+        }
+
+        /* P this warp owns, in the layout the PV fragments load: the two keys a
+         * lane holds from a score slice go in as they are, the other two come
+         * back from the next lane out of this tile. */
+#pragma unroll
+        for (uint32_t slice = 0; slice < H3D_F8_KEYS / 8u; slice++) {
+            const uint32_t column = slice * 8u + within * 2u;
+            const uint32_t low = h3d_f8_pack(weight[slice][0] * H3D_FP8_MAX,
+                                             weight[slice][1] * H3D_FP8_MAX,
+                                             0.0f, 0.0f) & 0xffffu;
+            const uint32_t high = h3d_f8_pack(weight[slice][2] * H3D_FP8_MAX,
+                                              weight[slice][3] * H3D_FP8_MAX,
+                                              0.0f, 0.0f) & 0xffffu;
+            *(unsigned short *)(p_tile + (size_t)quad * H3D_F8_PSTRIDE + column) =
+                    (unsigned short)low;
+            *(unsigned short *)(p_tile + (size_t)(quad + 8u) * H3D_F8_PSTRIDE +
+                                column) = (unsigned short)high;
+        }
+        __syncwarp();
+
+        /* O += P * V, both fragments from the tiles. */
+        uint32_t p[2][4];
+#pragma unroll
+        for (uint32_t step = 0; step < 2u; step++) {
+            const uint32_t row = 8u * ((lane >> 3) & 1u) + (lane & 7u);
+            const uint32_t at = step * 32u + 16u * ((lane >> 4) & 1u);
+            h3d_mma_load(p[step], p_tile + (size_t)row * H3D_F8_PSTRIDE + at);
+        }
+#pragma unroll
+        for (uint32_t step = 0; step < 2u; step++) {
+#pragma unroll
+            for (uint32_t part = 0; part < H3D_F8_HD / 16u; part++) {
+                const uint32_t dim =
+                        part * 16u + 8u * ((lane >> 4) & 1u) + (lane & 7u);
+                const uint32_t at = step * 32u + 16u * ((lane >> 3) & 1u);
+                uint32_t b[4];
+                h3d_mma_load(b, shared_value + (size_t)dim * H3D_F8_VSTRIDE + at);
+                h3d_mma_step_fp8(result[2u * part], p[step], b[0], b[1]);
+                h3d_mma_step_fp8(result[2u * part + 1u], p[step], b[2], b[3]);
+            }
+        }
+        __syncthreads();   /* every warp is done with this stage before it refills */
+    }
+
+    /* The accumulator's last factor is the *last* tile's V scale, because the
+     * recursion's ratios telescope from the tile being added down to the one
+     * that was: R = (448 / v_last) * the true weighted sum, and P's fixed scale
+     * of 448 divides out with it. */
+    const float final = carry / (H3D_FP8_MAX * denominator0);
+    const float final1 = carry / (H3D_FP8_MAX * denominator1);
+    if (live0) {
+#pragma unroll
+        for (uint32_t dim = 0; dim < H3D_F8_HD / 8u; dim++) {
+            const size_t at = ((size_t)row0 * heads + head) * H3D_F8_HD +
+                              dim * 8u + within * 2u;
+            output[at] = __float2bfloat16(result[dim][0] * final);
+            output[at + 1u] = __float2bfloat16(result[dim][1] * final);
+        }
+    }
+    if (live1) {
+#pragma unroll
+        for (uint32_t dim = 0; dim < H3D_F8_HD / 8u; dim++) {
+            const size_t at = ((size_t)row1 * heads + head) * H3D_F8_HD +
+                              dim * 8u + within * 2u;
+            output[at] = __float2bfloat16(result[dim][2] * final1);
+            output[at + 1u] = __float2bfloat16(result[dim][3] * final1);
+        }
+    }
+}
+
+/* The FP8 block's own shared-memory admission, as the pipelined BF16 block has
+ * one. A refused request retires the arm, and the caller runs BF16 instead. */
+static int h3d_f8_admit(void) {
+    static int refused = -1;
+    if (refused < 0) {
+        const cudaError_t status = cudaFuncSetAttribute(
+                (const void *)h3d_attention_fp8_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, H3D_F8_SMEM);
+        refused = status == cudaSuccess ? 0 : 1;
+        if (refused) (void)cudaGetLastError();
+    }
+    return refused;
+}
+
+/* The arm's two launches and the scratch they share. The bound is per call, not
+ * per shape, because the tensors are: K and V prepared as E4M3, and one scale a
+ * 64-key tile for each. */
+static int h3d_f8_run(h3d_context *context, h3d_tensor *output,
+                      const h3d_tensor *query, const h3d_tensor *key,
+                      const h3d_tensor *value, uint32_t sequence,
+                      uint32_t heads, uint32_t head_dim, float scale,
+                      char *error, size_t error_size) {
+    if (h3d_f8_admit() != 0) return 0;
+    /* One line per distinct shape the arm actually runs, so a render log names
+     * the attention that produced its clip instead of leaving it to infer from
+     * a step time. A job reaches this with more than one shape - the connector
+     * attention is 128-wide too, and much shorter than the DiT's sequence - and
+     * the first line a job prints is the small one. Four shapes is every
+     * distinct call any render in this port makes. */
+    {
+        static uint32_t seen[4];
+        static int shapes = 0;
+        int known = 0;
+        for (int at = 0; at < shapes; at++) known |= seen[at] == sequence;
+        if (!known && shapes < 4) {
+            seen[shapes++] = sequence;
+            fprintf(stderr,
+                    "E4M3 attention (mma 8 warps, prepared operands): sequence=%u "
+                    "heads=%u\n",
+                    sequence, heads);
+        }
+    }
+    const size_t elements = (size_t)sequence * heads * head_dim;
+    const uint32_t tiles = (sequence + H3D_F8_KEYS - 1u) / H3D_F8_KEYS;
+    /* V's prepared rows are one dimension's keys, and the stride is every tile
+     * the sequence has - not the sequence rounded up. Both arms of the last
+     * tile write past `sequence` (the casts that land in the dead keys write
+     * zeros), so a stride that stopped at the rounded sequence let a partial
+     * tile's last group write into the *next* dimension's row, which is real
+     * data another thread was writing: the prepared V moved between runs while
+     * every scale held. Rows this wide give each tile its own bytes, each
+     * written exactly once, and leave the ring's copy of the tail aligned. */
+    const uint32_t value_stride = tiles * H3D_F8_KEYS;
+    const size_t values = (size_t)heads * head_dim * value_stride;
+    const size_t scales = (size_t)heads * tiles;
+    const size_t need = elements + values + scales * 2u * sizeof(float) + 64u;
+    if (context->attn_scratch_bytes < need) {
+        if (context->attn_scratch) {
+            cudaFree(context->attn_scratch);
+            context->attn_scratch = NULL;
+            context->attn_scratch_bytes = 0;
+        }
+        void *grown = NULL;
+        if (cudaMalloc(&grown, need) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        context->attn_scratch = grown;
+        context->attn_scratch_bytes = need;
+    }
+    if (cudaMemsetAsync(context->attn_scratch, 0, need, context->stream) !=
+        cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    unsigned char *const key8 = (unsigned char *)context->attn_scratch;
+    unsigned char *const value8 = key8 + elements;   /* its own, padded rows */
+    float *const k_scale = (float *)(value8 + values);
+    float *const v_scale = k_scale + scales;
+
+    dim3 prepare_grid(tiles, heads);
+    h3d_f8_prepare_kernel<<<prepare_grid, H3D_F8_THREADS, 0,
+                            context->stream>>>(
+            (const __nv_bfloat16 *)key->data, (const __nv_bfloat16 *)value->data,
+            key8, value8, k_scale, v_scale, sequence, value_stride);
+    if (!h3d_launch_ok("E4M3 attention preparation", error, error_size)) {
+        return -1;
+    }
+    dim3 grid((sequence + H3D_F8_ROWS - 1) / H3D_F8_ROWS, heads);
+    h3d_attention_fp8_kernel<<<grid, H3D_F8_THREADS, (size_t)H3D_F8_SMEM,
+                               context->stream>>>(
+            (__nv_bfloat16 *)output->data, (const __nv_bfloat16 *)query->data,
+            key8, value8, k_scale, v_scale, sequence, heads, value_stride, scale);
+    if (!h3d_launch_ok("E4M3 attention (mma, pipelined 8 warps)", error,
+                       error_size)) {
+        return -1;
+    }
+    return 1;
+}
+
 int h3d_sdpa(h3d_context *context, h3d_tensor *output,
              const h3d_tensor *query, const h3d_tensor *key,
              const h3d_tensor *value, uint32_t sequence, uint32_t heads,
@@ -3548,6 +4305,17 @@ int h3d_sdpa(h3d_context *context, h3d_tensor *output,
      * Both pipelined and four-warp kernels are 128-wide, so the 64-wide
      * connector attention stays on the tiled path. */
     if (context->attention_mma && head_dim == 128) {
+        /* The E4M3 block first when the environment asked for it, and only
+         * after its shared-memory admission succeeds: a refusal drops to the
+         * BF16 arm below rather than failing, and prints as that arm's label so
+         * a log never claims FP8 it did not run. */
+        if (context->attention_fp8) {
+            const int issued = h3d_f8_run(context, output, query, key, value,
+                                          sequence, heads, head_dim, scale,
+                                          error, error_size);
+            if (issued > 0) return 1;
+            if (issued < 0) return 0;
+        }
         int issued = 0;
         if (context->attention_warps == H3D_ATTN_PIPE16) {
             issued = h3d_pipe_launch<H3D_ATTN_PIPE16>(

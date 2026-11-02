@@ -1,5 +1,9 @@
 # E4M3 attention: the pipe halves, and the cast eats it (2026-11-02)
 
+> Resumed by the next unit: the prepared shape was reproducible after all, and
+> the defect was V's row width in the preparation pass. See
+> [`fp8-attention-arm-2026-11-02.md`](fp8-attention-arm-2026-11-02.md).
+
 Unit: handoff section 3, steps 0-2. The width unit before it closed every shape
 the block can take - twelve warps +1.0% over eight, sixteen -30% on spills - and
 concluded the critical path is the per-row MMA and softmax, which only a
