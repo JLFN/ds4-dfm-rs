@@ -223,6 +223,7 @@ fn main() {
         .unwrap_or_else(|_| args.bind.clone());
     println!("h3-server-rs: local v1 video API on http://{address}/v1/videos");
     println!("  output {}", args.out_dir.display());
+    println!("  diT arm H3_DIT_GEMM={}", server.dit_gemm());
     match (&args.model_dir, &args.renderer) {
         (Some(model_dir), _) => println!(
             "  engine {} (steps {}, reuse {})",

@@ -503,6 +503,11 @@ pub struct VideoServer {
     out_dir: PathBuf,
     /// The recipe file the create body's `profile` names are read from.
     profiles: PathBuf,
+    /// The DiT projection arm this process loaded. `H3_DIT_GEMM` is read once
+    /// per load (`minimax_h3::dit::gemm_mode_from_env`), so a recipe that names
+    /// a different arm cannot be honoured here: it is refused by name rather
+    /// than served as a picture the recipe did not ask for.
+    dit_gemm: String,
 }
 
 impl VideoServer {
@@ -512,7 +517,14 @@ impl VideoServer {
             renderer,
             out_dir,
             profiles: PathBuf::from("tools/h3-profiles.json"),
+            dit_gemm: resident_dit_gemm(),
         }
+    }
+
+    /// The arm the engine actually loaded, for the startup line and the
+    /// recipe check.
+    pub fn dit_gemm(&self) -> &str {
+        &self.dit_gemm
     }
 
     /// The recipe file `profile` names resolve against (`--profiles`).
@@ -555,7 +567,7 @@ impl VideoServer {
         let plan = match parse_create(&http.body)
             .and_then(|body| body.plan_with(&probe))
             .and_then(|mut plan| {
-                apply_recipe(&mut plan, &self.profiles)?;
+                apply_recipe(&mut plan, &self.profiles, &self.dit_gemm)?;
                 Ok(plan)
             }) {
             Ok(plan) => plan,
@@ -725,7 +737,40 @@ enum Route {
 /// is resolved here rather than in the parser: one reader
 /// (`minimax_h3::profiles`) serves the CLI, the route script and this API, so a
 /// name cannot mean one thing to one caller and something else to another.
-fn apply_recipe(plan: &mut Plan, path: &Path) -> Result<(), ApiError> {
+/// The DiT projection arm this process loaded, in the words `H3_DIT_GEMM` takes.
+/// The engine reads the same variable once per load and refuses an unknown
+/// word there, so a running server holds one of the three or nothing at all.
+fn resident_dit_gemm() -> String {
+    match std::env::var("H3_DIT_GEMM") {
+        Ok(word) if !word.trim().is_empty() => word.trim().to_string(),
+        _ => "bf16".to_string(),
+    }
+}
+
+/// Refuse a recipe whose projection arm this process did not load.
+fn recipe_arm_fits(
+    name: &str,
+    recipe: &ds4_core::minimax_h3::profiles::Profile,
+    resident_gemm: &str,
+) -> Result<(), ApiError> {
+    let Some(word) = &recipe.dit_gemm else {
+        return Ok(());
+    };
+    if word.trim() == resident_gemm {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "profile_needs_reload",
+        Some("profile"),
+        format!(
+            "profile {name:?} asks for H3_DIT_GEMM={word} and this server loaded \
+             {resident_gemm}: the arm is read once per load, so restart it with \
+             H3_DIT_GEMM={word}, or render the recipe through h3-rs"
+        ),
+    ))
+}
+
+fn apply_recipe(plan: &mut Plan, path: &Path, resident_gemm: &str) -> Result<(), ApiError> {
     let Some(name) = plan.profile.clone() else {
         return Ok(());
     };
@@ -738,6 +783,11 @@ fn apply_recipe(plan: &mut Plan, path: &Path) -> Result<(), ApiError> {
             format!("no profile {name:?} in {}", path.display()),
         )
     })?;
+    // The projection arm is a property of the load, not of the request. A
+    // recipe that asks for the other one is refused here: applying the rest of
+    // it and dropping this key is exactly the silent substitution the recipe
+    // file exists to prevent.
+    recipe_arm_fits(&name, recipe, resident_gemm)?;
     if let Some(steps) = recipe.steps {
         plan.steps = Some(steps);
     }
@@ -1096,8 +1146,32 @@ mod tests {
         (renderer, release)
     }
 
-    fn test_server(renderer: SharedRenderer, max_jobs: usize) -> (Arc<VideoServer>, PathBuf) {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
+    /// A recipe that names the other projection arm is refused, and the
+    /// refusal names the word that would serve it. Serving the recipe's steps
+    /// and canvas while dropping its arm is the failure this guards.
+    #[test]
+    fn a_recipe_that_names_another_projection_arm_is_refused() {
+        use ds4_core::minimax_h3::profiles::Profile;
+
+        let fp8 = Profile {
+            name: "f".to_string(),
+            dit_gemm: Some("fp8".to_string()),
+            ..Profile::default()
+        };
+        let error = recipe_arm_fits("f", &fp8, "bf16").expect_err("fp8 on a bf16 load");
+        assert_eq!(error.code, "profile_needs_reload");
+        assert!(error.message.contains("H3_DIT_GEMM=fp8"), "{}", error.message);
+        assert!(recipe_arm_fits("f", &fp8, "fp8").is_ok(), "the same arm is served");
+
+        // A recipe that states no arm changes nothing and is always served.
+        let silent = Profile {
+            name: "s".to_string(),
+            ..Profile::default()
+        };
+        assert!(recipe_arm_fits("s", &silent, "bf16").is_ok());
+    }
+
+    fn test_server(renderer: SharedRenderer, max_jobs: usize) -> (Arc<VideoServer>, PathBuf) {        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "h3-video-test-{}-{}",
             std::process::id(),
@@ -1200,6 +1274,13 @@ mod tests {
             last_frame: None,
             references: Vec::new(),
             attention: Attention::Tensor,
+            vae_attention: ds4_core::minimax_h3::dit::VaeAttention::Scalar,
+            vae_gemm: ds4_core::minimax_h3::dit::VaeGemm::Fp32,
+            crf: None,
+            preset: None,
+            profile: None,
+            steps: None,
+            draft: None,
         }
     }
 

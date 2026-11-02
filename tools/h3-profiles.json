@@ -8,7 +8,8 @@
     "printed on the PLAN lines of every render, so a clip always records its own",
     "recipe. Keys are the script's own flags; `doc` is for --list-profiles.",
     "A profile may carry `prompt` or `prompt_file`, which makes it a whole shot and not only its settings; an explicit -p still wins.",
-    "The two `quality-*` profiles are the reference's own rule for a face or a moving camera: one stage at full size rather than a 0.7 draft, whose small canvas is what gives up close-up detail; they also trade the `bf16a` decode for the reference-faithful `bf16i` one and encode at crf 12/veryslow."
+    "The `quality-*` profiles are the reference's own rule for a face or a moving camera: one stage at full size rather than a 0.7 draft, whose small canvas is what gives up close-up detail; they also trade the `bf16a` decode for the reference-faithful `bf16i` one and encode at crf 12/veryslow.",
+    "The `master` pair goes one step further on the same canvas: crf 6 on veryslow and the reference's Fp32 decode. `master` also drops the fp8 arm (the largest picture change there is, 21.7 dB), while `master-fp8` keeps it so the latent is the one `quality-portrait` already produced. Neither is a larger canvas: the engine refuses anything over the released 768*1344 pixel limit (render.rs), which is why no 2K or 4K profile exists."
   ],
   "profiles": {
     "ts_h2": {
@@ -132,36 +133,36 @@
       "vae_gemm": "bf16i",
       "vae_attention": "tensor"
     },
-    "quality-2k": {
-      "doc": "2K portrait, 1536x2688 (4.0 MP, four times `quality-portrait`): one stage, six steps, reference decode numerics, crf 12/veryslow. The step cost scales with pixels and nothing else, so ~16 min of denoise for five seconds.",
+    "master": {
+      "doc": "The cleanest picture the released canvas allows: one stage at 768x1344, six steps, and the reference's BF16 projection arithmetic instead of the fp8 arm - fp8 measures 21.7 dB from bf16, which is a different picture and not a noisy one - with the reference's decode numerics (fp32, tensor attention, tile 320) and crf 6 on veryslow. It is a different sample from `quality-portrait` because the generator's arm changed; about 6.5 min for five seconds.",
       "one_pass": true,
       "steps": 6,
       "draft_scale": 0.7,
       "refine_sigma": 0.72,
       "draft_attention": "bf16",
       "seconds": 5,
-      "width": 1536,
-      "height": 2688,
-      "crf": 12,
+      "width": 768,
+      "height": 1344,
+      "crf": 6,
       "preset": "veryslow",
-      "dit_gemm": "fp8",
-      "vae_gemm": "bf16i",
+      "dit_gemm": "bf16",
+      "vae_gemm": "fp32",
       "vae_attention": "tensor"
     },
-    "quality-4k": {
-      "doc": "4K portrait: 2176x3840 (8.36 MP, eight times `quality-portrait`) - 4K's 2160 is not a multiple of 32, so the nearest legal canvas is used and it is 8 pixels wider than UHD. One stage, six steps, reference decode numerics, crf 12/veryslow. ~31 min of denoise for five seconds, and the checkpoint was trained near 1 MP, so detail may not scale with the pixels - measured, not assumed.",
+    "master-fp8": {
+      "doc": "The clip `quality-portrait` already made - the fp8 arm, the same seed, so the denoised latent is the same - decoded and encoded as cleanly as the pipeline can: fp32 decode at the reference's tile, crf 6/veryslow. This redoes the pixels of a shot you already have; `master` is the more faithful sample instead. About 6 min for five seconds.",
       "one_pass": true,
       "steps": 6,
       "draft_scale": 0.7,
       "refine_sigma": 0.72,
       "draft_attention": "bf16",
       "seconds": 5,
-      "width": 2176,
-      "height": 3840,
-      "crf": 12,
+      "width": 768,
+      "height": 1344,
+      "crf": 6,
       "preset": "veryslow",
       "dit_gemm": "fp8",
-      "vae_gemm": "bf16i",
+      "vae_gemm": "fp32",
       "vae_attention": "tensor"
     },
     "ts_h": {
