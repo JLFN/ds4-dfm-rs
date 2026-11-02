@@ -8,8 +8,10 @@
 # video-only. This is the reference's route (`/data/Rapid-H3`), kept an arm and
 # never the default: the route returns a *different shot* from the one pass.
 #
-# What it costs on this box at 1344x768 and five seconds (124 frames): 187.3 s
-# warm on the wall against 347.6 s one-pass, and 235.5 s on a cold page cache
+# What it costs on this box at 1344x768 and five seconds (124 frames): 187-196 s
+# warm on the wall against 347.6 s one-pass, and 235-252 s on a cold page cache.
+# Two sessions' walls differ by 9 s while their stages agree to a percent, so
+# read the wall as the clock state and the stages as the measurement
 # (`docs/minimax-h3/draft-fp8-attention-2026-11-02.md` section 2).
 #
 # Usage: tools/h3-rapid.sh -p PROMPT [-o OUT] [options]

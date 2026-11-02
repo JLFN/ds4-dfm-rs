@@ -90,10 +90,11 @@ reference, which is why the choice is a switch
 
 At the delivery canvas the fast route is the number that matters: **five seconds**
 of 1344×768 at 24 fps is 120 frames requested, 124 aligned (5.167 s), and it
-renders in **187.3 s warm** (235.5 s on a cold page cache) at four draft steps,
-against **347.6 s** for the one pass. The parts are a 49.9 s draft at 928×544,
-a 3.8 s upscale, a 38.5 s refine at the delivery canvas, 47.0 s of decode and
-27.4 s of text encoding
+renders in **187-196 s warm** (235-252 s on a cold page cache) at four draft
+steps, against **347.6 s** for the one pass. The parts are a 49.8 s draft at
+928×544, a 3.8 s upscale, a 38.6 s refine at the delivery canvas, 49.1 s of
+decode and 29.0 s of text encoding; two sessions' walls differ by 9 s while
+their stages agree to a percent, which is the clock state and not a regression
 ([route](draft-fp8-attention-2026-11-02.md#2-where-the-36-s-comes-from-and-what-the-wall-can-and-cannot-say),
 [one pass](two-stage-delivery-2026-11-02.md)).
 The [v0.1.4 integration review](validation-2026-10-26.md#v014-integration-review--2026-10-27)
