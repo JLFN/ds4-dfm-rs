@@ -1471,6 +1471,15 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
                             prompt, seed, steps, width, height, frames, output
                             (blank and # lines are skipped; per-request flags
                             above are refused, the line owns them)
+  --draft F                 the two-stage route: denoise a draft canvas at F of
+                            the delivery canvas, upscale its latent, refine once
+                            (the reference's 0.7; needs --jobs, and the route is
+                            a different shot, so it is an arm and not a default)
+  --refine-sigma F          the refine step's sigma (the preset's 0.72); it
+                            belongs to the draft's own schedule
+  --draft-attention bf16|e4m3  the draft leg's attention data type only; needs
+                            --draft. e4m3 is the measured arm, bf16 pins a draft
+                            while H3_DIT_ATTENTION carries the refine
   --preview-dir PATH        write one PPM preview per denoising step
   --vae-workers N           decode the video through N device contexts, 1-64
                             (default 1, the reference's serial chunk loop)

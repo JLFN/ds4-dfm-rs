@@ -51,6 +51,22 @@ Ordered references use `--ref-image`, `--ref-video`, `--ref-silent-video`,
 `--ref-video-audio` or `--ref-audio`; a request cannot combine references and
 frame anchors. Audio alone is insufficient for Ref2VA.
 
+The fast route - a small draft, one learned upscale, one refine step - has one
+command:
+
+```sh
+H3_ROOT=$PWD tools/h3-rapid.sh -p 'A red fox trots through fresh snow at dawn.' \
+  --seconds 5 -o outputs/rapid/five-seconds.mp4
+```
+
+It resolves the shipped arms itself (`H3_DIT_GEMM=fp8`, `H3_VAE_GEMM=bf16i`,
+`H3_VAE_ATTENTION=tensor`, `--crf 15 --preset slow`), prints the geometry it
+resolved before rendering, writes the job line beside the clip, and reports the
+wall. `--one-pass` renders the comparison without the route, `--dry-run` prints
+the command it would run, and `--help` carries the rest. The route returns a
+**different shot** from the one pass, so it stays an arm and never the delivery
+default ([the measurement](two-stage-delivery-2026-11-02.md)).
+
 ## Measured generation cost
 
 On GB10, one 512×512, 56-frame, 20-step text run took **762.36 s** (12m42s)
@@ -71,6 +87,15 @@ on the same 512×512, 56-frame, 20-step shape it measures 139.418 s against the
 scalar kernel's 460.399 s, both on one binary. It is not byte-identical to the
 reference, which is why the choice is a switch
 ([why it is the default](tensor-default-2026-10-27.md)).
+
+At the delivery canvas the fast route is the number that matters: **five seconds**
+of 1344×768 at 24 fps is 120 frames requested, 124 aligned (5.167 s), and it
+renders in **187.3 s warm** (235.5 s on a cold page cache) at four draft steps,
+against **347.6 s** for the one pass. The parts are a 49.9 s draft at 928×544,
+a 3.8 s upscale, a 38.5 s refine at the delivery canvas, 47.0 s of decode and
+27.4 s of text encoding
+([route](draft-fp8-attention-2026-11-02.md#2-where-the-36-s-comes-from-and-what-the-wall-can-and-cannot-say),
+[one pass](two-stage-delivery-2026-11-02.md)).
 The [v0.1.4 integration review](validation-2026-10-26.md#v014-integration-review--2026-10-27)
 records subsequent fixes and model-free checks; full-model renders were not
 repeated for that review.
