@@ -585,6 +585,23 @@ mod tests {
         assert!(refine.video[0] > draft.video[5]);
     }
 
+    /// Four evaluations end the same grid at 0.8, so the preset's 0.72 sits
+    /// *below* the draft's own terminal - and that is a shape the reference
+    /// ships, not a mistake: its 4-NFE draft preset pairs with a lower refine
+    /// (0.55, `harness/fast_test.py:58`), and the measured 4-step draft
+    /// preferred 0.72 to a sigma above 0.8
+    /// (`docs/minimax-h3/four-step-draft-2026-11-02.md` section 3). The
+    /// inequality above is a property of the preset pair it names, not a rule
+    /// for a shorter draft.
+    #[test]
+    fn four_evaluations_end_above_the_presets_refine_sigma() {
+        let draft = Schedule::serving(4).expect("four evaluations are legal");
+        let refine = Schedule::refine(0.72).expect("0.72 is a legal refine sigma");
+
+        assert_eq!(draft.video[3].to_bits(), 0.8f32.to_bits());
+        assert!(refine.video[0] < draft.video[3]);
+    }
+
     /// A sigma outside `(0, 1]` is not a refine grid: zero would divide the
     /// base time by zero, and above one is not a time the model was trained on.
     #[test]

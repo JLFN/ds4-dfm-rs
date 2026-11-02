@@ -123,6 +123,7 @@ The model's license is included in the downloaded repository.
 - [The Gemma4 encoder path leaves the tree, and the gate hashes do not move, 2026-11-02](gemma-removal-2026-11-02.md)
 - [The clip-scoring gate: the reference harness, pointed at two clips from this port, 2026-11-02](clip-score-gate-2026-11-02.md)
 - [The E4M3 attention arm reproduces and ships opt-in, and the gate refuses its picture, 2026-11-02](fp8-attention-arm-2026-11-02.md)
+- [The route's 4-step draft: -25.5 s, a picture the gate passes, and the audio it changes, 2026-11-02](four-step-draft-2026-11-02.md)
 - [The draft's anatomy: what holds it, 2026-10-31](draft-anatomy-2026-10-31.md)
 - [The two-stage route: a draft at 0.7, one upscale, one refine step, 2026-11-01](two-stage-route-2026-11-01.md)
 - [The H3 latent upscaler, ported and gated, 2026-11-01](latent-upscale-2026-11-01.md)

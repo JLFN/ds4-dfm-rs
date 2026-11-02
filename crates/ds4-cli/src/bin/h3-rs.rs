@@ -112,7 +112,11 @@ struct Options {
     /// the engine's second prepared graph.
     draft: Option<f32>,
     /// `--refine-sigma`: the refine's one-step sigma, `0.72` in the preset.
-    /// `--draft` without it takes the preset's own number.
+    /// `--draft` without it takes the preset's own number, and that number
+    /// belongs to the preset's *six*-step draft: a shorter draft ends at a
+    /// higher sigma, and the reference re-tunes the refine per draft schedule
+    /// rather than deriving it from the draft's terminal
+    /// (`docs/minimax-h3/four-step-draft-2026-11-02.md` section 3).
     refine_sigma: Option<f32>,
     /// `--vae-workers` (`:1089`): the decode's chunk loop spread over this
     /// many device contexts. One is the reference's own serial loop.
