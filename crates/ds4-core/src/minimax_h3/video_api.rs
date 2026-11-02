@@ -269,7 +269,9 @@ struct JobEntry {
 
 /// A job the store has admitted. One device renders one request at a time
 /// (`h3.c:697-723`), so admission belongs to the store, not to the caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Plan` carries a `Draft`, whose sigmas are `f32`, so this is `PartialEq`
+// only: `f32` has no total equality and a `NaN` sigma is no plan at all.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Admitted {
     pub id: String,
     pub plan: Plan,

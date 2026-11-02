@@ -37,6 +37,8 @@ struct Args {
     renderer: Option<PathBuf>,
     renderer_args: Vec<String>,
     max_jobs: usize,
+    /// The recipe file the create body's `profile` resolves against.
+    profiles: PathBuf,
     timeout: Duration,
 }
 
@@ -54,6 +56,8 @@ Usage: h3-server-rs [options]
   --renderer PROGRAM     external renderer executable; without --model-dir or
                          --renderer every create answers 503
   --renderer-arg ARG     fixed argument passed to the renderer (repeatable)
+  --profiles FILE        recipe file the create body's `profile` names resolve
+                         against (default tools/h3-profiles.json)
   --max-jobs N           retained jobs (default 8)
   --timeout-secs N       external renderer timeout in seconds (default 3600)
   --help                 this text
@@ -92,6 +96,7 @@ fn parse_args() -> Args {
         renderer: None,
         renderer_args: Vec::new(),
         max_jobs: DEFAULT_MAX_JOBS,
+        profiles: PathBuf::from("tools/h3-profiles.json"),
         timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         model_dir: None,
         steps: DEFAULT_STEPS,
@@ -117,6 +122,7 @@ fn parse_args() -> Args {
             }
             "--renderer" => args.renderer = Some(PathBuf::from(value(&mut argv, &flag))),
             "--renderer-arg" => args.renderer_args.push(value(&mut argv, &flag)),
+            "--profiles" => args.profiles = PathBuf::from(value(&mut argv, &flag)),
             "--max-jobs" => {
                 let text = value(&mut argv, &flag);
                 args.max_jobs = text.parse().unwrap_or_else(|_| fail(&flag, &text));
@@ -200,7 +206,10 @@ fn main() {
         )),
         (None, None) => Arc::new(DisabledRenderer),
     };
-    let server = Arc::new(VideoServer::new(store, renderer, args.out_dir.clone()));
+    let server = Arc::new(
+        VideoServer::new(store, renderer, args.out_dir.clone())
+            .with_profiles(args.profiles.clone()),
+    );
     let listener = match TcpListener::bind(&args.bind) {
         Ok(listener) => listener,
         Err(error) => {

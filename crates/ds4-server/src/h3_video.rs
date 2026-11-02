@@ -40,6 +40,8 @@ use ds4_core::minimax_h3::local_api::{
     image_size, parse_create, Plan, ReferenceKind, ReferenceMedia,
 };
 use ds4_core::minimax_h3::media::probe_visual_size;
+use ds4_core::minimax_h3::profiles::Profiles;
+use ds4_core::minimax_h3::video_api::VideoSize;
 use ds4_core::minimax_h3::video_api::{
     unknown_video, Admitted, AnchorImage, ApiError, VideoError, VideoStatus, VideoStore,
 };
@@ -499,6 +501,8 @@ pub struct VideoServer {
     store: Arc<VideoStore>,
     renderer: SharedRenderer,
     out_dir: PathBuf,
+    /// The recipe file the create body's `profile` names are read from.
+    profiles: PathBuf,
 }
 
 impl VideoServer {
@@ -507,7 +511,14 @@ impl VideoServer {
             store,
             renderer,
             out_dir,
+            profiles: PathBuf::from("tools/h3-profiles.json"),
         }
+    }
+
+    /// The recipe file `profile` names resolve against (`--profiles`).
+    pub fn with_profiles(mut self, profiles: PathBuf) -> Self {
+        self.profiles = profiles;
+        self
     }
 
     pub fn store(&self) -> &Arc<VideoStore> {
@@ -541,7 +552,12 @@ impl VideoServer {
         // `aspect_ratio: auto` over a reference needs that reference's pixel
         // size, which the body does not state; the probe reads it here.
         let probe = |media: &ReferenceMedia| probe_visual(media, &self.out_dir);
-        let plan = match parse_create(&http.body).and_then(|body| body.plan_with(&probe)) {
+        let plan = match parse_create(&http.body)
+            .and_then(|body| body.plan_with(&probe))
+            .and_then(|mut plan| {
+                apply_recipe(&mut plan, &self.profiles)?;
+                Ok(plan)
+            }) {
             Ok(plan) => plan,
             Err(error) => return H3Response::error(&error),
         };
@@ -703,6 +719,41 @@ enum Route {
     Video(String),
     Content(String),
     Unknown,
+}
+
+/// Apply the recipe a create body named. The host owns the file, so the recipe
+/// is resolved here rather than in the parser: one reader
+/// (`minimax_h3::profiles`) serves the CLI, the route script and this API, so a
+/// name cannot mean one thing to one caller and something else to another.
+fn apply_recipe(plan: &mut Plan, path: &Path) -> Result<(), ApiError> {
+    let Some(name) = plan.profile.clone() else {
+        return Ok(());
+    };
+    let profiles = Profiles::load(path)
+        .map_err(|error| ApiError::bad_request("invalid_profile_file", Some("profile"), error))?;
+    let recipe = profiles.get(&name).ok_or_else(|| {
+        ApiError::bad_request(
+            "unknown_profile",
+            Some("profile"),
+            format!("no profile {name:?} in {}", path.display()),
+        )
+    })?;
+    if let Some(steps) = recipe.steps {
+        plan.steps = Some(steps);
+    }
+    if let (Some(width), Some(height)) = (recipe.width, recipe.height) {
+        plan.size = VideoSize::new(width, height);
+    }
+    if let Some(gemm) = recipe.vae_gemm {
+        plan.vae_gemm = gemm;
+    }
+    if let Some(attention) = recipe.vae_attention {
+        plan.vae_attention = attention;
+    }
+    if let Some(draft) = recipe.draft() {
+        plan.draft = Some(draft);
+    }
+    Ok(())
 }
 
 fn route(path: &str) -> Route {
@@ -912,7 +963,6 @@ mod tests {
     use super::*;
     use ds4_core::minimax_h3::dit::Attention;
     use ds4_core::minimax_h3::local_api::Task;
-    use ds4_core::minimax_h3::video_api::VideoSize;
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;

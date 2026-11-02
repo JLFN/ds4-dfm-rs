@@ -61,7 +61,7 @@ pub const MAX_REFERENCES: usize = 12;
 /// switches are the port's own, as `attention` is: they choose kernels on the
 /// context the DiT is loaded with, and every one of them is optional with the
 /// reference's own behaviour as its default.
-pub const CREATE_FIELDS: [&str; 8] = [
+pub const CREATE_FIELDS: [&str; 9] = [
     "task",
     "prompt",
     "conditions",
@@ -70,6 +70,7 @@ pub const CREATE_FIELDS: [&str; 8] = [
     "attention",
     "vae_attention",
     "vae_gemm",
+    "profile",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +190,10 @@ pub struct CreateBody {
     pub vae_attention: VaeAttention,
     /// `"vae_gemm"`, optional: `fp32` is the reference rounding.
     pub vae_gemm: VaeGemm,
+    /// `"profile"`, optional: a named recipe from the recipe file
+    /// (`minimax_h3::profiles`). It is resolved by the host, which owns the
+    /// file, and it overrides the body's steps, canvas, arms and route.
+    pub profile: Option<String>,
 }
 
 /// The class of one ordered reference (`h3_reference_kind`, `h3.h:30-34`).
@@ -239,7 +244,7 @@ impl ReferenceMedia {
 /// One create, validated and mapped onto the engine's request. `size` is both
 /// the model canvas and the delivered frame: this contract has no separate
 /// delivery frame, so the file is the canvas.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub task: Task,
     pub prompt: String,
@@ -256,6 +261,10 @@ pub struct Plan {
     /// The decoder's own switches, carried through untouched.
     pub vae_attention: VaeAttention,
     pub vae_gemm: VaeGemm,
+    /// The recipe the body named, if any, and what the host resolved from it.
+    pub profile: Option<String>,
+    pub steps: Option<usize>,
+    pub draft: Option<super::engine::Draft>,
 }
 
 /// Parse and validate a create body.
@@ -418,6 +427,18 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         }
     };
 
+    let profile = match object.get("profile") {
+        None => None,
+        Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_profile",
+                Some("profile"),
+                "profile must be the name of a recipe",
+            ))
+        }
+    };
+
     Ok(CreateBody {
         task,
         prompt,
@@ -427,6 +448,7 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         attention,
         vae_attention,
         vae_gemm,
+        profile,
     })
 }
 
@@ -542,6 +564,9 @@ impl CreateBody {
             attention: self.attention,
             vae_attention: self.vae_attention,
             vae_gemm: self.vae_gemm,
+            profile: self.profile.clone(),
+            steps: None,
+            draft: None,
         })
     }
 

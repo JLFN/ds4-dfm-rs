@@ -13,8 +13,11 @@ the stdlib-only way to use it:
 Contract: `docs/minimax-h3/local-v1-contract.md` - `POST /v1/videos`,
 `GET /v1/videos/{id}` until `status` is terminal, `GET /v1/videos/{id}/content`
 for the bytes. The create body is checked strictly by the server: exactly
-`task`, `prompt`, `conditions`, `target`, `seed` (plus optional `attention`), and
-an unknown field is refused rather than ignored.
+`task`, `prompt`, `conditions`, `target`, `seed` (plus optional `attention`,
+`vae_attention`, `vae_gemm` and `profile`), and an unknown field is refused
+rather than ignored. `--profile` names a recipe the host resolves: the same
+`tools/h3-profiles.json` the CLI reads, so a served render and a local one mean
+the same thing by the same name.
 """
 import argparse
 import json
@@ -50,6 +53,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--attention", choices=["tensor", "scalar"])
+    parser.add_argument("--profile", help="a named recipe from tools/h3-profiles.json")
     parser.add_argument("--out", required=True)
     parser.add_argument("--poll", type=float, default=2.0)
     arguments = parser.parse_args()
@@ -74,6 +78,8 @@ def main():
     }
     if arguments.attention:
         body["attention"] = arguments.attention
+    if arguments.profile:
+        body["profile"] = arguments.profile
 
     started = time.time()
     status, payload = request(f"{arguments.base}/v1/videos", body)

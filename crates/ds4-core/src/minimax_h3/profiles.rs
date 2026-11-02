@@ -51,6 +51,12 @@ impl Profile {
         if self.one_pass {
             return None;
         }
+        // A recipe that states no route key is settings-only and renders in one
+        // stage: defaulting it to the released route would silently turn a
+        // canvas recipe into a two-stage render.
+        if self.draft_scale.is_none() && self.refine_sigmas.is_empty() {
+            return None;
+        }
         let mut draft = super::engine::Draft::RELEASED;
         if let Some(scale) = self.draft_scale {
             draft.scale = scale;
@@ -218,19 +224,14 @@ impl Profiles {
                     }
                     "refine_sigma" => profile.refine_sigmas = vec![float(field, name, key)?],
                     "refine_sigmas" => {
-                        let list = field.as_array().ok_or_else(|| {
-                            format!("profile {name:?}: {key} is not an array")
-                        })?;
+                        let list = field
+                            .as_array()
+                            .ok_or_else(|| format!("profile {name:?}: {key} is not an array"))?;
                         let mut sigmas = Vec::with_capacity(list.len());
                         for entry in list {
-                            sigmas.push(
-                                entry
-                                    .as_f64()
-                                    .map(|value| value as f32)
-                                    .ok_or_else(|| {
-                                        format!("profile {name:?}: {key} holds a non-number")
-                                    })?,
-                            );
+                            sigmas.push(entry.as_f64().map(|value| value as f32).ok_or_else(
+                                || format!("profile {name:?}: {key} holds a non-number"),
+                            )?);
                         }
                         // The reference writes the grid with a terminal zero
                         // (`"0.78, 0.45, 0"`); it ends the schedule and is not
@@ -250,20 +251,20 @@ impl Profiles {
                     "vae_attention" => {
                         let word = string(field, name, key)?;
                         profile.vae_attention = Some(vae_attention(&word).ok_or_else(|| {
-                            format!("profile {name:?}: vae_attention {word:?} is not scalar or tensor")
+                            format!(
+                                "profile {name:?}: vae_attention {word:?} is not scalar or tensor"
+                            )
                         })?);
                     }
                     "preset" => profile.preset = Some(string(field, name, key)?),
                     "prompt" => profile.prompt = Some(string(field, name, key)?),
                     "prompt_file" => profile.prompt_file = Some(string(field, name, key)?),
-                    other => {
-                        return Err(format!(
-                            "profile {name:?}: unknown key {other:?}; have doc, steps, width, height, \
+                    other => return Err(format!(
+                        "profile {name:?}: unknown key {other:?}; have doc, steps, width, height, \
                              seconds, crf, one_pass, draft_scale, draft_attention, refine_sigma, \
                              refine_sigmas, \
                              dit_gemm, vae_gemm, vae_attention, preset, prompt, prompt_file"
-                        ))
-                    }
+                    )),
                 }
             }
             entries.insert(name.clone(), profile);

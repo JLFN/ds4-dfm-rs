@@ -2381,8 +2381,10 @@ impl Dit {
         Ok(())
     }
 
-    /// The two-stage refine: one evaluation at the schedule's own sigma, then
-    /// Euler on the video latent alone.
+    /// The two-stage refine: one evaluation per entry in the schedule's grid,
+    /// each followed by Euler on the video latent alone. `ts_h2` states one
+    /// entry (`0.72, 0`) and the reference's earlier `ts_h` states two
+    /// (`0.78, 0.45, 0`), so the grid and not the caller decides how many.
     ///
     /// The audio latent is the draft's and is never updated. The reference's
     /// `LTXVFreezeLatent` sets a zero denoise mask on the audio stream
@@ -2395,11 +2397,12 @@ impl Dit {
     /// The caller seeds `video` with `host::renoise` before this call, as the
     /// reference's sampler seeds its first step (`comfy/samplers.py:993`).
     pub fn denoise_refine(&mut self, video: &mut [f32], audio: &[f32]) -> Result<(), DitError> {
-        if self.schedule.steps != 1 {
+        if self.schedule.steps == 0 || self.schedule.video.len() != self.schedule.steps + 1 {
             return Err(DitError::Geometry {
                 detail: format!(
-                    "refine needs a one-step schedule, this graph has {}",
-                    self.schedule.steps
+                    "refine needs a grid of steps, this schedule has {} steps and {} sigmas",
+                    self.schedule.steps,
+                    self.schedule.video.len()
                 ),
             });
         }
@@ -2415,16 +2418,20 @@ impl Dit {
             });
         }
 
-        let (video_velocity, _audio_velocity) = self.forward(0, video, audio)?;
-        if !host::euler_step(
-            video,
-            &video_velocity,
-            self.schedule.video[0],
-            self.schedule.video[1],
-        ) {
-            return Err(DitError::Geometry {
-                detail: "Euler solver rejected the refine step".into(),
-            });
+        // The audio rows are the draft's: they enter the model as conditioning
+        // and are handed back unchanged, so every step re-uses the same audio.
+        for step in 0..self.schedule.steps {
+            let (video_velocity, _audio_velocity) = self.forward(step, video, audio)?;
+            if !host::euler_step(
+                video,
+                &video_velocity,
+                self.schedule.video[step],
+                self.schedule.video[step + 1],
+            ) {
+                return Err(DitError::Geometry {
+                    detail: format!("Euler solver rejected refine step {step}"),
+                });
+            }
         }
 
         Ok(())
