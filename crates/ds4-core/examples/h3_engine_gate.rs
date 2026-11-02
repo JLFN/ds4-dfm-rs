@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     let mut vae_gemm = Some(VaeGemm::Reduced);
     let mut draft: Option<Draft> = None;
 
-    let mut argv = std::env::args().skip(1);
+    let mut argv = std::env::args().skip(1).peekable();
     while let Some(flag) = argv.next() {
         let mut value = |name: &str| -> Option<i64> {
             argv.next().and_then(|raw| match raw.trim().parse() {
@@ -99,9 +99,25 @@ fn main() -> ExitCode {
                 }
             },
             // The two-stage route (`harness/workflow.py:50`). `--draft` alone
-            // is the reference's 0.7 / 0.72; the sigma is the only knob the
-            // route's arithmetic has not already fixed.
-            "--draft" => draft = Some(Draft::RELEASED),
+            // is the reference's 0.7 / 0.72; a number after it is the route's
+            // draft scale, because the preset fixes that number only at its
+            // own step count and the scale ladder measured 0.6 and 0.5 as arms
+            // (`docs/minimax-h3/draft-scale-ladder-2026-11-02.md`). Each arm is
+            // a canvas of its own, and the frozen-audio assertion is a property
+            // of the canvas the draft leg ran on.
+            "--draft" => {
+                let scale = match argv.peek().and_then(|raw| raw.parse::<f32>().ok()) {
+                    Some(scale) => {
+                        argv.next();
+                        scale
+                    }
+                    None => Draft::RELEASED.scale,
+                };
+                draft = Some(Draft {
+                    scale,
+                    sigma: draft.map_or(Draft::RELEASED.sigma, |held| held.sigma),
+                });
+            }
             "--refine-sigma" => match argv.next().as_deref().map(str::parse::<f32>) {
                 Some(Ok(sigma)) => {
                     draft = Some(Draft {
@@ -127,7 +143,7 @@ fn main() -> ExitCode {
                 println!(
                     "usage: h3_engine_gate [--width N --height N --frames N --steps N] \
                      [--vae-arms env] [--vae-attention scalar|tensor] \
-                     [--vae-gemm fp32|bf16] [--draft [--refine-sigma S]] [--upscaler DIR]"
+                     [--vae-gemm fp32|bf16] [--draft [SCALE] [--refine-sigma S]] [--upscaler DIR]"
                 );
                 return ExitCode::SUCCESS;
             }

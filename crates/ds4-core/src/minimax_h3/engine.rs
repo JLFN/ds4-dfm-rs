@@ -1072,6 +1072,21 @@ mod tests {
         assert_eq!(half.canvas(544, 928), Ok((256, 448)));
     }
 
+    /// A draft at 0.6 of the delivery canvas, the scale ladder's middle arm:
+    /// 1344 x 768 gives 800 x 448 (`docs/minimax-h3/draft-scale-ladder-2026-11-02.md`),
+    /// and the gate's own 512 x 512 shape gives 320 x 320.
+    #[test]
+    fn a_sixty_percent_draft_is_the_ladders_middle_canvas() {
+        let middle = Draft {
+            scale: 0.6,
+            ..Draft::RELEASED
+        };
+
+        assert_eq!(middle.canvas(1344, 768), Ok((800, 448)));
+        assert_eq!(middle.canvas(768, 1344), Ok((448, 800)));
+        assert_eq!(middle.canvas(512, 512), Ok((320, 320)));
+    }
+
     /// A canvas that would round below one multiple, or a scale that is not a
     /// shrink, is refused rather than snapped to something the model has never
     /// seen.
