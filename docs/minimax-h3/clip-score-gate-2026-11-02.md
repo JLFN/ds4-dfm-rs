@@ -17,8 +17,8 @@ answer.
 | the instrument | `tools/h3-clip-score.py`, the reference harness's criterion 9 + `flow_block`, imported not re-implemented |
 | harness copy | `harness/eval_clips.py` sha256 `cdc1656442e491fb…`, byte-identical to the reference tree's file |
 | cost per clip | 26.6 s (1344x768), 23.0 s, 11.5 s (928x544) on the GB10 |
-| deterministic | nine of the ten metrics reproduce to the printed digit across four runs |
-| not deterministic | **DOVER: 0.667, 0.670, 0.683, 0.691 on one unchanged file** |
+| deterministic | nine of the ten metrics reproduce to the printed digit across five runs |
+| not deterministic | **DOVER: 0.667, 0.670, 0.677, 0.683, 0.691 on one unchanged file** |
 | two-stage route pair | **flagged: `sharp_frame_r` x0.500**, and `comp_ssim` 0.147 |
 | MUSIQ and CLIP-IQA | **both rise** on the softer clip (+1.23, +0.069) |
 | exit status | 1 on a flagged pair, 0 otherwise |
@@ -111,7 +111,8 @@ route's own draft stage, decoded instead of upscaled.
 
 ## 4. The instrument's own noise floor
 
-Four runs over the same two files, same binary, same host:
+Five runs over the same two files, same binary, same host - the last of them
+through the shipped command, from the checkout at `0108d7c4`:
 
 | run | `one.mp4` DOVER | `draft.mp4` DOVER | delta |
 |---|---:|---:|---:|
@@ -119,14 +120,16 @@ Four runs over the same two files, same binary, same host:
 | 2 | 0.670 | — | — |
 | 3 | 0.667 | 0.661 | -0.006 |
 | 4 | 0.691 | 0.658 | -0.033 |
+| 5 | 0.677 | 0.665 | -0.012 |
 
 Every other metric - MUSIQ, CLIP-IQA, sharpness, noise, flicker, tflick,
 warping error, flow, acceleration, zoom - reproduced to the printed digit in
-all four runs. DOVER moves by up to 0.024 on an unchanged file, and its two
+all five runs. DOVER moves by up to 0.024 on an unchanged file, and its two
 heads show where: the aesthetic head held 0.131 across runs while the
 technical head went 0.063 to 0.070. So the campaign's DOVER delta budget
-(-0.08) is only 2.5-3x the pair-to-pair noise seen here, and a single DOVER
-delta sitting near its threshold is not a verdict.
+(0.08) is only about 2.4x the largest delta this instrument produced on one
+unchanged pair (0.033), and a single DOVER delta sitting near its threshold is
+not a verdict.
 
 This is the reason `--no-dover` exists in the driver. Everything else in the
 gate is exact, which is what makes it usable on a numerics arm: any change in
