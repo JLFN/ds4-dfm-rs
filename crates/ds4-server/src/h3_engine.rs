@@ -105,7 +105,10 @@ impl Renderer for EngineRenderer {
             vae_attention: Some(spec.vae_attention),
             vae_gemm: Some(spec.vae_gemm),
             text_encoder: self.text_encoder.clone(),
-            encode: Encode::default(),
+            encode: Encode {
+                crf: spec.crf.unwrap_or(Encode::default().crf),
+                preset: spec.preset.unwrap_or(Encode::default().preset),
+            },
             output: output.to_path_buf(),
         };
         let report = self

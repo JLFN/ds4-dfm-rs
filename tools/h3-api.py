@@ -54,6 +54,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--attention", choices=["tensor", "scalar"])
     parser.add_argument("--profile", help="a named recipe from tools/h3-profiles.json")
+    parser.add_argument("--crf", type=int, help="the mux line's crf (1-51)")
+    parser.add_argument("--preset", help="the mux line's x264 preset")
     parser.add_argument("--out", required=True)
     parser.add_argument("--poll", type=float, default=2.0)
     arguments = parser.parse_args()
@@ -80,6 +82,10 @@ def main():
         body["attention"] = arguments.attention
     if arguments.profile:
         body["profile"] = arguments.profile
+    if arguments.crf:
+        body["crf"] = arguments.crf
+    if arguments.preset:
+        body["preset"] = arguments.preset
 
     started = time.time()
     status, payload = request(f"{arguments.base}/v1/videos", body)

@@ -61,7 +61,7 @@ pub const MAX_REFERENCES: usize = 12;
 /// switches are the port's own, as `attention` is: they choose kernels on the
 /// context the DiT is loaded with, and every one of them is optional with the
 /// reference's own behaviour as its default.
-pub const CREATE_FIELDS: [&str; 9] = [
+pub const CREATE_FIELDS: [&str; 11] = [
     "task",
     "prompt",
     "conditions",
@@ -71,6 +71,8 @@ pub const CREATE_FIELDS: [&str; 9] = [
     "vae_attention",
     "vae_gemm",
     "profile",
+    "crf",
+    "preset",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +192,11 @@ pub struct CreateBody {
     pub vae_attention: VaeAttention,
     /// `"vae_gemm"`, optional: `fp32` is the reference rounding.
     pub vae_gemm: VaeGemm,
+    /// `"crf"` and `"preset"`, optional: the mux line's encoder settings -
+    /// "crf" costs bits, "preset" costs encode time, and neither touches the
+    /// graph, which is why they are the caller's to state.
+    pub crf: Option<u8>,
+    pub preset: Option<super::render::Preset>,
     /// `"profile"`, optional: a named recipe from the recipe file
     /// (`minimax_h3::profiles`). It is resolved by the host, which owns the
     /// file, and it overrides the body's steps, canvas, arms and route.
@@ -261,6 +268,9 @@ pub struct Plan {
     /// The decoder's own switches, carried through untouched.
     pub vae_attention: VaeAttention,
     pub vae_gemm: VaeGemm,
+    /// The encoder settings the body stated, if any.
+    pub crf: Option<u8>,
+    pub preset: Option<super::render::Preset>,
     /// The recipe the body named, if any, and what the host resolved from it.
     pub profile: Option<String>,
     pub steps: Option<usize>,
@@ -427,6 +437,50 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         }
     };
 
+    let crf = match object.get("crf") {
+        None => None,
+        Some(Value::Number(number)) => {
+            let value = number.as_u64().filter(|value| (1..=51).contains(value));
+            match value {
+                Some(value) => Some(value as u8),
+                None => {
+                    return Err(ApiError::bad_request(
+                        "invalid_crf",
+                        Some("crf"),
+                        "crf must be an integer from 1 to 51",
+                    ))
+                }
+            }
+        }
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_crf",
+                Some("crf"),
+                "crf must be an integer from 1 to 51",
+            ))
+        }
+    };
+    let preset = match object.get("preset") {
+        None => None,
+        Some(Value::String(word)) => match super::render::Preset::parse(word) {
+            Some(preset) => Some(preset),
+            None => {
+                return Err(ApiError::bad_request(
+                    "invalid_preset",
+                    Some("preset"),
+                    format!("preset {word:?} is not an x264 preset"),
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_preset",
+                Some("preset"),
+                "preset must be a string such as veryslow",
+            ))
+        }
+    };
+
     let profile = match object.get("profile") {
         None => None,
         Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
@@ -448,6 +502,8 @@ pub fn parse_create(body: &[u8]) -> Result<CreateBody, ApiError> {
         attention,
         vae_attention,
         vae_gemm,
+        crf,
+        preset,
         profile,
     })
 }
@@ -564,6 +620,8 @@ impl CreateBody {
             attention: self.attention,
             vae_attention: self.vae_attention,
             vae_gemm: self.vae_gemm,
+            crf: self.crf,
+            preset: self.preset,
             profile: self.profile.clone(),
             steps: None,
             draft: None,

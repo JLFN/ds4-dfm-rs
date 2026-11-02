@@ -750,6 +750,12 @@ fn apply_recipe(plan: &mut Plan, path: &Path) -> Result<(), ApiError> {
     if let Some(attention) = recipe.vae_attention {
         plan.vae_attention = attention;
     }
+    if let Some(crf) = recipe.crf {
+        plan.crf = Some(crf as u8);
+    }
+    if let Some(word) = &recipe.preset {
+        plan.preset = ds4_core::minimax_h3::render::Preset::parse(word);
+    }
     if let Some(draft) = recipe.draft() {
         plan.draft = Some(draft);
     }
