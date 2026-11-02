@@ -118,6 +118,7 @@ The model's license is included in the downloaded repository.
 - [Three attention widths, measured: the block is not bound by K/V traffic, 2026-11-02](attention-widths-2026-11-02.md)
 - [E4M3 attention: the pipe halves, and the cast eats it, 2026-11-02](fp8-attention-2026-11-02.md)
 - [The decode's two schedule levers: 48.1 s to 45.9 s, every frame bit-identical, 2026-11-02](vae-decode-levers-2026-11-02.md)
+- [The denoise step's rope is already at its ceiling, and the 1,890 launches were the decoder's, 2026-11-02](denoise-rope-ceiling-2026-11-02.md)
 - [The Gemma4 encoder path leaves the tree, and the gate hashes do not move, 2026-11-02](gemma-removal-2026-11-02.md)
 - [The draft's anatomy: what holds it, 2026-10-31](draft-anatomy-2026-10-31.md)
 - [The two-stage route: a draft at 0.7, one upscale, one refine step, 2026-11-01](two-stage-route-2026-11-01.md)

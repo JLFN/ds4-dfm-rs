@@ -449,6 +449,12 @@ tests/h3/attn_f32_bm: tests/h3/attn_f32_bm.cu native/h3/h3_dit_gpu.cu native/h3/
 tests/h3/vae_rope_bm: tests/h3/vae_rope_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# The DiT's BF16 twin of that kernel, at the denoise shape it runs 51 times a
+# step: the shipped staged arm, the reference spelling it replaced, two
+# rows-per-block shapes and the traffic floor, every output hashed.
+tests/h3/dit_rope_bm: tests/h3/dit_rope_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # The video VAE decoder's four F32 matmuls at the tile shape, one call per
 # block, so a per-call figure times 1,944 prices the block's matmul set.
 tests/h3/vae_gemm_bm: tests/h3/vae_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
