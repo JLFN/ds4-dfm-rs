@@ -91,7 +91,13 @@ tools/h3-rapid.sh --profile one-pass -p "…"                         # its ts_s
 
 Shipped: `ts_h2` (6 steps, the reference's preset), `rapid` (4 steps, the speed
 point), `rapid-e4m3` (the draft on the E4M3 arm), `one-pass` (no draft, the
-`ts_s6` shape, 347.6 s), `portrait` (768x1344).
+`ts_s6` shape, 347.6 s), `portrait` (768x1344) and `ipanema` (a whole shot).
+
+A profile may also carry `prompt` or `prompt_file`, which makes it a complete
+shot rather than only its settings - `ipanema` holds its scene text, so
+`--profile ipanema` is one word for a full 9:16 render. An explicit `-p` still
+wins, and a profile that carries no prompt is settings only, as the first five
+are.
 
 Precedence, and it matters: **a flag beats a profile, and a profile beats the
 environment.** The route runs `target/release/h3-rs`, and a shell that still
@@ -118,6 +124,7 @@ seed 42, five seconds, on `2cd8e5f0`:
 |---|---|---|---:|---:|---:|---:|---:|---|
 | `--profile ts_h2` | 1344x768 | 928x544 | 6 | 74.4 | 38.5 | 28.1 | 192.3 s | `89392d81e25979439e3c0af13678ba2d` |
 | `--profile portrait` | 768x1344 | 544x928 | 4 | 50.0 | 38.7 | 28.2 | 168.1 s | (its own, `frames_fnv 4c77fcbeefab146f`) |
+| `--profile ipanema` | 768x1344 | 544x928 | 4 | 49.9 | 38.5 | 28.2 | 167.3 s | `7b2caec8d8611c86f594d066675e73e7` |
 
 - **The profile is the flags it expands to, bit for bit**: `--profile ts_h2`
   reproduced the earlier `--steps 6` render exactly - same md5, same

@@ -38,6 +38,8 @@ SHELL = {
     "preset": "PRESET",
     "seed": "SEED",
     "one_pass": "ONE_PASS",
+    "prompt": "PROMPT",
+    "prompt_file": "PROMPT_FILE",
     "dit_gemm": "H3_DIT_GEMM",
     "vae_gemm": "H3_VAE_GEMM",
     "vae_attention": "H3_VAE_ATTENTION",

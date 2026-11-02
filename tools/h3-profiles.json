@@ -6,7 +6,8 @@
     "H3_DIT_GEMM/H3_VAE_GEMM/H3_VAE_ATTENTION, because choosing a profile is an",
     "explicit act and the shell's leftovers are not. The resolved values are",
     "printed on the PLAN lines of every render, so a clip always records its own",
-    "recipe. Keys are the script's own flags; `doc` is for --list-profiles."
+    "recipe. Keys are the script's own flags; `doc` is for --list-profiles.",
+    "A profile may carry `prompt` or `prompt_file`, which makes it a whole shot and not only its settings; an explicit -p still wins."
   ],
   "profiles": {
     "ts_h2": {
@@ -69,6 +70,22 @@
     },
     "portrait": {
       "doc": "The same speed point at 9:16. Draft lands at 544x928 (0.7 of 768x1344, rounded to /32) and the delivery at 768x1344; nothing else moves.",
+      "steps": 4,
+      "draft_scale": 0.7,
+      "refine_sigma": 0.72,
+      "draft_attention": "bf16",
+      "seconds": 5,
+      "width": 768,
+      "height": 1344,
+      "crf": 15,
+      "preset": "slow",
+      "dit_gemm": "fp8",
+      "vae_gemm": "bf16a",
+      "vae_attention": "tensor"
+    },
+    "ipanema": {
+      "doc": "The Ipanema shot: portrait canvas, four steps, the scene baked into the profile so the whole shot is one word. Rendered at 167.3 s, md5 7b2caec8d8611c86f594d066675e73e7.",
+      "prompt": "A Brazilian woman in a thong bikini walks across the wet sand on Ipanema beach in Rio de Janeiro at golden hour, medium shot, 9:16 portrait framing, ocean and the Two Brothers mountain behind her, warm low sunlight, light wind in her hair. She looks into the camera, smiling, and sings a bossa nova, swaying gently with the music.",
       "steps": 4,
       "draft_scale": 0.7,
       "refine_sigma": 0.72,
