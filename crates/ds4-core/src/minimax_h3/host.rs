@@ -272,27 +272,45 @@ impl Schedule {
         })
     }
 
-    /// The two-stage refine grid: one evaluation at `sigma_video` and the
-    /// terminal zero. The reference's preset says `0.72, 0`
-    /// (`harness/workflow.py:50`, `:418`), which is exactly one step.
+    /// The two-stage refine grid. `ts_h2` states `0.72, 0`
+    /// (`harness/workflow.py:50`, `:418`) - one evaluation and the terminal
+    /// zero - and the earlier `ts_h` states `0.78, 0.45, 0`
+    /// (`harness/workflow.py:53`), which is two. `next` is that second sigma:
+    /// `None` is the one-step grid, `Some(s1)` the two-step one, and the
+    /// reference's format is a list because it never needed a third.
     ///
-    /// The audio sigma is derived from the video one the way `serving` derives
+    /// The audio sigma is derived from each video one the way `serving` derives
     /// every index from the shared base grid: invert the video shift to the
     /// base time, apply the audio shift. That is the reference's
     /// `time_shift_sigma(sigma_v, 12, 3)`
     /// (`comfy/ldm/minimax/model.py:36-39`), which ComfyUI's H3 passes to the
     /// audio stream while the sampler carries a single sigma.
-    pub fn refine(sigma_video: f32) -> Option<Schedule> {
+    pub fn refine(sigma_video: f32, next: Option<f32>) -> Option<Schedule> {
+        let audio_sigma = |sigma: f32| {
+            let base = base_grid(sigma, VIDEO_SIGMA_SHIFT);
+            AUDIO_SIGMA_SHIFT * base / (1.0f32 + (AUDIO_SIGMA_SHIFT - 1.0f32) * base)
+        };
         if !(sigma_video.is_finite() && sigma_video > 0.0 && sigma_video <= 1.0) {
             return None;
         }
-        let base = base_grid(sigma_video, VIDEO_SIGMA_SHIFT);
-        let audio = AUDIO_SIGMA_SHIFT * base / (1.0f32 + (AUDIO_SIGMA_SHIFT - 1.0f32) * base);
+        let mut video = vec![sigma_video];
+        let mut audio = vec![audio_sigma(sigma_video)];
+        if let Some(next) = next {
+            // A refine descends: a second sigma at or above the first would
+            // re-noise upward, which no preset does and no grant covers.
+            if !(next.is_finite() && next > 0.0 && next < sigma_video) {
+                return None;
+            }
+            video.push(next);
+            audio.push(audio_sigma(next));
+        }
+        video.push(0.0);
+        audio.push(0.0);
 
         Some(Schedule {
-            steps: 1,
-            video: vec![sigma_video, 0.0],
-            audio: vec![audio, 0.0],
+            steps: video.len() - 1,
+            video,
+            audio,
         })
     }
 }
@@ -545,7 +563,7 @@ mod tests {
     /// base time the video sigma came from.
     #[test]
     fn refine_grid_is_the_presets_one_step() {
-        let schedule = Schedule::refine(0.72).expect("0.72 is a legal refine sigma");
+        let schedule = Schedule::refine(0.72, None).expect("0.72 is a legal refine sigma");
 
         assert_eq!(schedule.steps, 1);
         assert_eq!(schedule.video[0].to_bits(), 0x3f38_51ec);
@@ -564,7 +582,7 @@ mod tests {
 
         // The last entry is the terminal zero, which is not a refine sigma.
         for index in 0..6 {
-            let refine = Schedule::refine(serving.video[index]).expect("a serving sigma is legal");
+            let refine = Schedule::refine(serving.video[index], None).expect("a serving sigma is legal");
             assert!(
                 (refine.audio[0] - serving.audio[index]).abs() <= 1.2e-7,
                 "index {index}: {} against {}",
@@ -580,7 +598,7 @@ mod tests {
     #[test]
     fn refine_enters_above_the_drafts_last_sigma() {
         let draft = Schedule::serving(6).expect("six evaluations are legal");
-        let refine = Schedule::refine(0.72).expect("0.72 is a legal refine sigma");
+        let refine = Schedule::refine(0.72, None).expect("0.72 is a legal refine sigma");
 
         assert!(refine.video[0] > draft.video[5]);
     }
@@ -596,7 +614,7 @@ mod tests {
     #[test]
     fn four_evaluations_end_above_the_presets_refine_sigma() {
         let draft = Schedule::serving(4).expect("four evaluations are legal");
-        let refine = Schedule::refine(0.72).expect("0.72 is a legal refine sigma");
+        let refine = Schedule::refine(0.72, None).expect("0.72 is a legal refine sigma");
 
         assert_eq!(draft.video[3].to_bits(), 0.8f32.to_bits());
         assert!(refine.video[0] < draft.video[3]);
@@ -606,11 +624,30 @@ mod tests {
     /// base time by zero, and above one is not a time the model was trained on.
     #[test]
     fn refine_grid_refuses_a_sigma_it_cannot_invert() {
-        assert!(Schedule::refine(0.0).is_none());
-        assert!(Schedule::refine(-0.1).is_none());
-        assert!(Schedule::refine(1.2).is_none());
-        assert!(Schedule::refine(f32::NAN).is_none());
-        assert!(Schedule::refine(1.0).is_some());
+        assert!(Schedule::refine(0.0, None).is_none());
+        assert!(Schedule::refine(-0.1, None).is_none());
+        assert!(Schedule::refine(1.2, None).is_none());
+        assert!(Schedule::refine(f32::NAN, None).is_none());
+        assert!(Schedule::refine(1.0, None).is_some());
+    }
+
+    /// The reference's earlier two-step refine, its `ts_h` preset
+    /// (`harness/workflow.py:53`, `refine_sigmas="0.78, 0.45, 0"`): two
+    /// evaluations at the delivery canvas instead of one, both descending.
+    #[test]
+    fn the_two_step_refine_is_the_presets_second_grid() {
+        let refine = Schedule::refine(0.78, Some(0.45)).expect("0.78 -> 0.45 -> 0 descends");
+        assert_eq!(refine.steps, 2);
+        assert_eq!(refine.video, vec![0.78, 0.45, 0.0]);
+        assert_eq!(refine.audio.len(), 3);
+        assert!(refine.audio[0] > refine.audio[1]);
+        assert!(refine.audio[1] > 0.0);
+
+        // A second sigma at or above the first would re-noise upward, and a
+        // zero second sigma would be the terminal entry, not a sigma.
+        assert!(Schedule::refine(0.45, Some(0.78)).is_none());
+        assert!(Schedule::refine(0.78, Some(0.78)).is_none());
+        assert!(Schedule::refine(0.78, Some(0.0)).is_none());
     }
 
     /// `comfy/model_sampling.py:94-97`: the seed is `sigma * noise +

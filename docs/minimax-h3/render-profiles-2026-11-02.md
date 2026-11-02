@@ -115,6 +115,24 @@ The loader (`tools/h3-profile.py`) is standard library only, refuses an unknown
 key by name rather than ignoring it, and `shlex.quote`s every value so a `doc`
 with an apostrophe cannot break the `eval`.
 
+## 3b. The reader is Rust, and the refine can hold two steps
+
+The recipes are read by `crates/ds4-core/src/minimax_h3/profiles.rs` and by
+nothing else. `tools/h3-rapid.sh` asks the renderer itself
+(`h3-rs --print-profile NAME`, `h3-rs --list-profiles`), the CLI applies one with
+`--profile NAME`, and the Python loader this started as is deleted: Python stays
+for tests, not for anything a render depends on. An unknown key is refused by
+name, so a typo in a recipe is an error rather than a line that quietly does
+nothing.
+
+The engine's refine grid gained the reference's second sigma. `Draft` now carries
+`next`, `Schedule::refine(sigma, next)` builds `[s0, s1, 0]` with the audio
+schedule derived per sigma, and the prepared-graph key carries both sigmas so
+`0.72, 0` and `0.78, 0.45, 0` cannot share a graph. `ts_h2`'s one step is
+unchanged (`next: None`); `ts_h` states the two. `--refine-sigma` takes either
+form (`0.72`, or `0.78,0.45`, with the reference's trailing `,0` accepted and
+dropped).
+
 ## 4. Run for real, twice
 
 The profile path was not only dry-run. Both renders below are the same prompt,

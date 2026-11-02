@@ -42,6 +42,10 @@ use ds4_sys::h3_dit::Gpu;
 pub struct Draft {
     pub scale: f32,
     pub sigma: f32,
+    /// The second refine sigma: `None` is the preset's one-step refine, and
+    /// `Some(0.45)` is the reference's earlier `ts_h` two-step one
+    /// (`harness/workflow.py:53`, `refine_sigmas="0.78, 0.45, 0"`).
+    pub next: Option<f32>,
 }
 
 impl Draft {
@@ -50,6 +54,16 @@ impl Draft {
     pub const RELEASED: Draft = Draft {
         scale: 0.7,
         sigma: 0.72,
+        next: None,
+    };
+
+    /// The reference's two-step refine, its `ts_h` preset: `0.78, 0.45, 0`.
+    /// It is the grid `ts_h2` replaced, kept because it is the only lever left
+    /// above the released canvas: two evaluations at full size instead of one.
+    pub const TS_H: Draft = Draft {
+        scale: 0.7,
+        sigma: 0.78,
+        next: Some(0.45),
     };
 
     /// The draft canvas: `round(scale * size / 32) * 32` per axis, the
@@ -209,7 +223,9 @@ struct PreparedKey {
     /// maps are baked per step at load, so two sigmas are two different graphs
     /// even though both schedules have one step: without this, a render at
     /// 0.55 would reuse a graph prepared for 0.72 and run the wrong timestep.
-    sigma: Option<u32>,
+    /// The refine grid's sigmas as bits: one on a single-step refine, both on
+    /// the reference's two-step one, so two grids cannot share a stage.
+    sigma: Option<(u32, u32)>,
     rope: u32,
     /// Which attention the held DiT was loaded with. Its path is set once, on
     /// the context `Dit::load_with` creates, so a request that asks for the
@@ -316,8 +332,11 @@ impl Engine {
                 let (width, height) = route.canvas(request.width, request.height)?;
                 let draft_canvas = Canvas::new(width, height, 0, 0)
                     .map_err(|error| EngineError::new(format!("draft canvas: {error}")))?;
-                let refine = Schedule::refine(route.sigma).ok_or_else(|| {
-                    EngineError::new(format!("refine sigma {} is outside (0, 1]", route.sigma))
+                let refine = Schedule::refine(route.sigma, route.next).ok_or_else(|| {
+                    EngineError::new(format!(
+                        "refine sigmas {:?} are not a descending grid in (0, 1]",
+                        (route.sigma, route.next)
+                    ))
                 })?;
                 Some((route, draft_canvas, refine))
             }
@@ -549,7 +568,10 @@ impl Engine {
                 frames: frame_count,
                 steps: refine_schedule.steps,
                 reuse: 1,
-                sigma: Some(route.sigma.to_bits()),
+                sigma: Some((
+                    route.sigma.to_bits(),
+                    route.next.map(f32::to_bits).unwrap_or(0),
+                )),
                 rope: canvas.rope_scale(false).to_bits(),
                 attention: request.attention,
                 // The refine is the delivery: this stage keeps the
@@ -1404,18 +1426,39 @@ mod tests {
         let conditioning = [3u8; 32];
         let mut narrow = key(4, conditioning);
         narrow.steps = 1;
-        narrow.sigma = Some(0.72f32.to_bits());
+        narrow.sigma = Some((0.72f32.to_bits(), 0));
 
         let mut wide = narrow.clone();
-        wide.sigma = Some(0.55f32.to_bits());
+        wide.sigma = Some((0.55f32.to_bits(), 0));
 
         assert_ne!(narrow, wide);
-        assert_eq!(narrow.sigma, Some(0.72f32.to_bits()));
+        assert_eq!(narrow.sigma, Some((0.72f32.to_bits(), 0)));
         // The same sigma still hits.
         assert_eq!(narrow, {
             let mut same = narrow.clone();
-            same.sigma = Some(0.72f32.to_bits());
+            same.sigma = Some((0.72f32.to_bits(), 0));
             same
         });
+    }
+
+    /// The reference's two-step refine is two evaluations under one entry sigma,
+    /// so the key has to carry the second one as well: `ts_h2` at `0.72, 0` and
+    /// `ts_h` at `0.78, 0.45, 0` differ in both sigmas and must not share a
+    /// prepared graph.
+    #[test]
+    fn the_second_refine_sigma_is_part_of_the_key_too() {
+        let conditioning = [5u8; 32];
+        let mut first = key(4, conditioning);
+        first.steps = 2;
+        first.sigma = Some((0.78f32.to_bits(), 0.45f32.to_bits()));
+
+        let mut second = first.clone();
+        second.sigma = Some((0.78f32.to_bits(), 0.55f32.to_bits()));
+        assert_ne!(first, second);
+
+        let mut single = first.clone();
+        single.steps = 1;
+        single.sigma = Some((0.78f32.to_bits(), 0));
+        assert_ne!(first, single);
     }
 }

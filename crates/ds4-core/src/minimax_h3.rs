@@ -42,6 +42,7 @@ pub mod multimodal;
 pub mod nvfp4;
 pub mod partition;
 pub mod presets;
+pub mod profiles;
 pub mod prompt_cache;
 pub mod reference;
 pub mod render;

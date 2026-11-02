@@ -75,6 +75,11 @@ DRY_RUN=0
 PROFILE=
 PROFILES=$ROOT/tools/h3-profiles.json
 
+# The recipe reader is the renderer binary itself. It is needed before the flag
+# loop (the artifact checks below run later), so its path is resolved here too.
+recipe_bin=${H3_RS:-$ROOT/target/release/h3-rs}
+[ -x "$recipe_bin" ] || recipe_bin=$ROOT/h3-rs
+
 # The profile is applied BEFORE the flag loop, so a flag on the command line
 # still overrides the recipe. This is a pre-scan only; the loop below parses the
 # same words again.
@@ -86,15 +91,17 @@ while [ $index -lt $prescan ]; do
     --profiles) PROFILES=${prescan_args[$((index + 1))]:-}; index=$((index + 2)) ;;
     --profile) PROFILE=${prescan_args[$((index + 1))]:-}; index=$((index + 2)) ;;
     --list-profiles)
-      exec /usr/bin/python3 "$ROOT/tools/h3-profile.py" --file "$PROFILES" --list
+      exec "$recipe_bin" --profiles "$PROFILES" --list-profiles
       ;;
     *) index=$((index + 1)) ;;
   esac
 done
 if [ -n "$PROFILE" ]; then
+  case "$PROFILES" in /*) ;; *) PROFILES=$ROOT/$PROFILES ;; esac
   [ -r "$PROFILES" ] || { echo "cannot read profile file: $PROFILES" >&2; exit 2; }
-  recipe=$(/usr/bin/python3 "$ROOT/tools/h3-profile.py" --file "$PROFILES" --name "$PROFILE") ||
-    exit 2
+  # The recipe is read by the renderer itself (`minimax_h3::profiles`), so the
+  # script and the API cannot disagree about what a name means.
+  recipe=$("$recipe_bin" --profiles "$PROFILES" --print-profile "$PROFILE") || exit 2
   eval "$recipe"
 fi
 

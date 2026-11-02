@@ -100,8 +100,10 @@ impl Renderer for EngineRenderer {
             // The local contract has no two-stage route, so it has no draft leg
             // to state an arm for.
             draft_attention: None,
-            vae_attention: spec.vae_attention,
-            vae_gemm: spec.vae_gemm,
+            // The spec resolved its arms when the request was parsed, so the
+            // engine is told them rather than left to read the environment.
+            vae_attention: Some(spec.vae_attention),
+            vae_gemm: Some(spec.vae_gemm),
             text_encoder: self.text_encoder.clone(),
             encode: Encode::default(),
             output: output.to_path_buf(),

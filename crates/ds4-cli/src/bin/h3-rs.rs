@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use ds4_core::minimax_h3::profiles::Profiles;
 use ds4_core::minimax_h3::dit::{
     Attention, AttentionType, Dit, DitError, LoadMode, LoadOptions, Reduction, VaeAttention,
     VaeGemm,
@@ -53,6 +54,10 @@ const REF2VA: &str = "Ref2VA";
 
 struct Options {
     model_dir: PathBuf,
+    /// The recipe file and the recipe it names. Resolved by
+    /// `minimax_h3::profiles`, the same reader the server uses.
+    profiles: PathBuf,
+    profile: Option<String>,
     prompt: String,
     output: PathBuf,
     width: i32,
@@ -118,7 +123,7 @@ struct Options {
     /// higher sigma, and the reference re-tunes the refine per draft schedule
     /// rather than deriving it from the draft's terminal
     /// (`docs/minimax-h3/four-step-draft-2026-11-02.md` section 3).
-    refine_sigma: Option<f32>,
+    refine_sigma: Option<(f32, Option<f32>)>,
     /// `--draft-attention`: the **draft leg's** attention data type. `e4m3` is
     /// the arm the E4M3 unit measured and the clip gate refused when it ran the
     /// whole delivery (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`);
@@ -167,8 +172,50 @@ fn main() -> ExitCode {
     }
 }
 
+/// The value after a bare flag. The recipe commands answer before the option
+/// parser runs, so they cannot use it.
+fn flag_value(arguments: &[String], flag: &str) -> Option<String> {
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        if word == flag {
+            return words.next().cloned();
+        }
+    }
+    None
+}
+
+/// The recipe file: `--profiles`, or the one the repository ships.
+fn profile_path(arguments: &[String]) -> PathBuf {
+    flag_value(arguments, "--profiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("tools/h3-profiles.json"))
+}
+
 fn run() -> Result<ExitCode, String> {
-    let Some(options) = parse(std::env::args().skip(1).collect())? else {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // The recipe commands are read-only and answer before anything else, so
+    // `--print-profile` needs neither `--jobs` nor a checkpoint.
+    if let Some(name) = flag_value(&arguments, "--print-profile") {
+        let path = profile_path(&arguments);
+        let profiles = Profiles::load(&path)?;
+        let profile = profiles
+            .get(&name)
+            .ok_or_else(|| format!("no profile {name:?} in {}", path.display()))?;
+        for (key, value) in profile.shell() {
+            println!("{key}={}", ds4_core::minimax_h3::profiles::shell_quote(&value));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if arguments.iter().any(|argument| argument == "--list-profiles") {
+        let profiles = Profiles::load(&profile_path(&arguments))?;
+        let width = profiles.names().map(|(name, _)| name.len()).max().unwrap_or(0);
+        for (name, doc) in profiles.names() {
+            println!("{name:<width$}  {doc}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some(options) = parse(arguments)? else {
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -581,10 +628,31 @@ fn run_jobs(options: &Options) -> Result<ExitCode, String> {
     if options.draft_attention.is_some() && options.draft.is_none() {
         return Err("--draft-attention needs --draft".to_string());
     }
-    let draft = options.draft.map(|scale| Draft {
-        scale,
-        sigma: options.refine_sigma.unwrap_or(Draft::RELEASED.sigma),
-    });
+    let (refine_sigma, refine_next) = options
+        .refine_sigma
+        .unwrap_or((Draft::RELEASED.sigma, Draft::RELEASED.next));
+    // A recipe is the flags it names (`minimax_h3::profiles`); a flag on the
+    // command line still wins over it, and the recipe wins over a job line's
+    // step count because that is what a recipe is for.
+    let recipe = match &options.profile {
+        Some(name) => Some(
+            Profiles::load(&options.profiles)?
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("no profile {name:?}"))?,
+        ),
+        None => None,
+    };
+    let draft = recipe
+        .as_ref()
+        .and_then(|recipe| recipe.draft())
+        .or_else(|| {
+            options.draft.map(|scale| Draft {
+                scale,
+                sigma: refine_sigma,
+                next: refine_next,
+            })
+        });
 
     // Every line is checked before the first weight is read: a bad canvas must
     // not cost a 62 GiB load. The draft canvas is checked here for the same
@@ -597,8 +665,15 @@ fn run_jobs(options: &Options) -> Result<ExitCode, String> {
             route
                 .canvas(job.width, job.height)
                 .map_err(|error| format!("line {}: {}", index + 1, error.message()))?;
-            Schedule::refine(route.sigma)
-                .ok_or_else(|| format!("--refine-sigma {} is outside (0, 1]", route.sigma))?;
+            Schedule::refine(route.sigma, route.next).ok_or_else(|| {
+                format!(
+                    "--refine-sigma {} is not a descending grid in (0, 1]",
+                    match route.next {
+                        Some(next) => format!("{},{}", route.sigma, next),
+                        None => route.sigma.to_string(),
+                    }
+                )
+            })?;
         }
     }
 
@@ -622,7 +697,10 @@ fn run_jobs(options: &Options) -> Result<ExitCode, String> {
             width: job.width,
             height: job.height,
             frames: job.frames,
-            steps: job.steps,
+            steps: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.steps)
+                .unwrap_or(job.steps),
             reuse: options.reuse,
             seed: job.seed,
             draft,
@@ -630,9 +708,22 @@ fn run_jobs(options: &Options) -> Result<ExitCode, String> {
             last_frame: None,
             references: Vec::new(),
             attention: options.attention,
-            draft_attention: options.draft_attention,
-            vae_attention: options.vae_attention,
-            vae_gemm: options.vae_gemm,
+            draft_attention: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.draft_attention.as_deref())
+                .map(|word| match word {
+                    "e4m3" | "fp8" => AttentionType::E4M3,
+                    _ => AttentionType::Bf16,
+                })
+                .or(options.draft_attention),
+            vae_attention: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.vae_attention)
+                .or(options.vae_attention),
+            vae_gemm: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.vae_gemm)
+                .or(options.vae_gemm),
             text_encoder: options.text_encoder.clone(),
             encode: options.encode,
             output: job.output.clone(),
@@ -1049,6 +1140,8 @@ fn read_anchors(options: &Options, canvas: &Canvas, frame_count: i32) -> Result<
 fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut options = Options {
         model_dir: PathBuf::new(),
+        profiles: PathBuf::from("tools/h3-profiles.json"),
+        profile: None,
         prompt: String::new(),
         output: PathBuf::from(DEFAULT_OUTPUT),
         width: DEFAULT_WIDTH,
@@ -1184,12 +1277,32 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                         .map_err(|_| "--draft takes a scale such as 0.7".to_string())?,
                 );
             }
+            "--profiles" => options.profiles = PathBuf::from(value(&mut argv, &flag)?),
+            "--profile" => options.profile = Some(value(&mut argv, &flag)?),
             "--refine-sigma" => {
                 let text = value(&mut argv, &flag)?;
-                options.refine_sigma = Some(
-                    text.parse()
-                        .map_err(|_| "--refine-sigma takes a sigma such as 0.72".to_string())?,
-                );
+                // The reference writes its grids as lists with a terminal zero
+                // (`"0.72, 0"`, `"0.78, 0.45, 0"`); the zero is the schedule's
+                // end, not a sigma, so it is accepted and dropped.
+                let mut sigmas = text
+                    .split(',')
+                    .map(|part| part.trim().parse::<f32>())
+                    .collect::<Result<Vec<f32>, _>>()
+                    .map_err(|_| {
+                        "--refine-sigma takes one sigma such as 0.72, or a grid such as 0.78,0.45"
+                            .to_string()
+                    })?;
+                if sigmas.last() == Some(&0.0) {
+                    sigmas.pop();
+                }
+                options.refine_sigma = Some(match sigmas.as_slice() {
+                    [one] => (*one, None),
+                    [one, two] => (*one, Some(*two)),
+                    _ => {
+                        return Err("--refine-sigma takes at most two sigmas: the reference's grids are 0.72,0 and 0.78,0.45,0"
+                            .to_string())
+                    }
+                });
             }
             // The draft leg's data type. Two words, both stated on purpose:
             // `e4m3` is the arm, and `bf16` is how a run pins the draft while

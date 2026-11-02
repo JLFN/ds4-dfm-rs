@@ -122,6 +122,7 @@ fn main() -> ExitCode {
                 draft = Some(Draft {
                     scale,
                     sigma: draft.map_or(Draft::RELEASED.sigma, |held| held.sigma),
+                    next: draft.and_then(|held| held.next),
                 });
             }
             "--refine-sigma" => match argv.next().as_deref().map(str::parse::<f32>) {
@@ -129,6 +130,7 @@ fn main() -> ExitCode {
                     draft = Some(Draft {
                         scale: draft.unwrap_or(Draft::RELEASED).scale,
                         sigma,
+                        next: None,
                     });
                 }
                 _ => {
