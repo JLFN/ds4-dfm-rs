@@ -15,6 +15,9 @@ They are not linked into production hosts.
 | `ppm_diff.c` | Pixel differences, PSNR and spatial attribution |
 | `standin-renderer.sh` | Model-free HTTP plumbing, not model qualification |
 
+The latent resizer's oracle is gone with the stage it probed. Every remaining
+probe here is media comparison against a reference checkout.
+
 Build probes against a reference checkout supplied by the operator. For
 example, after building its `libh3.a`:
 

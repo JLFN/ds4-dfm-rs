@@ -292,6 +292,18 @@ tests/naive_banks
 # /tests/h3/, which this rule does not cover.
 /tests/h3-*
 /tests/h3/native_test
+# H3 kernel reproducers (`make tests/h3/<name>`).
+/tests/h3/attn_bm
+/tests/h3/attn_f32_bm
+/tests/h3/vae_gemm_bm
+/tests/h3/sol_route_bm
+/tests/h3/sol_forward_bm
+/tests/h3/sol_vsa_bm
+/tests/h3/elementwise_bm
+/tests/h3/linear_fp8_bm
+/tests/h3/fp8_gemm_bm
+/tests/h3/int8_convrot_bm
+/tests/h3/gemma_tower_bm
 
 # h3 host binaries (`make h3-rs`, `make h3-server-rs`)
 /h3-rs
@@ -310,3 +322,13 @@ tests/naive_banks
 /tests/gemma4_q4_decode
 /tests/gemma4_mtp_gate
 /tests/gemma4_ring
+
+# Sol-H3 separate engine (`sol/`): upstream sources, environments, weights and
+# renders stay out of the repository. Only sol/README.md, prepare.sh and run.sh
+# are tracked.
+/sol/upstream/
+/sol/venvs/
+/sol/checkpoints/
+/sol/outputs/
+/sol/paths.json
+/sol/dependencies/

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use ds4_core::minimax_h3::engine::{EngineHandle, RenderRequest};
 use ds4_core::minimax_h3::local_api::{Plan, ReferenceKind};
 use ds4_core::minimax_h3::reference;
+use ds4_core::minimax_h3::render::Encode;
+use ds4_core::minimax_h3::text_forward::Encoder;
 
 use crate::h3_video::{MediaFile, RenderError, Renderer, RendererState};
 
@@ -18,6 +20,8 @@ pub struct EngineRenderer {
     engine: EngineHandle,
     steps: usize,
     reuse: usize,
+    /// Which checkpoint encodes the prompt (`prompt_encoder`).
+    text_encoder: Encoder,
 }
 
 impl EngineRenderer {
@@ -31,7 +35,20 @@ impl EngineRenderer {
             engine,
             steps,
             reuse,
+            text_encoder: prompt_encoder(),
         })
+    }
+}
+
+/// `H3_TEXT_NVFP4`: the path of the reference's NVFP4-AWQ prompt encoder.
+/// Unset, the engine reads the released BF16 shards in the model directory.
+/// The port's Qwen read path already takes its knobs from the environment
+/// (`H3_QWEN_PREFETCH`), and this one is a startup setting like steps and
+/// reuse rather than a field of the local body.
+fn prompt_encoder() -> Encoder {
+    match std::env::var("H3_TEXT_NVFP4") {
+        Ok(path) if !path.trim().is_empty() => Encoder::Quantized(PathBuf::from(path.trim())),
+        _ => Encoder::Bf16,
     }
 }
 
@@ -72,12 +89,26 @@ impl Renderer for EngineRenderer {
             width: spec.size.width as i32,
             height: spec.size.height as i32,
             frames: spec.frames as i32,
-            steps: self.steps,
+            steps: spec.steps.unwrap_or(self.steps),
             reuse: self.reuse,
             seed: spec.seed,
+            draft: spec.draft,
             first_frame: first.as_ref().map(|file| file.path().to_path_buf()),
             last_frame: last.as_ref().map(|file| file.path().to_path_buf()),
             references,
+            attention: spec.attention,
+            // The local contract has no two-stage route, so it has no draft leg
+            // to state an arm for.
+            draft_attention: None,
+            // The spec resolved its arms when the request was parsed, so the
+            // engine is told them rather than left to read the environment.
+            vae_attention: Some(spec.vae_attention),
+            vae_gemm: Some(spec.vae_gemm),
+            text_encoder: self.text_encoder.clone(),
+            encode: Encode {
+                crf: spec.crf.unwrap_or(Encode::default().crf),
+                preset: spec.preset.unwrap_or(Encode::default().preset),
+            },
             output: output.to_path_buf(),
         };
         let report = self

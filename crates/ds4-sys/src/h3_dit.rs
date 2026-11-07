@@ -9,12 +9,16 @@
 //! than inventing a friendlier one: a swapped shape argument would still be
 //! accepted by cuBLASLt and would silently change the graph.
 
-use std::ffi::c_char;
+use std::ffi::{c_char, CString};
 use std::os::raw::c_int;
 use std::ptr::NonNull;
 
 /// `error[1024]` in the probe; the native side writes at most this much.
 const ERROR_SIZE: usize = 1024;
+
+/// Room for the algorithm report: the resizer's stage dispatches under a dozen
+/// distinct shapes, at about a hundred characters each.
+const LT_ALGO_REPORT_SIZE: usize = 4096;
 
 #[repr(C)]
 struct Context {
@@ -29,6 +33,8 @@ struct CTensor {
 unsafe extern "C" {
     fn h3d_create(error: *mut c_char, error_size: usize) -> *mut Context;
     fn h3d_destroy(context: *mut Context);
+    fn h3d_set_attention(context: *mut Context, scalar: c_int);
+    fn h3d_set_attention_type(context: *mut Context, fp8: c_int);
 
     fn h3d_alloc(
         context: *mut Context,
@@ -75,6 +81,120 @@ unsafe extern "C" {
         dtype: c_int,
         error: *mut c_char,
         error_size: usize,
+    ) -> c_int;
+
+    fn h3d_vae_linear(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_vae_linear_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_vae_gemm_mode(context: *const Context) -> c_int;
+
+    fn h3d_vae_attention_mma(context: *const Context) -> c_int;
+
+    fn h3d_vae_sdpa_rows(context: *const Context) -> c_int;
+
+    fn h3d_fp8_scale(
+        context: *mut Context,
+        scale: *mut CTensor,
+        input: *const CTensor,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_quantize(
+        context: *mut Context,
+        output: *mut CTensor,
+        scale: *const CTensor,
+        input: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_linear_e4m3(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        input_scale: *const CTensor,
+        weight: *const CTensor,
+        weight_scale: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_scale_rows(
+        context: *mut Context,
+        scales: *mut CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_quantize_rows(
+        context: *mut Context,
+        output: *mut CTensor,
+        scales: *const CTensor,
+        input: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_linear_e4m3_raw(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_fp8_scale_epilogue(
+        context: *mut Context,
+        output: *mut CTensor,
+        accumulator: *const CTensor,
+        row_scale: *const CTensor,
+        column_scale: *const CTensor,
+        rows: u32,
+        columns: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_set_vae_option(
+        context: *mut Context,
+        name: *const c_char,
+        value: *const c_char,
     ) -> c_int;
 
     fn h3d_patch_linear(
@@ -234,6 +354,142 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3d_text_attention(
+        context: *mut Context,
+        output: *mut CTensor,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        q_rows: u32,
+        kv_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_layer_norm`: the refiner's `elementwise_affine=False` output norm.
+    fn h3d_layer_norm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_randn_bf16`: torch's CUDA normal draw at the generator's own
+    /// `(seed, offset)`, reporting the offset advance the caller applies.
+    fn h3d_randn_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        elements: usize,
+        seed: u64,
+        offset: u64,
+        increment: *mut u64,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_noise_lerp`: `GaussianNoiser.__call__`'s two float32 lerps.
+    fn h3d_noise_lerp(
+        context: *mut Context,
+        output: *mut CTensor,
+        latent: *const CTensor,
+        noise: *const CTensor,
+        clean: *const CTensor,
+        mask: *const CTensor,
+        rows: u32,
+        width: u32,
+        weight: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_timesteps`: the F32 `[rows]` `denoise_mask * sigma`.
+    fn h3d_timesteps(
+        context: *mut Context,
+        output: *mut CTensor,
+        mask: *const CTensor,
+        rows: u32,
+        sigma: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_to_denoised`: `X0Model`'s `to_denoised` at the per-token timestep.
+    fn h3d_to_denoised(
+        context: *mut Context,
+        output: *mut CTensor,
+        latent: *const CTensor,
+        velocity: *const CTensor,
+        timestep: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_to_velocity`: `to_velocity`, whose BF16 round the step reads back.
+    fn h3d_to_velocity(
+        context: *mut Context,
+        output: *mut CTensor,
+        sample: *const CTensor,
+        denoised: *const CTensor,
+        sigma: f32,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_euler_step`: `EulerDiffusionStep.step`'s `sample + velocity*dt`.
+    fn h3d_euler_step(
+        context: *mut Context,
+        output: *mut CTensor,
+        sample: *const CTensor,
+        velocity: *const CTensor,
+        delta: f32,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// `h3d_sol_words`: the mask words one query block carries at this length.
+    fn h3d_sol_words(sequence: u32) -> u32;
+    /// VSA's selector: the reference's own sparsity rule for the H3 stage.
+    fn h3d_sol_vsa(
+        context: *mut Context,
+        plan: *const SolPlan,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        sparsity: f64,
+        prefix_blocks: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    /// The sparse forward the selector's mask was built for.
+    fn h3d_sol_forward(
+        context: *mut Context,
+        output: *mut CTensor,
+        plan: *const SolPlan,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3d_add(
         context: *mut Context,
         output: *mut CTensor,
@@ -244,7 +500,149 @@ unsafe extern "C" {
         error_size: usize,
     ) -> c_int;
 
+    fn h3d_add_f32(
+        context: *mut Context,
+        output: *mut CTensor,
+        left: *const CTensor,
+        right: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_conv3d_gemm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        depth: u32,
+        height: u32,
+        width: u32,
+        input_channels: u32,
+        output_channels: u32,
+        kernel: u32,
+        tile: u32,
+        scratch: *const CTensor,
+        tf32: u32,
+        orientation: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_conv3d_timing(enable: c_int) -> c_int;
+    fn h3d_conv3d_timing_read(seconds: *mut f64);
+    fn h3d_conv3d_timing_reset();
+    fn h3d_lt_algo_report(text: *mut c_char, size: usize) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_zero_pad3d(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        pad_depth: u32,
+        pad_height: u32,
+        pad_width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_group_norm(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        groups: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_group_norm_activate(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        groups: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_channel_affine(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        scale: *const CTensor,
+        shift: *const CTensor,
+        channels: u32,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_temporal_dwconv(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        kernel: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_resize_hw(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        batch: u32,
+        depth: u32,
+        in_height: u32,
+        in_width: u32,
+        out_height: u32,
+        out_width: u32,
+        channels: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
     fn h3d_cast_f32_to_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        elements: usize,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    fn h3d_cast_bf16_to_f32(
         context: *mut Context,
         output: *mut CTensor,
         input: *const CTensor,
@@ -432,6 +830,7 @@ unsafe extern "C" {
         context: *mut Context,
         output: *mut CTensor,
         fused: *const CTensor,
+        bias: *const CTensor,
         rows: u32,
         width: u32,
         error: *mut c_char,
@@ -443,6 +842,7 @@ unsafe extern "C" {
         output: *mut CTensor,
         residual: *const CTensor,
         branch: *const CTensor,
+        bias: *const CTensor,
         scale: *const CTensor,
         rows: u32,
         width: u32,
@@ -456,6 +856,95 @@ unsafe extern "C" {
         key: *mut CTensor,
         value: *mut CTensor,
         qkv: *const CTensor,
+        bias: *const CTensor,
+        rope_cos: *const CTensor,
+        rope_sin: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        rope_half: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    // The `bf16a` chain's six primitives: the same kernels over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_sdpa_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        query: *const CTensor,
+        key: *const CTensor,
+        value: *const CTensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_rms_norm_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_layer_norm_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        input: *const CTensor,
+        weight: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_swiglu_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        fused: *const CTensor,
+        bias: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_scale_add_bf16(
+        context: *mut Context,
+        output: *mut CTensor,
+        residual: *const CTensor,
+        branch: *const CTensor,
+        bias: *const CTensor,
+        scale: *const CTensor,
+        rows: u32,
+        width: u32,
+        error: *mut c_char,
+        error_size: usize,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    fn h3d_video_qkv_rope_bf16(
+        context: *mut Context,
+        query: *mut CTensor,
+        key: *mut CTensor,
+        value: *mut CTensor,
+        qkv: *const CTensor,
+        bias: *const CTensor,
         rope_cos: *const CTensor,
         rope_sin: *const CTensor,
         sequence: u32,
@@ -593,6 +1082,7 @@ unsafe extern "C" {
         error: *mut c_char,
         error_size: usize,
     ) -> c_int;
+
 }
 
 /// `h3d_dtype`.
@@ -601,6 +1091,11 @@ pub enum Dtype {
     Bf16,
     F32,
     U32,
+    /// E4M3, one byte per element: the FP8 projection route's operand type.
+    Fp8,
+    /// IEEE half: the resizer's F16 operand route, where the weight is stored
+    /// as the checkpoint has it and the GEMM accumulates in F32.
+    F16,
 }
 
 impl Dtype {
@@ -609,14 +1104,17 @@ impl Dtype {
             Dtype::Bf16 => 0,
             Dtype::F32 => 1,
             Dtype::U32 => 2,
+            Dtype::Fp8 => 3,
+            Dtype::F16 => 4,
         }
     }
 
     /// Bytes per element, so a host slice can be checked before a copy.
     pub fn size(self) -> usize {
         match self {
-            Dtype::Bf16 => 2,
+            Dtype::Bf16 | Dtype::F16 => 2,
             Dtype::F32 | Dtype::U32 => 4,
+            Dtype::Fp8 => 1,
         }
     }
 }
@@ -647,6 +1145,41 @@ impl Tensor {
     }
 }
 
+/// `H3D_SOL_BLOCK`, `H3D_SOL_HEAD_DIM` (`native/h3/h3_dit_gpu.h:45`).
+const SOL_BLOCK: u32 = 64;
+const SOL_HEAD_DIM: usize = 128;
+
+/// `struct h3d_sol_plan` (`native/h3/h3_dit_gpu.h:65-74`), field for field:
+/// the block summaries the search step pools, the routing mask, its count,
+/// the threshold the tau policy writes, the query centroids and the kc
+/// statistics. Field order is the C struct's.
+#[repr(C)]
+pub struct SolPlan {
+    pub kc: *mut CTensor,
+    pub vc: *mut CTensor,
+    pub mask: *mut CTensor,
+    pub count: *mut CTensor,
+    pub threshold: *mut CTensor,
+    pub query_bar: *mut CTensor,
+    pub kc_mean: *mut CTensor,
+    pub kc_var: *mut CTensor,
+}
+
+/// The plan and the buffers it points at: the plan holds raw pointers, so
+/// the tensors must outlive it and cannot be moved out. `Send` is not
+/// claimed, as the tensors are device memory owned by one stream.
+pub struct SolPlanBuffers {
+    plan: SolPlan,
+    _kc: Tensor,
+    _vc: Tensor,
+    _mask: Tensor,
+    _count: Tensor,
+    _threshold: Tensor,
+    _query_bar: Tensor,
+    _kc_mean: Tensor,
+    _kc_var: Tensor,
+}
+
 /// One CUDA stream and one cuBLASLt handle: the reference's `h3_gpu`.
 #[derive(Debug)]
 pub struct Gpu {
@@ -661,6 +1194,21 @@ impl Gpu {
         NonNull::new(raw)
             .map(|raw| Gpu { raw })
             .ok_or_else(|| message(&error))
+    }
+
+    /// Select the attention path for this context. `scalar` true asks for the
+    /// byte-exact scalar kernel, the only path that reproduces the reference;
+    /// false selects the tensor-core default. Overrides the environment.
+    pub fn set_attention(&self, scalar: bool) {
+        unsafe { h3d_set_attention(self.raw.as_ptr(), scalar as c_int) };
+    }
+
+    /// State this context's attention data type: `fp8` true asks for the E4M3
+    /// block, false for the BF16 one, overriding `H3_DIT_ATTENTION` for this
+    /// context alone. Call it after [`Gpu::set_attention`], which resets the
+    /// flag to the environment's word.
+    pub fn set_attention_type(&self, fp8: bool) {
+        unsafe { h3d_set_attention_type(self.raw.as_ptr(), fp8 as c_int) };
     }
 
     pub fn alloc(&self, dtype: Dtype, elements: usize) -> Result<Tensor, String> {
@@ -757,6 +1305,33 @@ impl Gpu {
         )
     }
 
+    /// Copy an F32 tensor back to the host as `f32`, waiting for the stream.
+    ///
+    /// The decoder reads 31 MB back per tile and 54 tiles per render, and the
+    /// byte form of that readback cost it a fresh buffer plus a
+    /// `f32::from_le_bytes` pass over 7.8 million words every tile. On a
+    /// little-endian host the device's bytes are already the host's `f32`
+    /// values and every bit pattern is a valid `f32`, so this is the same copy
+    /// `read` makes with no conversion at all.
+    pub fn read_f32(&self, tensor: &Tensor, out: &mut [f32]) -> Result<(), String> {
+        if out.len() * 4 != tensor.bytes() {
+            return Err(format!(
+                "read_f32 of {} floats from a {} byte tensor",
+                out.len(),
+                tensor.bytes()
+            ));
+        }
+        if !cfg!(target_endian = "little") {
+            return Err("read_f32 needs a little-endian host; use read".into());
+        }
+        // SAFETY: four bytes per element with no padding, `out.len() * 4` bytes
+        // long, and `f32` has no invalid bit patterns, so the view is in bounds
+        // for its whole length and the copy writes only `f32` values.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len() * 4) };
+        self.read(tensor, bytes)
+    }
+
     /// `h3_gpu_linear_bf16` (or `h3_gpu_linear_f32`): `rows x input_dim` by
     /// `output_dim x input_dim`, optional bias.
     #[allow(clippy::too_many_arguments)]
@@ -789,6 +1364,321 @@ impl Gpu {
             },
             "linear",
         )
+    }
+
+    /// The release's FP8 route (`h3d_fp8_scale`): one element of `scale`
+    /// receives the tensorwise scale of `input`, `max(amax / 448, 1/(448*512))`
+    /// in F32, which is the number `torch._scaled_mm` receives as its scale.
+    pub fn fp8_scale(&self, scale: &Tensor, input: &Tensor) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_scale(self.raw.as_ptr(), scale.raw(), input.raw(), error, size)
+            },
+            "fp8 scale",
+        )
+    }
+
+    /// `h3d_fp8_quantize`: the first `elements` of `input` rounded to E4M3
+    /// through `scale`, the reference's
+    /// `(x / x_scale).clamp(-448, 448).to(float8_e4m3fn)`. `output` may be a
+    /// scratch larger than the activation, as the four projections' shared one
+    /// is.
+    pub fn fp8_quantize(
+        &self,
+        output: &Tensor,
+        scale: &Tensor,
+        input: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_quantize(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    scale.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "fp8 quantize",
+        )
+    }
+
+    /// `torch._scaled_mm`'s matmul (`h3d_linear_e4m3`): E4M3 operands at the
+    /// same row-major TRANSB shapes as `linear`, a BF16 output, and the two
+    /// tensorwise scales applied by the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_e4m3(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        input_scale: &Tensor,
+        weight: &Tensor,
+        weight_scale: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_linear_e4m3(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    input_scale.raw(),
+                    weight.raw(),
+                    weight_scale.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "fp8 linear",
+        )
+    }
+
+    /// `h3d_fp8_scale_rows`: one element of `scale` per row of a row-major
+    /// `[rows, columns]` BF16 tensor, the reference's `_quantize_rowwise`
+    /// (`fp8_config.py:63-68`) and, for a `[n, k]` weight, its `abs().amax(dim=1)`
+    /// (`:226`) whose rows are output channels.
+    pub fn fp8_scale_rows(
+        &self,
+        scales: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_scale_rows(
+                    self.raw.as_ptr(),
+                    scales.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "fp8 row scale",
+        )
+    }
+
+    /// `h3d_fp8_quantize_rows`: `input` rounded to E4M3 through the scale of
+    /// its own row.
+    pub fn fp8_quantize_rows(
+        &self,
+        output: &Tensor,
+        scales: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_quantize_rows(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    scales.raw(),
+                    input.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "fp8 row quantize",
+        )
+    }
+
+    /// `h3d_linear_e4m3_raw`: the same E4M3 matmul with no scales at all and
+    /// an F32 output, the accumulator `fp8_scale_epilogue` scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_e4m3_raw(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_linear_e4m3_raw(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "raw fp8 linear",
+        )
+    }
+
+    /// `h3d_fp8_scale_epilogue`: `out[i][j] = bf16(acc[i][j] * row[i] *
+    /// col[j])`, the reference's `(A @ W^T) * scale_a * scale_b` applied to
+    /// the accumulator `_scaled_mm` would have scaled itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_scale_epilogue(
+        &self,
+        output: &Tensor,
+        accumulator: &Tensor,
+        row_scale: &Tensor,
+        column_scale: &Tensor,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_fp8_scale_epilogue(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    accumulator.raw(),
+                    row_scale.raw(),
+                    column_scale.raw(),
+                    rows,
+                    columns,
+                    error,
+                    size,
+                )
+            },
+            "fp8 scale epilogue",
+        )
+    }
+
+
+    /// The video VAE decoder's F32 linear (`h3d_vae_linear`): `linear` at
+    /// `Dtype::F32` with the decoder's own bench options applied. Only the
+    /// decoder uses it, so those options cannot reach the encoder or the audio
+    /// VAE, whose gates are bit-exact against the reference.
+    pub fn vae_linear(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_vae_linear(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "video VAE linear",
+        )
+    }
+
+    /// The decoder's block GEMM on BF16 operands and a BF16 output
+    /// (`h3d_vae_linear_bf16`), the `bf16i` arm. It takes no bias: the arm's
+    /// consumers add the bias in F32, as they do since `c7bb59e1`.
+    pub fn vae_linear_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_vae_linear_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    input_dim,
+                    output_dim,
+                    error,
+                    size,
+                )
+            },
+            "video VAE BF16 linear",
+        )
+    }
+
+    /// Whether this context's video VAE decoder takes BF16 GEMM operands, which
+    /// is `H3_VAE_GEMM=bf16i`. The context parsed the value when it was created,
+    /// so the host asks it rather than reading the environment a second time.
+    pub fn vae_bf16_operands(&self) -> bool {
+        const BF16_INPUTS: c_int = 3; // H3D_VAE_GEMM_BF16_INPUTS
+
+        unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) == BF16_INPUTS }
+    }
+
+    /// This context's video VAE GEMM mode by name, as the context parsed it:
+    /// "fp32", "tf32", "bf16", "bf16i" or "bf16a" (`H3D_VAE_GEMM_*`).
+    pub fn vae_gemm_name(&self) -> &'static str {
+        match unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) } {
+            1 => "tf32",
+            2 => "bf16",
+            3 => "bf16i",
+            4 => "bf16a",
+            _ => "fp32",
+        }
+    }
+
+    /// Whether this context's video VAE decoder runs the BF16 activation chain,
+    /// which is `H3_VAE_GEMM=bf16a`.
+    pub fn vae_bf16_chain(&self) -> bool {
+        const BF16_CHAIN: c_int = 4; // H3D_VAE_GEMM_BF16_CHAIN
+
+        unsafe { h3d_vae_gemm_mode(self.raw.as_ptr()) == BF16_CHAIN }
+    }
+
+    /// Whether this context's video VAE attention is the tensor-core F32 kernel
+    /// (`H3_VAE_ATTENTION=tensor`) rather than the reference's scalar one.
+    pub fn vae_attention_mma(&self) -> bool {
+        unsafe { h3d_vae_attention_mma(self.raw.as_ptr()) != 0 }
+    }
+
+    /// Whether that attention walks its CTA order row-major
+    /// (`H3_VAE_SDPA_ORDER=rows`) rather than head-major.
+    pub fn vae_sdpa_rows(&self) -> bool {
+        unsafe { h3d_vae_sdpa_rows(self.raw.as_ptr()) != 0 }
+    }
+
+    /// Set one video VAE decoder bench option on this context
+    /// (`h3d_set_vae_option`). The native side owns the names and the accepted
+    /// values — "attention" (scalar, tensor), "sdpa_order" (heads, rows),
+    /// "gemm" (fp32, tf32, bf16, bf16i, bf16a) — and refuses an unknown pair, so a
+    /// typo is an error rather than a silent default.
+    pub fn set_vae_option(&self, name: &str, value: &str) -> Result<(), String> {
+        let name = CString::new(name).map_err(|_| "option name has a NUL".to_string())?;
+        let value = CString::new(value).map_err(|_| "option value has a NUL".to_string())?;
+        let accepted =
+            unsafe { h3d_set_vae_option(self.raw.as_ptr(), name.as_ptr(), value.as_ptr()) };
+        if accepted == 0 {
+            return Err(format!(
+                "unknown video VAE option {:?} = {:?}",
+                name.to_string_lossy(),
+                value.to_string_lossy()
+            ));
+        }
+        Ok(())
     }
 
     /// `h3_gpu_patch_linear_bf16_offset`: F32 matmul, bias and one BF16 cast.
@@ -1044,22 +1934,30 @@ impl Gpu {
     }
 
     /// `h3_gpu_rms_norm_bf16`.
+    /// The BF16 RMS norm (`h3d_rms_norm`) with the reference's reduction tree.
+    /// `weight` is optional because the reference's `with_scale=False` builds
+    /// carry none.
     pub fn rms_norm(
         &self,
         output: &Tensor,
         input: &Tensor,
-        weight: &Tensor,
+        weight: Option<&Tensor>,
         rows: u32,
         width: u32,
         epsilon: f32,
     ) -> Result<(), String> {
+        let weight = match weight {
+            Some(weight) => weight.raw(),
+            None => std::ptr::null(),
+        };
+
         self.call(
             |error, size| unsafe {
                 h3d_rms_norm(
                     self.raw.as_ptr(),
                     output.raw(),
                     input.raw(),
-                    weight.raw(),
+                    weight,
                     rows,
                     width,
                     epsilon,
@@ -1171,6 +2069,411 @@ impl Gpu {
         )
     }
 
+    /// `h3d_text_attention`: the token-major dense attention
+    /// `PytorchAttention.__call__` runs (`attention.py:82-102`), with the query
+    /// and key row counts independent - the AV cross-attention reads 16,128
+    /// video queries against 126 audio keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_attention(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        q_rows: u32,
+        kv_rows: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_text_attention(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    q_rows,
+                    kv_rows,
+                    heads,
+                    head_dim,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "attention",
+        )
+    }
+
+    /// The refiner's `elementwise_affine=False` output LayerNorm.
+    pub fn layer_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_layer_norm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    rows,
+                    width,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "layer norm",
+        )
+    }
+
+    // ---- the stage-2 sampler (`the stage-2 sampler module`). One wrapper per
+    // reference expression; the Rust side keeps the schedule and the
+    // generator's offset, the device keeps every float32 rounding.
+
+    /// torch's own CUDA normal draw at `dtype=bfloat16`: the grid-stride
+    /// kernel of `ATen/native/cuda/DistributionTemplates.h:66-89`, one Philox
+    /// subsequence per thread, `curand_normal4` and a `__float2bfloat16`
+    /// store. The returned value is the offset advance
+    /// `calc_execution_policy` (`:50-62`) gives the caller, so the caller's
+    /// generator keeps torch's `philox_offset_per_thread_` itself.
+    pub fn randn_bf16(&self, output: &Tensor, seed: u64, offset: u64) -> Result<u64, String> {
+        let elements = output.elements();
+        let mut increment = 0u64;
+
+        self.call(
+            |error, size| unsafe {
+                h3d_randn_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    elements,
+                    seed,
+                    offset,
+                    &mut increment,
+                    error,
+                    size,
+                )
+            },
+            "bf16 randn",
+        )?;
+
+        Ok(increment)
+    }
+
+    /// `GaussianNoiser.__call__` (`components/noisers.py:30-37`): two float32
+    /// `torch.lerp`s and one cast back to the latent's dtype.
+    pub fn noise_lerp(
+        &self,
+        output: &Tensor,
+        latent: &Tensor,
+        noise: &Tensor,
+        clean: &Tensor,
+        mask: &Tensor,
+        rows: u32,
+        width: u32,
+        weight: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_noise_lerp(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    latent.raw(),
+                    noise.raw(),
+                    clean.raw(),
+                    mask.raw(),
+                    rows,
+                    width,
+                    weight,
+                    error,
+                    size,
+                )
+            },
+            "bf16 noise lerp",
+        )
+    }
+
+    /// `timesteps_from_mask` (`helpers.py:494-501`): the F32 `[rows]`
+    /// `denoise_mask * sigma` the block AdaLN and `to_denoised` read.
+    pub fn timesteps(
+        &self,
+        output: &Tensor,
+        mask: &Tensor,
+        rows: u32,
+        sigma: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_timesteps(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    mask.raw(),
+                    rows,
+                    sigma,
+                    error,
+                    size,
+                )
+            },
+            "f32 timesteps",
+        )
+    }
+
+    /// `to_denoised` (`utils.py:39-52`) at the per-token timestep that
+    /// `X0Model.forward` (`model.py:590-605`) passes.
+    pub fn to_denoised(
+        &self,
+        output: &Tensor,
+        latent: &Tensor,
+        velocity: &Tensor,
+        timestep: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_to_denoised(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    latent.raw(),
+                    velocity.raw(),
+                    timestep.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "bf16 to-denoised",
+        )
+    }
+
+    /// `to_velocity` (`utils.py:21-35`), kept separate from the step because
+    /// the reference rounds to BF16 between them.
+    pub fn to_velocity(
+        &self,
+        output: &Tensor,
+        sample: &Tensor,
+        denoised: &Tensor,
+        sigma: f32,
+    ) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_to_velocity(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    sample.raw(),
+                    denoised.raw(),
+                    sigma,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 to-velocity",
+        )
+    }
+
+    /// `EulerDiffusionStep.step` (`diffusion_steps.py:32-40`) with
+    /// `delta = sigma_next - sigma`.
+    pub fn euler_step(
+        &self,
+        output: &Tensor,
+        sample: &Tensor,
+        velocity: &Tensor,
+        delta: f32,
+    ) -> Result<(), String> {
+        let elements = output.elements();
+
+        self.call(
+            |error, size| unsafe {
+                h3d_euler_step(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    sample.raw(),
+                    velocity.raw(),
+                    delta,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "bf16 Euler step",
+        )
+    }
+
+    /// The mask words per query block at this sequence length
+    /// (`h3d_sol_words`), for callers sizing anything against the plan.
+    pub fn sol_words(&self, sequence: u32) -> u32 {
+        unsafe { h3d_sol_words(sequence) }
+    }
+
+    /// Allocate the sparse attention's workspace for `sequence x heads`. Every
+    /// shape is the one `h3d_sol_check` validates before a kernel writes: the
+    /// summaries are `[heads][blocks][128]`, the mask is `[blocks][heads]` of
+    /// `words` words, and the rest is per (block, head).
+    pub fn sol_plan(&self, sequence: u32, heads: u32) -> Result<SolPlanBuffers, String> {
+        if sequence == 0 || heads == 0 {
+            return Err("Sol-Attn plan needs a sequence and a head count".into());
+        }
+        let blocks = sequence.div_ceil(SOL_BLOCK);
+        let words = self.sol_words(sequence);
+        let summary = heads as usize * blocks as usize * SOL_HEAD_DIM;
+        let pairs = heads as usize * blocks as usize;
+
+        let kc = self.alloc(Dtype::Bf16, summary)?;
+        let vc = self.alloc(Dtype::Bf16, summary)?;
+        let query_bar = self.alloc(Dtype::F32, summary)?;
+        let mask = self.alloc(Dtype::U32, pairs * words as usize)?;
+        let count = self.alloc(Dtype::U32, pairs)?;
+        let threshold = self.alloc(Dtype::F32, pairs)?;
+        let kc_mean = self.alloc(Dtype::F32, heads as usize * SOL_HEAD_DIM)?;
+        let kc_var = self.alloc(Dtype::F32, heads as usize * SOL_HEAD_DIM)?;
+
+        let plan = SolPlan {
+            kc: kc.raw(),
+            vc: vc.raw(),
+            mask: mask.raw(),
+            count: count.raw(),
+            threshold: threshold.raw(),
+            query_bar: query_bar.raw(),
+            kc_mean: kc_mean.raw(),
+            kc_var: kc_var.raw(),
+        };
+        Ok(SolPlanBuffers {
+            plan,
+            _kc: kc,
+            _vc: vc,
+            _mask: mask,
+            _count: count,
+            _threshold: threshold,
+            _query_bar: query_bar,
+            _kc_mean: kc_mean,
+            _kc_var: kc_var,
+        })
+    }
+
+    /// The exact-block share of the mask the last `sol_vsa` wrote, read back
+    /// from the mask itself. This is the model's own realized sparsity, which
+    /// no fixture can supply, and it costs one synchronised readback, so a
+    /// caller asks for it once rather than per layer.
+    pub fn sol_exact_share(
+        &self,
+        plan: &SolPlanBuffers,
+        sequence: u32,
+        heads: u32,
+    ) -> Result<f64, String> {
+        let blocks = sequence.div_ceil(SOL_BLOCK) as u64;
+        let words = self.sol_words(sequence) as u64;
+        let mut bytes = vec![0u8; (blocks * heads as u64 * words * 4) as usize];
+        self.read(&plan._mask, &mut bytes)?;
+
+        let exact: u64 = bytes
+            .chunks_exact(4)
+            .map(|word| {
+                u32::from_le_bytes([word[0], word[1], word[2], word[3]]).count_ones() as u64
+            })
+            .sum();
+        Ok(exact as f64 / (blocks * blocks * heads as u64) as f64)
+    }
+
+    /// The routing mask's words for `(sequence, heads)`, one readback. Word
+    /// order is `[q_block][head][word]` (`native/h3/h3_dit_gpu.h:65-74`), so a
+    /// caller can check the diagonal band and the sink itself instead of
+    /// trusting a share.
+    pub fn sol_mask(
+        &self,
+        plan: &SolPlanBuffers,
+        sequence: u32,
+        heads: u32,
+    ) -> Result<Vec<u32>, String> {
+        let blocks = sequence.div_ceil(SOL_BLOCK) as usize;
+        let words = self.sol_words(sequence) as usize;
+        let mut bytes = vec![0u8; blocks * heads as usize * words * 4];
+        self.read(&plan._mask, &mut bytes)?;
+
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect())
+    }
+
+    /// VSA's selector at `sparsity`, exempting the first `prefix_blocks` blocks.    /// `sparsity` is a double because the reference computes its keep count from
+    /// a Python float: 0.9 rounded to F32 asks for a different count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sol_vsa(
+        &self,
+        plan: &SolPlanBuffers,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+        sparsity: f64,
+        prefix_blocks: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sol_vsa(
+                    self.raw.as_ptr(),
+                    &plan.plan,
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    scale,
+                    sparsity,
+                    prefix_blocks,
+                    error,
+                    size,
+                )
+            },
+            "VSA selector",
+        )
+    }
+
+    /// The sparse forward over the mask the selector just wrote.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sol_forward(
+        &self,
+        output: &Tensor,
+        plan: &SolPlanBuffers,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sol_forward(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    &plan.plan,
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "sparse attention",
+        )
+    }
+
     /// `h3_gpu_add_bf16`.
     pub fn add(&self, output: &Tensor, left: &Tensor, right: &Tensor) -> Result<(), String> {
         self.call(
@@ -1237,6 +2540,52 @@ impl Gpu {
                 )
             },
             "cast",
+        )
+    }
+
+    /// The same cast over `elements` values, which may be fewer than the tensors
+    /// hold: the video VAE decoder's BF16 arm keeps one scratch pair for every
+    /// projection, sized to the tile's largest of each.
+    pub fn cast_narrow(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_cast_f32_to_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "narrow cast",
+        )
+    }
+
+    /// `h3_gpu_cast_bf16_to_f32`, its reverse: exact, not a rounding.
+    pub fn cast_widen(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_cast_bf16_to_f32(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "wide cast",
         )
     }
 
@@ -1577,10 +2926,13 @@ impl Gpu {
         )
     }
 
+    /// `bias`, when given, is the fused linear's own: the kernel adds it on
+    /// load, so its producer is called with `H3D`'s bias left off.
     pub fn swiglu_f32(
         &self,
         output: &Tensor,
         fused: &Tensor,
+        bias: Option<&Tensor>,
         rows: u32,
         width: u32,
     ) -> Result<(), String> {
@@ -1590,6 +2942,7 @@ impl Gpu {
                     self.raw.as_ptr(),
                     output.raw(),
                     fused.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
                     rows,
                     width,
                     error,
@@ -1605,6 +2958,7 @@ impl Gpu {
         output: &Tensor,
         residual: &Tensor,
         branch: &Tensor,
+        bias: Option<&Tensor>,
         scale: &Tensor,
         rows: u32,
         width: u32,
@@ -1616,6 +2970,7 @@ impl Gpu {
                     output.raw(),
                     residual.raw(),
                     branch.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
                     scale.raw(),
                     rows,
                     width,
@@ -1634,6 +2989,7 @@ impl Gpu {
         key: &Tensor,
         value: &Tensor,
         qkv: &Tensor,
+        bias: Option<&Tensor>,
         rope_cos: &Tensor,
         rope_sin: &Tensor,
         sequence: u32,
@@ -1650,6 +3006,7 @@ impl Gpu {
                     key.raw(),
                     value.raw(),
                     qkv.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
                     rope_cos.raw(),
                     rope_sin.raw(),
                     sequence,
@@ -1662,6 +3019,199 @@ impl Gpu {
                 )
             },
             "video_qkv_rope_f32",
+        )
+    }
+
+    /// The `bf16a` chain's attention: BF16 Q/K/V in and BF16 out, the
+    /// tensor-core kernel only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa_bf16(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        scale: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_sdpa_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    sequence,
+                    heads,
+                    head_dim,
+                    scale,
+                    error,
+                    size,
+                )
+            },
+            "sdpa_bf16",
+        )
+    }
+
+    /// `rms_norm_f32` over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_rms_norm_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    rows,
+                    width,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "rms_norm_bf16",
+        )
+    }
+
+    /// `layer_norm_f32` over a BF16 input, still writing F32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer_norm_bf16(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        rows: u32,
+        width: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_layer_norm_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    rows,
+                    width,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "layer_norm_bf16",
+        )
+    }
+
+    /// `swiglu_f32` over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_bf16(
+        &self,
+        output: &Tensor,
+        fused: &Tensor,
+        bias: Option<&Tensor>,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_swiglu_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    fused.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "swiglu_bf16",
+        )
+    }
+
+    /// `scale_add_f32` over BF16 buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_add_bf16(
+        &self,
+        output: &Tensor,
+        residual: &Tensor,
+        branch: &Tensor,
+        bias: Option<&Tensor>,
+        scale: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_scale_add_bf16(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    residual.raw(),
+                    branch.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    scale.raw(),
+                    rows,
+                    width,
+                    error,
+                    size,
+                )
+            },
+            "scale_add_bf16",
+        )
+    }
+
+    /// `video_qkv_rope_f32` over BF16 Q/K/V and a BF16 QKV row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn video_qkv_rope_bf16(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        qkv: &Tensor,
+        bias: Option<&Tensor>,
+        rope_cos: &Tensor,
+        rope_sin: &Tensor,
+        sequence: u32,
+        heads: u32,
+        head_dim: u32,
+        rope_half: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_video_qkv_rope_bf16(
+                    self.raw.as_ptr(),
+                    query.raw(),
+                    key.raw(),
+                    value.raw(),
+                    qkv.raw(),
+                    bias.map_or(std::ptr::null(), |bias| bias.raw()),
+                    rope_cos.raw(),
+                    rope_sin.raw(),
+                    sequence,
+                    heads,
+                    head_dim,
+                    rope_half,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "video_qkv_rope_bf16",
         )
     }
 
@@ -1754,6 +3304,329 @@ impl Gpu {
                 )
             },
             "conv3d",
+        )
+    }
+
+    /// `h3d_add_f32`: elementwise F32 add, the resizer's identity skips.
+    pub fn add_f32(&self, output: &Tensor, left: &Tensor, right: &Tensor) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_add_f32(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    left.raw(),
+                    right.raw(),
+                    output.elements(),
+                    error,
+                    size,
+                )
+            },
+            "F32 add",
+        )
+    }
+
+    /// `h3d_conv3d_gemm`: the resizer's 3x3x3 convolution through im2col and
+    /// the F32 GEMM. `input` is the padded volume, `scratch` the expanded
+    /// matrix's home (`tile * in * k^3` floats).
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv3d_gemm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        depth: u32,
+        height: u32,
+        width: u32,
+        input_channels: u32,
+        output_channels: u32,
+        kernel: u32,
+        tile: u32,
+        scratch: &Tensor,
+        tf32: bool,
+        columns: bool,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_conv3d_gemm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    depth,
+                    height,
+                    width,
+                    input_channels,
+                    output_channels,
+                    kernel,
+                    tile,
+                    scratch.raw(),
+                    tf32 as u32,
+                    columns as u32,
+                    error,
+                    size,
+                )
+            },
+            "conv3d gemm",
+        )
+    }
+
+    /// `h3d_conv3d_timing`: make `conv3d_gemm` sample its phases with device
+    /// events. Returns the previous state. `conv3d_timing_read` reports the
+    /// accumulated seconds as `[im2col, gemm, bias]`; the accumulation is per
+    /// context and survives calls, so `conv3d_timing_reset` precedes a run.
+    pub fn conv3d_timing(&self, enable: bool) -> bool {
+        unsafe { h3d_conv3d_timing(enable as c_int) != 0 }
+    }
+
+    /// `h3d_conv3d_timing_read`: `[im2col, gemm, bias]` seconds since the last
+    /// reset, over every `conv3d_gemm` call on any context.
+    pub fn conv3d_timing_read() -> [f64; 3] {
+        let mut seconds = [0.0f64; 3];
+        unsafe { h3d_conv3d_timing_read(seconds.as_mut_ptr()) };
+        seconds
+    }
+
+    /// `h3d_conv3d_timing_reset`: clear the accumulators.
+    pub fn conv3d_timing_reset() {
+        unsafe { h3d_conv3d_timing_reset() };
+    }
+
+    /// `h3d_lt_algo_report`: the cuBLASLt algorithm each distinct GEMM shape
+    /// dispatched this run, `rows x k x n <type> <compute> <layout> cand=..
+    /// id=.. tile=.. stages=.. splitk=.. wk=..`, one entry per shape
+    /// separated by `; `. The algorithm is chosen once per shape through
+    /// `cublasLtMatmulAlgoGetHeuristic` and passed explicitly instead of
+    /// NULL, so a timing can be read beside the kernel that produced it.
+    /// `H3D_LT_ALGO=<i>` selects the i-th candidate, `H3D_LT_ALGO_TRACE=1`
+    /// prints each choice to stderr.
+    pub fn lt_algo_report() -> String {
+        let mut text = [0 as c_char; LT_ALGO_REPORT_SIZE];
+        unsafe { h3d_lt_algo_report(text.as_mut_ptr(), LT_ALGO_REPORT_SIZE) };
+        let end = text
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(LT_ALGO_REPORT_SIZE);
+        let bytes: Vec<u8> = text[..end].iter().map(|byte| *byte as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// `h3d_zero_pad3d`: zero padding for the resizer's 3x3x3 convolutions,
+    /// channels-last, `[batch, depth, height, width, channels]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zero_pad3d(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        pad: [u32; 3],
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_zero_pad3d(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    batch,
+                    depth,
+                    height,
+                    width,
+                    channels,
+                    pad[0],
+                    pad[1],
+                    pad[2],
+                    error,
+                    size,
+                )
+            },
+            "zero pad",
+        )
+    }
+
+    /// `h3d_group_norm`: GroupNorm without the SiLU epilogue, statistics over
+    /// the whole volume per (batch, group).
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        groups: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_group_norm(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    batch,
+                    depth,
+                    height,
+                    width,
+                    channels,
+                    groups,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "GroupNorm",
+        )
+    }
+
+    /// `h3d_group_norm_activate`: the same norm with the reference's
+    /// `F.silu(norm(x))` folded into the apply pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_norm_activate(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        groups: u32,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_group_norm_activate(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    batch,
+                    depth,
+                    height,
+                    width,
+                    channels,
+                    groups,
+                    epsilon,
+                    error,
+                    size,
+                )
+            },
+            "GroupNorm activate",
+        )
+    }
+
+    /// `h3d_channel_affine`: `input * scale[c] + shift[c]`, the resizer's
+    /// embedding modulation.
+    pub fn channel_affine(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        scale: &Tensor,
+        shift: &Tensor,
+        channels: u32,
+        elements: usize,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_channel_affine(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    scale.raw(),
+                    shift.raw(),
+                    channels,
+                    elements,
+                    error,
+                    size,
+                )
+            },
+            "channel affine",
+        )
+    }
+
+    /// `h3d_temporal_dwconv`: the resizer's depthwise convolution over time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn temporal_dwconv(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        batch: u32,
+        depth: u32,
+        height: u32,
+        width: u32,
+        channels: u32,
+        kernel: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_temporal_dwconv(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    weight.raw(),
+                    bias.raw(),
+                    batch,
+                    depth,
+                    height,
+                    width,
+                    channels,
+                    kernel,
+                    error,
+                    size,
+                )
+            },
+            "temporal depthwise conv",
+        )
+    }
+
+    /// `h3d_resize_hw`: trilinear resize with the temporal axis held fixed,
+    /// the upscale inside the resizer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resize_hw(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        batch: u32,
+        depth: u32,
+        in_height: u32,
+        in_width: u32,
+        out_height: u32,
+        out_width: u32,
+        channels: u32,
+    ) -> Result<(), String> {
+        self.call(
+            |error, size| unsafe {
+                h3d_resize_hw(
+                    self.raw.as_ptr(),
+                    output.raw(),
+                    input.raw(),
+                    batch,
+                    depth,
+                    in_height,
+                    in_width,
+                    out_height,
+                    out_width,
+                    channels,
+                    error,
+                    size,
+                )
+            },
+            "trilinear resize",
         )
     }
 

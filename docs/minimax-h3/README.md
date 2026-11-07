@@ -10,6 +10,15 @@ The runtime reads the released BF16 safetensors. FL2VA supplies text-to-video
 and first/last-frame conditioning. Ref2VA supplies ordered image, video and
 audio references. There is no H3 GGUF or VQ loader.
 
+One process does the whole job: `h3-rs` encodes the prompt, the DiT denoises
+the latent at the requested canvas, the H3 video VAE decodes it, the H3 audio
+VAE decodes the soundtrack and FFmpeg muxes the MP4. Nothing upscales,
+re-renders or re-decodes the delivered file afterwards, so the clip is the
+model's own generation at the canvas the request names. The model's own
+two-stage route - a draft at 0.7 of the canvas, one latent upscale and one
+refine step - runs inside the render and is asked for with `--draft`, which
+needs the resident route (`--jobs`); it is not a post-process.
+
 ## Build and run
 
 Linux CUDA, the repository's Rust toolchain, FFmpeg and FFprobe are required.
@@ -42,18 +51,52 @@ Ordered references use `--ref-image`, `--ref-video`, `--ref-silent-video`,
 `--ref-video-audio` or `--ref-audio`; a request cannot combine references and
 frame anchors. Audio alone is insufficient for Ref2VA.
 
+The fast route - a small draft, one learned upscale, one refine step - has one
+command:
+
+```sh
+H3_ROOT=$PWD tools/h3-rapid.sh -p 'A red fox trots through fresh snow at dawn.' \
+  --seconds 5 -o outputs/rapid/five-seconds.mp4
+```
+
+It resolves the shipped arms itself (`H3_DIT_GEMM=fp8`, `H3_VAE_GEMM=bf16i`,
+`H3_VAE_ATTENTION=tensor`, `--crf 15 --preset slow`), prints the geometry it
+resolved before rendering, writes the job line beside the clip, and reports the
+wall. `--one-pass` renders the comparison without the route, `--dry-run` prints
+the command it would run, and `--help` carries the rest. The route returns a
+**different shot** from the one pass, so it stays an arm and never the delivery
+default ([the measurement](two-stage-delivery-2026-11-02.md)).
+
 ## Measured generation cost
 
 On GB10, one 512×512, 56-frame, 20-step text run took **762.36 s** (12m42s)
 for a 2.333-second clip. The matched h3.c run took 764.62 s and produced the
-same MP4 bytes. The native API at its smallest square request (768×768,
+same MP4 bytes. The native API at the tier's square request (768×768,
 4 seconds requested, 107 aligned frames) took **1,340.264 s** to observed
 completion and download even at **two steps**. That includes 10-second
-status polling. Larger canvases and more steps require separate measurement.
+status polling. Larger canvases and more steps require separate measurement,
+and a lower `target.short_edge` is served at proportionally lower cost.
 
 The [dated validation](validation-2026-10-26.md) records exact inputs,
 phase timings, memory observations and qualification limits. These single
 runs are execution receipts, not throughput or broad quality guarantees.
+
+Those receipts are the byte-exact scalar path's, which is now the option rather
+than the default: the tensor-core kernel runs unless a caller asks otherwise, and
+on the same 512×512, 56-frame, 20-step shape it measures 139.418 s against the
+scalar kernel's 460.399 s, both on one binary. It is not byte-identical to the
+reference, which is why the choice is a switch
+([why it is the default](tensor-default-2026-10-27.md)).
+
+At the delivery canvas the fast route is the number that matters: **five seconds**
+of 1344×768 at 24 fps is 120 frames requested, 124 aligned (5.167 s), and it
+renders in **187-196 s warm** (235-252 s on a cold page cache) at four draft
+steps, against **347.6 s** for the one pass. The parts are a 49.8 s draft at
+928×544, a 3.8 s upscale, a 38.6 s refine at the delivery canvas, 49.1 s of
+decode and 29.0 s of text encoding; two sessions' walls differ by 9 s while
+their stages agree to a percent, which is the clock state and not a regression
+([route](draft-fp8-attention-2026-11-02.md#2-where-the-36-s-comes-from-and-what-the-wall-can-and-cannot-say),
+[one pass](two-stage-delivery-2026-11-02.md)).
 The [v0.1.4 integration review](validation-2026-10-26.md#v014-integration-review--2026-10-27)
 records subsequent fixes and model-free checks; full-model renders were not
 repeated for that review.
@@ -90,6 +133,38 @@ The model's license is included in the downloaded repository.
 - [Starting and using the API](api-usage.md)
 - [Reference probes and media comparison](../../tools/minimax_h3/README.md)
 - [GB10 maintainer validation, 2026-10-26](validation-2026-10-26.md)
+- [Speed baseline against h3.c, 2026-10-27](speed-2026-10-27.md)
+- [The DiT's elementwise pair: a staged layout, bit for bit, 2026-10-29](dit-elementwise-2026-10-29.md)
+- [The projections' true shapes, the gap that was bookkeeping, and FP8 re-priced, 2026-10-29](dit-gemm-shape-2026-10-29.md)
+- [The projections in FP8, and the in-model gap, 2026-10-29](fp8-projections-2026-10-29.md)
+- [The release's own FP8 route, ported and measured in both arms, 2026-10-29](fp8-route-2026-10-29.md)
+- [The FP8 arm's per-row scales: cuBLASLt refuses, and the route that is left, 2026-10-29](fp8-row-scales-2026-10-29.md)
+- [The per-row FP8 arm, built and priced: exact, 1.73 s/eval, no visible gain, 2026-10-29](fp8-row-arm-2026-10-29.md)
+- [The release's FP8 route at the delivery canvas: 12.8% of a step, and detail the arm does not lose, 2026-11-02](fp8-delivery-2026-11-02.md)
+- [Three attention widths, measured: the block is not bound by K/V traffic, 2026-11-02](attention-widths-2026-11-02.md)
+- [E4M3 attention: the pipe halves, and the cast eats it, 2026-11-02](fp8-attention-2026-11-02.md)
+- [The decode's two schedule levers: 48.1 s to 45.9 s, every frame bit-identical, 2026-11-02](vae-decode-levers-2026-11-02.md)
+- [The denoise step's rope is already at its ceiling, and the 1,890 launches were the decoder's, 2026-11-02](denoise-rope-ceiling-2026-11-02.md)
+- [The delivery on the two-stage route: 1.61x on the wall, and a different shot, 2026-11-02](two-stage-delivery-2026-11-02.md)
+- [The Gemma4 encoder path leaves the tree, and the gate hashes do not move, 2026-11-02](gemma-removal-2026-11-02.md)
+- [The clip-scoring gate: the reference harness, pointed at two clips from this port, 2026-11-02](clip-score-gate-2026-11-02.md)
+- [The E4M3 attention arm reproduces and ships opt-in, and the gate refuses its picture, 2026-11-02](fp8-attention-arm-2026-11-02.md)
+- [The route's 4-step draft: -25.5 s, a picture the gate passes, and the audio it changes, 2026-11-02](four-step-draft-2026-11-02.md)
+- [The route's draft scale: -16.6 s and -31.1 s, and the shot they cost, 2026-11-02](draft-scale-ladder-2026-11-02.md)
+- [The draft leg's E4M3 attention: 3.6 s, no clip-gate flag, and audio that moves, 2026-11-02](draft-fp8-attention-2026-11-02.md)
+- [The draft's anatomy: what holds it, 2026-10-31](draft-anatomy-2026-10-31.md)
+- [The two-stage route: a draft at 0.7, one upscale, one refine step, 2026-11-01](two-stage-route-2026-11-01.md)
+- [The H3 latent upscaler, ported and gated, 2026-11-01](latent-upscale-2026-11-01.md)
+- [The resizer's cost, split three ways, 2026-11-01](resizer-cost-2026-11-01.md)
+- [The resizer's last four seconds named, then halved, 2026-11-01](resizer-algorithm-2026-11-01.md)
+- [The video VAE decoder attributed, and its four bias passes fused away, 2026-10-29](vae-decoder-attribution-2026-10-29.md)
+- [The decoder's block GEMMs on BF16 operands: 19% of FRAMES, and what it rounds, 2026-10-29](vae-bf16-arm-2026-10-29.md)
+- [The decoder's readback: 1.87 s of pageable D2H, and the route it hid behind, 2026-10-29](vae-readback-2026-10-29.md)
+- [Where a DiT evaluation goes: the per-kernel table, 2026-10-28](denoise-attribution-2026-10-28.md)
+- [The server's steady state, 2026-10-28](steady-state-2026-10-28.md)
+- [The video VAE decoder's bench options, 2026-10-28](vae-options-2026-10-28.md)
+- [The reference's NVFP4-AWQ prompt encoder, 2026-10-28](nvfp4-encoder-2026-10-28.md)
+- [The product route in one process: a job list on the resident engine, 2026-10-31](resident-product-2026-10-31.md)
 
 Model-free checks include H3 core and server unit tests, the portable
 host/tokenizer gates, and `make tests/h3-test_av_mux`. The CUDA boundary gate

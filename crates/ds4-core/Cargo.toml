@@ -42,6 +42,18 @@ required-features = ["h3-gates"]
 name = "h3_device_gate"
 required-features = ["h3-gates"]
 
+[[example]]
+name = "h3_prompt_cache_gate"
+required-features = ["h3-gates"]
+
+[[example]]
+name = "h3_engine_gate"
+required-features = ["h3-gates"]
+
+[[example]]
+name = "h3_vae_gate"
+required-features = ["h3-gates"]
+
 [dependencies]
 ds4-sys = { path = "../ds4-sys" }
 serde = { version = "1", features = ["derive"] }
@@ -96,3 +108,4 @@ required-features = ["h3-gates"]
 name = "test_av_mux"
 path = "../../tests/h3/test_av_mux.rs"
 required-features = ["h3-gates"]
+

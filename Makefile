@@ -406,18 +406,25 @@ H3_LINK_ARGS = -C metadata=$(shell cksum $(filter %.o,$^) </dev/null 2>/dev/null
 $(H3_OBJS): %.o: %.cu %.h
 	$(NVCC) $(H3_NVCCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-H3_GATES := $(addprefix tests/h3_,$(addsuffix _gate,text dit vision multimodal video_encoder audio_encoder device partition canvas reference))
+H3_GATES := $(addprefix tests/h3_,$(addsuffix _gate,text dit vision multimodal video_encoder audio_encoder device partition canvas reference prompt_cache engine vae upscale))
 tests/h3_text_gate: native/h3/h3_text_gpu.o
 tests/h3_dit_gate: native/h3/h3_text_gpu.o native/h3/h3_dit_gpu.o
+tests/h3_engine_gate: native/h3/h3_text_gpu.o native/h3/h3_dit_gpu.o native/h3/h3_vision_gpu.o
 tests/h3_vision_gate: native/h3/h3_vision_gpu.o
 tests/h3_multimodal_gate: native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 tests/h3_video_encoder_gate tests/h3_audio_encoder_gate tests/h3_reference_gate: native/h3/h3_dit_gpu.o
+tests/h3_vae_gate tests/h3_upscale_gate: native/h3/h3_dit_gpu.o
 tests/h3_device_gate: native/h3/h3_device_gpu.o
 tests/h3_device_gate: H3_LIBS = $(DS4_RS_LIBS)
 # Header/canvas readers do not need a GPU object or CUDA libraries.
 tests/h3_partition_gate tests/h3_canvas_gate: H3_LIBS =
+# The cache gate is host-only: the container, the pickle and the payload rules.
+tests/h3_prompt_cache_gate: H3_LIBS =
+# The resizer on a real latent: not a gate (no reference, no bound), the step
+# between `h3-rs --save-latent` and `h3_vae_gate --latent-file`.
+tests/h3_upscale_probe: native/h3/h3_dit_gpu.o
 
-$(H3_GATES): tests/%: $(DS4_RS_SOURCES)
+$(H3_GATES) tests/h3_upscale_probe: tests/%: $(DS4_RS_SOURCES)
 	cargo rustc -p ds4-core --example $* --release --features h3-gates -- \
 		$(H3_LINK_ARGS) $(H3_LIBS)
 	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/$*" $@
@@ -425,11 +432,84 @@ $(H3_GATES): tests/%: $(DS4_RS_SOURCES)
 tests/h3/native_test: tests/h3/test_native.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
 	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
 
+# Bounded attention reproducer: times `h3d_sdpa` at a denoise shape and prints
+# an output hash, so a kernel change can be gated on bit identity without the
+# model. See tests/h3/attn_bm.cu and docs/minimax-h3/speed-2026-10-27.md.
+tests/h3/attn_bm: tests/h3/attn_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# Same reproducer shape for the video VAE's F32 attention kernel, which the
+# decoder calls once per layer per tile: 54 submissions of 2,532 rows at
+# 768x768 and 12 of 2,273 at 512x512, by `configured_tile_pixels`/`tile_axis`.
+tests/h3/attn_f32_bm: tests/h3/attn_f32_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# And for the QKV/RoPE kernel the decoder runs once per block per tile (105
+# submissions of 2,805 rows at the product canvas): the staged shapes against
+# the shipped one, hashed, with the traffic floor beside them.
+tests/h3/vae_rope_bm: tests/h3/vae_rope_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# The DiT's BF16 twin of that kernel, at the denoise shape it runs 51 times a
+# step: the shipped staged arm, the reference spelling it replaced, two
+# rows-per-block shapes and the traffic floor, every output hashed.
+tests/h3/dit_rope_bm: tests/h3/dit_rope_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# The video VAE decoder's four F32 matmuls at the tile shape, one call per
+# block, so a per-call figure times 1,944 prices the block's matmul set.
+tests/h3/vae_gemm_bm: tests/h3/vae_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# The LTX refiner block's thirty-four projections at the release's stage-2
+# shape (16,128 video rows, 126 audio, 1,024 prompt), in forward order, so a
+# per-block profile splits into what cuBLASLt owns and what the port's own
+# kernels own. Also prices `CUBLAS_COMPUTE_32F_FAST_16BF` against the class the
+# refiner asks for.
+tests/h3/refiner_gemm_bm: tests/h3/refiner_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# Sol-Attn's search step at a denoise shape: the four routing kernels timed
+# separately, then priced against the dense attention at the same shape.
+tests/h3/sol_route_bm: tests/h3/sol_route_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# Sol-Attn's sparse forward at a denoise shape, against the dense attention at
+# the same shape, with the realized sparsity beside every time.
+tests/h3/sol_forward_bm: tests/h3/sol_forward_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# VSA's selector: the reference's own H3-stage sparsity rule, priced against the
+# tau search step it replaces and against the dense attention it routes.
+tests/h3/sol_vsa_bm: tests/h3/sol_vsa_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# What FP8 weights would buy the DiT's four projections: the same cuBLASLt
+# configuration in BF16 and in E4M3 at job A's shapes.
+tests/h3/linear_fp8_bm: tests/h3/linear_fp8_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# The release's own FP8 projection route in isolation: the two quantization
+# steps checked element by element against their host arithmetic, and the E4M3
+# matmul against the BF16 path it replaces.
+tests/h3/fp8_gemm_bm: tests/h3/fp8_gemm_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
+# The DiT's two elementwise kernels at the denoise shape: AdaLN's row chain and
+# the QKV/RoPE boundary, each timed against the reduction-free control and the
+# candidate designs, with every arm's output hashed.
+tests/h3/elementwise_bm: tests/h3/elementwise_bm.cu native/h3/h3_dit_gpu.cu native/h3/h3_dit_gpu.h native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o
+	$(NVCC) $(H3_NVCCFLAGS) -o $@ $< native/h3/h3_text_gpu.o native/h3/h3_vision_gpu.o -lcublasLt
+
 # Portable reference tests: host-only, without model weights.
 H3_REFERENCE_TESTS := test_host_portable test_av_mux test_tokenizer_portable
 H3_REFERENCE_SUITE := $(addprefix tests/h3-,$(H3_REFERENCE_TESTS))
+# The suite's sources live outside crates/, so DS4_RS_SOURCES does not cover
+# them: without this an edited portable test rebuilt nothing and the copy
+# stayed stale.
+H3_REFERENCE_SOURCES := $(shell find tests/h3 -maxdepth 1 -name 'test_*.rs' -print)
 
-$(H3_REFERENCE_SUITE): tests/h3-%: $(DS4_RS_SOURCES)
+$(H3_REFERENCE_SUITE): tests/h3-%: $(DS4_RS_SOURCES) $(H3_REFERENCE_SOURCES)
 	cargo build -p ds4-core --example $* --release --features h3-gates --locked
 	cp -f "$(DS4_RS_TARGET_DIR)/release/examples/$*" $@
 
@@ -460,6 +540,13 @@ h3-rs h3-server-rs: $(DS4_RS_SOURCES)
 	cargo rustc -p $(H3_PACKAGE) --bin $@ --release --features native -- \
 		$(H3_LINK_ARGS) $(H3_LIBS)
 	cp -f "$(DS4_RS_TARGET_DIR)/release/$@" $@
+
+# Merging a few-step adapter is shard I/O and BF16 arithmetic, no device work,
+# but it links the same way so one toolchain builds every H3 host.
+h3-lora-merge: $(H3_OBJS) $(DS4_RS_SOURCES)
+	cargo rustc -p ds4-cli --bin h3-lora-merge --release --features native -- \
+		$(H3_LINK_ARGS) $(H3_LIBS)
+	cp -f "$(DS4_RS_TARGET_DIR)/release/h3-lora-merge" $@
 
 # Common residency probes use at most one MiB of actual model-file mapping.
 tests/weight_mapping_probe: tests/test_weight_mapping.cu
@@ -2779,8 +2866,12 @@ BUILD_PROGRAMS := \
     tests/weight_mapping_policy tests/weight_mapping_probe tools/gb10_peaks
 
 BUILD_OBJECTS += tests/test_iquest_prefix.o $(H3_OBJS)
-BUILD_PROGRAMS += h3-rs h3-server-rs $(H3_GATES) $(H3_REFERENCE_SUITE) \
-    tests/h3/native_test tools/minimax_h3/ppm_diff
+BUILD_PROGRAMS += h3-rs h3-server-rs $(H3_GATES) tests/h3_upscale_probe $(H3_REFERENCE_SUITE) \
+    tests/h3/native_test tests/h3/attn_bm tests/h3/attn_f32_bm \
+    tests/h3/vae_gemm_bm tests/h3/sol_route_bm tests/h3/sol_forward_bm \
+    tests/h3/elementwise_bm tests/h3/linear_fp8_bm \
+    tests/h3/refiner_gemm_bm \
+    tools/minimax_h3/ppm_diff
 DEPFILES := $(addsuffix .d,$(BUILD_OBJECTS))
 -include $(wildcard $(DEPFILES))
 

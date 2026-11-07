@@ -1,0 +1,19 @@
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+TEXT tokens=11 width=5120 fnv=d97d6ce16b160dbf seconds=11.350
+LOAD seconds=10.365 layers=50 latent=32x48x48 frames=107 audio_t=178
+SOL sparsity=0.900 prefix_blocks=6 first call: 18799 rows, 56 heads, exact share 0.1370
+DENOISE steps=4 reuse=1 selected=4 seconds=31.812
+AUDIO channels=2 samples=142400 rate=32000 seconds=2.608
+FRAMES frames=107 height=768 width=768 seconds=30.374
+VIDEO path=/home/leandro/decfuse-n.mp4 width=768 height=768 frames=107 fps=24 sample_rate=32000 seconds=0.604
+Collecting data...
+Generating '/tmp/nsys-report-13c1.qdstrm'
+[1/1] [0%                          ] decfuse.nsys-rep[1/1] [0%                          ] decfuse.nsys-rep[1/1] [=16%                        ] decfuse.nsys-rep[1/1] [14%                         ] decfuse.nsys-rep[1/1] [12%                         ] decfuse.nsys-rep[1/1] [11%                         ] decfuse.nsys-rep[1/1] [==19%                       ] decfuse.nsys-rep[1/1] [==18%                       ] decfuse.nsys-rep[1/1] [====26%                     ] decfuse.nsys-rep[1/1] [======34%                   ] decfuse.nsys-rep[1/1] [========42%                 ] decfuse.nsys-rep[1/1] [===========50%              ] decfuse.nsys-rep[1/1] [=============59%            ] decfuse.nsys-rep[1/1] [================68%         ] decfuse.nsys-rep[1/1] [==================76%       ] decfuse.nsys-rep[1/1] [===================80%      ] decfuse.nsys-rep[1/1] [========================100%] decfuse.nsys-rep[1/1] [========================100%] decfuse.nsys-rep
+Generated:
+	/home/leandro/decfuse.nsys-rep
+4611c9478c00ee28c159e04d9a057ee19bb08fe827aad7d79ef2f855392532aa  /home/leandro/decfuse-n.mp4

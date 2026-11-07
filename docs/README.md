@@ -112,7 +112,23 @@ These reports preserve successful gates, rejected experiments and unresolved lim
 - **Ling-3.1 1019:** [October 28 follow-up](ling31-optimization-2026-10-28-followup.md),
   per-change throughput, numerical gates and Decode variability.
 - **MiniMax-H3:** [October 26 BF16 validation](minimax-h3/validation-2026-10-26.md),
-  three matched h3.c outputs, a native video API gate and measured generation cost.
+  three matched h3.c outputs, a native video API gate and measured generation cost;
+  [October 27 speed baseline](minimax-h3/speed-2026-10-27.md), the port against
+  h3.c on one job, phase by phase; [that job with both attention arms on one
+  binary](benchmarks/h3-jobA-2026-10-27/README.md); [the attention sweep across
+  sequence lengths](benchmarks/h3-attention-2026-10-27/README.md); and [why the
+  tensor path is the default](minimax-h3/tensor-default-2026-10-27.md).
+  October 28 adds the sparse arm — [the reference's VSA selector](minimax-h3/vsa-policy-2026-10-28.md)
+  — and [the FastH3 distilled adapter merged into a derived checkpoint](minimax-h3/lora-merge-2026-10-28.md),
+  which is what makes a four-step render a finished picture and cuts DENOISE
+  5.1x. [The reference's NVFP4-AWQ prompt encoder](minimax-h3/nvfp4-encoder-2026-10-28.md)
+  is the same forward reading 15.69 GB instead of 48.8 GiB: TEXT 27.4-28.2 s to
+  15.5 s, the BF16 path bit-unchanged, the render's difference bounded at 7.7%
+  detail energy. Toward the Spark: [the server's steady state](minimax-h3/steady-state-2026-10-28.md)
+  (88.99 s hot, MP4-identical to the CLI); [where a DiT evaluation goes](minimax-h3/denoise-attribution-2026-10-28.md)
+  (per-kernel, projections 64% of it at 61-68% of the sm_121 peak); and
+  [the product route in one process](minimax-h3/resident-product-2026-10-31.md),
+  a job list on the resident encoder and DiT.
 - **MiMo VQ:** [October 31 MTP context and long prefill](mimo2-vq-optimization-2026-10-31.md):
   MTP blocks see the prompt, E4M3 full-layer prefill scores;
   [2K–64K sweep](benchmarks/mimo2-vq-spark-64k-2026-10-31/README.md).

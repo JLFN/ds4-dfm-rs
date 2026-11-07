@@ -34,6 +34,10 @@ pub const LENGTH_BYTES: u64 = 8;
 pub const MAX_RANK: usize = 8;
 
 /// `h3_dtype` (`h3_safetensors.h:9-23`), minus the UNKNOWN failure case.
+///
+/// `F8E4M3` is this port's addition: the reference reads BF16 checkpoints only,
+/// and the NVFP4-AWQ prompt encoder carries its block scales in E4M3 under
+/// safetensors' `F8_E4M3` name (`minimax_h3::nvfp4`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dtype {
     Bool,
@@ -43,6 +47,7 @@ pub enum Dtype {
     U16,
     F16,
     Bf16,
+    F8E4M3,
     I32,
     U32,
     F32,
@@ -62,6 +67,7 @@ impl Dtype {
             "U16" => Self::U16,
             "F16" => Self::F16,
             "BF16" => Self::Bf16,
+            "F8_E4M3" => Self::F8E4M3,
             "I32" => Self::I32,
             "U32" => Self::U32,
             "F32" => Self::F32,
@@ -82,6 +88,7 @@ impl Dtype {
             Self::U16 => "U16",
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
+            Self::F8E4M3 => "F8_E4M3",
             Self::I32 => "I32",
             Self::U32 => "U32",
             Self::F32 => "F32",
@@ -94,7 +101,7 @@ impl Dtype {
     /// `h3_dtype_size` (`h3_safetensors.c:200-217`).
     pub fn size(self) -> u64 {
         match self {
-            Self::Bool | Self::I8 | Self::U8 => 1,
+            Self::Bool | Self::I8 | Self::U8 | Self::F8E4M3 => 1,
             Self::I16 | Self::U16 | Self::F16 | Self::Bf16 => 2,
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::I64 | Self::U64 | Self::F64 => 8,
@@ -136,6 +143,10 @@ pub struct Shard {
     pub file_size: u64,
     pub header_size: u64,
     pub tensors: Vec<Tensor>,
+    /// `__metadata__`, which the reference skips (`h3_safetensors.c:441`).
+    /// Kept because an adapter states its own contract there and a derived
+    /// checkpoint has to carry it through (`ShardWriter`).
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl Shard {
@@ -173,6 +184,15 @@ impl Shard {
     /// Total tensor bytes in this shard (`inventory_dir`'s `tensor_bytes`).
     pub fn tensor_bytes(&self) -> u64 {
         self.tensors.iter().map(Tensor::bytes).sum()
+    }
+
+    /// The tensors in the order their bytes appear in the file. `read_shard`
+    /// sorts by name; the released files are written in the model's own order,
+    /// and that is the order a rewrite has to keep.
+    pub fn file_order(&self) -> Vec<&Tensor> {
+        let mut order: Vec<&Tensor> = self.tensors.iter().collect();
+        order.sort_by_key(|tensor| tensor.data_begin);
+        order
     }
 }
 
@@ -436,9 +456,17 @@ pub fn read_shard(path: &Path) -> Result<Shard, StError> {
 
     let data_start = LENGTH_BYTES + header_size;
     let mut tensors = Vec::with_capacity(object.len());
+    let mut metadata = BTreeMap::new();
 
     for (name, entry) in object {
         if name == "__metadata__" {
+            if let Some(fields) = entry.as_object() {
+                for (key, value) in fields {
+                    if let Some(text) = value.as_str() {
+                        metadata.insert(key.clone(), text.to_string());
+                    }
+                }
+            }
             continue;
         }
         tensors.push(parse_tensor(name, entry, data_start, file_size).map_err(
@@ -459,7 +487,167 @@ pub fn read_shard(path: &Path) -> Result<Shard, StError> {
         file_size,
         header_size,
         tensors,
+        metadata,
     })
+}
+
+/// One tensor's descriptor for [`ShardWriter::create`], before its bytes.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub name: String,
+    pub dtype: Dtype,
+    pub shape: Vec<u64>,
+}
+
+/// Compose a safetensors shard.
+///
+/// The layout is the released files' own: a compact JSON header, then every
+/// tensor's bytes contiguously in entry order, so a shard whose tensors are
+/// copied unchanged comes out byte for byte identical to its source. Data is
+/// written by absolute offset, which lets a caller stream one tensor at a time
+/// instead of holding the shard in memory.
+pub struct ShardWriter {
+    file: File,
+    path: PathBuf,
+    spans: Vec<(u64, u64)>,
+    header_end: u64,
+}
+
+impl ShardWriter {
+    /// Create `path` and write the header. `entries` order is the file order.
+    pub fn create(
+        path: &Path,
+        entries: &[Entry],
+        metadata: &BTreeMap<String, String>,
+    ) -> Result<ShardWriter, StError> {
+        let mut header = String::from("{");
+        if !metadata.is_empty() {
+            header.push_str("\"__metadata__\":{");
+            for (index, (key, value)) in metadata.iter().enumerate() {
+                if index > 0 {
+                    header.push(',');
+                }
+                header.push_str(&quoted(key));
+                header.push(':');
+                header.push_str(&quoted(value));
+            }
+            header.push_str("},");
+        }
+
+        // Every entry's span, laid out contiguously in entry order.
+        let mut spans = Vec::with_capacity(entries.len());
+        let mut cursor = 0u64;
+        for (index, entry) in entries.iter().enumerate() {
+            let elements: u64 = entry.shape.iter().product();
+            let bytes =
+                elements
+                    .checked_mul(entry.dtype.size())
+                    .ok_or_else(|| StError::Header {
+                        path: path.to_path_buf(),
+                        detail: format!("{}: byte count overflows", entry.name),
+                    })?;
+            let end = cursor.checked_add(bytes).ok_or_else(|| StError::Header {
+                path: path.to_path_buf(),
+                detail: format!("{}: data area overflows", entry.name),
+            })?;
+
+            if index > 0 {
+                header.push(',');
+            }
+            header.push_str(&quoted(&entry.name));
+            header.push_str(":{\"dtype\":");
+            header.push_str(&quoted(entry.dtype.name()));
+            header.push_str(",\"shape\":[");
+            for (axis, dimension) in entry.shape.iter().enumerate() {
+                if axis > 0 {
+                    header.push(',');
+                }
+                header.push_str(&dimension.to_string());
+            }
+            header.push_str("],\"data_offsets\":[");
+            header.push_str(&cursor.to_string());
+            header.push(',');
+            header.push_str(&end.to_string());
+            header.push_str("]}");
+
+            spans.push((cursor, end));
+            cursor = end;
+        }
+        header.push('}');
+
+        let header_end = LENGTH_BYTES + header.len() as u64;
+        let file = File::create(path).map_err(|error| StError::Io {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+
+        file.write_all_at(&(header.len() as u64).to_le_bytes(), 0)
+            .and_then(|()| file.write_all_at(header.as_bytes(), LENGTH_BYTES))
+            .and_then(|()| file.set_len(header_end + cursor))
+            .map_err(|error| StError::Io {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+
+        Ok(ShardWriter {
+            file,
+            path: path.to_path_buf(),
+            spans,
+            header_end,
+        })
+    }
+
+    /// The byte span reserved for entry `index`.
+    pub fn span(&self, index: usize) -> (u64, u64) {
+        self.spans[index]
+    }
+
+    /// Write entry `index`'s data, which must be exactly its reserved span.
+    pub fn write(&self, index: usize, data: &[u8]) -> Result<(), StError> {
+        let (begin, end) = self.spans[index];
+
+        if data.len() as u64 != end - begin {
+            return Err(StError::SizeMismatch {
+                name: format!("entry {index}"),
+                expected: end - begin,
+                got: data.len() as u64,
+            });
+        }
+
+        self.write_at(index, 0, data)
+    }
+
+    /// Write `data` into entry `index` at `offset` bytes from its start, so a
+    /// caller can stream a tensor in tiles.
+    pub fn write_at(&self, index: usize, offset: u64, data: &[u8]) -> Result<(), StError> {
+        let (begin, end) = self.spans[index];
+
+        if offset
+            .checked_add(data.len() as u64)
+            .map(|last| last > end - begin)
+            != Some(false)
+        {
+            return Err(StError::SizeMismatch {
+                name: format!("entry {index} at {offset}"),
+                expected: end - begin,
+                got: offset + data.len() as u64,
+            });
+        }
+
+        // pwrite, not write: the offsets are absolute and the calls are out of
+        // order by construction.
+        self.file
+            .write_all_at(data, self.header_end + begin + offset)
+            .map_err(|error| StError::Io {
+                path: self.path.clone(),
+                detail: error.to_string(),
+            })
+    }
+}
+
+/// A JSON string literal, escaped the way `serde_json` writes one.
+fn quoted(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| String::from("\"\""))
 }
 
 /// `h3_parse_tensor` plus `h3_validate_tensor`

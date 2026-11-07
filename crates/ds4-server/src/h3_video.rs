@@ -40,6 +40,8 @@ use ds4_core::minimax_h3::local_api::{
     image_size, parse_create, Plan, ReferenceKind, ReferenceMedia,
 };
 use ds4_core::minimax_h3::media::probe_visual_size;
+use ds4_core::minimax_h3::profiles::Profiles;
+use ds4_core::minimax_h3::video_api::VideoSize;
 use ds4_core::minimax_h3::video_api::{
     unknown_video, Admitted, AnchorImage, ApiError, VideoError, VideoStatus, VideoStore,
 };
@@ -499,6 +501,13 @@ pub struct VideoServer {
     store: Arc<VideoStore>,
     renderer: SharedRenderer,
     out_dir: PathBuf,
+    /// The recipe file the create body's `profile` names are read from.
+    profiles: PathBuf,
+    /// The DiT projection arm this process loaded. `H3_DIT_GEMM` is read once
+    /// per load (`minimax_h3::dit::gemm_mode_from_env`), so a recipe that names
+    /// a different arm cannot be honoured here: it is refused by name rather
+    /// than served as a picture the recipe did not ask for.
+    dit_gemm: String,
 }
 
 impl VideoServer {
@@ -507,7 +516,21 @@ impl VideoServer {
             store,
             renderer,
             out_dir,
+            profiles: PathBuf::from("tools/h3-profiles.json"),
+            dit_gemm: resident_dit_gemm(),
         }
+    }
+
+    /// The arm the engine actually loaded, for the startup line and the
+    /// recipe check.
+    pub fn dit_gemm(&self) -> &str {
+        &self.dit_gemm
+    }
+
+    /// The recipe file `profile` names resolve against (`--profiles`).
+    pub fn with_profiles(mut self, profiles: PathBuf) -> Self {
+        self.profiles = profiles;
+        self
     }
 
     pub fn store(&self) -> &Arc<VideoStore> {
@@ -541,7 +564,12 @@ impl VideoServer {
         // `aspect_ratio: auto` over a reference needs that reference's pixel
         // size, which the body does not state; the probe reads it here.
         let probe = |media: &ReferenceMedia| probe_visual(media, &self.out_dir);
-        let plan = match parse_create(&http.body).and_then(|body| body.plan_with(&probe)) {
+        let plan = match parse_create(&http.body)
+            .and_then(|body| body.plan_with(&probe))
+            .and_then(|mut plan| {
+                apply_recipe(&mut plan, &self.profiles, &self.dit_gemm)?;
+                Ok(plan)
+            }) {
             Ok(plan) => plan,
             Err(error) => return H3Response::error(&error),
         };
@@ -703,6 +731,85 @@ enum Route {
     Video(String),
     Content(String),
     Unknown,
+}
+
+/// Apply the recipe a create body named. The host owns the file, so the recipe
+/// is resolved here rather than in the parser: one reader
+/// (`minimax_h3::profiles`) serves the CLI, the route script and this API, so a
+/// name cannot mean one thing to one caller and something else to another.
+/// The DiT projection arm this process loaded, in the words `H3_DIT_GEMM` takes.
+/// The engine reads the same variable once per load and refuses an unknown
+/// word there, so a running server holds one of the three or nothing at all.
+fn resident_dit_gemm() -> String {
+    match std::env::var("H3_DIT_GEMM") {
+        Ok(word) if !word.trim().is_empty() => word.trim().to_string(),
+        _ => "bf16".to_string(),
+    }
+}
+
+/// Refuse a recipe whose projection arm this process did not load.
+fn recipe_arm_fits(
+    name: &str,
+    recipe: &ds4_core::minimax_h3::profiles::Profile,
+    resident_gemm: &str,
+) -> Result<(), ApiError> {
+    let Some(word) = &recipe.dit_gemm else {
+        return Ok(());
+    };
+    if word.trim() == resident_gemm {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "profile_needs_reload",
+        Some("profile"),
+        format!(
+            "profile {name:?} asks for H3_DIT_GEMM={word} and this server loaded \
+             {resident_gemm}: the arm is read once per load, so restart it with \
+             H3_DIT_GEMM={word}, or render the recipe through h3-rs"
+        ),
+    ))
+}
+
+fn apply_recipe(plan: &mut Plan, path: &Path, resident_gemm: &str) -> Result<(), ApiError> {
+    let Some(name) = plan.profile.clone() else {
+        return Ok(());
+    };
+    let profiles = Profiles::load(path)
+        .map_err(|error| ApiError::bad_request("invalid_profile_file", Some("profile"), error))?;
+    let recipe = profiles.get(&name).ok_or_else(|| {
+        ApiError::bad_request(
+            "unknown_profile",
+            Some("profile"),
+            format!("no profile {name:?} in {}", path.display()),
+        )
+    })?;
+    // The projection arm is a property of the load, not of the request. A
+    // recipe that asks for the other one is refused here: applying the rest of
+    // it and dropping this key is exactly the silent substitution the recipe
+    // file exists to prevent.
+    recipe_arm_fits(&name, recipe, resident_gemm)?;
+    if let Some(steps) = recipe.steps {
+        plan.steps = Some(steps);
+    }
+    if let (Some(width), Some(height)) = (recipe.width, recipe.height) {
+        plan.size = VideoSize::new(width, height);
+    }
+    if let Some(gemm) = recipe.vae_gemm {
+        plan.vae_gemm = gemm;
+    }
+    if let Some(attention) = recipe.vae_attention {
+        plan.vae_attention = attention;
+    }
+    if let Some(crf) = recipe.crf {
+        plan.crf = Some(crf as u8);
+    }
+    if let Some(word) = &recipe.preset {
+        plan.preset = ds4_core::minimax_h3::render::Preset::parse(word);
+    }
+    if let Some(draft) = recipe.draft() {
+        plan.draft = Some(draft);
+    }
+    Ok(())
 }
 
 fn route(path: &str) -> Route {
@@ -910,8 +1017,8 @@ fn answer(server: &VideoServer, stream: &mut std::net::TcpStream) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ds4_core::minimax_h3::dit::Attention;
     use ds4_core::minimax_h3::local_api::Task;
-    use ds4_core::minimax_h3::video_api::VideoSize;
     use serde_json::Value;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -1039,8 +1146,32 @@ mod tests {
         (renderer, release)
     }
 
-    fn test_server(renderer: SharedRenderer, max_jobs: usize) -> (Arc<VideoServer>, PathBuf) {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
+    /// A recipe that names the other projection arm is refused, and the
+    /// refusal names the word that would serve it. Serving the recipe's steps
+    /// and canvas while dropping its arm is the failure this guards.
+    #[test]
+    fn a_recipe_that_names_another_projection_arm_is_refused() {
+        use ds4_core::minimax_h3::profiles::Profile;
+
+        let fp8 = Profile {
+            name: "f".to_string(),
+            dit_gemm: Some("fp8".to_string()),
+            ..Profile::default()
+        };
+        let error = recipe_arm_fits("f", &fp8, "bf16").expect_err("fp8 on a bf16 load");
+        assert_eq!(error.code, "profile_needs_reload");
+        assert!(error.message.contains("H3_DIT_GEMM=fp8"), "{}", error.message);
+        assert!(recipe_arm_fits("f", &fp8, "fp8").is_ok(), "the same arm is served");
+
+        // A recipe that states no arm changes nothing and is always served.
+        let silent = Profile {
+            name: "s".to_string(),
+            ..Profile::default()
+        };
+        assert!(recipe_arm_fits("s", &silent, "bf16").is_ok());
+    }
+
+    fn test_server(renderer: SharedRenderer, max_jobs: usize) -> (Arc<VideoServer>, PathBuf) {        static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "h3-video-test-{}-{}",
             std::process::id(),
@@ -1142,6 +1273,14 @@ mod tests {
             first_frame: None,
             last_frame: None,
             references: Vec::new(),
+            attention: Attention::Tensor,
+            vae_attention: ds4_core::minimax_h3::dit::VaeAttention::Scalar,
+            vae_gemm: ds4_core::minimax_h3::dit::VaeGemm::Fp32,
+            crf: None,
+            preset: None,
+            profile: None,
+            steps: None,
+            draft: None,
         }
     }
 
@@ -1239,6 +1378,31 @@ mod tests {
             head.to_bytes().ends_with(b"\r\n\r\n"),
             "HEAD carries no body"
         );
+    }
+
+    #[test]
+    fn a_short_edge_below_the_tier_is_served() {
+        // 576 is on the released canvas grid, so 16:9 there is 1024x576: the
+        // request renders rather than being refused, and the record reports
+        // the canvas it was given.
+        let (server, _dir) = test_server(renderer(|_, output| write_output(output)), 4);
+
+        let response = post(
+            &server,
+            r#"{
+                "task": "t2va",
+                "prompt": "a red cube on a wooden table",
+                "conditions": [],
+                "target": {"short_edge": 576, "aspect_ratio": "16:9", "duration_seconds": 4},
+                "seed": 0
+            }"#,
+        );
+        assert_eq!(response.status, 200);
+        let id = json_of(&response)["id"].as_str().unwrap().to_string();
+
+        let done = poll_until(&server, &id, "completed");
+        assert_eq!(done["size"], "1024x576");
+        assert_eq!(done["frames"], 107);
     }
 
     #[test]
@@ -1576,7 +1740,17 @@ mod tests {
             ),
             (
                 r#"{"task":"t2va","prompt":"p","conditions":[],
-                   "target":{"short_edge":480,"aspect_ratio":"16:9","duration_seconds":8},
+                   "target":{"short_edge":500,"aspect_ratio":"16:9","duration_seconds":8},
+                   "seed":0}"#
+                    .to_string(),
+                "unsupported_short_edge",
+            ),
+            (
+                // On the grid, but above the ceiling the released area allows:
+                // its square does not fit, and the long edge would clamp under
+                // the short edge and invert the canvas.
+                r#"{"task":"t2va","prompt":"p","conditions":[],
+                   "target":{"short_edge":1024,"aspect_ratio":"1:1","duration_seconds":8},
                    "seed":0}"#
                     .to_string(),
                 "unsupported_short_edge",

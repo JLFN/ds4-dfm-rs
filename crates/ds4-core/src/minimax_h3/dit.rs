@@ -67,7 +67,7 @@
 use std::fmt;
 use std::path::Path;
 
-use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
+use ds4_sys::h3_dit::{Dtype, Gpu, SolPlanBuffers, Tensor};
 
 use crate::minimax_h3::host::{self, Schedule};
 use crate::minimax_h3::layout::{Config, Role};
@@ -144,12 +144,31 @@ struct Block {
 }
 
 /// The four matrices that stream from the checkpoint, one slot per block
-/// (`h3_dit.c:600-621`, `:2223-2240`).
+/// (`h3_dit.c:600-621`, `:2223-2240`). Under `H3_DIT_GEMM` the four hold E4M3
+/// and `scales` carries each one's scale, tensorwise or per row; the BF16
+/// tensor they were converted from is dropped, as the release drops the
+/// parameter it converted.
 struct BlockMatrices {
     qkv: Tensor,
     out: Tensor,
     fc1: Tensor,
     fc2: Tensor,
+    scales: Option<BlockScales>,
+}
+
+/// One matrix's scale: the release's tensorwise F32, or the per-row vector
+/// `granularity="channel"` produces, one element per output channel.
+enum MatrixScale {
+    Tensorwise(Tensor),
+    Rows(Tensor),
+}
+
+/// One scale per matrix: FastVideo's `_fp8_weight_scale`.
+struct BlockScales {
+    qkv: MatrixScale,
+    out: MatrixScale,
+    fc1: MatrixScale,
+    fc2: MatrixScale,
 }
 
 /// A core block's norms. Both residency modes keep them device-resident: they
@@ -253,6 +272,7 @@ impl Streamer {
                 out: gpu_alloc(gpu, Dtype::Bf16, hidden * inner)?,
                 fc1: gpu_alloc(gpu, Dtype::Bf16, 2 * ffn * hidden)?,
                 fc2: gpu_alloc(gpu, Dtype::Bf16, hidden * ffn)?,
+                scales: None,
             })
         };
         let slots = [slot()?, slot()?];
@@ -786,6 +806,63 @@ impl Reduction {
     }
 }
 
+/// Which attention the DiT runs. `Tensor` is the default and is the tensor-core
+/// kernel; `Scalar` is the byte-exact kernel and the only one that reproduces
+/// the reference, so it is the one to ask for when a byte-identical output is
+/// what is wanted (`docs/minimax-h3/tensor-default-2026-10-27.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Attention {
+    #[default]
+    Tensor,
+    Scalar,
+}
+
+/// The attention's data type, the `fp8` word of `H3_DIT_ATTENTION` at load
+/// time. `Bf16` is the block the release ships; `E4M3` is the arm that measured
+/// **-15.9%** on the attention class and that the clip gate refused when it ran
+/// the whole delivery (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`). A
+/// third choice and not a variant of [`Attention`]: that one names the kernel
+/// family, and the data type applies to the tensor-core family alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttentionType {
+    #[default]
+    Bf16,
+    E4M3,
+}
+
+/// The video decoder's attention kernel (`H3_VAE_ATTENTION`). A separate choice
+/// from [`Attention`], and with the opposite default: the decoder's `Scalar` is
+/// the reference path and the only arm whose output is reproducible across
+/// architectures, while the DiT's default is its tensor kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaeAttention {
+    #[default]
+    Scalar,
+    Tensor,
+}
+
+/// The decoder's GEMM mode (`H3_VAE_GEMM`). `Fp32` is the reference's rounding;
+/// `Reduced` is one tensor-core computation, 2.75e-05 relative rms from `Fp32`,
+/// four orders below the value scale, and it is what turned the decoder's
+/// matmul share into the 34-36 s arm (`vae-options-2026-10-28.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VaeGemm {
+    #[default]
+    Fp32,
+    /// F32 storage, tensor-core compute: the reference's `FAST_16BF` class.
+    Reduced,
+    /// BF16 operands and a BF16 output, the `bf16i` arm. Halves the bytes the
+    /// block GEMMs move and is priced at 3.6 ms against 11.3 ms a block
+    /// (`tests/h3/vae_gemm_bm`); the output is narrowed, so it is a rounding
+    /// arm like `Reduced`, not the reference's class.
+    Full,
+    /// `Full`'s operands with every block activation in BF16 as well, the
+    /// `bf16a` chain. The narrows and widens that cost `Full` 10.4 s of a 46.2 s
+    /// decode collapse to one pair a tile, and the rounding moves from each
+    /// projection's output to each primitive's store.
+    Chain,
+}
+
 /// How the core runs: residency, active block count and token pairing
 /// (`h3_dit.c:1601-1665`). The reference takes the same three choices as
 /// separate loader arguments; one struct keeps the call sites readable.
@@ -797,6 +874,20 @@ pub struct LoadOptions {
     pub reduction: Reduction,
     /// Core refresh interval, 1..=6 (`h3_dit.c:1591-1592`, `:2161-2163`).
     pub core_reuse: u32,
+    /// Attention path; the tensor-core kernel unless `Scalar` is asked for.
+    pub attention: Attention,
+    /// The attention's data type, set on the same context. `None` states
+    /// nothing: the context keeps what `H3_DIT_ATTENTION` gave it at creation,
+    /// which is the reference's BF16 block when the environment is unset.
+    pub attention_type: Option<AttentionType>,
+    /// The video decoder's attention kernel, set on the same context as
+    /// [`LoadOptions::attention`] and independent of it. `None` states nothing:
+    /// the context keeps what the environment gave it at creation, which is the
+    /// reference's scalar kernel when `H3_VAE_ATTENTION` is unset.
+    pub vae_attention: Option<VaeAttention>,
+    /// The video decoder's GEMM mode, likewise. `None` leaves the reference's
+    /// F32 route.
+    pub vae_gemm: Option<VaeGemm>,
 }
 
 impl LoadOptions {
@@ -807,6 +898,10 @@ impl LoadOptions {
             layers: DIT_BLOCKS as u32,
             reduction: Reduction::Environment,
             core_reuse: 1,
+            attention: Attention::Tensor,
+            attention_type: None,
+            vae_attention: None,
+            vae_gemm: None,
         }
     }
 }
@@ -1420,11 +1515,96 @@ impl Geometry {
 
 /// The FL2VA DiT with its weights resident: one device context, the loaded
 /// core, and the per-step tensors the forward indexes.
+/// `H3D_SOL_BLOCK` (`native/h3/h3_dit_gpu.h:45`): the sparse attention's query
+/// and key block, in rows.
+const SOL_BLOCK: u32 = 64;
+
+/// VSA's selector and the sparse forward it feeds, with the workspace they
+/// share across the 50 blocks and every step of one sequence.
+struct SolAttention {
+    plan: SolPlanBuffers,
+    sparsity: f64,
+    /// Whole blocks holding the prefix. `_build_block_mask` requires at least
+    /// one video block, and a block with a prefix row is treated as prefix.
+    prefix_blocks: u32,
+}
+
+/// One line per process with the first sparse call's realized share: the
+/// number no fixture can supply, and the one that decides whether the mask
+/// leaves anything for the fold to carry.
+static SOL_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `H3_DIT_SOL` names the VSA sparsity the DiT's own attention should run at,
+/// or is unset for the dense path. Read once per load, like the native side's
+/// `H3_DIT_ATTENTION`, so one binary serves both arms of an A/B. A value that
+/// is not a finite number is refused: a typo must not quietly serve dense.
+fn sol_from_env() -> Result<Option<f64>, DitError> {
+    let Ok(raw) = std::env::var("H3_DIT_SOL") else {
+        return Ok(None);
+    };
+    let sparsity: f64 = raw.trim().parse().map_err(|_| DitError::Unsupported {
+        detail: format!("H3_DIT_SOL={raw} is not a sparsity"),
+    })?;
+    if !sparsity.is_finite() {
+        return Err(DitError::Unsupported {
+            detail: format!("H3_DIT_SOL={raw} is not a finite sparsity"),
+        });
+    }
+    Ok(Some(sparsity))
+}
+
+/// `H3_DIT_GEMM` names the route the DiT's four projection linears take: the
+/// engine's BF16 matmul, the release's own W8A8 route (`runtime/stage1.py:126-134`;
+/// the arithmetic is `fastvideo/layers/quantization/fp8_config.py` at the
+/// revision `configs/dependencies.json` pins), or that route at the
+/// reference's finer `granularity="channel"` - per-token activation and
+/// per-output-channel weight scales, which cuBLASLt refuses to apply itself
+/// and the port therefore applies in an epilogue. Read once per load, like
+/// `H3_DIT_SOL`, so one binary serves every arm of an A/B. A value that is
+/// none of the three is refused: a typo must not quietly serve BF16.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GemmMode {
+    Bf16,
+    Fp8Tensorwise,
+    Fp8Rows,
+}
+
+impl GemmMode {
+    /// Whether the weights are E4M3 at all; both FP8 arms share the scratch.
+    fn fp8(self) -> bool {
+        self != GemmMode::Bf16
+    }
+
+    /// The reference's per-row granularity: `_quantize_rowwise` for the
+    /// activation and `weight.abs().amax(dim=1)` for the weight.
+    fn rows(self) -> bool {
+        self == GemmMode::Fp8Rows
+    }
+}
+
+fn gemm_mode_from_env() -> Result<GemmMode, DitError> {
+    let Ok(raw) = std::env::var("H3_DIT_GEMM") else {
+        return Ok(GemmMode::Bf16);
+    };
+    match raw.trim() {
+        "bf16" => Ok(GemmMode::Bf16),
+        "fp8" => Ok(GemmMode::Fp8Tensorwise),
+        "fp8-row" => Ok(GemmMode::Fp8Rows),
+        other => Err(DitError::Unsupported {
+            detail: format!("H3_DIT_GEMM={other} is not bf16, fp8 or fp8-row"),
+        }),
+    }
+}
+
 pub struct Dit {
     gpu: Gpu,
     config: Config,
     sequence: Sequence,
     schedule: Schedule,
+    /// VSA's sparse attention, present only when `H3_DIT_SOL` asked for it.
+    /// The dense `h3d_sdpa` path is the engine's; this one approximates it by
+    /// folding unselected blocks from their pooled summaries.
+    sol: Option<SolAttention>,
     hidden_width: u32,
     inner: u32,
     video_width: u32,
@@ -1475,6 +1655,17 @@ pub struct Dit {
 
     hidden: Tensor,
     mod_attention: Tensor,
+    /// An FP8 arm's per-call activation scratch, reused by all four
+    /// projections: one E4M3 buffer and the F32 scale its amax pass writes -
+    /// one element for the tensorwise arm, one per row for the per-row one.
+    /// Present only when `H3_DIT_GEMM` asked for an FP8 weight.
+    activation_fp8: Option<Tensor>,
+    activation_scale: Option<Tensor>,
+    /// The per-row arm's F32 accumulator, reused the same way: the unscaled
+    /// matmul writes it and the epilogue reads it, because the reference's
+    /// scales multiply the accumulator before its BF16 cast. Sized for the
+    /// widest of the four outputs (the MLP's `fc1`).
+    accumulator: Option<Tensor>,
     qkv: Tensor,
     query: Tensor,
     key: Tensor,
@@ -1490,6 +1681,101 @@ pub struct Dit {
 }
 
 impl Dit {
+    /// One of the four projection linears. Without `H3_DIT_GEMM` this is the
+    /// engine's `h3_gpu_linear_bf16`; with it, the release's steps on this
+    /// call's activation: the amax and scale the arm's granularity asks for,
+    /// its E4M3 copy, then the matmul - which applies the two scales itself in
+    /// the tensorwise arm and leaves them to `epilogue` in the per-row one.
+    /// `scale` is `None` exactly when the weight is the BF16 one.
+    fn projection(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        scale: Option<&MatrixScale>,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), DitError> {
+        let Some(weight_scale) = scale else {
+            return device(self.gpu.linear(
+                output,
+                input,
+                weight,
+                None,
+                rows,
+                input_dim,
+                output_dim,
+                Dtype::Bf16,
+            ));
+        };
+        // Both exist whenever an FP8 weight does; the load builds them first.
+        let (Some(activation), Some(activation_scale)) =
+            (self.activation_fp8.as_ref(), self.activation_scale.as_ref())
+        else {
+            return Err(DitError::Gpu(
+                "FP8 projection without its activation scratch".into(),
+            ));
+        };
+        let elements = rows as usize * input_dim as usize;
+        match weight_scale {
+            MatrixScale::Tensorwise(weight_scale) => {
+                device(self.gpu.fp8_scale(activation_scale, input))?;
+                device(
+                    self.gpu
+                        .fp8_quantize(activation, activation_scale, input, elements),
+                )?;
+                device(self.gpu.linear_e4m3(
+                    output,
+                    activation,
+                    activation_scale,
+                    weight,
+                    weight_scale,
+                    rows,
+                    input_dim,
+                    output_dim,
+                ))
+            }
+            // The scales go on the accumulator, which is why the matmul writes
+            // F32: a BF16 output would round before scaling and round again
+            // after, and the reference rounds once.
+            MatrixScale::Rows(weight_scale) => {
+                let Some(accumulator) = self.accumulator.as_ref() else {
+                    return Err(DitError::Gpu(
+                        "FP8 row projection without its accumulator".into(),
+                    ));
+                };
+                device(
+                    self.gpu
+                        .fp8_scale_rows(activation_scale, input, rows, input_dim),
+                )?;
+                device(self.gpu.fp8_quantize_rows(
+                    activation,
+                    activation_scale,
+                    input,
+                    rows,
+                    input_dim,
+                ))?;
+                device(self.gpu.linear_e4m3_raw(
+                    accumulator,
+                    activation,
+                    weight,
+                    rows,
+                    input_dim,
+                    output_dim,
+                ))?;
+                device(self.gpu.fp8_scale_epilogue(
+                    output,
+                    accumulator,
+                    activation_scale,
+                    weight_scale,
+                    rows,
+                    output_dim,
+                ))
+            }
+        }
+    }
+
     /// Load and prepare every tensor `h3_dit.c:1559-1700` prepares, in the
     /// reference's order.
     ///
@@ -1542,9 +1828,63 @@ impl Dit {
         }
         let mode = options.mode;
         let reduction = options.reduction;
+        let gemm = gemm_mode_from_env()?;
+        // The streaming ring's slots are BF16 and are refilled per block, so an
+        // FP8 arm has nothing to convert into; the resident layout is the one
+        // the FP8 route was ported for.
+        if gemm.fp8() && mode == LoadMode::Stream {
+            return Err(DitError::Unsupported {
+                detail: "H3_DIT_GEMM with the streaming ring: the ring's \
+                         slots are BF16"
+                    .into(),
+            });
+        }
         let weights = Weights::open(dir).map_err(|error| DitError::Weights(error.to_string()))?;
         let config = weights.config().clone();
         let gpu = device(Gpu::create())?;
+        gpu.set_attention(matches!(options.attention, Attention::Scalar));
+        // `scalar` is the byte-exact kernel and has no quantized path, so the
+        // two words together are a contradiction: refuse it rather than let the
+        // arm be dropped, or applied, behind the promise the caller asked for.
+        if options.attention == Attention::Scalar
+            && options.attention_type == Some(AttentionType::E4M3)
+        {
+            return Err(DitError::Unsupported {
+                detail: "E4M3 attention is the tensor-core block's data type; \
+                         the scalar kernel is the byte-exact one"
+                    .into(),
+            });
+        }
+        if let Some(kind) = options.attention_type {
+            gpu.set_attention_type(matches!(kind, AttentionType::E4M3));
+        }
+        // The decoder's two switches, in the native side's own words. A value it
+        // does not know is a bug in this mapping rather than user input: every
+        // string here is one of the three the header documents. `None` is not a
+        // default: it leaves the context with what it read from the environment
+        // (the same words) when it was created.
+        if let Some(attention) = options.vae_attention {
+            gpu.set_vae_option(
+                "attention",
+                match attention {
+                    VaeAttention::Scalar => "scalar",
+                    VaeAttention::Tensor => "tensor",
+                },
+            )
+            .map_err(DitError::Gpu)?;
+        }
+        if let Some(gemm) = options.vae_gemm {
+            gpu.set_vae_option(
+                "gemm",
+                match gemm {
+                    VaeGemm::Fp32 => "fp32",
+                    VaeGemm::Reduced => "bf16",
+                    VaeGemm::Full => "bf16i",
+                    VaeGemm::Chain => "bf16a",
+                },
+            )
+            .map_err(DitError::Gpu)?;
+        }
 
         let geometry = Geometry::check(&config, &sequence, text.tokens())?;
         let hidden_width = config.hidden as u32;
@@ -1570,7 +1910,7 @@ impl Dit {
             modulation_maps(&gpu, &tree, &sequence, text_tags)?;
 
         // `h3_dit.c:1685-1688`: the core, then the activation arena.
-        let blocks = load_blocks(&gpu, &weights, &config, mode)?;
+        let blocks = load_blocks(&gpu, &weights, &config, mode, gemm)?;
         let mut streamer = match mode {
             LoadMode::Resident => None,
             LoadMode::Stream => Some(Streamer::new(&gpu, &weights, &config)?),
@@ -1641,6 +1981,25 @@ impl Dit {
         let attention_output = bf16(rows * hidden_width as usize)?;
         let fc1 = bf16(rows * config.ffn as usize * 2)?;
         let activated = bf16(rows * config.ffn as usize)?;
+        // The FP8 arms quantize one activation at a time through one scratch
+        // pair, sized for the widest of the four (the MLP's `activated`); the
+        // per-row arm's scale is one element per row, and its accumulator F32
+        // at the widest output (the MLP's `fc1`).
+        let (activation_fp8, activation_scale, accumulator) = if gemm.fp8() {
+            let scale = if gemm.rows() { rows as usize } else { 1 };
+            let accumulator = if gemm.rows() {
+                Some(f32t(rows as usize * config.ffn as usize * 2)?)
+            } else {
+                None
+            };
+            (
+                Some(gpu_alloc(&gpu, Dtype::Fp8, rows * config.ffn as usize)?),
+                Some(gpu_alloc(&gpu, Dtype::F32, scale)?),
+                accumulator,
+            )
+        } else {
+            (None, None, None)
+        };
         // `h3_dit.c:1534-1543`: the cached core delta needs its own input copy.
         let (core_input, core_residual) = if options.core_reuse > 1 {
             (
@@ -1665,9 +2024,38 @@ impl Dit {
             streamer.ensure(&gpu, 0)?;
         }
 
+        // The sparse arm is opt-in and is refused rather than quietly ignored
+        // when the layout it was built for is not the one in use: token pairing
+        // halves the video rows and moves every block boundary, so its block
+        // count and prefix span are not this one's.
+        let sol = match sol_from_env()? {
+            None => None,
+            Some(sparsity) => {
+                if reduction.is_some() {
+                    return Err(DitError::Unsupported {
+                        detail: "H3_DIT_SOL with token pairing: VSA's blocks are \
+                                 the unreduced sequence's"
+                            .into(),
+                    });
+                }
+                let plan = gpu
+                    .sol_plan(rows as u32, config.heads as u32)
+                    .map_err(DitError::Gpu)?;
+                Some(SolAttention {
+                    plan,
+                    sparsity,
+                    prefix_blocks: geometry.video_target_start.div_ceil(SOL_BLOCK),
+                })
+            }
+        };
+
         Ok(Dit {
             gpu,
             config,
+            sol,
+            activation_fp8,
+            activation_scale,
+            accumulator,
             hidden_width,
             inner,
             video_width,
@@ -1987,6 +2375,62 @@ impl Dit {
             // step's own latent, and a refusal ends the sampler.
             if let Some(hook) = preview.as_mut() {
                 hook(step, video)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The two-stage refine: one evaluation per entry in the schedule's grid,
+    /// each followed by Euler on the video latent alone. `ts_h2` states one
+    /// entry (`0.72, 0`) and the reference's earlier `ts_h` states two
+    /// (`0.78, 0.45, 0`), so the grid and not the caller decides how many.
+    ///
+    /// The audio latent is the draft's and is never updated. The reference's
+    /// `LTXVFreezeLatent` sets a zero denoise mask on the audio stream
+    /// (`comfy_extras/nodes_lt_keyframes.py:984-1036`) and the sampler hands
+    /// the model's audio output back as `latent_image` instead of accepting it
+    /// (`comfy/samplers.py:634-642`). The rows do still enter the model, which
+    /// is the point of the freeze: they are the conditioning the video's lip
+    /// sync is computed against.
+    ///
+    /// The caller seeds `video` with `host::renoise` before this call, as the
+    /// reference's sampler seeds its first step (`comfy/samplers.py:993`).
+    pub fn denoise_refine(&mut self, video: &mut [f32], audio: &[f32]) -> Result<(), DitError> {
+        if self.schedule.steps == 0 || self.schedule.video.len() != self.schedule.steps + 1 {
+            return Err(DitError::Geometry {
+                detail: format!(
+                    "refine needs a grid of steps, this schedule has {} steps and {} sigmas",
+                    self.schedule.steps,
+                    self.schedule.video.len()
+                ),
+            });
+        }
+        if video.len() != self.video_elements() || audio.len() != self.audio_elements() {
+            return Err(DitError::Geometry {
+                detail: format!(
+                    "refine of {}x{} values, expected {}x{}",
+                    video.len(),
+                    audio.len(),
+                    self.video_elements(),
+                    self.audio_elements()
+                ),
+            });
+        }
+
+        // The audio rows are the draft's: they enter the model as conditioning
+        // and are handed back unchanged, so every step re-uses the same audio.
+        for step in 0..self.schedule.steps {
+            let (video_velocity, _audio_velocity) = self.forward(step, video, audio)?;
+            if !host::euler_step(
+                video,
+                &video_velocity,
+                self.schedule.video[step],
+                self.schedule.video[step + 1],
+            ) {
+                return Err(DitError::Geometry {
+                    detail: format!("Euler solver rejected refine step {step}"),
+                });
             }
         }
 
@@ -2356,6 +2800,8 @@ impl Dit {
                 .as_ref()
                 .ok_or_else(|| DitError::Gpu("resident block without matrices".into()))?,
         };
+        // The FP8 route's four scales, present together with its weights.
+        let matrix_scales = matrices.scales.as_ref();
         let attention_adaln_ready = *carried;
         *carried = false;
 
@@ -2378,16 +2824,15 @@ impl Dit {
 
         // `h3_dit.c:1902-1919`: grouped QKV projection, then the Q/K norm and
         // RoPE boundary.
-        device(self.gpu.linear(
+        self.projection(
             &self.qkv,
             &self.mod_attention,
             &matrices.qkv,
-            None,
+            matrix_scales.map(|scales| &scales.qkv),
             rows,
             hidden,
             inner * 3,
-            Dtype::Bf16,
-        ))?;
+        )?;
         device(self.gpu.qkv_rope(
             &self.query,
             &self.key,
@@ -2406,26 +2851,66 @@ impl Dit {
 
         // `h3_dit.c:1921-1956`: full attention into the qkv buffer (the
         // reference's `attention_heads` alias), then the output projection.
-        device(self.gpu.sdpa(
-            &self.qkv,
-            &self.query,
-            &self.key,
-            &self.value,
-            rows,
-            self.config.heads as u32,
-            self.config.head_dim as u32,
-            1.0 / ((self.config.head_dim as f32).sqrt()),
-        ))?;
-        device(self.gpu.linear(
+        // The opt-in sparse arm replaces this one call and nothing else: the
+        // same inputs and the same output buffer, routed from this step's own
+        // Q and K. It is skipped on the reduced layout, whose row count is not
+        // the one its plan and prefix span were sized for.
+        let heads = self.config.heads as u32;
+        let scale = 1.0 / ((self.config.head_dim as f32).sqrt());
+        match self.sol.as_ref().filter(|_| rows == self.rows) {
+            Some(sol) => {
+                device(self.gpu.sol_vsa(
+                    &sol.plan,
+                    &self.query,
+                    &self.key,
+                    &self.value,
+                    rows,
+                    heads,
+                    scale,
+                    sol.sparsity,
+                    sol.prefix_blocks,
+                ))?;
+                if !SOL_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    match self.gpu.sol_exact_share(&sol.plan, rows, heads) {
+                        Ok(share) => eprintln!(
+                            "SOL sparsity={:.3} prefix_blocks={} first call: {} rows, \
+                             {} heads, exact share {:.4}",
+                            sol.sparsity, sol.prefix_blocks, rows, heads, share
+                        ),
+                        Err(detail) => eprintln!("SOL sparsity report failed: {detail}"),
+                    }
+                }
+                device(self.gpu.sol_forward(
+                    &self.qkv,
+                    &sol.plan,
+                    &self.query,
+                    &self.key,
+                    &self.value,
+                    rows,
+                    heads,
+                    scale,
+                ))?;
+            }
+            None => device(self.gpu.sdpa(
+                &self.qkv,
+                &self.query,
+                &self.key,
+                &self.value,
+                rows,
+                heads,
+                self.config.head_dim as u32,
+                scale,
+            ))?,
+        }
+        self.projection(
             &self.attention_output,
             &self.qkv,
             &matrices.out,
-            None,
+            matrix_scales.map(|scales| &scales.out),
             rows,
             inner,
             hidden,
-            Dtype::Bf16,
-        ))?;
+        )?;
 
         // `h3_dit.c:1958-1982`: the attention gate, then the MLP AdaLN, which
         // reuses the qkv buffer as `mod_mlp`.
@@ -2456,30 +2941,28 @@ impl Dit {
         ))?;
 
         // `h3_dit.c:1984-2013`: `h3_gpu_mlp_bf16` is linear, SwiGLU, linear.
-        device(self.gpu.linear(
+        self.projection(
             &self.fc1,
             &self.qkv,
             &matrices.fc1,
-            None,
+            matrix_scales.map(|scales| &scales.fc1),
             rows,
             hidden,
             self.config.ffn as u32 * 2,
-            Dtype::Bf16,
-        ))?;
+        )?;
         device(
             self.gpu
                 .swiglu(&self.activated, &self.fc1, rows, self.config.ffn as u32),
         )?;
-        device(self.gpu.linear(
+        self.projection(
             &self.attention_output,
             &self.activated,
             &matrices.fc2,
-            None,
+            matrix_scales.map(|scales| &scales.fc2),
             rows,
             self.config.ffn as u32,
             hidden,
-            Dtype::Bf16,
-        ))?;
+        )?;
 
         // `h3_dit.c:2015-2046`: the MLP gate, and, when another block follows,
         // the next block's attention AdaLN in the same step.
@@ -2569,7 +3052,7 @@ fn refine_text(
     // `h3_dit.c:763-801` `run_refiner_block`: no AdaLN, no RoPE (the call
     // passes `rope_half = 0`), residuals in BF16.
     for block in [&block0, &block1] {
-        device(gpu.rms_norm(&norm, &refined, &block.norm1, rows, hidden, EPSILON))?;
+        device(gpu.rms_norm(&norm, &refined, Some(&block.norm1), rows, hidden, EPSILON))?;
         device(gpu.linear(
             &qkv,
             &norm,
@@ -2617,7 +3100,7 @@ fn refine_text(
         ))?;
         device(gpu.add(&refined, &refined, &branch))?;
 
-        device(gpu.rms_norm(&norm, &refined, &block.norm2, rows, hidden, EPSILON))?;
+        device(gpu.rms_norm(&norm, &refined, Some(&block.norm2), rows, hidden, EPSILON))?;
         device(gpu.linear(
             &fc1,
             &norm,
@@ -2643,7 +3126,7 @@ fn refine_text(
     }
 
     // `h3_dit.c:866-869`: in place, as the reference writes it.
-    device(gpu.rms_norm(&refined, &refined, &final_norm, rows, hidden, EPSILON))?;
+    device(gpu.rms_norm(&refined, &refined, Some(&final_norm), rows, hidden, EPSILON))?;
 
     Ok(refined)
 }
@@ -2916,10 +3399,11 @@ fn load_blocks(
     weights: &Weights,
     config: &Config,
     mode: LoadMode,
+    gemm: GemmMode,
 ) -> Result<Vec<CoreBlock>, DitError> {
     let mut blocks = Vec::with_capacity(config.layers as usize);
     for layer in 0..config.layers {
-        blocks.push(load_block(gpu, weights, layer, mode)?);
+        blocks.push(load_block(gpu, weights, config, layer, mode, gemm)?);
     }
     Ok(blocks)
 }
@@ -2929,8 +3413,10 @@ fn load_blocks(
 fn load_block(
     gpu: &Gpu,
     weights: &Weights,
+    config: &Config,
     layer: u32,
     mode: LoadMode,
+    gemm: GemmMode,
 ) -> Result<CoreBlock, DitError> {
     let norms = BlockNorms {
         norm1: tensor_from_role(gpu, weights, Role::BlockNorm1(layer), Dtype::Bf16)?,
@@ -2939,7 +3425,7 @@ fn load_block(
         k_norm: tensor_from_role(gpu, weights, Role::BlockKNorm(layer), Dtype::Bf16)?,
     };
     let matrices = match mode {
-        LoadMode::Resident => Some(load_block_matrices(gpu, weights, layer)?),
+        LoadMode::Resident => Some(load_block_matrices(gpu, weights, config, layer, gemm)?),
         LoadMode::Stream => None,
     };
     Ok(CoreBlock { norms, matrices })
@@ -2948,14 +3434,78 @@ fn load_block(
 fn load_block_matrices(
     gpu: &Gpu,
     weights: &Weights,
+    config: &Config,
     layer: u32,
+    gemm: GemmMode,
 ) -> Result<BlockMatrices, DitError> {
-    Ok(BlockMatrices {
+    let matrices = BlockMatrices {
         qkv: tensor_from_role(gpu, weights, Role::BlockQkv(layer), Dtype::Bf16)?,
         out: tensor_from_role(gpu, weights, Role::BlockOut(layer), Dtype::Bf16)?,
         fc1: tensor_from_role(gpu, weights, Role::BlockFc1(layer), Dtype::Bf16)?,
         fc2: tensor_from_role(gpu, weights, Role::BlockFc2(layer), Dtype::Bf16)?,
+        scales: None,
+    };
+    if !gemm.fp8() {
+        return Ok(matrices);
+    }
+    fp8_block(gpu, config, matrices, gemm)
+}
+
+/// The release's conversion, on the BF16 tensor the loader already uploaded:
+/// one scale per matrix, then its E4M3 copy. The BF16 tensor is dropped as the
+/// reference drops the parameter it converted, which is half of what the FP8
+/// route saves on the projections. Each matrix's own `[n, k]` shape is the
+/// DiT's (`h3_dit.c:1559-1700`'s four projections), and a weight's rows are
+/// its output channels, which is what the per-row arm reduces over.
+fn fp8_block(
+    gpu: &Gpu,
+    config: &Config,
+    bf16: BlockMatrices,
+    gemm: GemmMode,
+) -> Result<BlockMatrices, DitError> {
+    let hidden = config.hidden as u32;
+    let inner = config.inner() as u32;
+    let ffn = config.ffn as u32;
+    let (qkv, qkv_scale) = fp8_matrix(gpu, bf16.qkv, gemm, inner * 3, hidden)?;
+    let (out, out_scale) = fp8_matrix(gpu, bf16.out, gemm, hidden, inner)?;
+    let (fc1, fc1_scale) = fp8_matrix(gpu, bf16.fc1, gemm, ffn * 2, hidden)?;
+    let (fc2, fc2_scale) = fp8_matrix(gpu, bf16.fc2, gemm, hidden, ffn)?;
+    Ok(BlockMatrices {
+        qkv,
+        out,
+        fc1,
+        fc2,
+        scales: Some(BlockScales {
+            qkv: qkv_scale,
+            out: out_scale,
+            fc1: fc1_scale,
+            fc2: fc2_scale,
+        }),
     })
+}
+
+/// One matrix's two steps, as `convert_model_to_fp8` runs them: the amax
+/// reduction and the scale, then the E4M3 rounding. The reduction's shape is
+/// the arm's: one amax for the whole tensor, or one per row (`rows` is the
+/// weight's output channels).
+fn fp8_matrix(
+    gpu: &Gpu,
+    bf16: Tensor,
+    gemm: GemmMode,
+    rows: u32,
+    columns: u32,
+) -> Result<(Tensor, MatrixScale), DitError> {
+    let e4m3 = gpu_alloc(gpu, Dtype::Fp8, bf16.elements())?;
+    if gemm.rows() {
+        let scales = gpu_alloc(gpu, Dtype::F32, rows as usize)?;
+        device(gpu.fp8_scale_rows(&scales, &bf16, rows, columns))?;
+        device(gpu.fp8_quantize_rows(&e4m3, &scales, &bf16, rows, columns))?;
+        return Ok((e4m3, MatrixScale::Rows(scales)));
+    }
+    let scale = gpu_alloc(gpu, Dtype::F32, 1)?;
+    device(gpu.fp8_scale(&scale, &bf16))?;
+    device(gpu.fp8_quantize(&e4m3, &scale, &bf16, bf16.elements()))?;
+    Ok((e4m3, MatrixScale::Tensorwise(scale)))
 }
 
 fn load_refiner_block(gpu: &Gpu, weights: &Weights, layer: u32) -> Result<Block, DitError> {

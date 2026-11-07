@@ -20,15 +20,21 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ds4_core::minimax_h3::dit::{Dit, DitError, LoadMode, LoadOptions, Reduction};
+use ds4_core::minimax_h3::profiles::Profiles;
+use ds4_core::minimax_h3::dit::{
+    Attention, AttentionType, Dit, DitError, LoadMode, LoadOptions, Reduction, VaeAttention,
+    VaeGemm,
+};
+use ds4_core::minimax_h3::engine::{Draft, EngineHandle, RenderRequest};
 use ds4_core::minimax_h3::host::{reuse_schedule, temporal, Rng, Schedule};
 use ds4_core::minimax_h3::render::mux_mp4;
-use ds4_core::minimax_h3::render::{check_frames, Canvas, RgbFrames};
+use ds4_core::minimax_h3::render::{check_frames, Canvas, Encode, Preset, RgbFrames};
 use ds4_core::minimax_h3::sequence::{self, Spec};
 use ds4_core::minimax_h3::text_forward;
 use ds4_core::minimax_h3::tokenizer::{EmptyPrompt, Tokenizer};
+use ds4_core::minimax_h3::vision::f32_to_bf16;
 use ds4_core::minimax_h3::{
-    condition, device, media, reference, render, terminal, vae_audio, vae_encoder, vae_video,
+    condition, device, jobs, media, reference, render, terminal, vae_audio, vae_encoder, vae_video,
 };
 
 /// `h3.h:13-17`.
@@ -48,6 +54,10 @@ const REF2VA: &str = "Ref2VA";
 
 struct Options {
     model_dir: PathBuf,
+    /// The recipe file and the recipe it names. Resolved by
+    /// `minimax_h3::profiles`, the same reader the server uses.
+    profiles: PathBuf,
+    profile: Option<String>,
     prompt: String,
     output: PathBuf,
     width: i32,
@@ -73,8 +83,65 @@ struct Options {
     token_reduction: bool,
     /// `--core-reuse` (`main.c:33`, `:305`, `:392`).
     core_reuse: u32,
+    /// `--attention`: `tensor` is the tensor-core kernel and the default,
+    /// `scalar` the byte-exact one.
+    attention: Attention,
+    /// `--vae-attention`: the video decoder's own kernel, with the opposite
+    /// default. `scalar` is the reference path and portable; `tensor` is faster
+    /// and not portable across architectures. Absent, the decoder keeps what
+    /// `H3_VAE_ATTENTION` said when it was created, else the reference path.
+    vae_attention: Option<VaeAttention>,
+    /// `--vae-gemm`: `fp32` is the reference rounding, `bf16` the one
+    /// tensor-core computation four orders below the value scale. Absent,
+    /// the same rule: the environment's word, else the reference.
+    vae_gemm: Option<VaeGemm>,
+    /// `--text-nvfp4`: the reference's NVFP4-AWQ prompt encoder. Absent means
+    /// the released BF16 shards under `-d`.
+    text_encoder: text_forward::Encoder,
     /// `--frames-dir` (`main.c:57`, `:339`, `:492`): the decoded frames.
     frames_dir: Option<PathBuf>,
+    /// `--save-latent`: the denoised video latent as raw BF16
+    /// `[channel][time][height][width]`, the latent path's own layout.
+    latent_out: Option<PathBuf>,
+    /// `--save-audio`: the decoded soundtrack as raw little-endian F32,
+    /// interleaved, at the printed rate and channel count.
+    audio_out: Option<PathBuf>,
+    /// `--latent-only`: stop after the soundtrack. The latent route never
+    /// decodes the H3 video; it is rendered by whatever reads the latent.
+    latent_only: bool,
+    /// `--jobs FILE`: the resident product route. One request per line,
+    /// rendered in one process through a resident encoder and DiT
+    /// (the one-shot path stays the default when this is absent).
+    jobs: Option<PathBuf>,
+    /// `--draft`: the two-stage route's draft scale, `0.7` in the reference's
+    /// preset. Only the resident route can render it, because the refine needs
+    /// the engine's second prepared graph.
+    draft: Option<f32>,
+    /// `--refine-sigma`: the refine's one-step sigma, `0.72` in the preset.
+    /// `--draft` without it takes the preset's own number, and that number
+    /// belongs to the preset's *six*-step draft: a shorter draft ends at a
+    /// higher sigma, and the reference re-tunes the refine per draft schedule
+    /// rather than deriving it from the draft's terminal
+    /// (`docs/minimax-h3/four-step-draft-2026-11-02.md` section 3).
+    refine_sigma: Option<(f32, Option<f32>)>,
+    /// `--draft-attention`: the **draft leg's** attention data type. `e4m3` is
+    /// the arm the E4M3 unit measured and the clip gate refused when it ran the
+    /// whole delivery (`docs/minimax-h3/fp8-attention-arm-2026-11-02.md`);
+    /// `bf16` states the released block and is what pins the draft while
+    /// `H3_DIT_ATTENTION=fp8` carries the refine. Absent, the leg keeps the
+    /// environment's word. Needs `--draft`: on a single pass the draft leg is
+    /// the delivery.
+    draft_attention: Option<AttentionType>,
+    /// `--vae-workers` (`:1089`): the decode's chunk loop spread over this
+    /// many device contexts. One is the reference's own serial loop.
+    vae_workers: usize,
+    /// `--vae-tile`: the decoder's spatial tile in pixels. `None` keeps the
+    /// reference's own search, which is what every released shape takes.
+    vae_tile: Option<usize>,
+    /// `--crf` / `--preset`: the encoder words on the mux line. The default
+    /// is the reference's own pair (`veryfast`, CRF 19), so a request that
+    /// says nothing muxes the reference's line.
+    encode: Encode,
     /// `--preview-dir` (`main.c:58`, `:340`, `:493`).
     preview_dir: Option<PathBuf>,
     /// `--show` (`main.c:59`, `:541-560`).
@@ -83,6 +150,16 @@ struct Options {
     zoom: u16,
     info: bool,
     hash: bool,
+}
+
+/// The video decoder's arms as this run states them: a flag when it was given,
+/// otherwise nothing, which leaves the decoder with the environment's word and
+/// then the reference's own path.
+fn vae_arms(options: &Options) -> vae_video::Arms {
+    vae_video::Arms {
+        attention: options.vae_attention,
+        gemm: options.vae_gemm,
+    }
 }
 
 fn main() -> ExitCode {
@@ -95,10 +172,74 @@ fn main() -> ExitCode {
     }
 }
 
+/// The value after a bare flag. The recipe commands answer before the option
+/// parser runs, so they cannot use it.
+fn flag_value(arguments: &[String], flag: &str) -> Option<String> {
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        if word == flag {
+            return words.next().cloned();
+        }
+    }
+    None
+}
+
+/// The recipe file: `--profiles`, or the one the repository ships.
+fn profile_path(arguments: &[String]) -> PathBuf {
+    flag_value(arguments, "--profiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("tools/h3-profiles.json"))
+}
+
 fn run() -> Result<ExitCode, String> {
-    let Some(options) = parse(std::env::args().skip(1).collect())? else {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // The recipe commands are read-only and answer before anything else, so
+    // `--print-profile` needs neither `--jobs` nor a checkpoint.
+    if let Some(name) = flag_value(&arguments, "--print-profile") {
+        let path = profile_path(&arguments);
+        let profiles = Profiles::load(&path)?;
+        let profile = profiles
+            .get(&name)
+            .ok_or_else(|| format!("no profile {name:?} in {}", path.display()))?;
+        for (key, value) in profile.shell() {
+            println!("{key}={}", ds4_core::minimax_h3::profiles::shell_quote(&value));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if arguments.iter().any(|argument| argument == "--list-profiles") {
+        let profiles = Profiles::load(&profile_path(&arguments))?;
+        let width = profiles.names().map(|(name, _)| name.len()).max().unwrap_or(0);
+        for (name, doc) in profiles.names() {
+            println!("{name:<width$}  {doc}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some(options) = parse(arguments)? else {
         return Ok(ExitCode::SUCCESS);
     };
+
+    // The resident list is its own lifetime: one process, one engine, one
+    // request at a time. Without `--jobs` everything below is unchanged.
+    if options.jobs.is_some() {
+        return run_jobs(&options);
+    }
+
+    // A flag the route cannot apply is refused, not dropped: the one-shot path
+    // renders one canvas, and the two-stage route needs the engine's second
+    // prepared graph.
+    if options.draft.is_some() || options.refine_sigma.is_some() {
+        return Err(
+            "--draft/--refine-sigma need --jobs: the two-stage route runs through the resident engine"
+                .to_string(),
+        );
+    }
+    if options.draft_attention.is_some() {
+        return Err(
+            "--draft-attention needs --jobs and --draft: it states one leg of the two-stage route"
+                .to_string(),
+        );
+    }
 
     let canvas = Canvas::new(
         options.width,
@@ -183,7 +324,8 @@ fn run() -> Result<ExitCode, String> {
         let ids = tokenizer
             .encode(&options.prompt, EmptyPrompt::Pad)
             .map_err(|error| format!("tokenizer: {}", error.token()))?;
-        text_forward::encode(&component("text_encoder"), &ids).map_err(|error| error.token())
+        text_forward::encode_with(&options.text_encoder, &component("text_encoder"), &ids)
+            .map_err(|error| error.token())
     }?;
     println!(
         "TEXT tokens={} width={} fnv={:016x} seconds={:.3}",
@@ -226,6 +368,12 @@ fn run() -> Result<ExitCode, String> {
         layers: options.layers as u32,
         reduction,
         core_reuse: options.core_reuse,
+        attention: options.attention,
+        // The one-shot path renders one canvas and refuses the arm above, so
+        // this stage's data type is the environment's word.
+        attention_type: None,
+        vae_attention: options.vae_attention,
+        vae_gemm: options.vae_gemm,
     };
 
     let started = Instant::now();
@@ -296,6 +444,28 @@ fn run() -> Result<ExitCode, String> {
         started.elapsed().as_secs_f64()
     );
 
+    // The latent path's handoff: the denoised state before any VAE touches it.
+    if let Some(path) = &options.latent_out {
+        let started = Instant::now();
+        write_latent(
+            path,
+            &video,
+            shape.video_t as usize,
+            latent_h as usize,
+            latent_w as usize,
+        )?;
+        println!(
+            "LATENT path={} channels={} time={} height={} width={} bytes={} seconds={:.3}",
+            path.display(),
+            vae_video::LATENT_CHANNELS,
+            shape.video_t,
+            latent_h,
+            latent_w,
+            video.len() * 2,
+            started.elapsed().as_secs_f64()
+        );
+    }
+
     // Retire the DiT before the two VAEs are loaded: their weights are
     // allocated in the same unified pool the denoise just used.
     drop(model);
@@ -311,13 +481,45 @@ fn run() -> Result<ExitCode, String> {
         started.elapsed().as_secs_f64()
     );
 
+    // The stage-2 pipeline re-muxes the same soundtrack beside its own video.
+    if let Some(path) = &options.audio_out {
+        write_pcm(path, &waveform.pcm)?;
+        println!(
+            "AUDIO-RAW path={} samples={} channels={} rate={} bytes={}",
+            path.display(),
+            waveform.samples,
+            waveform.channels,
+            waveform.sample_rate,
+            waveform.pcm.len() * 4
+        );
+    }
+
+    // The latent route stops here: the denoised latent is written out and no
+    // H3 video is materialized, so the decode that would cost more than every
+    // denoise update together is not paid at all.
+    if options.latent_only {
+        if options.latent_out.is_none() {
+            return Err("--latent-only needs --save-latent".to_string());
+        }
+
+        println!("LATENT-ONLY skipped=video_decode");
+
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let started = Instant::now();
-    let decoded = vae_video::decode(
+    let decoded = vae_video::decode_with(
         &component("video_vae/source"),
         &video,
         shape.video_t as usize,
         latent_h as usize,
         latent_w as usize,
+        // The decoder builds its own device context, so the arms have to
+        // travel with the call; setting them on the DiT's context leaves the
+        // decoder on the environment's word.
+        vae_arms(&options),
+        options.vae_workers,
+        options.vae_tile,
     )
     .map_err(|error| error.to_string())?;
     println!(
@@ -384,6 +586,7 @@ fn run() -> Result<ExitCode, String> {
         small(waveform.samples, "audio samples")?,
         small(waveform.channels, "audio channels")?,
         small(waveform.sample_rate, "sample rate")?,
+        options.encode,
     )?;
     println!(
         "VIDEO path={} width={} height={} frames={} fps={} sample_rate={} seconds={:.3}",
@@ -395,6 +598,174 @@ fn run() -> Result<ExitCode, String> {
         waveform.sample_rate,
         started.elapsed().as_secs_f64()
     );
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The product route as a list: one request per line, rendered through the
+/// resident engine. The one-shot path above is the same work with the weights
+/// loaded per clip; here the encoder and the DiT stay resident, so clip N+1
+/// pays only the denoise, the audio and the decode.
+///
+/// Rollback is the absence of `--jobs`: every line of this function is new,
+/// and the one-shot path it returns to is the one the campaign measured.
+fn run_jobs(options: &Options) -> Result<ExitCode, String> {
+    let path = options
+        .jobs
+        .as_ref()
+        .expect("run_jobs is only reached with --jobs");
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let jobs = jobs::parse(&text, &path.display().to_string())
+        .map_err(|error| error.message().to_string())?;
+
+    // `--refine-sigma` without `--draft` names a stage that would not run.
+    if options.refine_sigma.is_some() && options.draft.is_none() {
+        return Err("--refine-sigma needs --draft".to_string());
+    }
+    // The same rule for the arm: it names a leg, and without the route the leg
+    // it would name is the delivery.
+    if options.draft_attention.is_some() && options.draft.is_none() {
+        return Err("--draft-attention needs --draft".to_string());
+    }
+    let (refine_sigma, refine_next) = options
+        .refine_sigma
+        .unwrap_or((Draft::RELEASED.sigma, Draft::RELEASED.next));
+    // A recipe is the flags it names (`minimax_h3::profiles`); a flag on the
+    // command line still wins over it, and the recipe wins over a job line's
+    // step count because that is what a recipe is for.
+    let recipe = match &options.profile {
+        Some(name) => Some(
+            Profiles::load(&options.profiles)?
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("no profile {name:?}"))?,
+        ),
+        None => None,
+    };
+    let draft = recipe
+        .as_ref()
+        .and_then(|recipe| recipe.draft())
+        .or_else(|| {
+            options.draft.map(|scale| Draft {
+                scale,
+                sigma: refine_sigma,
+                next: refine_next,
+            })
+        });
+
+    // Every line is checked before the first weight is read: a bad canvas must
+    // not cost a 62 GiB load. The draft canvas is checked here for the same
+    // reason - it is derived, and its derivation can fail.
+    for (index, job) in jobs.iter().enumerate() {
+        Canvas::new(job.width, job.height, 0, 0)
+            .map_err(|error| format!("line {}: canvas: {error}", index + 1))?;
+        check_frames(job.frames).map_err(|error| format!("line {}: {error}", index + 1))?;
+        if let Some(route) = draft {
+            route
+                .canvas(job.width, job.height)
+                .map_err(|error| format!("line {}: {}", index + 1, error.message()))?;
+            Schedule::refine(route.sigma, route.next).ok_or_else(|| {
+                format!(
+                    "--refine-sigma {} is not a descending grid in (0, 1]",
+                    match route.next {
+                        Some(next) => format!("{},{}", route.sigma, next),
+                        None => route.sigma.to_string(),
+                    }
+                )
+            })?;
+        }
+    }
+
+    println!(
+        "JOBS count={} route={} model={}",
+        jobs.len(),
+        match draft {
+            Some(route) => format!("two-stage draft={} refine={}", route.scale, route.sigma),
+            None => "direct".to_string(),
+        },
+        options.model_dir.display()
+    );
+
+    let engine =
+        EngineHandle::spawn(&options.model_dir).map_err(|error| error.message().to_string())?;
+
+    let started = Instant::now();
+    for (index, job) in jobs.iter().enumerate() {
+        let request = RenderRequest {
+            prompt: job.prompt.clone(),
+            width: job.width,
+            height: job.height,
+            frames: job.frames,
+            steps: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.steps)
+                .unwrap_or(job.steps),
+            reuse: options.reuse,
+            seed: job.seed,
+            draft,
+            first_frame: None,
+            last_frame: None,
+            references: Vec::new(),
+            attention: options.attention,
+            draft_attention: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.draft_attention.as_deref())
+                .map(|word| match word {
+                    "e4m3" | "fp8" => AttentionType::E4M3,
+                    _ => AttentionType::Bf16,
+                })
+                .or(options.draft_attention),
+            vae_attention: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.vae_attention)
+                .or(options.vae_attention),
+            vae_gemm: recipe
+                .as_ref()
+                .and_then(|recipe| recipe.vae_gemm)
+                .or(options.vae_gemm),
+            text_encoder: options.text_encoder.clone(),
+            encode: options.encode,
+            output: job.output.clone(),
+        };
+
+        let job_started = Instant::now();
+        let report = engine
+            .render(request)
+            .map_err(|error| format!("line {}: {}", index + 1, error.message()))?;
+
+        println!(
+            "JOB n={} canvas={}x{}x{} steps={} seed={} text={:.3}s{} load={:.3}s{} \
+             denoise={:.3}s draft={:.3}s upscale={:.3}s refine={:.3}s audio_frozen={} \
+             audio={:.3}s video={:.3}s mux={:.3}s wall={:.3}s video_fnv={:016x} audio_fnv={:016x} \
+             frames_fnv={:016x} out={}",
+            index + 1,
+            job.width,
+            job.height,
+            job.frames,
+            job.steps,
+            job.seed,
+            report.text_seconds,
+            if report.text_hit { " (hit)" } else { "" },
+            report.load_seconds,
+            if report.prepared_hit { " (hit)" } else { "" },
+            report.denoise_seconds,
+            report.draft_seconds,
+            report.upscale_seconds,
+            report.refine_seconds,
+            report.audio_frozen,
+            report.audio_seconds,
+            report.video_seconds,
+            report.mux_seconds,
+            job_started.elapsed().as_secs_f64(),
+            report.video_hash,
+            report.audio_hash,
+            report.frames_hash,
+            job.output.display()
+        );
+    }
+
+    println!("JOBS wall={:.3}s", started.elapsed().as_secs_f64());
 
     Ok(ExitCode::SUCCESS)
 }
@@ -438,8 +809,13 @@ impl Preview {
             })?;
         }
 
-        let decoder = vae_video::PreviewDecoder::load(&vae, latent_h as usize, latent_w as usize)
-            .map_err(|error| error.to_string())?;
+        let decoder = vae_video::PreviewDecoder::load(
+            &vae,
+            latent_h as usize,
+            latent_w as usize,
+            vae_arms(options),
+        )
+        .map_err(|error| error.to_string())?;
 
         Ok(Some(Preview {
             decoder,
@@ -527,6 +903,62 @@ fn write_ppm(
 /// `cli_frame`'s frame branch (`main.c:214-245`): `--frames-dir` gets one
 /// `frame-%04d.ppm` per generated frame, written straight rather than through
 /// a scratch name, as the reference does for final frames.
+/// Raw BF16 `[channel][time][height][width]`: the layout the latent path's
+/// kernels read (channel-major, 24 channels). The only rounding is the BF16
+/// boundary, so the file holds the model's own values.
+fn write_latent(
+    path: &std::path::Path,
+    latent: &[f32],
+    time: usize,
+    height: usize,
+    width: usize,
+) -> Result<(), String> {
+    let expected = vae_video::LATENT_CHANNELS * time * height * width;
+
+    if latent.len() != expected {
+        return Err(format!(
+            "latent has {} values, expected {expected}",
+            latent.len()
+        ));
+    }
+
+    create_parent(path)?;
+    let mut bytes = Vec::with_capacity(latent.len() * 2);
+
+    for value in latent {
+        bytes.extend_from_slice(&f32_to_bf16(*value).to_le_bytes());
+    }
+
+    std::fs::write(path, &bytes)
+        .map_err(|error| format!("cannot write latent to {}: {error}", path.display()))
+}
+
+/// Raw little-endian F32, interleaved: `mux_mp4`'s own sample form.
+fn write_pcm(path: &std::path::Path, pcm: &[f32]) -> Result<(), String> {
+    create_parent(path)?;
+    let mut bytes = Vec::with_capacity(pcm.len() * 4);
+
+    for value in pcm {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    std::fs::write(path, &bytes)
+        .map_err(|error| format!("cannot write audio to {}: {error}", path.display()))
+}
+
+fn create_parent(path: &std::path::Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))
+}
+
 fn write_frames(dir: &std::path::Path, frames: &RgbFrames) -> Result<(), String> {
     use std::io::Write;
 
@@ -708,6 +1140,8 @@ fn read_anchors(options: &Options, canvas: &Canvas, frame_count: i32) -> Result<
 fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut options = Options {
         model_dir: PathBuf::new(),
+        profiles: PathBuf::from("tools/h3-profiles.json"),
+        profile: None,
         prompt: String::new(),
         output: PathBuf::from(DEFAULT_OUTPUT),
         width: DEFAULT_WIDTH,
@@ -727,7 +1161,21 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         stream: false,
         token_reduction: false,
         core_reuse: 1,
+        attention: Attention::Tensor,
+        vae_attention: None,
+        vae_gemm: None,
+        text_encoder: text_forward::Encoder::Bf16,
         frames_dir: None,
+        latent_out: None,
+        audio_out: None,
+        latent_only: false,
+        jobs: None,
+        draft: None,
+        refine_sigma: None,
+        draft_attention: None,
+        vae_workers: 1,
+        vae_tile: None,
+        encode: Encode::default(),
         preview_dir: None,
         show: false,
         zoom: 2,
@@ -816,6 +1264,95 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--ssd-streaming" => options.stream = true,
             "--token-reduction" => options.token_reduction = true,
             "--frames-dir" => options.frames_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--save-latent" => options.latent_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--save-audio" => options.audio_out = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            "--latent-only" => options.latent_only = true,
+            "--jobs" => options.jobs = Some(PathBuf::from(value(&mut argv, &flag)?)),
+            // The two-stage route's two numbers. They are route-wide, like the
+            // arms: a job line states the canvas and the prompt, not the route.
+            "--draft" => {
+                let text = value(&mut argv, &flag)?;
+                options.draft = Some(
+                    text.parse()
+                        .map_err(|_| "--draft takes a scale such as 0.7".to_string())?,
+                );
+            }
+            "--profiles" => options.profiles = PathBuf::from(value(&mut argv, &flag)?),
+            "--profile" => options.profile = Some(value(&mut argv, &flag)?),
+            "--refine-sigma" => {
+                let text = value(&mut argv, &flag)?;
+                // The reference writes its grids as lists with a terminal zero
+                // (`"0.72, 0"`, `"0.78, 0.45, 0"`); the zero is the schedule's
+                // end, not a sigma, so it is accepted and dropped.
+                let mut sigmas = text
+                    .split(',')
+                    .map(|part| part.trim().parse::<f32>())
+                    .collect::<Result<Vec<f32>, _>>()
+                    .map_err(|_| {
+                        "--refine-sigma takes one sigma such as 0.72, or a grid such as 0.78,0.45"
+                            .to_string()
+                    })?;
+                if sigmas.last() == Some(&0.0) {
+                    sigmas.pop();
+                }
+                options.refine_sigma = Some(match sigmas.as_slice() {
+                    [one] => (*one, None),
+                    [one, two] => (*one, Some(*two)),
+                    _ => {
+                        return Err("--refine-sigma takes at most two sigmas: the reference's grids are 0.72,0 and 0.78,0.45,0"
+                            .to_string())
+                    }
+                });
+            }
+            // The draft leg's data type. Two words, both stated on purpose:
+            // `e4m3` is the arm, and `bf16` is how a run pins the draft while
+            // `H3_DIT_ATTENTION` carries another leg. `fp8` is accepted as the
+            // arm's other spelling in the environment, so a script that reads
+            // one name writes the other.
+            "--draft-attention" => {
+                options.draft_attention = Some(match value(&mut argv, &flag)?.as_str() {
+                    "bf16" => AttentionType::Bf16,
+                    "e4m3" | "fp8" => AttentionType::E4M3,
+                    other => {
+                        return Err(format!(
+                            "--draft-attention must be bf16 or e4m3, not {other}"
+                        ))
+                    }
+                });
+            }
+            "--vae-tile" => {
+                let pixels: usize = unsigned(&mut argv, &flag)?
+                    .try_into()
+                    .map_err(|_| "--vae-tile is out of range".to_string())?;
+                if !(256..=512).contains(&pixels) || !pixels.is_multiple_of(16) {
+                    return Err("--vae-tile is 256-512, a multiple of 16".to_string());
+                }
+                options.vae_tile = Some(pixels);
+            }
+            "--vae-workers" => {
+                options.vae_workers = unsigned(&mut argv, &flag)?
+                    .try_into()
+                    .map_err(|_| "--vae-workers is larger than 64".to_string())?;
+                if options.vae_workers < 1 || options.vae_workers > 64 {
+                    return Err("--vae-workers is 1-64".to_string());
+                }
+            }
+            "--upscaler" => {
+                return Err("--upscaler was removed: H3 renders its own canvas".to_string())
+            }
+            "--crf" => {
+                options.encode.crf = unsigned(&mut argv, &flag)?
+                    .try_into()
+                    .map_err(|_| "--crf is larger than 51".to_string())?;
+                if options.encode.crf > 51 {
+                    return Err("--crf is larger than 51".to_string());
+                }
+            }
+            "--preset" => {
+                let name = value(&mut argv, &flag)?;
+                options.encode.preset = Preset::parse(&name)
+                    .ok_or_else(|| format!("--preset: {name} is not an libx264 preset (--help)"))?;
+            }
             "--preview-dir" => options.preview_dir = Some(PathBuf::from(value(&mut argv, &flag)?)),
             "--show" => options.show = true,
             "--zoom" => {
@@ -828,6 +1365,43 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                     .try_into()
                     .map_err(|_| "--core-reuse is larger than 6".to_string())?
             }
+            "--attention" => {
+                options.attention = match value(&mut argv, &flag)?.as_str() {
+                    "tensor" => Attention::Tensor,
+                    "scalar" => Attention::Scalar,
+                    other => {
+                        return Err(format!("--attention must be tensor or scalar, not {other}"))
+                    }
+                }
+            }
+            "--vae-attention" => {
+                options.vae_attention = Some(match value(&mut argv, &flag)?.as_str() {
+                    "scalar" => VaeAttention::Scalar,
+                    "tensor" => VaeAttention::Tensor,
+                    other => {
+                        return Err(format!(
+                            "--vae-attention must be scalar or tensor, not {other}"
+                        ))
+                    }
+                })
+            }
+            "--vae-gemm" => {
+                options.vae_gemm = Some(match value(&mut argv, &flag)?.as_str() {
+                    "fp32" => VaeGemm::Fp32,
+                    "bf16" => VaeGemm::Reduced,
+                    "bf16i" => VaeGemm::Full,
+                    "bf16a" => VaeGemm::Chain,
+                    other => {
+                        return Err(format!(
+                            "--vae-gemm must be fp32, bf16, bf16i or bf16a, not {other}"
+                        ))
+                    }
+                })
+            }
+            "--text-nvfp4" => {
+                options.text_encoder =
+                    text_forward::Encoder::Quantized(PathBuf::from(value(&mut argv, &flag)?))
+            }
             "--info" => options.info = true,
             "--hash" => options.hash = true,
             other => return Err(format!("unknown flag {other}; see --help")),
@@ -838,8 +1412,12 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         return Err("-d MODEL_DIR is required".to_string());
     }
 
-    if !options.info && options.prompt.is_empty() {
+    if !options.info && options.jobs.is_none() && options.prompt.is_empty() {
         return Err("-p PROMPT is required".to_string());
+    }
+
+    if options.jobs.is_some() {
+        check_jobs_mode(&options)?;
     }
 
     // The port runs the full stack; a truncated layer count is a diagnostic
@@ -853,6 +1431,50 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
 
 fn value(argv: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
     argv.next().ok_or_else(|| format!("{flag} needs a value"))
+}
+
+/// `--jobs` owns every per-request field, and the resident route has no
+/// preview, latent file or streaming mode. A flag the route cannot apply is a
+/// refusal, not a silent drop: the whole point of the resident list is that
+/// each line is the request that ran.
+fn check_jobs_mode(options: &Options) -> Result<(), String> {
+    let unusable = [
+        (!options.prompt.is_empty(), "-p"),
+        (options.output != PathBuf::from(DEFAULT_OUTPUT), "-o"),
+        (options.width != DEFAULT_WIDTH, "--width"),
+        (options.height != DEFAULT_HEIGHT, "--height"),
+        (options.render_width != 0, "--render-width"),
+        (options.render_height != 0, "--render-height"),
+        (options.frames != DEFAULT_FRAMES, "--frames"),
+        (options.steps != DEFAULT_STEPS, "--steps"),
+        (options.seed != DEFAULT_SEED, "--seed"),
+        (options.reuse != DEFAULT_REUSE, "--reuse"),
+        (options.core_reuse != 1, "--core-reuse"),
+        (options.stream, "--ssd-streaming"),
+        (options.token_reduction, "--token-reduction"),
+        (options.latent_only, "--latent-only"),
+        (options.latent_out.is_some(), "--save-latent"),
+        (options.audio_out.is_some(), "--save-audio"),
+        (options.frames_dir.is_some(), "--frames-dir"),
+        (options.preview_dir.is_some(), "--preview-dir"),
+        (options.show, "--show"),
+        (options.first_frame.is_some(), "--first-frame"),
+        (options.last_frame.is_some(), "--last-frame"),
+        (!options.references.is_empty(), "--ref-*"),
+        (options.info, "--info"),
+        (options.hash, "--hash"),
+    ];
+
+    for (given, flag) in unusable {
+        if given {
+            return Err(format!(
+                "{flag} does not apply with --jobs: every request field comes from \
+                 the list (prompt, seed, steps, width, height, frames, output)"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Decoded geometry is `usize` in the VAE APIs and the reference's `int` in
@@ -938,10 +1560,53 @@ Usage: h3-rs -d MODEL_DIR -p PROMPT [options]
   --use-reference-rope      rope scale 1.0 even at 256x256
   --ssd-streaming           stream the DiT blocks from the checkpoint
   --token-reduction         pair video tokens in middle DiT blocks
+  --attention tensor|scalar attention kernel; tensor is the default, scalar
+                            is byte-exact and slower
+  --vae-attention scalar|tensor  decoder attention kernel; unset keeps
+                            H3_VAE_ATTENTION's word, else the reference's scalar
+                            path; tensor is faster, not portable
+                            the reference's fp32 rounding; bf16 is one
+                            tensor-core computation below its scale
                             (window from H3_TOKEN_REDUCTION_* env)
+  --text-nvfp4 PATH         encode the prompt with the reference's NVFP4-AWQ
+                            artifact instead of the BF16 shards; the same
+                            forward, a smaller read
   --core-reuse N            core refresh: 1 exact, 4 fast, 6 aggressive
   --frames-dir PATH         write one PPM per generated frame
+  --save-latent PATH        write the denoised video latent as raw BF16
+                            [channel][time][height][width]
+  --save-audio PATH         write the soundtrack as raw little-endian F32,
+                            interleaved at the printed rate and channels
+  --latent-only             stop after the soundtrack: no H3 video decode and
+                            no mux (the reference's latency route)
+  --jobs FILE               render a list of requests in one process, through a
+                            resident encoder and DiT; one request per
+                            line, TAB-separated:
+                            prompt, seed, steps, width, height, frames, output
+                            (blank and # lines are skipped; per-request flags
+                            above are refused, the line owns them)
+  --draft F                 the two-stage route: denoise a draft canvas at F of
+                            the delivery canvas, upscale its latent, refine once
+                            (the reference's 0.7; needs --jobs, and the route is
+                            a different shot, so it is an arm and not a default)
+  --refine-sigma F          the refine step's sigma (the preset's 0.72); it
+                            belongs to the draft's own schedule
+  --draft-attention bf16|e4m3  the draft leg's attention data type only; needs
+                            --draft. e4m3 is the measured arm, bf16 pins a draft
+                            while H3_DIT_ATTENTION carries the refine
   --preview-dir PATH        write one PPM preview per denoising step
+  --vae-workers N           decode the video through N device contexts, 1-64
+                            (default 1, the reference's serial chunk loop)
+  --vae-tile N              the decoder's spatial tile in pixels, 256-512,
+                            a multiple of 16 (default: the reference's search)
+  --vae-gemm fp32|bf16|bf16i|bf16a
+                            the decoder's GEMM class: fp32 is the reference,
+                            bf16 narrows the compute, bf16i narrows the
+                            operands too, bf16a keeps the block's activations
+                            in BF16 as well and needs --vae-attention tensor
+  --crf N                   x264 quality, 0-51 (default 19, the reference's)
+  --preset NAME             x264 preset (default veryfast, the reference's);
+                            slow and veryslow keep far more fine texture
   --show                    display a preview frame per step (Kitty/iTerm2)
   --zoom N                  preview zoom for the terminal (default 2)
   --info                    resolve the device, components and geometry, run nothing

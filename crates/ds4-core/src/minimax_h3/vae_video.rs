@@ -25,16 +25,32 @@
 //!   it (`run_decoder`, `:458-531`); the port keeps all 36 blocks resident
 //!   (`load_resident_weights`, `:518-531`), which the chunked path needs
 //!   anyway. The arithmetic per row is unchanged and the E8 gate is bit-exact.
-//! - `H3_VAE_TILE_PIXELS` (`:666-690`) is not read; the default search that
-//!   the reference uses when the variable is absent is. Every released shape
-//!   picks the reference's tile size.
+//! - `H3_VAE_TILE_PIXELS` (`:666-690`) is read, with the reference's own
+//!   bounds (256..=512, a multiple of 16); when it is absent the default
+//!   search runs. Every released shape picks the reference's tile size.
+//!
+//! A third is a schedule change with no value change: the four block linears
+//! are called without their bias and the bias is added on load by their
+//! consumer (`run_block`). The reference's `h3_linear_bias_kernel`
+//! (`:783-791`) adds the same F32 value to the same element before the
+//! consumer reads it, so every consumer sees identical inputs and the render
+//! stays byte-identical; it removes one read-modify-write pass per linear.
+//!
+//! The fourth is an arm, not a deviation: `H3_VAE_GEMM=bf16i` runs the same
+//! four block linears on BF16 operands and a BF16 output, narrowing each
+//! activation before the GEMM and widening each result after it (`project`).
+//! The reference has no analogue and the value changes - the arm is the
+//! decoder's only numerical switch beyond the compute mode, and the F32 route
+//! stays the default.
 
 use std::fmt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use ds4_sys::h3_dit::{Dtype, Gpu, Tensor};
 
-use super::vae_store::{f1, f2, Store};
+use super::dit::{VaeAttention, VaeGemm};
+use super::vae_store::{f1, f2, f2_bf16, Store};
 
 pub const LATENT_CHANNELS: usize = 24;
 /// One trained chunk: seven latents in, twenty-two frames out.
@@ -55,6 +71,10 @@ const ROPE_HALF: u32 = 24;
 const OUTPUT_PATCH: usize = 3 * 4 * 16 * 16;
 const SPATIAL_RATIO: usize = 16;
 const TILE_PIXELS: usize = 256;
+/// The override's ceiling (`:671`): `H3_VAE_TILE_PIXELS` may name 512, which is
+/// the largest tile the release accepts and the only one that fits two frames
+/// of a 512x512 canvas in a single tap.
+const TILE_PIXELS_MAX: usize = 512;
 const TILE_OVERLAP_MIN: usize = 64;
 const EPSILON: f32 = 1e-5;
 /// Pixels per latent edge, both axes.
@@ -106,6 +126,10 @@ fn f32_alloc(gpu: &Gpu, elements: usize) -> Result<Tensor, VaeError> {
     device(gpu.alloc(Dtype::F32, elements))
 }
 
+fn bf16_alloc(gpu: &Gpu, elements: usize) -> Result<Tensor, VaeError> {
+    device(gpu.alloc(Dtype::Bf16, elements))
+}
+
 /// Upload an f32 slice as its own bytes; the reference streams the same
 /// buffer, so no conversion happens on either side.
 fn upload_f32(gpu: &Gpu, tensor: &Tensor, values: &[f32]) -> Result<(), VaeError> {
@@ -118,6 +142,7 @@ fn upload_f32(gpu: &Gpu, tensor: &Tensor, values: &[f32]) -> Result<(), VaeError
 }
 
 /// The spatial tile plan for one axis (`tile_axis`, `h3_video_vae.c:692-731`).
+#[derive(Clone)]
 struct TileAxis {
     starts: Vec<usize>,
     /// One entry fewer than `starts`; the last tile has no following overlap.
@@ -150,10 +175,32 @@ fn tile_count_for_extent(extent: usize, tile_pixels: usize) -> usize {
     count
 }
 
-/// `configured_tile_pixels` (`:666-690`): the smallest `tiles * pixels^2`
-/// wins, searching 256..=320 in 16-pixel steps. The reference's environment
-/// override is not read here.
-fn configured_tile_pixels(height: usize, width: usize) -> usize {
+/// `configured_tile_pixels` (`:666-690`): the reference's own
+/// `H3_VAE_TILE_PIXELS` override first (256..=512, a multiple of 16), then the
+/// smallest `tiles * pixels^2`, searching 256..=320 in 16-pixel steps. The
+/// override is the reference's, not this port's: it is how the release picks a
+/// tile size the search cannot, and the only way to ask for one tile.
+fn configured_tile_pixels(height: usize, width: usize, stated: Option<usize>) -> usize {
+    if let Some(pixels) = stated {
+        let allowed = (TILE_PIXELS..=TILE_PIXELS_MAX).contains(&pixels)
+            && pixels.is_multiple_of(SPATIAL_RATIO);
+        if allowed {
+            return pixels;
+        }
+    }
+    if let Some(value) = std::env::var_os("H3_VAE_TILE_PIXELS") {
+        let text = value.to_string_lossy();
+        if !text.is_empty() {
+            if let Ok(pixels) = text.parse::<usize>() {
+                let allowed = (TILE_PIXELS..=TILE_PIXELS_MAX).contains(&pixels)
+                    && pixels.is_multiple_of(SPATIAL_RATIO);
+                if allowed {
+                    return pixels;
+                }
+            }
+        }
+    }
+
     let mut best = TILE_PIXELS;
     let mut best_score = usize::MAX;
 
@@ -206,6 +253,22 @@ fn tile_axis(extent: usize, tile_pixels: usize) -> Result<TileAxis, VaeError> {
     })
 }
 
+/// The spatial plan `decode` will use for a pixel canvas: the tile edge and
+/// the tile counts. Exposed so a gate can report what it measured instead of
+/// inferring it from the timing line.
+pub fn tile_plan(pixel_h: usize, pixel_w: usize) -> Result<(usize, usize, usize), VaeError> {
+    let pixels = configured_tile_pixels(pixel_h, pixel_w, None);
+    let y_axis = tile_axis(pixel_h, pixels)?;
+    let x_axis = tile_axis(pixel_w, pixels)?;
+    Ok((pixels, y_axis.count(), x_axis.count()))
+}
+
+/// `(chunks, frames)` for a latent time, without decoding: what the gate's
+/// plan line reports and what a caller sizes its output buffer by.
+pub fn frame_plan(latent_time: usize) -> Result<(usize, usize), VaeError> {
+    chunk_plan(latent_time)
+}
+
 /// `(latent_time - 2) / 5` chunks and `chunks * 17 + 5` frames
 /// (`h3_video_vae.c:1092-1093`); latent time 2 is the two-token path.
 fn chunk_plan(latent_time: usize) -> Result<(usize, usize), VaeError> {
@@ -221,20 +284,122 @@ fn chunk_plan(latent_time: usize) -> Result<(usize, usize), VaeError> {
     Ok((chunks, chunks * CHUNK_STRIDE + CHUNK_OVERLAP))
 }
 
-/// One transformer block's tensors (`load_block`, `:169-203`).
+/// One transformer block's tensors (`load_block`, `:169-203`). The four
+/// projections carry their dtype with them, so `run_block` reads the arm off the
+/// weight rather than off a second flag that could disagree with it. The norms,
+/// the two scales and the two biases stay F32 in both arms.
 struct Block {
     norm1: Tensor,
-    qkv_w: Tensor,
+    qkv_w: Weight,
     qkv_b: Tensor,
-    out_w: Tensor,
+    out_w: Weight,
     out_b: Tensor,
     scale1: Tensor,
     norm2: Tensor,
-    w1: Tensor,
+    w1: Weight,
     w1_b: Tensor,
-    w2: Tensor,
+    w2: Weight,
     w2_b: Tensor,
     scale2: Tensor,
+}
+
+/// The arms a decode was asked to run.
+///
+/// `None` states nothing and leaves the choice to the context, which read
+/// `H3_VAE_ATTENTION`/`H3_VAE_GEMM` when it was created and otherwise runs the
+/// reference's own path. A host with an explicit value states it. The decoder
+/// creates its own device context, so a request field that is only applied to
+/// the DiT's context never reaches it; this is the path that carries it.
+#[derive(Clone, Copy, Default)]
+pub struct Arms {
+    pub attention: Option<VaeAttention>,
+    pub gemm: Option<VaeGemm>,
+}
+
+impl Arms {
+    /// Both arms stated: what a request that carries its own values means.
+    pub fn stated(attention: VaeAttention, gemm: VaeGemm) -> Arms {
+        Arms {
+            attention: Some(attention),
+            gemm: Some(gemm),
+        }
+    }
+}
+
+fn apply_arms(gpu: &Gpu, arms: Arms) -> Result<(), VaeError> {
+    if let Some(attention) = arms.attention {
+        gpu.set_vae_option(
+            "attention",
+            match attention {
+                VaeAttention::Scalar => "scalar",
+                VaeAttention::Tensor => "tensor",
+            },
+        )?;
+    }
+    if let Some(gemm) = arms.gemm {
+        gpu.set_vae_option(
+            "gemm",
+            match gemm {
+                VaeGemm::Fp32 => "fp32",
+                VaeGemm::Reduced => "bf16",
+                VaeGemm::Full => "bf16i",
+                VaeGemm::Chain => "bf16a",
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// A block projection's weight: the reference's F32, or the BF16 copy the arm
+/// narrows it to at load. The F32 copy is not kept beside the BF16 one, so the
+/// arm's four weights are half the resident bytes.
+enum Weight {
+    F32(Tensor),
+    Bf16(Tensor),
+}
+
+/// The decoder's block arithmetic: the reference's F32 projections, the
+/// `bf16i` arm's narrow, compute, widen, or the `bf16a` chain, which keeps the
+/// block's activations in BF16 so the narrows and widens do not exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arithmetic {
+    F32,
+    Bf16,
+    Bf16Chain,
+}
+
+impl Arithmetic {
+    /// What this context's decoder was set to (`H3_VAE_GEMM`). The context
+    /// parsed the variable when it was created, so the host asks it instead of
+    /// reading the same variable a second time and risking a different answer.
+    fn of(gpu: &Gpu) -> Arithmetic {
+        if gpu.vae_bf16_chain() {
+            Arithmetic::Bf16Chain
+        } else if gpu.vae_bf16_operands() {
+            Arithmetic::Bf16
+        } else {
+            Arithmetic::F32
+        }
+    }
+
+    /// Whether the block's activations live in BF16 rather than F32.
+    fn bf16_buffers(self) -> bool {
+        self == Arithmetic::Bf16Chain
+    }
+
+    /// Whether the block projections take BF16 operands and a BF16 result, in
+    /// either arm: the checkpoint's weights are loaded narrowed either way.
+    fn bf16_weights(self) -> bool {
+        self != Arithmetic::F32
+    }
+}
+
+/// The arm's scratch: one activation and one result, BF16, sized to the largest
+/// of the four projections (`sequence * FFN` in and `sequence * FFN * 2` out,
+/// both `w1` and `w2`), so one pair serves the block's whole chain.
+struct Narrow {
+    activations: Tensor,
+    results: Tensor,
 }
 
 /// The projections around the blocks (`load_input_weights` `:205-220`,
@@ -260,43 +425,44 @@ pub struct Decoder {
     sequence: usize,
     rope_cos: Tensor,
     rope_sin: Tensor,
+    /// Present exactly when the context's `H3_VAE_GEMM` is `bf16i`.
+    narrow: Option<Narrow>,
+    /// Which arithmetic the buffers and the primitives use (`H3_VAE_GEMM`).
+    arithmetic: Arithmetic,
     mean: Vec<f32>,
     deviation: Vec<f32>,
 }
 
-fn load_block(store: &Store, gpu: &Gpu, index: usize) -> Result<Block, VaeError> {
+fn load_block(
+    store: &Store,
+    gpu: &Gpu,
+    index: usize,
+    arithmetic: Arithmetic,
+) -> Result<Block, VaeError> {
     let prefix = format!("decoder.transformer_blocks.{index}.");
     let name = |suffix: &str| format!("{prefix}{suffix}");
+    // The arm's four projections are loaded already rounded, which is the only
+    // difference between the arms at load: the checkpoint is F32 either way.
+    let projection = |suffix: &str, rows: u64, columns: u64| -> Result<Weight, VaeError> {
+        let name = name(suffix);
+        Ok(if arithmetic.bf16_weights() {
+            Weight::Bf16(f2_bf16(store, gpu, &name, rows, columns)?)
+        } else {
+            Weight::F32(f2(store, gpu, &name, rows, columns)?)
+        })
+    };
 
     Ok(Block {
         norm1: f1(store, gpu, &name("norm1.weight"), HIDDEN as u64)?,
-        qkv_w: f2(
-            store,
-            gpu,
-            &name("attn.to_qkv.weight"),
-            (INNER * 3) as u64,
-            HIDDEN as u64,
-        )?,
+        qkv_w: projection("attn.to_qkv.weight", (INNER * 3) as u64, HIDDEN as u64)?,
         qkv_b: f1(store, gpu, &name("attn.to_qkv.bias"), (INNER * 3) as u64)?,
-        out_w: f2(
-            store,
-            gpu,
-            &name("attn.to_out.weight"),
-            HIDDEN as u64,
-            INNER as u64,
-        )?,
+        out_w: projection("attn.to_out.weight", HIDDEN as u64, INNER as u64)?,
         out_b: f1(store, gpu, &name("attn.to_out.bias"), HIDDEN as u64)?,
         scale1: f1(store, gpu, &name("scale1"), HIDDEN as u64)?,
         norm2: f1(store, gpu, &name("norm2.weight"), HIDDEN as u64)?,
-        w1: f2(
-            store,
-            gpu,
-            &name("ff.w1.weight"),
-            (FFN * 2) as u64,
-            HIDDEN as u64,
-        )?,
+        w1: projection("ff.w1.weight", (FFN * 2) as u64, HIDDEN as u64)?,
         w1_b: f1(store, gpu, &name("ff.w1.bias"), (FFN * 2) as u64)?,
-        w2: f2(store, gpu, &name("ff.w2.weight"), HIDDEN as u64, FFN as u64)?,
+        w2: projection("ff.w2.weight", HIDDEN as u64, FFN as u64)?,
         w2_b: f1(store, gpu, &name("ff.w2.bias"), HIDDEN as u64)?,
         scale2: f1(store, gpu, &name("scale2"), HIDDEN as u64)?,
     })
@@ -382,18 +548,31 @@ fn prepare_input_rows(
 
 impl Decoder {
     /// Load the whole decoder for one tile shape and build its RoPE tables.
+    /// `arms` is applied before the weights are read: the BF16 arm's weights
+    /// are narrowed as they load, so the choice cannot come later.
     pub fn load(
         directory: &Path,
         latent_height: usize,
         latent_width: usize,
         mean: Vec<f32>,
         deviation: Vec<f32>,
+        arms: Arms,
     ) -> Result<Decoder, VaeError> {
         if latent_height < 1 || latent_width < 1 {
             return fail("invalid video VAE latent shape");
         }
         let gpu = device(Gpu::create())?;
+        apply_arms(&gpu, arms)?;
         let store = Store::open(directory, "video VAE")?;
+        let arithmetic = Arithmetic::of(&gpu);
+        // The chain's attention runs on BF16 Q/K/V, which only the tensor-core
+        // kernel serves; refusing here names the combination instead of leaving
+        // the decode to fail inside a launch.
+        if arithmetic.bf16_buffers() && !gpu.vae_attention_mma() {
+            return fail(
+                "the bf16a chain needs the tensor-core attention (H3_VAE_ATTENTION=tensor)",
+            );
+        }
 
         let patches = CHUNK_LATENT_TIME * latent_height * latent_width;
         let sequence = patches + SUFFIX;
@@ -434,7 +613,7 @@ impl Decoder {
         };
         let mut blocks = Vec::with_capacity(LAYERS);
         for index in 0..LAYERS {
-            blocks.push(load_block(&store, &gpu, index)?);
+            blocks.push(load_block(&store, &gpu, index, arithmetic)?);
         }
         drop(store);
 
@@ -442,6 +621,17 @@ impl Decoder {
         upload_f32(&gpu, &rope_cos, &cosines)?;
         let rope_sin = f32_alloc(&gpu, sequence * ROPE_HALF as usize)?;
         upload_f32(&gpu, &rope_sin, &sines)?;
+
+        // The `bf16i` arm narrows and widens around every projection; the
+        // `bf16a` chain has no such pass to make.
+        let narrow = if arithmetic == Arithmetic::Bf16 {
+            Some(Narrow {
+                activations: bf16_alloc(&gpu, sequence * FFN)?,
+                results: bf16_alloc(&gpu, sequence * FFN * 2)?,
+            })
+        } else {
+            None
+        };
 
         Ok(Decoder {
             gpu,
@@ -451,12 +641,211 @@ impl Decoder {
             sequence,
             rope_cos,
             rope_sin,
+            narrow,
+            arithmetic,
             mean,
             deviation,
         })
     }
 
+    /// One block projection: the reference's F32 linear, or the arm's narrow,
+    /// compute, widen. The scratch is the largest of the four, so no shape in
+    /// the block can overflow it, and a widened result is the same value a
+    /// consumer would read had the GEMM written F32 itself.
+    fn project(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Weight,
+        rows: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+
+        match weight {
+            Weight::F32(weight) => {
+                device(gpu.vae_linear(output, input, weight, None, rows, input_dim, output_dim))
+            }
+            Weight::Bf16(weight) => {
+                // The chain's buffers are already BF16, so the projection is
+                // one call and its result is what the next primitive reads.
+                if self.arithmetic == Arithmetic::Bf16Chain {
+                    return device(
+                        gpu.vae_linear_bf16(output, input, weight, rows, input_dim, output_dim),
+                    );
+                }
+                let narrow = self
+                    .narrow
+                    .as_ref()
+                    .ok_or_else(|| VaeError("video VAE BF16 arm has no scratch".into()))?;
+                let activations = rows as usize * input_dim as usize;
+                let results = rows as usize * output_dim as usize;
+
+                device(gpu.cast_narrow(&narrow.activations, input, activations))?;
+                device(gpu.vae_linear_bf16(
+                    &narrow.results,
+                    &narrow.activations,
+                    weight,
+                    rows,
+                    input_dim,
+                    output_dim,
+                ))?;
+                device(gpu.cast_widen(output, &narrow.results, results))
+            }
+        }
+    }
+
     /// One block (`run_block`, `:423-456`) in the reference's op order.
+    /// The block's RMS norm over whichever element type its buffers hold.
+    fn rms_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        weight: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.rms_norm_bf16(output, input, weight, rows, width, EPSILON))
+            }
+            _ => device(gpu.rms_norm_f32(output, input, weight, rows, width, EPSILON)),
+        }
+    }
+
+    /// The Q/K RMS and the pair rotation, over the QKV row's element type.
+    fn qkv_rope(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        qkv: &Tensor,
+        bias: &Tensor,
+        rows: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => device(gpu.video_qkv_rope_bf16(
+                query,
+                key,
+                value,
+                qkv,
+                Some(bias),
+                &self.rope_cos,
+                &self.rope_sin,
+                rows,
+                HEADS,
+                HEAD_DIM,
+                ROPE_HALF,
+                EPSILON,
+            )),
+            _ => device(gpu.video_qkv_rope_f32(
+                query,
+                key,
+                value,
+                qkv,
+                Some(bias),
+                &self.rope_cos,
+                &self.rope_sin,
+                rows,
+                HEADS,
+                HEAD_DIM,
+                ROPE_HALF,
+                EPSILON,
+            )),
+        }
+    }
+
+    /// The block attention: the F32 tensor-core kernel, or its BF16 twin.
+    fn attention(
+        &self,
+        output: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        rows: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.sdpa_bf16(output, query, key, value, rows, HEADS, HEAD_DIM, scale))
+            }
+            _ => device(gpu.sdpa_f32(output, query, key, value, rows, HEADS, HEAD_DIM, scale)),
+        }
+    }
+
+    /// SwiGLU of the fused row, in the buffers' element type.
+    fn swiglu(
+        &self,
+        output: &Tensor,
+        fused: &Tensor,
+        bias: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.swiglu_bf16(output, fused, Some(bias), rows, width))
+            }
+            _ => device(gpu.swiglu_f32(output, fused, Some(bias), rows, width)),
+        }
+    }
+
+    /// `residual + branch * scale`, writing the residual stream back in place.
+    fn scale_add(
+        &self,
+        hidden: &Tensor,
+        branch: &Tensor,
+        bias: &Tensor,
+        scale: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => {
+                device(gpu.scale_add_bf16(hidden, hidden, branch, Some(bias), scale, rows, width))
+            }
+            _ => device(gpu.scale_add_f32(hidden, hidden, branch, Some(bias), scale, rows, width)),
+        }
+    }
+
+    /// The tile's output layer norm: `out` is the F32 buffer the `proj_out`
+    /// GEMM reads, which the chain keeps separately from its BF16 `norm`.
+    fn layer_norm(
+        &self,
+        output: &Tensor,
+        input: &Tensor,
+        rows: u32,
+        width: u32,
+    ) -> Result<(), VaeError> {
+        let gpu = &self.gpu;
+        match self.arithmetic {
+            Arithmetic::Bf16Chain => device(gpu.layer_norm_bf16(
+                output,
+                input,
+                &self.parts.norm_out_w,
+                &self.parts.norm_out_b,
+                rows,
+                width,
+                EPSILON,
+            )),
+            _ => device(gpu.layer_norm_f32(
+                output,
+                input,
+                &self.parts.norm_out_w,
+                &self.parts.norm_out_b,
+                rows,
+                width,
+                EPSILON,
+            )),
+        }
+    }
+
     fn run_block(
         &self,
         block: &Block,
@@ -464,111 +853,95 @@ impl Decoder {
         buffers: &Buffers,
         rows: u32,
     ) -> Result<(), VaeError> {
-        let gpu = &self.gpu;
-
-        device(gpu.rms_norm_f32(
-            &buffers.norm,
-            hidden,
-            &block.norm1,
-            rows,
-            HIDDEN as u32,
-            EPSILON,
-        ))?;
-        device(gpu.linear(
+        self.rms_norm(&buffers.norm, hidden, &block.norm1, rows, HIDDEN as u32)?;
+        self.project(
             &buffers.qkv,
             &buffers.norm,
             &block.qkv_w,
-            Some(&block.qkv_b),
             rows,
             HIDDEN as u32,
             (INNER * 3) as u32,
-            Dtype::F32,
-        ))?;
-        device(gpu.video_qkv_rope_f32(
+        )?;
+        self.qkv_rope(
             &buffers.query,
             &buffers.key,
             &buffers.value,
             &buffers.qkv,
-            &self.rope_cos,
-            &self.rope_sin,
+            &block.qkv_b,
             rows,
-            HEADS,
-            HEAD_DIM,
-            ROPE_HALF,
-            EPSILON,
-        ))?;
-        device(gpu.sdpa_f32(
+        )?;
+        self.attention(
             &buffers.heads,
             &buffers.query,
             &buffers.key,
             &buffers.value,
             rows,
-            HEADS,
-            HEAD_DIM,
-            1.0f32 / (HEAD_DIM as f32).sqrt(),
-        ))?;
-        device(gpu.linear(
+        )?;
+        self.project(
             &buffers.branch,
             &buffers.heads,
             &block.out_w,
-            Some(&block.out_b),
             rows,
             INNER as u32,
             HIDDEN as u32,
-            Dtype::F32,
-        ))?;
-        device(gpu.scale_add_f32(
-            hidden,
+        )?;
+        self.scale_add(
             hidden,
             &buffers.branch,
+            &block.out_b,
             &block.scale1,
             rows,
             HIDDEN as u32,
-        ))?;
+        )?;
 
-        device(gpu.rms_norm_f32(
-            &buffers.norm,
-            hidden,
-            &block.norm2,
-            rows,
-            HIDDEN as u32,
-            EPSILON,
-        ))?;
-        device(gpu.linear(
+        self.rms_norm(&buffers.norm, hidden, &block.norm2, rows, HIDDEN as u32)?;
+        self.project(
             &buffers.ff1,
             &buffers.norm,
             &block.w1,
-            Some(&block.w1_b),
             rows,
             HIDDEN as u32,
             (FFN * 2) as u32,
-            Dtype::F32,
-        ))?;
-        device(gpu.swiglu_f32(&buffers.activated, &buffers.ff1, rows, FFN as u32))?;
-        device(gpu.linear(
+        )?;
+        self.swiglu(
+            &buffers.activated,
+            &buffers.ff1,
+            &block.w1_b,
+            rows,
+            FFN as u32,
+        )?;
+        self.project(
             &buffers.branch,
             &buffers.activated,
             &block.w2,
-            Some(&block.w2_b),
             rows,
             FFN as u32,
             HIDDEN as u32,
-            Dtype::F32,
-        ))?;
-        device(gpu.scale_add_f32(
-            hidden,
+        )?;
+        self.scale_add(
             hidden,
             &buffers.branch,
+            &block.w2_b,
             &block.scale2,
             rows,
             HIDDEN as u32,
-        ))?;
+        )?;
         Ok(())
     }
 
     /// `run_resident_tile` (`:533-578`): one tile through every block, then
-    /// the output layer norm and projection, read back as F32 rows.
-    fn run_tile(&self, scratch: &TileScratch, rows_input: &[f32]) -> Result<Vec<f32>, VaeError> {
+    /// the output layer norm and projection, read back as F32 rows into `out`.
+    ///
+    /// `out` is the caller's buffer, reused tile after tile: the readback is
+    /// 31 MB per tile and 54 tiles to a render, and the byte form of it cost a
+    /// fresh 31 MB buffer and a `f32::from_le_bytes` pass over 7.8 million
+    /// words on every one of them.
+    fn run_tile(
+        &self,
+        scratch: &TileScratch,
+        rows_input: &[f32],
+        out: &mut Vec<f32>,
+    ) -> Result<(), VaeError> {
         let gpu = &self.gpu;
         let patches = self.patches;
         let rows = u32::try_from(self.sequence)
@@ -580,7 +953,7 @@ impl Decoder {
         let buffers = &scratch.buffers;
         let (post, patch_hidden, zero) = (&scratch.post, &scratch.patch_hidden, &scratch.zero);
 
-        device(gpu.linear(
+        device(gpu.vae_linear(
             post,
             &latent,
             &self.parts.post_w,
@@ -588,9 +961,8 @@ impl Decoder {
             patches as u32,
             LATENT_CHANNELS as u32,
             LATENT_CHANNELS as u32,
-            Dtype::F32,
         ))?;
-        device(gpu.linear(
+        device(gpu.vae_linear(
             patch_hidden,
             post,
             &self.parts.embed_w,
@@ -598,57 +970,81 @@ impl Decoder {
             patches as u32,
             LATENT_CHANNELS as u32,
             HIDDEN as u32,
-            Dtype::F32,
         ))?;
-        device(gpu.copy_f32(&buffers.hidden, 0, patch_hidden, 0, patches * HIDDEN))?;
-        device(gpu.copy_f32(
-            &buffers.hidden,
-            patches * HIDDEN,
-            &self.parts.registers,
-            0,
-            REGISTERS * HIDDEN,
-        ))?;
-        device(gpu.copy_f32(
-            &buffers.hidden,
-            (patches + REGISTERS) * HIDDEN,
-            zero,
-            0,
-            HIDDEN,
-        ))?;
+        if self.arithmetic.bf16_buffers() {
+            // The chain's one narrow: the tile's F32 embed output becomes the
+            // block's BF16 hidden, and the two constant rows are the copies
+            // `TileScratch` made once for the whole decode.
+            device(gpu.cast_narrow(&buffers.hidden, patch_hidden, patches * HIDDEN))?;
+            let registers = scratch
+                .chain_registers
+                .as_ref()
+                .ok_or_else(|| VaeError("video VAE chain has no register copy".into()))?;
+            let chain_zero = scratch
+                .chain_zero
+                .as_ref()
+                .ok_or_else(|| VaeError("video VAE chain has no zero row".into()))?;
+            device(gpu.copy(
+                &buffers.hidden,
+                patches * HIDDEN,
+                registers,
+                0,
+                REGISTERS * HIDDEN,
+            ))?;
+            device(gpu.copy(
+                &buffers.hidden,
+                (patches + REGISTERS) * HIDDEN,
+                chain_zero,
+                0,
+                HIDDEN,
+            ))?;
+        } else {
+            device(gpu.copy_f32(&buffers.hidden, 0, patch_hidden, 0, patches * HIDDEN))?;
+            device(gpu.copy_f32(
+                &buffers.hidden,
+                patches * HIDDEN,
+                &self.parts.registers,
+                0,
+                REGISTERS * HIDDEN,
+            ))?;
+            device(gpu.copy_f32(
+                &buffers.hidden,
+                (patches + REGISTERS) * HIDDEN,
+                zero,
+                0,
+                HIDDEN,
+            ))?;
+        }
 
         for block in &self.blocks {
             self.run_block(block, &buffers.hidden, buffers, rows)?;
         }
 
-        device(gpu.layer_norm_f32(
-            &buffers.norm,
-            &buffers.hidden,
-            &self.parts.norm_out_w,
-            &self.parts.norm_out_b,
-            rows,
-            HIDDEN as u32,
-            EPSILON,
-        ))?;
-        device(gpu.linear(
+        let norm_out = match &scratch.outer {
+            Some(outer) => outer,
+            None => &buffers.norm,
+        };
+        self.layer_norm(norm_out, &buffers.hidden, rows, HIDDEN as u32)?;
+        device(gpu.vae_linear(
             &buffers.projected,
-            &buffers.norm,
+            norm_out,
             &self.parts.proj_w,
             Some(&self.parts.proj_b),
             rows,
             HIDDEN as u32,
             OUTPUT_PATCH as u32,
-            Dtype::F32,
         ))?;
         device(gpu.sync())?;
 
-        let mut bytes = vec![0u8; self.sequence * OUTPUT_PATCH * 4];
-        device(gpu.read(&buffers.projected, &mut bytes))?;
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| f32::from_le_bytes(*word))
-            .collect())
+        // Sized once and then reused: the readback overwrites every byte, so a
+        // resize that zeroes 31 MB on each of 54 tiles would be the same waste
+        // this change removes.
+        let elements = self.sequence * OUTPUT_PATCH;
+        if out.len() != elements {
+            out.resize(elements, 0.0);
+        }
+        device(gpu.read_f32(&buffers.projected, out))?;
+        Ok(())
     }
 }
 
@@ -668,18 +1064,29 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn new(gpu: &Gpu, sequence: usize) -> Result<Buffers, VaeError> {
+    /// The block's activations in the arm's element type: F32 for the reference
+    /// and `bf16i` paths, BF16 for the `bf16a` chain, whose primitives read and
+    /// write BF16 and never widen. `projected` stays F32 either way: it is the
+    /// readback the frames are cut from.
+    fn new(gpu: &Gpu, sequence: usize, arithmetic: Arithmetic) -> Result<Buffers, VaeError> {
+        let alloc = |elements: usize| {
+            if arithmetic.bf16_buffers() {
+                bf16_alloc(gpu, elements)
+            } else {
+                f32_alloc(gpu, elements)
+            }
+        };
         Ok(Buffers {
-            hidden: f32_alloc(gpu, sequence * HIDDEN)?,
-            norm: f32_alloc(gpu, sequence * HIDDEN)?,
-            qkv: f32_alloc(gpu, sequence * INNER * 3)?,
-            query: f32_alloc(gpu, sequence * INNER)?,
-            key: f32_alloc(gpu, sequence * INNER)?,
-            value: f32_alloc(gpu, sequence * INNER)?,
-            heads: f32_alloc(gpu, sequence * INNER)?,
-            branch: f32_alloc(gpu, sequence * HIDDEN)?,
-            ff1: f32_alloc(gpu, sequence * FFN * 2)?,
-            activated: f32_alloc(gpu, sequence * FFN)?,
+            hidden: alloc(sequence * HIDDEN)?,
+            norm: alloc(sequence * HIDDEN)?,
+            qkv: alloc(sequence * INNER * 3)?,
+            query: alloc(sequence * INNER)?,
+            key: alloc(sequence * INNER)?,
+            value: alloc(sequence * INNER)?,
+            heads: alloc(sequence * INNER)?,
+            branch: alloc(sequence * HIDDEN)?,
+            ff1: alloc(sequence * FFN * 2)?,
+            activated: alloc(sequence * FFN)?,
             projected: f32_alloc(gpu, sequence * OUTPUT_PATCH)?,
         })
     }
@@ -698,18 +1105,42 @@ struct TileScratch {
     post: Tensor,
     patch_hidden: Tensor,
     zero: Tensor,
+    /// The `bf16a` chain's entry: the tile's F32 embed output, the register
+    /// tokens and the zero suffix row, narrowed once here instead of once a
+    /// projection. `None` on the F32 and `bf16i` paths.
+    chain_registers: Option<Tensor>,
+    chain_zero: Option<Tensor>,
+    /// The chain's output layer norm target, which it keeps F32 because the
+    /// `proj_out` GEMM runs on F32 operands. `None` off the chain.
+    outer: Option<Tensor>,
 }
 
 impl TileScratch {
-    fn new(gpu: &Gpu, patches: usize, sequence: usize) -> Result<TileScratch, VaeError> {
+    fn new(decoder: &Decoder, patches: usize, sequence: usize) -> Result<TileScratch, VaeError> {
+        let gpu = &decoder.gpu;
         let zero = f32_alloc(gpu, HIDDEN)?;
         upload_f32(gpu, &zero, &[0.0f32; HIDDEN])?;
 
+        let chain = decoder.arithmetic.bf16_buffers();
+        let (chain_registers, chain_zero, outer) = if chain {
+            let registers = bf16_alloc(gpu, REGISTERS * HIDDEN)?;
+            device(gpu.cast_narrow(&registers, &decoder.parts.registers, REGISTERS * HIDDEN))?;
+            let chain_zero = bf16_alloc(gpu, HIDDEN)?;
+            device(gpu.cast_narrow(&chain_zero, &zero, HIDDEN))?;
+            let outer = f32_alloc(gpu, sequence * HIDDEN)?;
+            (Some(registers), Some(chain_zero), Some(outer))
+        } else {
+            (None, None, None)
+        };
+
         Ok(TileScratch {
-            buffers: Buffers::new(gpu, sequence)?,
+            buffers: Buffers::new(gpu, sequence, decoder.arithmetic)?,
             post: f32_alloc(gpu, patches * LATENT_CHANNELS)?,
             patch_hidden: f32_alloc(gpu, patches * HIDDEN)?,
             zero,
+            chain_registers,
+            chain_zero,
+            outer,
         })
     }
 }
@@ -886,8 +1317,225 @@ fn extract_latent_tile(
     tile
 }
 
+/// What a finished chunk's worker hands back: the stitched frames, the two host
+/// costs it measured, and how many tiles it unpacked.
+struct ChunkDone {
+    frames: Frames,
+    unpacked: Duration,
+    stitched: Duration,
+    tiles: usize,
+}
+
+/// One unit of work for the unpack/stitch worker: a tile's projection, or the
+/// end of a chunk (which is when that chunk's tiles are stitched).
+enum LaundryJob {
+    Tile(Vec<f32>),
+    End,
+}
+
+/// What the worker needs that does not change inside one decode.
+struct Geometry<'a> {
+    tile_h: usize,
+    tile_w: usize,
+    total_frames: usize,
+    first_frame: usize,
+    frame_count: usize,
+    y_axis: &'a TileAxis,
+    x_axis: &'a TileAxis,
+}
+
+/// The video VAE's host work, behind the stream: `unpack_frames` per tile and
+/// `stitch_tiles` per chunk, both of which only need that tile's own readback.
+///
+/// The buffers are recycled - the worker hands each one back through `spare` -
+/// so no projection is ever copied or reallocated, and neither channel can
+/// block: exactly as many buffers exist as the pool holds, and the results
+/// channel is unbounded, so a chunk's `End` is never waiting on the main thread.
+fn laundry_worker(
+    work: std::sync::mpsc::Receiver<LaundryJob>,
+    spare: std::sync::mpsc::SyncSender<Vec<f32>>,
+    results: std::sync::mpsc::Sender<Result<ChunkDone, VaeError>>,
+    geometry: Geometry<'_>,
+) {
+    let mut tiles: Vec<Vec<f32>> = Vec::new();
+    let mut unpacked = Duration::ZERO;
+    for job in work.iter() {
+        match job {
+            LaundryJob::Tile(projected) => {
+                let started = Instant::now();
+                match unpack_frames(
+                    &projected,
+                    geometry.tile_h,
+                    geometry.tile_w,
+                    geometry.total_frames,
+                    geometry.first_frame,
+                    geometry.frame_count,
+                ) {
+                    Ok(rgb) => {
+                        tiles.push(rgb);
+                        unpacked += started.elapsed();
+                    }
+                    Err(error) => {
+                        let _ = results.send(Err(error));
+                        return;
+                    }
+                }
+                let _ = spare.send(projected);
+            }
+            LaundryJob::End => {
+                let started = Instant::now();
+                let frames =
+                    stitch_tiles(&tiles, geometry.y_axis, geometry.x_axis, geometry.frame_count);
+                let done = ChunkDone {
+                    frames,
+                    unpacked,
+                    stitched: started.elapsed(),
+                    tiles: tiles.len(),
+                };
+                if results.send(Ok(done)).is_err() {
+                    return;
+                }
+                tiles = Vec::new();
+                unpacked = Duration::ZERO;
+            }
+        }
+    }
+}
+
+/// The worker and the two channels, alive for as long as the chunks it serves.
+struct Laundry<'scope> {
+    jobs: std::sync::mpsc::SyncSender<LaundryJob>,
+    results: std::sync::mpsc::Receiver<Result<ChunkDone, VaeError>>,
+    spare: std::sync::mpsc::Receiver<Vec<f32>>,
+    pool: Vec<Vec<f32>>,
+    worker: std::thread::ScopedJoinHandle<'scope, ()>,
+}
+
+impl<'scope> Laundry<'scope> {
+    fn start<'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        geometry: Geometry<'scope>,
+        elements: usize,
+    ) -> Laundry<'scope> {
+        let (jobs, work) = std::sync::mpsc::sync_channel::<LaundryJob>(2);
+        let (spare, recycled) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let (results, finished) = std::sync::mpsc::channel::<Result<ChunkDone, VaeError>>();
+        let worker = scope.spawn(move || laundry_worker(work, spare, results, geometry));
+        Laundry {
+            jobs,
+            results: finished,
+            spare: recycled,
+            pool: vec![vec![0.0f32; elements], vec![0.0f32; elements]],
+            worker,
+        }
+    }
+
+    /// A projection buffer, from the pool or back from the worker.
+    fn buffer(&mut self) -> Result<Vec<f32>, VaeError> {
+        while let Ok(buffer) = self.spare.try_recv() {
+            self.pool.push(buffer);
+        }
+        match self.pool.pop() {
+            Some(buffer) => Ok(buffer),
+            None => self
+                .spare
+                .recv()
+                .map_err(|_| VaeError("the video VAE unpack worker stopped".into())),
+        }
+    }
+
+    fn send(&self, buffer: Vec<f32>) -> Result<(), VaeError> {
+        self.jobs
+            .send(LaundryJob::Tile(buffer))
+            .map_err(|_| VaeError("the video VAE unpack worker stopped".into()))
+    }
+
+    fn end_chunk(&self) -> Result<(), VaeError> {
+        self.jobs
+            .send(LaundryJob::End)
+            .map_err(|_| VaeError("the video VAE unpack worker stopped".into()))
+    }
+
+    /// The chunk that finished earliest and has not been taken yet.
+    fn take(&self) -> Result<ChunkDone, VaeError> {
+        self.results
+            .recv()
+            .map_err(|_| VaeError("the video VAE unpack worker stopped".into()))?
+    }
+
+    fn finish(self) {
+        let Laundry { jobs, worker, .. } = self;
+        drop(jobs);
+        let _ = worker.join();
+    }
+}
+
+/// One chunk's tiles through the graph, in tile order: extract, normalize,
+/// launch, read back, and hand the projection to the worker. Nothing here
+/// waits for the unpack, which is the point.
+#[allow(clippy::too_many_arguments)]
+fn run_chunk_tiles(
+    decoder: &Decoder,
+    scratch: &TileScratch,
+    laundry: &mut Laundry<'_>,
+    latent: &[f32],
+    latent_time: usize,
+    chunk: usize,
+    full_h: usize,
+    full_w: usize,
+    y_axis: &TileAxis,
+    x_axis: &TileAxis,
+) -> Result<(Duration, Duration), VaeError> {
+    let tile_h = y_axis.length / SPATIAL_RATIO;
+    let tile_w = x_axis.length / SPATIAL_RATIO;
+    let mut extracted = Duration::ZERO;
+    let mut graphed = Duration::ZERO;
+
+    for tile_y in 0..y_axis.count() {
+        for tile_x in 0..x_axis.count() {
+            let mut buffer = laundry.buffer()?;
+
+            let started = Instant::now();
+            let input = extract_latent_tile(
+                latent,
+                latent_time,
+                full_h,
+                full_w,
+                chunk * CHUNK_OVERLAP,
+                y_axis.starts[tile_y] / SPATIAL_RATIO,
+                x_axis.starts[tile_x] / SPATIAL_RATIO,
+                tile_h,
+                tile_w,
+            );
+            let rows =
+                prepare_input_rows(&input, tile_h, tile_w, &decoder.mean, &decoder.deviation);
+            extracted += started.elapsed();
+
+            let started = Instant::now();
+            decoder.run_tile(scratch, &rows, &mut buffer)?;
+            graphed += started.elapsed();
+            laundry.send(buffer)?;
+        }
+    }
+    Ok((extracted, graphed))
+}
+
 /// One chunk (`decoder_decode_chunk`, `:831-951`): every tile through the
 /// graph, then one stitched frame set.
+///
+/// The graph call is one stream, and the phase used to stop that stream twice
+/// per tile and once per chunk: the readback waits for the tile, then the host
+/// unpacks 26 MB of projection and, at the chunk's end, stitches fifteen tiles
+/// before the next chunk's first kernel can be submitted. In an nsys capture of
+/// the unchanged decoder that is 98 tile-boundary gaps of 11.8 ms (1.16 s) and
+/// 6 chunk-boundary gaps of 115 ms (0.69 s). The readback stays on the calling
+/// thread - it is the wait the tile's own kernels impose - and both pieces of
+/// host arithmetic run on a worker, which took the phase from 47.068 / 46.598 s
+/// to 46.342 / 45.837 s on the product canvas. `--vae-workers 2` was measured as
+/// the alternative and is slower (47.632 against 47.133 s: a second decoder's
+/// load and stream cost more than the gaps they hide), and hoisting this worker
+/// across the whole chunk loop was tried and did not beat it either (see the
+/// loop in `decode_with`).
 #[allow(clippy::too_many_arguments)]
 fn decode_chunk(
     decoder: &Decoder,
@@ -902,9 +1550,6 @@ fn decode_chunk(
     total_frames: usize,
     selected: Option<usize>,
 ) -> Result<Frames, VaeError> {
-    let tile_h = y_axis.length / SPATIAL_RATIO;
-    let tile_w = x_axis.length / SPATIAL_RATIO;
-    let mut tiles = Vec::with_capacity(y_axis.count() * x_axis.count());
     // `h3_video_vae.c:850`: a preview asks for one frame, so only that frame
     // is unpacked per tile (`:874-877`) instead of the whole chunk.
     let (first_frame, frame_count) = match selected {
@@ -918,35 +1563,49 @@ fn decode_chunk(
             },
         ),
     };
+    let elements = decoder.sequence * OUTPUT_PATCH;
 
-    for tile_y in 0..y_axis.count() {
-        for tile_x in 0..x_axis.count() {
-            let input = extract_latent_tile(
-                latent,
-                latent_time,
-                full_h,
-                full_w,
-                chunk * CHUNK_OVERLAP,
-                y_axis.starts[tile_y] / SPATIAL_RATIO,
-                x_axis.starts[tile_x] / SPATIAL_RATIO,
-                tile_h,
-                tile_w,
-            );
-            let rows =
-                prepare_input_rows(&input, tile_h, tile_w, &decoder.mean, &decoder.deviation);
-            let projected = decoder.run_tile(scratch, &rows)?;
-            tiles.push(unpack_frames(
-                &projected,
-                tile_h,
-                tile_w,
-                total_frames,
-                first_frame,
-                frame_count,
-            )?);
-        }
+    std::thread::scope(|scope| {
+        let geometry = Geometry {
+            tile_h: y_axis.length / SPATIAL_RATIO,
+            tile_w: x_axis.length / SPATIAL_RATIO,
+            total_frames,
+            first_frame,
+            frame_count,
+            y_axis,
+            x_axis,
+        };
+        let mut laundry = Laundry::start(scope, geometry, elements);
+        let (extracted, graphed) = run_chunk_tiles(
+            decoder, scratch, &mut laundry, latent, latent_time, chunk, full_h, full_w, y_axis,
+            x_axis,
+        )?;
+        laundry.end_chunk()?;
+        let done = laundry.take()?;
+        report_chunk(chunk, extracted, graphed, &done);
+        laundry.finish();
+        Ok(done.frames)
+    })
+}
+
+/// `H3_VAE_TIMING=1` splits the phase's host time: the latent tile's extraction
+/// and normalization and the graph call (which carries the readback wait) are
+/// the submitting thread's; the unpack and the stitch are the worker's, and
+/// they run behind the graph, so those two figures are what the phase no longer
+/// spends in front of the stream.
+fn report_chunk(chunk: usize, extracted: Duration, graphed: Duration, done: &ChunkDone) {
+    if std::env::var_os("H3_VAE_TIMING").is_none() {
+        return;
     }
-
-    Ok(stitch_tiles(&tiles, y_axis, x_axis, frame_count))
+    eprintln!(
+        "vae chunk {chunk}: extract {:.3}s graph {:.3}s unpack {:.3}s stitch {:.3}s \
+         ({} tiles, unpack and stitch on a worker)",
+        extracted.as_secs_f64(),
+        graphed.as_secs_f64(),
+        done.unpacked.as_secs_f64(),
+        done.stitched.as_secs_f64(),
+        done.tiles
+    );
 }
 
 /// `load_latent_normalization` (`:271-318`): `latents_mean` and `latents_std`
@@ -1023,13 +1682,14 @@ impl PreviewDecoder {
         weight_directory: &Path,
         latent_h: usize,
         latent_w: usize,
+        arms: Arms,
     ) -> Result<PreviewDecoder, VaeError> {
         if latent_h < 1 || latent_w < 1 {
             return fail("invalid video VAE latent shape");
         }
         let pixel_h = latent_h * SPATIAL_RATIO;
         let pixel_w = latent_w * SPATIAL_RATIO;
-        let tile_pixels = configured_tile_pixels(pixel_h, pixel_w);
+        let tile_pixels = configured_tile_pixels(pixel_h, pixel_w, None);
         let y_axis = tile_axis(pixel_h, tile_pixels)?;
         let x_axis = tile_axis(pixel_w, tile_pixels)?;
         let (mean, deviation) = latent_normalization(weight_directory)?;
@@ -1039,6 +1699,7 @@ impl PreviewDecoder {
             x_axis.length / SPATIAL_RATIO,
             mean,
             deviation,
+            arms,
         )?;
 
         Ok(PreviewDecoder {
@@ -1071,11 +1732,7 @@ impl PreviewDecoder {
         if global_frame >= output_frames {
             global_frame = output_frames - 1;
         }
-        let scratch = TileScratch::new(
-            &self.decoder.gpu,
-            self.decoder.patches,
-            self.decoder.sequence,
-        )?;
+        let scratch = TileScratch::new(&self.decoder, self.decoder.patches, self.decoder.sequence)?;
         let frames = decode_chunk(
             &self.decoder,
             &scratch,
@@ -1102,6 +1759,38 @@ pub fn decode(
     latent_time: usize,
     latent_h: usize,
     latent_w: usize,
+    arms: Arms,
+) -> Result<Frames, VaeError> {
+    decode_with(
+        weight_directory,
+        latent,
+        latent_time,
+        latent_h,
+        latent_w,
+        arms,
+        1,
+        None,
+    )
+}
+
+/// [`decode`] with the chunk loop spread over `workers` device contexts.
+///
+/// The chunks are independent: `decode_chunk` reads the latent and its own
+/// chunk index and nothing else, and the five-frame overlap between neighbours
+/// is blended afterwards from their own outputs (`:1105-1113`). Each worker
+/// builds its own decoder, and so its own context and stream, because a
+/// context is one stream: fifteen tiles waiting behind each other in one
+/// stream is the whole cost of this phase. The frames do not depend on the
+/// worker count - a worker only changes who runs a chunk, not what it runs.
+pub fn decode_with(
+    weight_directory: &Path,
+    latent: &[f32],
+    latent_time: usize,
+    latent_h: usize,
+    latent_w: usize,
+    arms: Arms,
+    workers: usize,
+    tile: Option<usize>,
 ) -> Result<Frames, VaeError> {
     let (chunks, output_frames) = chunk_plan(latent_time)?;
     if latent_h < 1 || latent_w < 1 {
@@ -1109,7 +1798,7 @@ pub fn decode(
     }
     let pixel_h = latent_h * SPATIAL_RATIO;
     let pixel_w = latent_w * SPATIAL_RATIO;
-    let tile_pixels = configured_tile_pixels(pixel_h, pixel_w);
+    let tile_pixels = configured_tile_pixels(pixel_h, pixel_w, tile);
     let y_axis = tile_axis(pixel_h, tile_pixels)?;
     let x_axis = tile_axis(pixel_w, tile_pixels)?;
     if latent_time == 2 && (y_axis.count() > 1 || x_axis.count() > 1) {
@@ -1130,10 +1819,40 @@ pub fn decode(
         x_axis.length / SPATIAL_RATIO,
         mean,
         deviation,
+        arms,
     )?;
 
+    // The line a product log needs to be reproducible: the plan the reference's
+    // own rules produced and the three arms the context parsed. A timing without
+    // it cannot say which computation it measured (the F32 route and the
+    // campaign's bf16 arm differ six-fold at 1344x768).
+    eprintln!(
+        "VAE latent={}x{}x{} canvas={}x{} tile={} tiles={}x{} chunks={} frames={} gemm={} attention={} order={}",
+        latent_time,
+        latent_h,
+        latent_w,
+        pixel_w,
+        pixel_h,
+        tile_pixels,
+        x_axis.count(),
+        y_axis.count(),
+        chunks,
+        output_frames,
+        decoder.gpu.vae_gemm_name(),
+        if decoder.gpu.vae_attention_mma() {
+            "tensor"
+        } else {
+            "scalar"
+        },
+        if decoder.gpu.vae_sdpa_rows() {
+            "rows"
+        } else {
+            "heads"
+        }
+    );
+
     // One activation set for every tile of every chunk (`:1089`).
-    let scratch = TileScratch::new(&decoder.gpu, decoder.patches, decoder.sequence)?;
+    let scratch = TileScratch::new(&decoder, decoder.patches, decoder.sequence)?;
 
     // `:1226-1252`: the two-token path hands the whole latent, already padded
     // to the chunk, straight to the graph; one spatial tile, five frames, no
@@ -1146,7 +1865,8 @@ pub fn decode(
             &decoder.mean,
             &decoder.deviation,
         );
-        let projected = decoder.run_tile(&scratch, &rows)?;
+        let mut projected = Vec::new();
+        decoder.run_tile(&scratch, &rows, &mut projected)?;
         let rgb = unpack_frames(
             &projected,
             latent_h,
@@ -1164,25 +1884,188 @@ pub fn decode(
     }
 
     let frame_elements = pixel_h * pixel_w * 3;
+    let decoded = if workers > 1 && chunks > 1 {
+        let plan = Plan {
+            latent_time,
+            latent_h,
+            latent_w,
+            y_axis: y_axis.clone(),
+            x_axis: x_axis.clone(),
+            mean: decoder.mean.clone(),
+            deviation: decoder.deviation.clone(),
+        };
+        decode_chunks(weight_directory, latent, &plan, arms, chunks, workers)?
+    } else {
+        // One worker per chunk. Hoisting it across the whole loop, so that a
+        // chunk's stitch would run behind the next chunk's kernels, was tried
+        // and did not beat this shape (46.640 s and up against 46.342 / 45.837),
+        // so the simpler shape ships.
+        let mut decoded = Vec::with_capacity(chunks);
+        for chunk in 0..chunks {
+            decoded.push(decode_chunk(
+                &decoder,
+                &scratch,
+                latent,
+                latent_time,
+                chunk,
+                latent_h,
+                latent_w,
+                &y_axis,
+                &x_axis,
+                FIRST_CHUNK_FRAMES,
+                None,
+            )?);
+        }
+        decoded
+    };
+
+    assemble(decoded, chunks, frame_elements, output_frames, pixel_h, pixel_w)
+}
+
+/// What a worker needs to know that does not depend on which chunk it takes.
+struct Plan {
+    latent_time: usize,
+    latent_h: usize,
+    latent_w: usize,
+    y_axis: TileAxis,
+    x_axis: TileAxis,
+    mean: Vec<f32>,
+    deviation: Vec<f32>,
+}
+
+/// The chunk loop spread over `workers` contexts. Each worker builds its own
+/// decoder, takes chunks from a shared counter, and leaves the frames in their
+/// own slot, so the assembly reads them in clip order whatever the order they
+/// finished in.
+fn decode_chunks(
+    weight_directory: &Path,
+    latent: &[f32],
+    plan: &Plan,
+    arms: Arms,
+    chunks: usize,
+    workers: usize,
+) -> Result<Vec<Frames>, VaeError> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let next = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Frames>>> = Mutex::new((0..chunks).map(|_| None).collect());
+    let failure: Mutex<Option<String>> = Mutex::new(None);
+
+    let record = |error: VaeError| {
+        let mut slot = failure.lock().expect("decode workers do not panic");
+        if slot.is_none() {
+            *slot = Some(error.0);
+        }
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(chunks) {
+            scope.spawn(|| {
+                let mut decoder: Option<Decoder> = None;
+                let mut scratch: Option<TileScratch> = None;
+                loop {
+                    if failure
+                        .lock()
+                        .expect("decode workers do not panic")
+                        .is_some()
+                    {
+                        return;
+                    }
+                    let chunk = next.fetch_add(1, Ordering::Relaxed);
+                    if chunk >= chunks {
+                        return;
+                    }
+                    if decoder.is_none() {
+                        let built = Decoder::load(
+                            weight_directory,
+                            plan.y_axis.length / SPATIAL_RATIO,
+                            plan.x_axis.length / SPATIAL_RATIO,
+                            plan.mean.clone(),
+                            plan.deviation.clone(),
+                            arms,
+                        )
+                        .and_then(|decoder| {
+                            let scratch =
+                                TileScratch::new(&decoder, decoder.patches, decoder.sequence)?;
+                            Ok((decoder, scratch))
+                        });
+                        match built {
+                            Ok((held, held_scratch)) => {
+                                decoder = Some(held);
+                                scratch = Some(held_scratch);
+                            }
+                            Err(error) => {
+                                record(error);
+                                return;
+                            }
+                        }
+                    }
+                    let frames = decode_chunk(
+                        decoder.as_ref().expect("the decoder was just built"),
+                        scratch.as_ref().expect("the scratch was just built"),
+                        latent,
+                        plan.latent_time,
+                        chunk,
+                        plan.latent_h,
+                        plan.latent_w,
+                        &plan.y_axis,
+                        &plan.x_axis,
+                        FIRST_CHUNK_FRAMES,
+                        None,
+                    );
+                    match frames {
+                        Ok(frames) => {
+                            slots
+                                .lock()
+                                .expect("decode workers do not panic")[chunk] = Some(frames);
+                        }
+                        Err(error) => {
+                            record(error);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(detail) = failure.into_inner().expect("decode workers do not panic") {
+        return fail(detail);
+    }
+
+    slots
+        .into_inner()
+        .expect("decode workers do not panic")
+        .into_iter()
+        .enumerate()
+        .map(|(chunk, frames)| {
+            frames.ok_or_else(|| VaeError(format!("chunk {chunk} decoded nothing")))
+        })
+        .collect()
+}
+
+/// `:1105-1113`: each chunk owns `CHUNK_STRIDE` new frames and its first
+/// `CHUNK_OVERLAP` fade from the previous chunk's tail with `frame / 5`.
+fn assemble(
+    decoded: Vec<Frames>,
+    chunks: usize,
+    frame_elements: usize,
+    output_frames: usize,
+    pixel_h: usize,
+    pixel_w: usize,
+) -> Result<Frames, VaeError> {
+    if decoded.len() != chunks {
+        return fail(format!(
+            "video VAE decoded {} chunks, expected {chunks}",
+            decoded.len()
+        ));
+    }
+
     let mut final_rgb = vec![0.0f32; output_frames * frame_elements];
     let mut overlap = vec![0.0f32; CHUNK_OVERLAP * frame_elements];
 
-    for chunk in 0..chunks {
-        let mut decoded = decode_chunk(
-            &decoder,
-            &scratch,
-            latent,
-            latent_time,
-            chunk,
-            latent_h,
-            latent_w,
-            &y_axis,
-            &x_axis,
-            FIRST_CHUNK_FRAMES,
-            None,
-        )?;
-        // `:1105-1113`: the repeated 5 frames fade from the previous chunk's
-        // tail into this chunk's own prediction.
+    for (chunk, mut decoded) in decoded.into_iter().enumerate() {
         if chunk > 0 {
             for frame in 0..CHUNK_OVERLAP {
                 let alpha = frame as f32 / CHUNK_OVERLAP as f32;
@@ -1201,6 +2084,7 @@ pub fn decode(
                 [CHUNK_STRIDE * frame_elements..(CHUNK_STRIDE + CHUNK_OVERLAP) * frame_elements],
         );
     }
+
     let base = chunks * CHUNK_STRIDE * frame_elements;
     final_rgb[base..base + CHUNK_OVERLAP * frame_elements].copy_from_slice(&overlap);
 
@@ -1217,13 +2101,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stated_tile_wins_over_the_search_and_the_environment() {
+        assert_eq!(configured_tile_pixels(768, 1344, Some(512)), 512);
+        assert_eq!(configured_tile_pixels(768, 1344, Some(320)), 320);
+        assert_eq!(configured_tile_pixels(768, 1344, Some(288)), 288);
+        // Outside 256..=512, or off the 16-pixel grid: the search decides.
+        assert_ne!(configured_tile_pixels(768, 1344, Some(48)), 48);
+    }
+
+    #[test]
     fn tile_plan_matches_the_reference_at_the_released_shapes() {
-        let single = tile_axis(256, configured_tile_pixels(256, 256)).expect("256");
+        let single = tile_axis(256, configured_tile_pixels(256, 256, None)).expect("256");
         assert_eq!(single.count(), 1);
         assert_eq!(single.length, 256);
         assert!(single.overlaps.is_empty());
 
-        let wide = configured_tile_pixels(256, 512);
+        let wide = configured_tile_pixels(256, 512, None);
         assert_eq!(wide, 288);
         let axis = tile_axis(512, wide).expect("wide");
         assert_eq!(axis.count(), 2);

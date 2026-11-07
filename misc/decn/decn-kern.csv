@@ -1,0 +1,57 @@
+Generating SQLite file /home/leandro/decn.sqlite from /home/leandro/decn.nsys-rep
+Processing [/home/leandro/decn.sqlite] with [/opt/nvidia/nsight-systems/2025.3.2/host-linux-armv8/reports/cuda_gpu_kern_sum.py]... 
+Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
+19.7,12697447936,3888,3265804.5,3257824.0,1621792,5595072,1469512.9,void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x256_16x3_tn_align4>(T1::Params)
+15.7,10083985472,400,25209963.7,24966080.0,20631136,29728672,3643835.6,nvjet_sm121_qqtst_mma_128x256x128_2_32x128x128_tmaAB_bz_TNNN
+8.0,5152368288,200,25761841.4,25655808.0,25248672,26575264,317714.1,"h3d_sol_forward_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, float)"
+7.0,4522602048,1944,2326441.4,2217984.0,2146656,2840032,190238.6,void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x128_32x3_tn_align4>(T1::Params)
+6.9,4463556384,400,11158891.0,11168496.0,6792800,15826400,3975352.2,nvjet_sm121_qqtst_mma_192x176x128_2_48x88x128_tmaAB_bz_TNNN
+6.3,4043498816,7940,509256.8,188240.0,1216,1573792,491840.7,"void h3d_linear_bias_kernel<float>(T1 *, const T1 *, unsigned long, unsigned int)"
+4.3,2775090304,1944,1427515.6,1361120.0,1326656,1859584,136008.4,"h3d_attention_mma_f32_kernel(float *, const float *, const float *, const float *, unsigned int, unsigned int, float)"
+3.9,2518604512,1000,2518604.5,2500880.0,364448,4647264,1361920.6,"h3d_fp8_amax_kernel(const __nv_bfloat16 *, float *, unsigned long)"
+3.5,2228323744,129,17273827.5,7865472.0,45952,88453568,20643367.8,"h3d_conv1d_kernel(float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, int)"
+3.4,2218667488,1000,2218667.5,1731344.0,512736,4847936,1143714.8,"h3d_fp8_quantize_kernel(unsigned char *, const __nv_bfloat16 *, const float *, unsigned long)"
+3.1,1966473280,1944,1011560.3,1000416.0,993760,1199904,29920.3,"h3d_swiglu_f32_kernel(float *, const float *, unsigned int, unsigned int)"
+2.7,1721345024,202,8521510.0,8478528.0,4416,9143808,883677.0,"h3d_qkv_rope_kernel(__nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, float)"
+2.3,1511577600,202,7483057.4,7424240.0,3488,8124800,780902.8,"h3d_swiglu_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int)"
+2.2,1391956064,1944,716026.8,686448.0,647488,1149440,78767.9,"h3d_video_qkv_rope_f32_kernel(float *, float *, float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, float)"
+1.9,1201364160,1998,601283.4,574192.0,530144,1134560,83488.9,void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_128x128_16x5_tn_align4>(T1::Params)
+1.8,1181839392,400,2954598.5,2874864.0,2828960,3347232,144317.2,"h3d_gate_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int)"
+1.4,913414240,3888,234931.6,232384.0,220288,313088,8862.2,"h3d_scale_add_f32_kernel(float *, const float *, const float *, const float *, unsigned int, unsigned int)"
+1.3,866209536,408,2123062.6,2076080.0,72160,2586720,245050.7,"h3d_adaln_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const unsigned int *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float, unsigned long)"
+1.3,853520352,200,4267601.8,4170032.0,4089760,4640576,161305.8,"h3d_sol_vsa_kernel(unsigned int *, unsigned int *, const float *, const __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, float)"
+1.0,625020864,3888,160756.4,158144.0,151360,269184,10566.2,"h3d_rms_norm_f32_kernel(float *, const float *, const float *, unsigned int, unsigned int, float)"
+0.8,500599456,200,2502997.3,2471776.0,2445088,2794432,67905.5,"h3d_sol_pool_kernel(__nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int)"
+0.4,254364256,200,1271821.3,1247680.0,1233600,1556960,59456.1,"h3d_sol_threshold_kernel(float *, float *, const float *, const float *, const __nv_bfloat16 *, unsigned int, unsigned int, float, float)"
+0.2,132131264,205,644542.8,1034336.0,54816,1393888,571402.4,void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8>(T1::Params)
+0.2,117959200,54,2184429.6,2268944.0,933056,2315520,328666.9,void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x1_tn_align8>(T1::Params)
+0.2,104876320,155,676621.4,425024.0,254304,1296960,381521.8,void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(T1::Params)
+0.2,97865120,7,13980731.4,5733664.0,972736,41447840,16562203.8,"h3d_conv_transpose1d_kernel(float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned long, int)"
+0.1,73448928,127,578338.0,629280.0,255136,650016,131024.8,"h3d_alias_free_snake_kernel(float *, const float *, const float *, const float *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned long)"
+0.1,67805600,135,502263.7,57056.0,1856,8110496,1051406.9,"h3d_weight_norm_kernel(float *, const float *, const float *, unsigned int, unsigned int)"
+0.0,12426464,4,3106616.0,3101792.0,2889024,3333856,242913.7,void cutlass::Kernel2<cutlass_80_simt_sgemm_128x128_8x4_tn_align1>(T1::Params)
+0.0,10285856,8,1285732.0,1254896.0,22080,2602336,1346929.6,"h3d_patch_convert_kernel(__nv_bfloat16 *, const float *, const float *, unsigned long, unsigned int, int)"
+0.0,8896320,54,164746.7,159872.0,148672,272704,19685.8,"h3d_layer_norm_f32_kernel(float *, const float *, const float *, const float *, unsigned int, unsigned int, float)"
+0.0,5339264,200,26696.3,23264.0,22240,102720,11755.3,"h3d_sol_stats_kernel(float *, float *, const __nv_bfloat16 *, unsigned int)"
+0.0,4358208,77,56600.1,58368.0,12896,129216,19498.8,"h3d_add_scaled_kernel(float *, const float *, const float *, unsigned long, float, float)"
+0.0,3800352,54,70376.9,67744.0,66016,103360,5895.4,void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_256x64_16x4_tn_align4>(T1::Params)
+0.0,1535872,1000,1535.9,1504.0,1184,11040,462.2,h3d_fp8_scale_kernel(float *)
+0.0,1154752,100,11547.5,11824.0,10208,19744,1158.3,"h3t_rms_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int, float)"
+0.0,1120768,100,11207.7,11040.0,10496,13952,748.5,"h3t_head_rms_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, float)"
+0.0,707232,50,14144.6,14016.0,13600,18368,638.6,"h3t_attention_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int, unsigned int, unsigned int, float)"
+0.0,653952,60,10899.2,11184.0,1216,19744,3794.3,"void h3d_linear_bias_kernel<__nv_bfloat16>(T1 *, const T1 *, unsigned long, unsigned int)"
+0.0,604000,50,12080.0,12032.0,11904,14304,348.0,"h3t_rope_kernel(__nv_bfloat16 *, __nv_bfloat16 *, const float *, const float *, unsigned int, unsigned int, unsigned int, unsigned int)"
+0.0,526752,150,3511.7,2176.0,1792,8576,1979.5,"h3t_binary_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned long, int)"
+0.0,317440,2,158720.0,158720.0,31040,286400,180566.8,"void gemmSN_TN_kernel<float, (int)128, (int)16, (int)2, (int)4, (int)8, (int)9, (bool)0, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<const float>, cublasGemvTensorStridedBatched<float>>(cublasGemmSmallNParams<T9, T10, T11, T1>)"
+0.0,221440,54,4100.7,2624.0,2560,24352,3359.0,void cutlass::Kernel2<cutlass_80_tensorop_s1688gemm_64x64_32x6_tn_align4>(T1::Params)
+0.0,98208,4,24552.0,23840.0,22944,27584,2065.7,void cutlass::Kernel2<cutlass_80_simt_sgemm_128x64_8x5_tn_align1>(T1::Params)
+0.0,69216,5,13843.2,12800.0,12672,18144,2405.3,"h3d_rms_norm_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int, float)"
+0.0,61952,4,15488.0,14032.0,13792,20096,3076.3,nvjet_sm121_tst_mma_16x32x64_16_16x8x64_tmaAB_bz_TNNN
+0.0,40672,7,5810.3,4864.0,896,12576,4645.1,"h3d_cast_kernel(__nv_bfloat16 *, const float *, unsigned long)"
+0.0,14016,2,7008.0,7008.0,6016,8000,1402.9,"h3d_attention_mma_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned int, unsigned int, float)"
+0.0,8640,4,2160.0,2160.0,1888,2432,222.5,"h3d_add_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *, unsigned long)"
+0.0,5920,1,5920.0,5920.0,5920,5920,0.0,"h3t_embed_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, const unsigned int *, unsigned int, unsigned int, unsigned int)"
+0.0,5632,1,5632.0,5632.0,5632,5632,0.0,"h3d_clip_kernel(float *, const float *, unsigned long, float, float)"
+0.0,1728,1,1728.0,1728.0,1728,1728,0.0,"h3d_silu_f32_kernel(float *, const float *, unsigned long)"
+0.0,1376,1,1376.0,1376.0,1376,1376,0.0,"h3d_silu_bf16_kernel(__nv_bfloat16 *, const __nv_bfloat16 *, unsigned long)"
+
