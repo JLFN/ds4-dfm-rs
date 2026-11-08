@@ -4,6 +4,7 @@ pub mod admit;
 pub mod cache_identity;
 pub mod chat_input;
 pub mod cont;
+pub mod debug;
 pub mod dist_cli;
 pub mod dsml;
 pub mod error;

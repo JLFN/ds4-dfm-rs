@@ -26,6 +26,7 @@ use ds4_kv::{
     EXT_THINKING_VISIBLE, EXT_TOOL_MAP,
 };
 
+use crate::debug;
 use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ChatMsg, ChatPart, EosPolicy, ParsedRequest, ToolCall, ToolChoice};
 use crate::render::{
@@ -2694,9 +2695,14 @@ pub(crate) fn generate_terminal_prepared(
     if req.stream {
         w.out.extend_from_slice(&sse_headers(cors));
         flush(&mut w, out)?;
+        debug::log(format_args!("headers written job={job_id}"));
     }
     engine.begin_trace();
     let t_prefill = Instant::now();
+    debug::log(format_args!(
+        "prefill start job={job_id} tokens={}",
+        tokens.len()
+    ));
     let sync_result = if !vision.is_empty() || !audios.is_empty() || !videos.is_empty() {
         engine
             .sync_mimo_prompt(&tokens, &vision, &audios, &videos)
@@ -2726,6 +2732,11 @@ pub(crate) fn generate_terminal_prepared(
     let prefill_elapsed = engine
         .prompt_sync_elapsed()
         .unwrap_or_else(|| decode_t0.duration_since(t_prefill));
+    debug::log(format_args!(
+        "prefill done job={job_id} tokens={} cached={cached} elapsed_ms={}",
+        tokens.len(),
+        prefill_elapsed.as_millis()
+    ));
     let mut first_tok = None;
     let mut decode_steps = 0i32;
     let mut speculation = false;
@@ -2767,6 +2778,7 @@ pub(crate) fn generate_terminal_prepared(
             sse_chunk(&mut w, &req, job_id, None, None);
         }
         flush(&mut w, out)?;
+        debug::log(format_args!("first sse chunk job={job_id}"));
     }
 
     let mut parsed_gen;

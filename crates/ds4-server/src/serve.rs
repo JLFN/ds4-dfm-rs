@@ -19,6 +19,7 @@ use crate::admit::{
     SHED_SLOW_READER,
 };
 use crate::cont::{monotonic_now, place_bank_continuation, ContOwner, ContPin, ContRegistry};
+use crate::debug;
 use crate::error::{http_response_bytes, wire_http_error_bytes, wire_stream_error_bytes};
 use crate::generate::{
     generate_terminal_prepared, prepare_serial_prompt, DecodeIo, GenerateError, GenerateOutcome,
@@ -1367,6 +1368,10 @@ fn run_prepared<W: TerminalSink>(
     let dec = route_for_model(model_id, job.parsed.needs, job.surface, &route_env);
     let id = next_job_id(&mut lock_inner(inner).admit, job.parsed.kind);
     let arrived_at = arrived_at.unwrap_or_else(Instant::now);
+    debug::log(format_args!(
+        "job start id={id} queue_age_ms={}",
+        arrived_at.elapsed().as_millis()
+    ));
     let (actual_lane, settlement) = match engine {
         Some(engine) => run_engine(cfg, inner, job, &id, dec, engine, cont, out, arrived_at),
         None => {
@@ -2394,14 +2399,18 @@ fn client_disconnected(stream: &TcpStream) -> bool {
     }
     let mut byte = [0u8; 1];
     let result = stream.peek(&mut byte);
-    match result {
+    let gone = match result {
         Ok(0) => true,
         Err(e) => matches!(
             e.kind(),
             ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
         ),
         Ok(_) => false,
+    };
+    if gone {
+        debug::log(format_args!("client disconnected"));
     }
+    gone
 }
 
 fn drain_job(mut stream: TcpStream, drain: JobDrain) {
@@ -2445,9 +2454,12 @@ fn drain_job_with_interval(stream: &mut TcpStream, drain: &JobDrain, interval: D
             break;
         } else if drain.state.observe_disconnect() {
             break;
-        } else if heartbeat && send_all_nonblocking(stream, b": keep-alive\n\n").is_err() {
-            drain.state.cancel(false);
-            break;
+        } else if heartbeat {
+            if send_all_nonblocking(stream, b": keep-alive\n\n").is_err() {
+                drain.state.cancel(false);
+                break;
+            }
+            debug::log(format_args!("keep-alive sent"));
         }
     }
 }
@@ -2488,6 +2500,10 @@ fn queue_client(
         );
         return;
     }
+    debug::log(format_args!(
+        "accepted surface={surface:?} stream={} body_bytes={body_bytes} queued={}",
+        prepared.parsed.stream, g.admit.queued
+    ));
     let pin = acquire_continuation_pin(&mut g, &mut prepared.parsed, monotonic_now());
     g.runtime.requests_started += 1;
     g.runtime.requests_inflight += 1;
@@ -2525,6 +2541,10 @@ fn run_owner_job(
         done,
         mut lease,
     } = job;
+    debug::log(format_args!(
+        "job begin queue_age_ms={}",
+        prepared.arrived_at.elapsed().as_millis()
+    ));
     lease.start();
     let queue_age = prepared.arrived_at.elapsed().as_secs_f64();
     let mut settlement = if sink.state.gone() || sink.state.observe_disconnect() {
@@ -2557,6 +2577,10 @@ fn run_owner_job(
     if sink.state.slow() {
         settlement = settlement.slow_reader();
     }
+    debug::log(format_args!(
+        "job done settlement={settlement:?} outcome={:?}",
+        settlement.outcome
+    ));
     drop(sink);
     lease.settlement = settlement;
     if let Err(err) = done.send(lease) {
