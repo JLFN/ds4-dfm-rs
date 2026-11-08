@@ -3209,6 +3209,7 @@ impl<W: Write> V41EmitState<'_, W> {
         }
         if self.first_tok.is_none() {
             self.first_tok = Some(Instant::now());
+            debug::log(format_args!("first token job={}", self.job_id));
         }
         if self.stop_requested.is_some_and(|stop| stop()) {
             self.finish = "error";
@@ -3332,7 +3333,11 @@ impl<W: Write> V41EmitState<'_, W> {
     /// keepalive (`: prefill`, the engine's 5 s interval) and the client
     /// probe; returning false aborts the prefill (the engine's nonzero
     /// return, `ds41_forward.h`).
-    fn prefill_progress(&mut self, _event: &str, _current: i32, _total: i32) -> bool {
+    fn prefill_progress(&mut self, event: &str, current: i32, total: i32) -> bool {
+        debug::log(format_args!(
+            "prefill progress job={} event={event} current={current} total={total}",
+            self.job_id
+        ));
         if self.req.stream {
             stream_heartbeat_if_due(
                 self.w,
@@ -3477,6 +3482,8 @@ fn generate_terminal_v41(
             sse_chunk(&mut w, &req, job_id, None, None);
         }
         flush(&mut w, out)?;
+        debug::log(format_args!("headers written job={job_id}"));
+        debug::log(format_args!("first sse chunk job={job_id}"));
     }
 
     let t0 = Instant::now();
@@ -3553,6 +3560,9 @@ fn generate_terminal_v41(
             state.borrow_mut().prefill_progress(event, current, total)
         };
         let mut greedy = |ahead: *const i32, n: u32| state.borrow_mut().syntax_greedy(ahead, n);
+        debug::log(format_args!(
+            "v41 generate start job={job_id} prompt_tokens={prompt_n}"
+        ));
         engine.v41_generate(
             prompt_tokens,
             max_tokens,
@@ -3563,6 +3573,7 @@ fn generate_terminal_v41(
             &mut progress,
         )
     };
+    debug::log(format_args!("v41 generate end job={job_id}"));
     let mut st = state.into_inner();
 
     if let Some(error) = st.err.take() {
