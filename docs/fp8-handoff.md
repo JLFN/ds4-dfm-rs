@@ -194,6 +194,35 @@ floor, record that and stop.
 | `mio_throttle` high | lookup issue | fewer wavefronts; needs book space |
 | `barrier` high | producer ring | pipeline structure |
 
+## What the literature settles (section 11 of the study)
+
+Four new sources were read against the measured bottleneck, and one of them
+explains why the best published fix cannot be used here.
+
+- **CodeGEMM** (NeurIPS 2025, 2512.17970) replaces dequantisation with a
+  Psumbook: precomputed centroid-by-activation inner products held on chip, so a
+  code index gathers a partial sum instead of decoding a weight. It reports 2.18x
+  over FP16 and 1.64x over AQLM, and it does not port: the table has `2^bits`
+  entries, so CodeGEMM's 2-bit case is 32 bytes where hVQ's 13-bit book needs
+  256 KiB at the same tile width, against 99 KiB of GB10 shared memory and 66 KiB
+  already spent on the book. The mechanism is right, the size precondition fails
+  because the bit width is fixed.
+- **MonoMoE** (2609.04244) is the paper for the decode item: weight-major
+  persistent grid, token tile on the tensor core's N axis, readiness flags instead
+  of grid-wide barriers, for the few-tokens-per-expert regime our 4-row verify
+  pass runs in (23.4 of 384 experts). Up to 1.54x over vLLM's grouped GEMM.
+- **Integer-Exact Microscaling** (2611.00486) lowers the block-scaled item again:
+  an MXFP4 weight row is exactly one INT8 vector times a power of two when its
+  block exponents span at most three, true for 97.9-99.97 percent of real rows. So
+  an INT8-exact route may beat the block-scaled FP8 form, and the item must be
+  argued against it rather than only against plain FP8.
+- **OASIS** (ISCA 2026, 2507.23035) is custom silicon, not a kernel. Direction
+  only.
+
+The diagnosis is now shared with the literature: a codebook kernel that keeps a
+per-element gather adds data movement without reducing the arithmetic, which is
+our 20 to 29 percent per-tile penalty stated as a cost model.
+
 ## Settled — do not redo
 
 - The BF16 and FP8 peaks: 107.8 and 215.6 TFLOPS at 2,190 MHz, and the FP4
@@ -216,6 +245,8 @@ floor, record that and stop.
 - Any bit-width change, codebook refit, or size-for-quality trade. The artifact is
   frozen at 113,556,639,424 bytes.
 - The hVQ converter as a performance target.
+- A Psumbook for a 13-bit book: 256 KiB at our tile width against 99 KiB of
+  shared memory, so CodeGEMM's mechanism cannot hold the table (section 11).
 
 ## Open discrepancies
 

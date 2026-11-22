@@ -1180,6 +1180,17 @@ that target them are ranked below for that reason, not because they are cheap.
    breakdown, not a code change, and if the ceiling looks low after it, prefill is
    the better target — which is why this is the last item.
 
+**Two additions from the codebook-GEMM literature (section 11).** First, the
+Psumbook mechanism that CodeGEMM uses to avoid exactly our measured gather cost
+needs a table of 2^bits entries, so at 13 bits it is 256 KiB against the 99 KiB
+the GB10 offers; the fix is real but has a size precondition hVQ fails, which is
+why the ranked items stay kernel work on the existing book. Second, before the
+decode item, read MonoMoE: its weight-major persistent grid with readiness flags
+is aimed at the few-tokens-per-expert regime our verify pass runs in. And the
+block-scaled instruction item must now be argued against an INT8-exact route,
+not only against plain FP8, because a row of MXFP4 weights is often exactly one
+INT8 vector times a power of two.
+
 **What the constraints rule out, stated so it is not proposed again.** The artifact
 is fixed: 13-bit indices on layers 0-13, 12-bit on 14-39, hVQ's quality, 113.56 GB.
 Nothing in this note changes a bit width, and nothing proposes a re-conversion.
@@ -1199,7 +1210,91 @@ and any format change whose only argument is a smaller cache footprint, since ou
 measurements show that case is decided by the dequantisation cost and not by the
 bytes.
 
-## 11. Verification status
+## 11. What the codebook-GEMM literature says about hVQ's actual bottleneck
+
+Section 9.2 concluded that hVQ's kernel spends its shared-memory pipe on a
+book gather, not on arithmetic, and section 9.4 repeated that for attention. A
+targeted search of the codebook-GEMM literature was then run against exactly
+that conclusion. Four works matter, and one of them does not transfer for a
+reason that can be computed rather than argued.
+
+**CodeGEMM (NeurIPS 2025, [2512.17970]) is the closest match and the most
+important negative result.** It attacks precisely the cost we measured: current
+codebook kernels "rely on dequantisation, which repeatedly fetches centroids and
+reconstructs weights, incurring substantial latency and cache pressure", and its
+remedy is to replace dequantisation with a **Psumbook** — precomputed inner
+products between each centroid and the current activation tile, stored on chip,
+so a code index becomes a direct gather of partial sums with no per-element
+lookup and no book residency. It reports 2.18x over an FP16 baseline and 1.64x
+over AQLM at equal bit precision, on an A100.
+
+That is the right diagnosis and the right shape of fix, and it does not port to
+a 13-bit book. The reason is the table's size, and it is arithmetic:
+
+    Psumbook entries = 2^bits x (tile width / vector length) x 2 bytes
+    CodeGEMM 2-bit (v=8, tw=32):      4 x 4 = 16 entries    =   32 B
+    hVQ 13-bit (v=8, tw=32):       8192 x 4 = 32,768 entries = 64 KiB
+    hVQ 13-bit (v=8, tw=128):     8192 x 16 = 131,072       = 256 KiB
+
+CodeGEMM's speedup comes from a table small enough to sit in shared memory with
+room to spare. hVQ's book has 2,048 times as many entries, so the same table at
+our column-tile width is 256 KiB against the 99 KiB the GB10 offers, and the
+expert kernel already spends 64 KiB of that on the book itself. This is the
+same wall CodeGEMM describes in AQLM's 1x16 configuration, where a 1 MiB
+codebook cannot fit in 164 or 224 KiB and must return to DRAM; the paper's own
+framing is that the technique is for "accelerators with limited programmable
+cache sizes" because shrinking the table is the point. hVQ's quality constraint
+fixes the book at 13 bits, so the table cannot shrink, and CodeGEMM's mechanism
+is unavailable for that reason and not for want of trying.
+
+**What does transfer is the diagnosis, in sharper form.** CodeGEMM's cost model
+says the dequantisation kernel "does not reduce computational complexity, which
+remains identical to that of the original matrix multiplication" while adding a
+gather per element. Our measurement is that statement quantified for hVQ:
+equal MMA work, more shared-memory traffic, 20 to 29 percent slower per tile for
+the codebook path than for a plain F32 row. Any hVQ proposal that keeps a
+per-element gather is buying data movement and paying compute cycles for it.
+
+**MonoMoE (2026, [2609.04244])** is the best current account of the other half
+of our problem, and it is aimed at decode rather than prefill. Its target is
+token-major grouping's padding and short-lived grids when few tokens reach each
+expert; its fixes are a weight-major persistent grid, the token tile placed on
+the tensor core's fine-grained N axis, and readiness flags replacing grid-wide
+barriers. It reports up to 1.54x over vLLM's Triton grouped GEMM and 18.7
+percent off time per output token. Our verify pass is exactly the "few tokens
+per expert" regime — four independent routes hit 23.4 of 384 experts — so this
+is the paper to read before the decode item, and it speaks to the 12-18 ms of
+verify headroom rather than to prefill.
+
+**Integer-Exact Microscaling (2026, [2611.00486])** is the most interesting
+result for the FP8 question itself, and it is a warning about our own plan. It
+shows that an MXFP4 weight row is *exactly* one INT8 vector times one power of
+two when its block exponents span at most three, and that 97.9 to 99.97 percent
+of real rows already satisfy that, including 99.93 percent of a 125B MoE's 95M
+rows. The consequence for us is that the block-scaled FP8 MMA is not
+necessarily the fastest exact route: where the exponent spread permits, an INT8
+tensor-core GEMM with one rescale per output is exact, and on the M5 that
+reaches prefill 1.22-1.29x over MLX on a 125B MoE. It does not transfer
+directly — our activation side is E4M3 per 32, not MXFP4 — but it means the
+"block-scaled FP4/FP8 instruction" item must be justified against an INT8
+alternative, not only against the plain FP8 form.
+
+**OASIS (ISCA 2026, [2507.23035])** is a custom-accelerator design: parallel
+LUT and outlier branches, a Cartesian-product LUT giving 64x smaller tables and
+1,024x more LUT parallelism, 3.00x over the FIGLUT accelerator. It is the
+strongest statement that LUT-based GEMM is the right family for non-uniform
+weights, and it is not implementable on a GB10 because it is silicon, not a
+kernel. Cited as direction, not as a step.
+
+**What this changes.** Nothing in the ranked plan, and three things in how it is
+argued. The book gather stays the measured bottleneck, now with the literature
+agreeing on the mechanism and explaining why the published fix has a size
+precondition we fail. The decode item gains a specific paper to read first
+(MonoMoE) instead of a generic instruction to profile. And the block-scaled
+instruction item now has to beat an INT8-exact alternative that the newest
+evidence says is often available, which lowers its expected value again.
+
+## 12. Verification status
 
 Measured in this session, with the snippet and commands in section 2: the
 block-scaled FP8 form assembles for `sm_120a` and `sm_121a` and emits
