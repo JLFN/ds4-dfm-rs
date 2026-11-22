@@ -40,12 +40,12 @@ for layers 20-39, so layers 0 and 1 attend to the 128-key window alone.
 | Thing | Where | State |
 |---|---|---|
 | Study | `docs/fp8-tensor-core-research-2026-11-22.md` | Committed here; also on vq-tools `dev` as `docs/fp8-tensor-cores.md` |
-| The attention bench | vq-tools `c/gpu/attn-bench.cu` → `bin/attn-bench`, `docs/attn-bench.md` | Built and run; needs `DS41_SRC` to build |
+| The attention bench | vq-tools `c/gpu/attn-bench.cu` → `bin/attn-bench`, `docs/attn-bench.md` | `dev` @ `9a3290b`; built and run on the GB10, cross-checked from a fresh clone |
 | Phases, edit sites | vq-tools `docs/handoff-fp8-phases.md` | Pushed, `dev` @ `42e9e43` |
 | The MMA rate probe | vq-tools `c/gpu/mma-rate.cu` → `bin/mma-rate` | Pushed, built, run |
 | hVQ fitter (cited by line) | vq-tools `crates/vq-calib/reference/hvq/` | Pushed, sha256 recorded |
 | Runtime repo | `~/ds4-dfm-rs` on the Spark, `main` @ `c57543fb` | Untouched |
-| Docs index | `docs/README.md` | Modified, uncommitted |
+| Docs index | `docs/README.md` | Updated with these findings |
 
 The fork rule holds: nothing goes to the upstream runtime repository. The runtime
 repo here is `github.com/JLFN/ds4-dfm-rs`; the toolkit is
