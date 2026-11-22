@@ -186,7 +186,7 @@ __device__ __forceinline__ static void ds4_fa_gather(__nv_bfloat16 *ks, int *val
     }
 }
 /* shared: ks 16x520x2 + spart 8x16x16x4 + stile 16x16x4 + ptile 16x16x2 + rmax/rsum/alpha 3x16x4 + valid 16x4 ~= 26 KB => 3 blocks per SM */
-__global__ __launch_bounds__(256) static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
+__global__ __launch_bounds__(256, 3) static void ds4_sparse_attn_mma_kernel(float *o, const float *q, const float *kvw, const uint8_t *kvc,
                                                   const int32_t *idx, const float *sink, uint32_t pos0, uint32_t window,
                                                   uint32_t ng, uint32_t topk, uint32_t n_head, float scale, uint32_t win_lo) {
     constexpr uint32_t KT = DS4_ATTN_MMA_KT, HB = DS4_ATTN_MMA_HEADS;
