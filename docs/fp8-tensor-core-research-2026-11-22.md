@@ -332,8 +332,8 @@ That is the largest and most specific opportunity in this note, and it is not an
 FP8 one. It is also why the phase order below puts attention first: the class is
 23.8 percent of the block and 11.8 percent of its own peak. What the measurement
 then changed is *which* part of it to attack: section 9.4's `attn-bench` run
-puts the compressed pool at 1.36x the F32 window path per tile at equal MMA
-work, so the decode is the cost, not the instruction.
+puts the compressed pool at 1.2 to 1.3x the F32 window path per tile at matched
+tile counts, so the decode is the cost, not the instruction.
 
 **The precedent that this is fixable, in this tree.** Gemma's full-layer E4M3 KV
 had the same shape — `g4_attn_fp8_kernel`, one warp per (row, head), a scalar
@@ -758,18 +758,38 @@ This reorders section 10's list, and section 10 is written to match.
 argument above is about hVQ's expert kernels; `attn-bench` (`docs/attn-bench.md`
 in the toolkit) puts it on attention directly. It times the shipped
 `ds4_sparse_attn_mma_kernel` with the FP4 compressed pool and with the F32
-window, so the two key sources are separated at identical MMA work per tile.
-The result on an Ada part, and the shape is what matters rather than the level:
+window. Measured on the reference host (GB10, 48 SMs, 2,048 rows, 2,470 MHz,
+scored against 118.8 TFLOPS at the device maximum):
 
-    F32 window tile    0.1895 ms/tile  (1.516 ms over 8 tiles)
-    FP4 pool tile      0.2583 ms/tile  (8.267 ms over 32 tiles)
-    pool / window      1.36x, and the excess is 24 percent of a 40-tile launch
+    matched tiles        F32 window      FP4 pool      pool / window
+        8 tiles           3.159 ms       3.775 ms         1.20x
+       16 tiles           4.483 ms       5.487 ms         1.22x
+    marginal 8->16      0.1655 ms/tile  0.2140 ms/tile    1.29x
 
 Every tile does the same MMA work — 16 keys by 512 dims by 64 heads — so the
-1.36x is the gather and decode: the 288-byte FP4 row, one scale per lane, two
-shuffles per element. The MMA is not what makes the compressed path expensive,
-and its instruction is not the lever. Fixing the decode path, or overlapping it
-with the MMA, is.
+20 to 29 percent excess is the gather and decode: the 288-byte FP4 row, one
+scale per lane, two shuffles per element. The MMA is not what makes the
+compressed path expensive, and its instruction is not the lever.
+
+The method matters and an earlier draft of this section got it wrong by
+comparing averages at unequal tile counts, where a fixed per-launch cost (about
+2.1 ms of a 2,048-row launch) is divided over a different denominator. Comparing
+8 tiles against 32 reported the pool as cheaper than the window on the same
+host, which is an artifact. Match the tile count, or take the slope.
+
+The launch is also markedly sublinear in tiles: 32 pool tiles take 10.4 ms where
+the 0.30 ms/tile marginal rate predicts 9.6 from the 8-tile point, and the first
+4 tiles cost 3.0 ms against a 0.9 ms marginal. That fixed cost is what an
+instruction change cannot touch, and it is why the ranking below puts the
+pipeline structure before the operand format.
+
+**The bench reproduces the record, which is the check that matters.** At 2,048
+rows and the shipped 640-key shape the bench reports **12.47 ms** for the
+kernel alone; the record gives 13.5 ms for the class per block-layer. So this
+kernel is 92 percent of the recorded attention time, and the remaining 8 percent
+is the prep and epilogue launches around it. That closes the accounting: the
+study's earlier claim that a large share of the class belonged to something
+other than this kernel was speculation, and it was mostly wrong.
 
 That also bounds what the block-scaled FP4 instruction can return here. It
 removes a widening whose cost is now measured as a share of a tile, not the
@@ -1055,9 +1075,10 @@ that target them are ranked below for that reason, not because they are cheap.
 1. **Sparse attention, measured and then profiled.** `bin/attn-bench` in the
    toolkit times the shipped kernel with no model loaded, which is what the
    engine's own safety table allows and what the resident server leaves room for.
-   It already answers the largest question: the compressed-pool path costs 1.36x
-   the F32 window path per tile at identical MMA work, so the gather and decode
-   are the cost and the MMA is not (section 9.4). The remaining split — barriers
+   It already answers the largest question: the compressed-pool path costs 1.2 to
+   1.3x the F32 window path per tile at matched tile counts, so the gather and
+   decode are the cost and the MMA is not (section 9.4). It also reproduces the
+   record: 12.47 ms of the 13.5 ms per block-layer. The remaining split — barriers
    against shared-memory traffic against the 16-thread softmax — needs the `ncu`
    Speed Of Light capture, which the same tool supports with `--once`. This is
    first because it is the largest class, it costs one capture rather than a
@@ -1077,9 +1098,10 @@ that target them are ranked below for that reason, not because they are cheap.
    Gate on teacher-forced NLL, not cmp: this family is documented as not
    bit-equal to the scalar kernel and its gate is the quality scale.
 
-3. **The compressed-pool decode, which is now the measured target.** The 1.36x
+3. **The compressed-pool decode, which is now the measured target.** The excess
    above is one scale byte per lane, 32 nibble reads per lane and two shuffles
-   per element, paid on 32 of the launch's 40 tiles. Vectorising that unpack and
+   per element, paid on the pool's tiles; it is also where the 2.1 ms fixed cost
+   of a launch sits, which no operand change touches. Vectorising that unpack and
    overlapping it with the MMAs addresses the cost the measurement actually
    found. This item did not exist in the earlier ranking, which put an
    instruction change here instead; the measurement moved it.

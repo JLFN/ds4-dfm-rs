@@ -23,8 +23,8 @@ BF16 in shared memory and then multiplies in BF16.
 That looked like the whole opportunity, and the measurement says it is not. The
 toolkit's `bin/attn-bench` times the shipped kernel with no model loaded and
 separates the two key sources at identical MMA work per tile: the FP4 pool path
-costs **1.36x** the F32 window path per tile, and that excess is about 24
-percent of a 40-tile launch. The gather and decode are the cost; the MMA is not.
+costs **1.2 to 1.3x** the F32 window path per tile at matched tile counts, and
+the per-launch fixed cost is about 2.1 ms of the 12.5 ms launch. The gather and decode are the cost; the MMA is not.
 The lever is the decode path — vectorising the unpack and overlapping it with
 the MMAs — not a change of tensor instruction.
 
@@ -83,32 +83,46 @@ A second sample with the server resident read 99.3 percent; both kept. It
 establishes that a per-32 hardware scale is free. It does not establish a
 throughput argument, because the promotion it removes is itself measured free.
 
-### Phase 2 — sparse attention: MEASURED, and the ranking changed
+### Phase 2 — sparse attention: MEASURED on the reference host
 
-**The decode is the cost, and it is now measured rather than guessed.** The
-toolkit's `bin/attn-bench` compiles this kernel's own source behind five host
-stubs, so it runs with no model loaded, in a few hundred MiB, and can be
-captured with `ncu` under the one-GPU-job rule. Run on an Ada part at 2,048
-rows:
+**The decode is the cost, and it is measured rather than guessed.** The toolkit's
+`bin/attn-bench` compiles this kernel's own source behind five host stubs, so it
+runs with no model loaded, in a few hundred MiB, and can be captured with `ncu`
+under the one-GPU-job rule. On the reference host (GB10, 2,048 rows, 2,470 MHz):
 
-    F32 window tile    0.1895 ms/tile  (1.516 ms over 8 tiles)
-    FP4 pool tile      0.2583 ms/tile  (8.267 ms over 32 tiles)
-    pool / window      1.36x; the excess is ~24 percent of a 40-tile launch
+    shipped shape (128 window + 512 topk, 40 tiles)   12.47 ms/kernel
+    record for the class per block-layer              13.5 ms
 
-Identical MMA work per tile, so 1.36x is the gather and decode: the 288-byte
-FP4 row, one scale per lane, two shuffles per element. Levels are
-architecture-specific and not the point; the ratio is the shape of the result.
+    matched tiles      F32 window     FP4 pool     pool / window
+        8 tiles          3.159 ms      3.775 ms        1.20x
+       16 tiles          4.483 ms      5.487 ms        1.22x
+    marginal 8->16     0.1655 ms/tile 0.2140 ms/tile   1.29x
 
-The kernel is `ds4_sparse_attn_mma_kernel` (`cuda/ds41_attn_mma.cuh:189`),
-BF16 MMA, `__launch_bounds__(256)`, 26 KB shared, 80 registers, no spills, three
-blocks per SM as its comment predicts (`attn-bench` prints these from the
-occupancy API).
+Two results, and both change the plan.
+
+1. **The bench reproduces the record.** 12.47 ms against 13.5 ms means this
+   kernel is 92 percent of the recorded attention time; only 8 percent is the
+   surrounding prep and epilogue. The class is one kernel, not a group.
+2. **The compressed pool costs 20 to 29 percent more per tile than the F32
+   window at equal MMA work.** That excess is the gather and decode — the
+   288-byte row, one scale per lane, two shuffles per element — so the decode is
+   the lever, not the tensor instruction.
+
+The launch is also sublinear in tiles: the first 4 tiles cost 3.0 ms against a
+0.9 ms marginal, about 2.1 ms of fixed cost in a 2,048-row launch. An
+instruction change cannot touch that, and it is a further reason to put the
+pipeline structure first.
+
+One method note, because an earlier run of this bench got it wrong: do not
+compare averages at unequal tile counts. The per-launch fixed cost is divided
+over a different denominator, and at 8 tiles against 32 the pool looked
+*cheaper* than the window on the same host. Match the count or take the slope.
 
 Three things the measurement settles:
 
 1. The FP4 instruction does **not** remove the decode cost, because the decode
-   is what the 1.36x measures and the instruction only removes the widening that
-   follows it. Ranking it first was wrong.
+   is what the matched-tile excess measures and the instruction only removes the
+   widening that follows it. Ranking it first was wrong.
 2. The rate is 11.8 percent of the BF16 peak, matching the record's 13 TFLOPS;
    the study's earlier 0.4 percent was a block-convention error.
 3. Softmax is serialised on 16 threads of 256 between full-CTA barriers
@@ -186,8 +200,11 @@ floor, record that and stop.
 - ds41's attention runs at 12.7 TFLOPS, 11.8 percent of the BF16 peak, and the
   record's "about 13 TFLOPS" is right. The block is 2,048 rows through layers
   0-19; the study's 0.4 percent was a 32x convention error.
-- The compressed-pool path costs 1.36x the F32 window path per tile at equal MMA
-  work, measured with `attn-bench`, so the decode is the cost and the MMA is not.
+- The compressed-pool path costs 1.2 to 1.3x the F32 window path per tile at
+  matched tile counts and equal MMA work, measured with `attn-bench`, so the
+  decode is the cost and the MMA is not.
+- The kernel alone is 12.47 ms of the record's 13.5 ms per block-layer, so the
+  class is one kernel and only 8 percent is the prep and epilogue around it.
 - The block-scaled FP4 instruction cannot serve PV on the stored pool, because
   its scale runs along `head_dim`, which is PV's output axis.
 - ds41's index scores are an exact INT8 problem on s8 tensor cores, 841 → 50 ms
@@ -205,8 +222,8 @@ floor, record that and stop.
    (`tools/vq_calib/cuda/ds41_hvq.cu:171-180`) but not cross-checked against a
    refit run. The E8M0 experiment depends on it.
 2. **The decode's internal split.** `attn-bench` measures the compressed path at
-   1.36x the window path per tile but does not say how much of that is shared-
-   memory wavefronts versus shuffle and issue. The capture settles it.
+   about 1.2 to 1.3x the window path per tile but does not say how much of that is
+   shared-memory wavefronts versus shuffle and issue. The capture settles it.
 
 ## Next action
 

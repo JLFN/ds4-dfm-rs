@@ -233,8 +233,9 @@ Recorded PIDs are historical.
 - [FP8 tensor-core research, November 22](fp8-tensor-core-research-2026-11-22.md):
   where ds41 multiplies on tensor cores, and the measured answer for its
   23.8-percent sparse-attention class: 11.8 percent of the BF16 peak, with the
-  compressed FP4 pool costing 1.36x the F32 window path per tile at equal MMA
-  work, so the decode is the lever rather than the tensor instruction; the SM120
+  compressed FP4 pool costing 1.2 to 1.3x the F32 window path per tile at matched
+  tile counts, so the decode is the lever rather than the tensor instruction, and
+  the kernel alone reproducing 12.47 ms of the record's 13.5 ms per block-layer; the SM120
   block-scaled FP8 MMA and its measured rate, P-cast collapse and the reverse KV
   walk, grouped expert tails, and how hVQ's post-reduction row gain composes with
   an E8M0 activation scale; kernel changes only, byte-identical artifact, nothing
