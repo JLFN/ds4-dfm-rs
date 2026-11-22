@@ -11,7 +11,7 @@ cores, and at what fraction of the peak, the answer is not the experts: they are
 29.5 percent of a prefill block and already within a quarter of their DRAM
 stream bound, so no arithmetic change helps them. The class that computes on
 tensor cores and does it badly is sparse attention, 23.8 percent of the block at
-two orders of magnitude below the peak. Two things about it are specific to this
+11.8 percent of its own peak. Two things about it are specific to this
 family. Its arithmetic is BF16, not FP8, while its compressed KV is already FP4
 with E4M3 scales — so the stored bytes are in the form the block-scaled FP4
 tensor instruction takes natively, and the kernel currently spends that
@@ -256,7 +256,7 @@ From the 2026-11-12 records on a 65,536-token prefill
 | Kernel class | ms per block | Share | Rate |
 |---|---:|---:|---|
 | Routed experts (FP8 kernels) | 334.9 | 29.5% | 75% of the DRAM stream bound |
-| Sparse attention | 270.4 | 23.8% | 13.7 ms per layer, constant across context |
+| Sparse attention | 270.4 | 23.8% | 13.5 ms per block-layer; window keys constant, pool keys per layer from the artifact |
 | q4_K projections | 244.5 | 21.5% | fused path, F32→BF16 conversions around it |
 | mHC | 171.0 | 15.1% | DRAM-bound, reads the hyper state twice |
 | Index scores and top-k | 31.3 | 2.8% | already fixed by round 1 |
@@ -267,23 +267,40 @@ largest class, sparse attention at 23.8 percent, is the one that computes on
 tensor cores and does it badly.
 
 **How badly, measured honestly.** The record states "about 13 TFLOPS" for sparse
-attention. Backing that out from first principles does not reproduce it: 13.5 ms
-per layer at 65,536 tokens with 64 heads of dimension 512, one QK and one PV
-product per attended key, gives
+attention, and an earlier draft of this section contradicted it by a factor of
+32. The error is worth recording because it inverted the phase ranking, and a
+tool now prevents it (`bin/attn-bench`, `docs/attn-bench.md`).
 
-    640 keys per query x 65,536 queries x 64 heads x 512 dims x 2 products x 2 FLOP
-      = 5.5 TFLOP per layer, and 5.5 TFLOP / 13.5 ms = 0.4 TFLOPS
+The figure is per **block**, and the block is 2,048 rows through layers 0-19,
+not a whole-prefill layer. The record's own words are "per 2,048-row block of
+layers 0-19" (`docs/deepseek41-optimization-2026-11-12-dense.md:43`), and the
+same document's independent numbers confirm the convention: "663 GFLOP per
+layer (13.3 TFLOP per block)" (`:54`), which is 663 GFLOP x 20 layers. Against
+that block,
 
-which is 0.2 percent of the FP8 peak and 0.4 percent of BF16. The recorded 13
-TFLOPS would require about 20 keys per query, which is the 16-key shared tile
-(`DS4_ATTN_MMA_KT = 16`), so that figure is most likely a per-tile spot
-measurement rather than the layer's.
+    2,048 rows x 64 heads x 640 keys x 512 dims x 2 products x 2 FLOP
+      = 0.1718 TFLOP per layer, and 0.1718 TFLOP / 13.5 ms = 12.7 TFLOPS
 
-Neither number is a usable rate, and this note does not have the profile to settle
-which is right. What both readings agree on is the conclusion: even at the
-generous 13 TFLOPS the class is at most 6 percent of the peak, and at the
-full-layer reading it is two orders of magnitude below it. The capture in the plan
-is what turns 0.4 into a measured figure.
+which is 11.8 percent of the 107.8 TFLOPS BF16 peak and reproduces the record's
+"about 13 TFLOPS". The earlier 0.4 came from dividing a whole 65,536-token
+layer's 5.5 TFLOP by the per-block 13.5 ms, mixing two conventions; 65,536/2,048
+is exactly 32, and 0.4 x 32 = 12.8.
+
+One caveat on the 640, and it is a correction to an earlier draft of this
+section as well: 640 keys is the shape of most layers, not of all of them. The
+artifact's own metadata (`deepseek4.attention.compress_ratios`, 40 entries in
+the release file) reads zero for layers 0-1, two for layers 2-19, and one for
+layers 20-39. A ratio of zero means no compressed pool, so layers 0 and 1
+attend to the 128-key sliding window alone; the attention sum over layers 0-19
+therefore covers 2 window-only layers and 18 at 640 keys. The rate above is
+quoted for the 640-key shape and is not diluted by that, but any per-layer
+budget that assumes a uniform 640 is wrong by those two layers.
+
+The corrected rate changes the conclusion. The class is not two orders of
+magnitude below its peak: it is at 12 percent, which is a normal
+tensor-core-attention number and leaves real headroom. What it does not settle
+is where that 88 percent goes, and the phase ranking below depends on that
+split, which is the counterfactual `attn-bench` performs.
 
 ### The correction that matters: ds41's attention is BF16, and its KV is already FP4
 
@@ -293,8 +310,8 @@ needed to become one. It is the reverse, and the difference changes the phase.
 `ds4_fa_mma` issues `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
 (`cuda/ds41_attn_mma.cuh:151-153`), and the kernel `ds4_sparse_attn_mma_kernel`
 (`:189`) uses it for both products, QK and PV. So the class runs against the
-**107.8 TFLOPS BF16 peak**, not 215.6, and at 13.5 ms per layer its arithmetic is
-0.4 percent of that.
+**107.8 TFLOPS BF16 peak**, not 215.6, and at 13.5 ms per block-layer its
+arithmetic is 11.8 percent of that.
 
 What is already low precision is the storage, and this is the DS41-specific fact
 that no generic FP8 survey would surface: the compressed KV is **FP4 with E4M3
@@ -313,8 +330,10 @@ arrives in the form the MMA wants.
 
 That is the largest and most specific opportunity in this note, and it is not an
 FP8 one. It is also why the phase order below puts attention first: the class is
-23.8 percent of the block, the arithmetic is at 0.4 percent of its own peak, and
-the bytes on disk already have the format the faster instruction takes.
+23.8 percent of the block and 11.8 percent of its own peak. What the measurement
+then changed is *which* part of it to attack: section 9.4's `attn-bench` run
+puts the compressed pool at 1.36x the F32 window path per tile at equal MMA
+work, so the decode is the cost, not the instruction.
 
 **The precedent that this is fixable, in this tree.** Gemma's full-layer E4M3 KV
 had the same shape — `g4_attn_fp8_kernel`, one warp per (row, head), a scalar
@@ -735,6 +754,31 @@ The honest summary, and the answer to the question this section exists for:
 
 This reorders section 10's list, and section 10 is written to match.
 
+**The same conclusion for ds41's attention, and this time measured.** The
+argument above is about hVQ's expert kernels; `attn-bench` (`docs/attn-bench.md`
+in the toolkit) puts it on attention directly. It times the shipped
+`ds4_sparse_attn_mma_kernel` with the FP4 compressed pool and with the F32
+window, so the two key sources are separated at identical MMA work per tile.
+The result on an Ada part, and the shape is what matters rather than the level:
+
+    F32 window tile    0.1895 ms/tile  (1.516 ms over 8 tiles)
+    FP4 pool tile      0.2583 ms/tile  (8.267 ms over 32 tiles)
+    pool / window      1.36x, and the excess is 24 percent of a 40-tile launch
+
+Every tile does the same MMA work — 16 keys by 512 dims by 64 heads — so the
+1.36x is the gather and decode: the 288-byte FP4 row, one scale per lane, two
+shuffles per element. The MMA is not what makes the compressed path expensive,
+and its instruction is not the lever. Fixing the decode path, or overlapping it
+with the MMA, is.
+
+That also bounds what the block-scaled FP4 instruction can return here. It
+removes a widening whose cost is now measured as a share of a tile, not the
+whole tile, and it cannot consume the compressed pool unmodified anyway: the
+stored scale is one per 16 elements along `head_dim`, which is the reduction
+axis of QK but the *output* axis of PV, and an MX block-scaled operand cannot be
+transposed across its scale axis without a re-quantisation. PV would need a
+separate scaling scheme even if QK did not.
+
 ### 9.5 Tokens per second: the decode side is a different problem
 
 The question above is about decode throughput, and the prefill analysis of 8.2 to
@@ -1004,44 +1048,49 @@ width; anything that does is out whatever its speed.
 Ranked by what the measurement says, not by what the note was originally
 organised around. Section 3 moves sparse attention to the top: it is 21 to 24
 percent of a prefill block, it is the class that computes on tensor cores, and it
-runs two orders of magnitude below the peak. The experts are 29.5 percent but
-within a quarter of their bandwidth floor, so no arithmetic change helps them; the
-items that target them are ranked below for that reason, not because they are
-cheap.
+runs at 12 percent of the BF16 peak. The experts are 29.5 percent but within a
+quarter of their bandwidth floor, so no arithmetic change helps them; the items
+that target them are ranked below for that reason, not because they are cheap.
 
-1. **Sparse attention, profiled before it is changed.** One `ncu` GPU Speed Of
-   Light capture on the attention kernel at a 65,536-token prefill, reporting
-   tensor pipe active, the shared-memory and LSU pipes, and the stall reasons.
-   Section 3 names the four questions it answers: whether softmax is overlapped
-   with the MMAs, whether P is quantised at all today (it is not; it is BF16), what
-   granularity Q and K carry, and whether the accumulator layout forces a shuffle.
-   This is first because it is the largest number in the note and because it costs
-   one capture, not a kernel. It is also the item that settles the disagreement
-   between the recorded 13 TFLOPS and this note's 0.4, which nothing else does.
+1. **Sparse attention, measured and then profiled.** `bin/attn-bench` in the
+   toolkit times the shipped kernel with no model loaded, which is what the
+   engine's own safety table allows and what the resident server leaves room for.
+   It already answers the largest question: the compressed-pool path costs 1.36x
+   the F32 window path per tile at identical MMA work, so the gather and decode
+   are the cost and the MMA is not (section 9.4). The remaining split — barriers
+   against shared-memory traffic against the 16-thread softmax — needs the `ncu`
+   Speed Of Light capture, which the same tool supports with `--once`. This is
+   first because it is the largest class, it costs one capture rather than a
+   kernel, and it settles the rate: the note's earlier 0.4 was a convention error
+   and the record's 13 TFLOPS is right.
 
-2. **Attention structural overlap, if the capture says softmax is serialised.**
-   FlashAttention-3's arithmetic applies directly and is architecture independent:
-   matmul throughput doubles at FP8 while the exponential unit's does not, so a
-   kernel that computes QK, waits, computes softmax, then computes PV leaves the
-   tensor cores idle by construction. Its warp-specialized ping-pong and two-stage
-   GEMM-softmax pipelining are the published cure
-   ([2407.08608](https://arxiv.org/abs/2407.08608) [page 1-2, 5-6]). Our kernel
-   already splits work across eight warps (`cuda/ds41_attn_mma.cuh:40-42`); the
-   question is whether one warpgroup's exponential runs while another's MMA is in
-   flight. Gate on teacher-forced NLL, not cmp: this family is documented as not
+2. **Attention: the serialised softmax, which is also the cheapest fix.** Three
+   of every four warps idle while 16 threads run the online softmax serially
+   (`cuda/ds41_attn_mma.cuh:253-261`), between full-CTA barriers that no other
+   work covers. The decode kernel already has the warp-parallel form
+   (`ds4_attn_mma_stats`, `:122-135`), so this is a port rather than an
+   invention, and the sum keeps its `k = 0..15` order, which makes it bit-equal.
+   Beyond that, FlashAttention-3's arithmetic applies: matmul throughput doubles
+   at FP8 while the exponential unit's does not, so a kernel that computes QK,
+   waits, computes softmax, then computes PV idles the tensor cores by
+   construction ([2407.08608](https://arxiv.org/abs/2407.08608) [page 1-2, 5-6]).
+   Gate on teacher-forced NLL, not cmp: this family is documented as not
    bit-equal to the scalar kernel and its gate is the quality scale.
 
-3. **FP8 PV, after the reverse key walk.** Section 4's precondition, then
-   SageAttention3's two-level P scaling so the E4M3 range is used
-   ([2505.11594](https://arxiv.org/abs/2505.11594) [page 1-5]). It is third
-   because it is the change with a numerics risk, not the one with the largest
-   headroom.
+3. **The compressed-pool decode, which is now the measured target.** The 1.36x
+   above is one scale byte per lane, 32 nibble reads per lane and two shuffles
+   per element, paid on 32 of the launch's 40 tiles. Vectorising that unpack and
+   overlapping it with the MMAs addresses the cost the measurement actually
+   found. This item did not exist in the earlier ranking, which put an
+   instruction change here instead; the measurement moved it.
 
-4. **Book-gather bank-conflict relief, by the one route still open.** The kernel
-   spends 48 percent of its shared-memory pipe on load wavefronts of which 42
-   percent are book-gather conflicts, and reaches 53 percent of the E4M3 peak once
-   the copies are removed (`cuda/minimax_mma8w.cuh:38-56`). Two of the three routes
-   are closed and were checked: FLUTE's bank duplication needs shared memory the
+4. **Block-scaled FP4 QK, only after the two above and only for QK.** Its
+   precondition is now explicit: the stored scale is one per 16 elements along
+   `head_dim`, which is the reduction axis of QK but the output axis of PV, so
+   PV cannot consume the stored pair without a re-quantisation (section 9.4). It
+   also prices P and the F32 window as operands that would have to become E2M1.
+   Ranked below the decode work because the decode is the measured cost and this
+   is the inferred one.
 
 5. **Book-gather bank-conflict relief, by the one route still open.** The kernel
    spends 48 percent of its shared-memory pipe on load wavefronts of which 42

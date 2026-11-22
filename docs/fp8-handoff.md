@@ -10,27 +10,37 @@ This file is the entry point and it is specific to this family.
 ds41's sparse attention kernel is not an FP8 kernel and cannot become one
 cheaply. It computes both products with `mma.sync` **BF16**
 (`cuda/ds41_attn_mma.cuh:151-153`, `ds4_fa_mma`), 21-24 percent of a
-65,536-token prefill block, 13.5-13.7 ms per layer. Against the 107.8 TFLOPS
-BF16 peak its arithmetic is 0.4 percent.
+65,536-token prefill block, 13.5 ms per block-layer. Against the 107.8 TFLOPS
+BF16 peak its arithmetic is **11.8 percent**, which agrees with the record's own
+"about 13 TFLOPS". An earlier draft of the study said 0.4 percent and was wrong
+by 32x: it divided a whole-prefill layer's FLOPs by a per-block time.
 
 But its compressed KV is **already FP4 with E4M3 scales** — `DS4_V41_CKV_NIB`
 scales decoded one per lane, four-bit values unpacked per lane
 (`cuda/ds41_attn_mma.cuh:47-52`, `:58-80`). The kernel therefore decodes FP4 to
-BF16 in shared memory and then multiplies in BF16. The block-scaled FP4 tensor
-instruction (`kind::mxf4nvf4`, `mma.sync m16n8k64`, E2M1 operands with an E4M3
-scale per 16) consumes exactly that stored pair natively, with no decode.
+BF16 in shared memory and then multiplies in BF16.
 
-That is the whole opportunity, and it is the opposite of what an FP8 study would
-predict: the storage is already low precision and the arithmetic is not. It is
-also the one place in this engine where an instruction change could reach a
-23.8-percent class without a re-quantisation, because the bytes on disk already
-have the format the instruction wants.
+That looked like the whole opportunity, and the measurement says it is not. The
+toolkit's `bin/attn-bench` times the shipped kernel with no model loaded and
+separates the two key sources at identical MMA work per tile: the FP4 pool path
+costs **1.36x** the F32 window path per tile, and that excess is about 24
+percent of a 40-tile launch. The gather and decode are the cost; the MMA is not.
+The lever is the decode path — vectorising the unpack and overlapping it with
+the MMAs — not a change of tensor instruction.
+
+Two constraints follow, and both are recorded in the study. The stored scale is
+one per 16 elements along `head_dim`, which is QK's reduction axis but PV's
+output axis, so the block-scaled FP4 form cannot consume the stored pair for PV
+without a re-quantisation. And the compressed pool does not exist on every
+layer: the artifact's metadata reads 0 for layers 0-1, 2 for layers 2-19 and 1
+for layers 20-39, so layers 0 and 1 attend to the 128-key window alone.
 
 ## Where the artefacts live
 
 | Thing | Where | State |
 |---|---|---|
-| Study | `docs/fp8-tensor-core-research-2026-11-22.md` | Uncommitted here; on vq-tools `dev` as `docs/fp8-tensor-cores.md` |
+| Study | `docs/fp8-tensor-core-research-2026-11-22.md` | Committed here; also on vq-tools `dev` as `docs/fp8-tensor-cores.md` |
+| The attention bench | vq-tools `c/gpu/attn-bench.cu` → `bin/attn-bench`, `docs/attn-bench.md` | Built and run; needs `DS41_SRC` to build |
 | Phases, edit sites | vq-tools `docs/handoff-fp8-phases.md` | Pushed, `dev` @ `42e9e43` |
 | The MMA rate probe | vq-tools `c/gpu/mma-rate.cu` → `bin/mma-rate` | Pushed, built, run |
 | hVQ fitter (cited by line) | vq-tools `crates/vq-calib/reference/hvq/` | Pushed, sha256 recorded |
@@ -73,46 +83,64 @@ A second sample with the server resident read 99.3 percent; both kept. It
 establishes that a per-32 hardware scale is free. It does not establish a
 throughput argument, because the promotion it removes is itself measured free.
 
-### Phase 2 — sparse attention: the largest number, and a format question
+### Phase 2 — sparse attention: MEASURED, and the ranking changed
 
-**Start here.** Cost: one `ncu` GPU Speed Of Light capture on an idle box, no
-code change.
+**The decode is the cost, and it is now measured rather than guessed.** The
+toolkit's `bin/attn-bench` compiles this kernel's own source behind five host
+stubs, so it runs with no model loaded, in a few hundred MiB, and can be
+captured with `ncu` under the one-GPU-job rule. Run on an Ada part at 2,048
+rows:
+
+    F32 window tile    0.1895 ms/tile  (1.516 ms over 8 tiles)
+    FP4 pool tile      0.2583 ms/tile  (8.267 ms over 32 tiles)
+    pool / window      1.36x; the excess is ~24 percent of a 40-tile launch
+
+Identical MMA work per tile, so 1.36x is the gather and decode: the 288-byte
+FP4 row, one scale per lane, two shuffles per element. Levels are
+architecture-specific and not the point; the ratio is the shape of the result.
 
 The kernel is `ds4_sparse_attn_mma_kernel` (`cuda/ds41_attn_mma.cuh:189`),
-BF16 MMA, `__launch_bounds__(256)`, 26 KB of shared memory. Its items are
-gathered from the FP4 compressed pool plus the FP8/F32 window, decoded to BF16
-into `ks`, then multiplied.
+BF16 MMA, `__launch_bounds__(256)`, 26 KB shared, 80 registers, no spills, three
+blocks per SM as its comment predicts (`attn-bench` prints these from the
+occupancy API).
 
-Four questions the capture answers:
+Three things the measurement settles:
 
-1. How much of the round is the decode versus the MMA? The gather resolves each
-   element with two shuffles (`cuda/ds41_attn_mma.cuh:47-52`); if that dominates,
-   the FP4 instruction removes it outright and the win is large.
-2. Is softmax overlapping the MMAs? FP8/FP4 double the matmul rate and leave the
-   exponential unit unchanged, so a serialised kernel idles the tensor cores by
-   construction ([2407.08608](https://arxiv.org/abs/2407.08608) [page 1-2, 5-6]).
-3. Does P get quantised? No: pass 2 recomputes S, exp's it and writes the tile as
-   `__float2bfloat16` (`cuda/ds41_attn_mma.cuh:589`), so the PV product is BF16
-   too. Making QK FP4
-   without PV leaves half the class at the old rate.
-4. Does the accumulator layout match the operand layout for the FP4 form?
-   SageAttention3 found it does not and permuted the P tile instead of shuffling
-   at run time ([2505.11594](https://arxiv.org/abs/2505.11594) [page 5]).
+1. The FP4 instruction does **not** remove the decode cost, because the decode
+   is what the 1.36x measures and the instruction only removes the widening that
+   follows it. Ranking it first was wrong.
+2. The rate is 11.8 percent of the BF16 peak, matching the record's 13 TFLOPS;
+   the study's earlier 0.4 percent was a block-convention error.
+3. Softmax is serialised on 16 threads of 256 between full-CTA barriers
+   (`cuda/ds41_attn_mma.cuh:253-261`), and the decode kernel already has the
+   warp-parallel form (`:122-135`), so the fix is a port and is bit-equal.
 
-Gate: this family is documented as **not** bit-equal to the scalar kernel — "the
-gate is the quality scale (NLL/PPL), not cmp"
-(`cuda/ds41_attn_mma.cuh:13-16`). Expect a large idle tensor-pipe fraction; if
-the capture disagrees, re-derive the arithmetic before touching code.
+Remaining question for the capture: the split between the decode's shared-memory
+traffic and its shuffle/issue cost, which decides whether vectorising the unpack
+or overlapping it with the MMAs is the better first move.
 
-### Phase 3 — QK and PV on the block-scaled FP4 instruction
+Gate for any of it: this family is documented as **not** bit-equal to the scalar
+kernel — "the gate is the quality scale (NLL/PPL), not cmp"
+(`cuda/ds41_attn_mma.cuh:13-16`).
 
-Only if Phase 2 says the decode or the MMA issue dominates. The stored form is
-already what `kind::mxf4nvf4` consumes, so the change is a layout and scale-plumbing
-change, not a re-quantisation.
+### Phase 3 — the compressed-pool decode: vectorise and overlap
+
+The measured target. Vectorise the nibble unpack and overlapping it with the
+MMAs. Two of the three sources of pooled keys are already ruled out on paper:
+FLUTE's bank duplication needs shared memory the kernel has spent, and a fixed
+lane rotation is a bijection that leaves a random gather unchanged.
+
+### Phase 3b — block-scaled FP4 QK, only for QK, only after Phase 3
+
+Demoted from the top of the list, and narrowed. The stored scale is one per 16
+elements along `head_dim`: QK's reduction axis, which the instruction can use,
+but PV's *output* axis, which it cannot without a re-quantisation. So at most
+half the class is reachable, P and the F32 window would have to become E2M1, and
+the measured cost is elsewhere besides.
 
 This is the item with a numerics risk, so it goes through the family's own
 quality gate over the release's 26 cases, against the original. Two named
-hazards: the accumulator layout differ from the operand's, and P is BF16 today,
+hazards: the accumulator layout differs from the operand's, and P is BF16 today,
 so enabling it is a second, separable change.
 
 ### Phase 4 — E8M0 per-32 activation scales on the routed experts
@@ -155,6 +183,13 @@ floor, record that and stop.
 
 - The BF16 and FP8 peaks: 107.8 and 215.6 TFLOPS at 2,190 MHz, and the FP4
   block-scaled form at 509.5 at ~2.5 GHz (`docs/gb10-hardware.md:90-100`).
+- ds41's attention runs at 12.7 TFLOPS, 11.8 percent of the BF16 peak, and the
+  record's "about 13 TFLOPS" is right. The block is 2,048 rows through layers
+  0-19; the study's 0.4 percent was a 32x convention error.
+- The compressed-pool path costs 1.36x the F32 window path per tile at equal MMA
+  work, measured with `attn-bench`, so the decode is the cost and the MMA is not.
+- The block-scaled FP4 instruction cannot serve PV on the stored pool, because
+  its scale runs along `head_dim`, which is PV's output axis.
 - ds41's index scores are an exact INT8 problem on s8 tensor cores, 841 → 50 ms
   at 59K. Round 1, not a lever.
 - The per-stage promotion removal: measured even at 180 registers.
@@ -166,20 +201,26 @@ floor, record that and stop.
 
 ## Open discrepancies
 
-1. **The attention rate.** The repo records "about 13 TFLOPS"; backing it out of
-   13.5 ms gives 0.4. Both are far below the 107.8 BF16 peak, and Phase 2 settles
-   which is real.
-2. **The hVQ gain's kernel independence.** Follows from the refit formula
+1. **The hVQ gain's kernel independence.** Follows from the refit formula
    (`tools/vq_calib/cuda/ds41_hvq.cu:171-180`) but not cross-checked against a
-   refit run. Phase 4 depends on it.
+   refit run. The E8M0 experiment depends on it.
+2. **The decode's internal split.** `attn-bench` measures the compressed path at
+   1.36x the window path per tile but does not say how much of that is shared-
+   memory wavefronts versus shuffle and issue. The capture settles it.
 
 ## Next action
 
-One capture, on the idle box:
+Run the bench on the Spark first; it needs no model, so the resident server can
+stay up and the one-GPU-job rule is respected:
+
+    DS41_SRC=~/ds4-dfm-rs ./build.sh && ./bin/attn-bench --rows 2048 \
+        --keys 512,0 --window 0,128 --reps 9 --clock-mhz <live SM clock>
+
+Then capture the same binary, one launch:
 
     ncu --clock-control none --set full --launch-count 1 \
-        --kernel-name ds4_sparse_attn_mma_kernel <the prefill command>
+        bin/attn-bench --rows 2048 --keys 512 --once
 
 Read tensor-pipe active, the shared-memory and LSU pipes, and the stall
-breakdown against the four questions. Everything else waits on that number, and
-it decides whether Phase 3 is worth its numerics risk.
+breakdown. That split decides whether Phase 3 vectorises the unpack or overlaps
+it with the MMAs; nothing else is waiting on it.
