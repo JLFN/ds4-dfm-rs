@@ -230,5 +230,15 @@ Recorded PIDs are historical.
   use the family guide and dated image gates for implemented scope.
 - [W2A16 fused-dequant GEMM proposal](ds4-w2a16-fused-dequant-gemm-design.md):
   proposed work, not a released path.
+- [FP8 tensor-core research, November 22](fp8-tensor-core-research-2026-11-22.md):
+  where ds41 multiplies on tensor cores and why the 23.8-percent sparse-attention
+  class is two orders of magnitude below the peak while its compressed KV is
+  already FP4 with E4M3 scales; the SM120 block-scaled FP8 MMA and its measured
+  rate, P-cast collapse and the reverse KV walk, grouped expert tails, and how
+  hVQ's post-reduction row gain composes with an E8M0 activation scale; kernel
+  changes only, byte-identical artifact, nothing adopted.
+- [FP8 handoff, November 22](fp8-handoff.md): the ds41-only entry point — the
+  finding, the host state, the six phases in ranked order with their gates, what
+  is settled and must not be redone, and the one capture to run next.
 - [DeepSeek model-card synopsis](../MODEL_CARD.md): upstream model information,
   separate from DS4 artifact and runtime validation.
