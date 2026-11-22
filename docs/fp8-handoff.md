@@ -92,6 +92,7 @@ under the one-GPU-job rule. On the reference host (GB10, 2,048 rows, 2,470 MHz):
 
     shipped shape (128 window + 512 topk, 40 tiles)   12.47 ms/kernel
     record for the class per block-layer              13.5 ms
+    with __launch_bounds__(256, 3)                    10.8 ms, 3 blocks/SM
 
     matched tiles      F32 window     FP4 pool     pool / window
         8 tiles          3.159 ms      3.775 ms        1.20x
@@ -227,17 +228,36 @@ floor, record that and stop.
 
 ## Next action
 
-Run the bench on the Spark first; it needs no model, so the resident server can
-stay up and the one-GPU-job rule is respected:
+The measurement produced one change with a verified gain, and it is cheap enough
+to land first.
 
-    DS41_SRC=~/ds4-dfm-rs ./build.sh && ./bin/attn-bench --rows 2048 \
-        --keys 512,0 --window 0,128 --reps 9 --clock-mhz <live SM clock>
+**Occupancy: the kernel asks for two blocks per SM where three fit.** On the
+GB10 `ds4_sparse_attn_mma_kernel` compiles to 128 registers, which admits two
+blocks per SM, while its own comment budgets three from 26 KB of shared memory.
+A source variant with `__launch_bounds__(256, 3)` in a scratch copy gives 80
+registers, 64 bytes of spill and three blocks per SM, and it is faster on every
+interleaved pair measured: 12.67 to 10.81, 12.56 to 11.11, 12.86 to 10.75, 12.33
+to 11.36 ms, i.e. 8.5 to 19.6 percent. The gain holds at 512 and 8,192 rows, and
+the output hash is identical on both hosts, so it is scheduling and not
+arithmetic. `-maxrregcount` cannot do this: `__launch_bounds__(256)` overrides
+it, which four builds confirmed.
 
-Then capture the same binary, one launch:
+Translated to the record's own block (1,135 ms, attention 270.4 ms), a 15
+percent attention gain takes 3.1 percent off a prefill block, about 1.03x on
+prefill tokens per second; the conservative 8.5 percent pair gives 1.019x. This
+is a prefill change: the recorded decode figures have no attention term this
+bench exercises.
+
+Gate before landing: the family is not bit-equal to the scalar kernel, so the
+check is the same quality scale (NLL/PPL) and a same-artifact before/after. The
+hash result above makes that cheap, because a pure scheduling change should
+reproduce bytes at a fixed launch configuration; any movement beyond it is
+arithmetic and should stop the change.
+
+Then, and still before any operand-format work, the capture:
 
     ncu --clock-control none --set full --launch-count 1 \
         bin/attn-bench --rows 2048 --keys 512 --once
 
-Read tensor-pipe active, the shared-memory and LSU pipes, and the stall
-breakdown. That split decides whether Phase 3 vectorises the unpack or overlaps
-it with the MMAs; nothing else is waiting on it.
+It decides whether vectorising the pool unpack or overlapping it with the MMAs
+comes first. Nothing else is waiting on it.

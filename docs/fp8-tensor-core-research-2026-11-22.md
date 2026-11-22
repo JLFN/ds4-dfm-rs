@@ -783,6 +783,16 @@ the 0.30 ms/tile marginal rate predicts 9.6 from the 8-tile point, and the first
 instruction change cannot touch, and it is why the ranking below puts the
 pipeline structure before the operand format.
 
+**One change came out of it that is worth landing, and it is not an instruction
+change.** The bench's receipt prints the kernel's register count and occupancy,
+and on the GB10 that pair reads 128 registers and two blocks per SM — where the
+kernel's own comment budgets three from 26 KB of shared memory. A source variant
+with `__launch_bounds__(256, 3)` in a scratch copy fits the budget at 80
+registers and 64 bytes of spill, and it is faster in every interleaved pair
+measured: 8.5 to 19.6 percent, holding at 512 and 8,192 rows, with an identical
+output hash. That is a scheduling change, not an arithmetic one, and it is the
+cheapest confirmed speedup this note has.
+
 **The bench reproduces the record, which is the check that matters.** At 2,048
 rows and the shipped 640-key shape the bench reports **12.47 ms** for the
 kernel alone; the record gives 13.5 ms for the class per block-layer. So this
