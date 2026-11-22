@@ -1210,6 +1210,57 @@ and any format change whose only argument is a smaller cache footprint, since ou
 measurements show that case is decided by the dequantisation cost and not by the
 bytes.
 
+## 10a. The expert kernel, measured: three overlapping costs
+
+The FP8 expert kernel was then measured directly, on the reference host at the
+production 4,096-row chunk and the ds41 shape (H 5120, F 2304, E 384, top-6),
+using the runtime's own model-free harness (`tests/test_minimax_mma8w.cu`, no
+model, random routes). Five outcomes, four of them negative, and the negatives
+are the useful part.
+
+**Warp specialization is confirmed, and it is a prefill gain.** The
+warp-specialized arm beats the older non-specialized kernel on every run: gate
+8.4-9.6 against 9.4-9.6 ms, and over gate, up and down together 1.12x on the
+13-bit arm and 1.21x on the 13-bit-plus-residual arm. That is already shipped
+code; the measurement confirms it rather than proposing it.
+
+**Two plausible levers were refuted, and both are recorded so they are not
+retried.** Moving the book gather from shared memory to global loads relying on
+L1 is 3x slower, 26 ms against 8.7 ms per gate: the 64 KiB book competes with
+the producer fills for the same path, and an 8-byte indexed read pays a
+wavefront either way. Splitting each 8-byte codeword read into two 4-byte halves
+— the idea the kernel's own comment left open — is bit-identical and changes
+nothing, 0.92 to 1.02x across three interleaved runs.
+
+**The cost decomposes into three terms that overlap.** Deleting only the
+activation copy takes gate from 8.12 to about 6.6 ms; deleting only the book
+gather takes it to about 6.7; moving all weights into L2 takes it to 6.48. Each
+is roughly 1.5 ms of a 8.12 ms kernel, about 19-20 percent, and they cannot be
+added: the kernel hides each behind the other, so the best single lever is
+about 1.6 ms and a combined fix buys much less than 3 ms. This is why the
+header's own decomposition (4.8 streamed, 3.6 in L2, 2.3 with copies removed)
+looked like three independent windows and is really one.
+
+**The largest untouched waste is on the 12-bit layers, not in the math.** The
+12-bit layers (14-39, 26 of 40) zero-pad their 4,096-word book to 8,192 words
+and stage the full 64 KiB, with a zero plane (`cuda/ds41_vq_prefill_fp8.cuh:23-24`,
+`:87-112`). Shared memory for that configuration is 68,448 B of the 101,376
+available, so 32 KiB sits unused on two thirds of the model. The fused
+gate-and-up geometry agy proposed — 256 weight rows per 128-row activation tile
+— needs 96,832 B with the padded book, which does not fit beside three stages
+but does fit with two; with the unpadded 12-bit book it fits three stages at
+78,688 B. That is the one structural change left with room to work, and its
+ceiling is the ~1.5 ms activation-copy term, not the arithmetic.
+
+**What the post-reduction gain does and does not buy.** hVQ applies one F16 row
+gain after the whole K reduction, so no weight scale crosses shared memory
+across K and the raw codeword is row-invariant: the 8-byte book entry serves
+every token tile from registers. That is why the consumer loop can drop the
+per-stage partial accumulator once the gain and the activation scale are folded
+together at the epilogue, which frees the registers a 12-warp fused kernel
+needs. It does not admit a Psumbook (section 11) and it does not make the
+codeword smaller.
+
 ## 11. What the codebook-GEMM literature says about hVQ's actual bottleneck
 
 Section 9.2 concluded that hVQ's kernel spends its shared-memory pipe on a
